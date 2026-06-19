@@ -244,3 +244,90 @@ fn test_iris_get_log_absent_from_baseline_and_nostub() {
         "iris_get_log must NOT appear in Nostub toolset"
     );
 }
+
+// ── Interop profile (fork default) ───────────────────────────────────────────
+
+#[test]
+fn test_toolset_from_str_interop() {
+    assert_eq!(Toolset::from_str("interop"), Toolset::Interop);
+    assert_eq!(Toolset::from_str("INTEROP"), Toolset::Interop);
+}
+
+/// Interop toolset must expose EXACTLY the interop keep-list (INTEROP_TOOLS).
+/// This is the registry self-check: derived from the live router, so a typo in the
+/// keep-list or an upstream rename makes this fail instead of silently shipping wrong tools.
+#[test]
+fn test_interop_toolset_exact() {
+    use iris_agentic_dev_core::tools::INTEROP_TOOLS;
+    let tools = IrisTools::new_with_toolset(None, Toolset::Interop).expect("interop IrisTools");
+    let names = tools.registered_tool_names();
+    let expected: std::collections::HashSet<String> =
+        INTEROP_TOOLS.iter().map(|s| s.to_string()).collect();
+    let missing: Vec<_> = expected.difference(&names).collect();
+    let unexpected: Vec<_> = names.difference(&expected).collect();
+    assert!(
+        missing.is_empty() && unexpected.is_empty(),
+        "Interop toolset must expose exactly INTEROP_TOOLS.\n  missing (in keep-list but not router — typo/rename?): {:?}\n  unexpected (in router but not keep-list): {:?}",
+        missing,
+        unexpected,
+    );
+    assert_eq!(
+        names.len(),
+        INTEROP_TOOLS.len(),
+        "Interop profile must be {} tools, got {}",
+        INTEROP_TOOLS.len(),
+        names.len()
+    );
+}
+
+/// Interop must keep the interop-critical tools the workshop actually needed.
+#[test]
+fn test_interop_preserves_critical_tools() {
+    let tools = IrisTools::new_with_toolset(None, Toolset::Interop).expect("interop IrisTools");
+    let names = tools.registered_tool_names();
+    for required in &[
+        "iris_query",
+        "iris_execute",
+        "iris_compile",
+        "iris_doc",
+        "iris_test",
+        "iris_production",
+        "iris_interop_query",
+        "iris_lookup_manage",
+        "iris_credential_manage",
+        "iris_table_info",
+    ] {
+        assert!(
+            names.contains(*required),
+            "interop-critical tool {} must be in the interop profile",
+            required
+        );
+    }
+}
+
+/// Interop must prune the meta/non-interop surface (skills/kb/agent/generate/search/info/debug-individual/scm/containers).
+#[test]
+fn test_interop_excludes_meta_tools() {
+    let tools = IrisTools::new_with_toolset(None, Toolset::Interop).expect("interop IrisTools");
+    let names = tools.registered_tool_names();
+    for excluded in &[
+        "skill",
+        "skill_list",
+        "kb",
+        "agent_info",
+        "iris_search",
+        "iris_info",
+        "iris_generate",
+        "iris_macro",
+        "iris_source_control",
+        "iris_containers",
+        "iris_admin",
+        "debug_capture_packet",
+    ] {
+        assert!(
+            !names.contains(*excluded),
+            "meta/non-interop tool {} must NOT be in the interop profile",
+            excluded
+        );
+    }
+}

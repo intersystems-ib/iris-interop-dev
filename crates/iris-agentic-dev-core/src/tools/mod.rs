@@ -45,6 +45,7 @@ pub mod log_store;
 pub mod scm;
 pub mod search;
 pub mod skills_tools;
+pub mod sql_lint;
 pub mod symbols_local;
 
 pub use doc::{DocMode, IrisDocParams};
@@ -60,6 +61,11 @@ pub enum Toolset {
     Nostub,
     /// 23 tools — stubs removed + 4 merger groups consolidated.
     Merged,
+    /// ~20 tools — interop-skills-focused profile (see `INTEROP_TOOLS`).
+    /// Keeps only the tools the iris-interop skills actually exercise; everything
+    /// else (skill_*/kb_*/agent_*/generate_*/individual debug_*/container/scm) is pruned.
+    /// Default for this fork. Additive: tool *code* is unchanged so upstream stays mergeable.
+    Interop,
 }
 
 impl Toolset {
@@ -68,6 +74,7 @@ impl Toolset {
         match s.trim().to_lowercase().as_str() {
             "nostub" => Toolset::Nostub,
             "merged" => Toolset::Merged,
+            "interop" => Toolset::Interop,
             _ => Toolset::Baseline,
         }
     }
@@ -77,9 +84,40 @@ impl Toolset {
             Toolset::Baseline => "baseline",
             Toolset::Nostub => "nostub",
             Toolset::Merged => "merged",
+            Toolset::Interop => "interop",
         }
     }
 }
+
+/// The interop-focused keep-list (Toolset::Interop). Source of truth for the
+/// `Interop` pruning AND the `registered_tool_names()` Interop branch. A unit test
+/// (`test_interop_toolset_exact`) asserts the live router exposes exactly these,
+/// which also guards against typos / upstream renames.
+pub const INTEROP_TOOLS: &[&str] = &[
+    // core execution
+    "iris_query",
+    "iris_doc",
+    "iris_execute",
+    "iris_compile",
+    "iris_test",
+    // diagnostics / introspection
+    "iris_symbols",
+    "docs_introspect",
+    "check_config",
+    "iris_get_log",
+    "iris_debug",
+    // interoperability
+    "iris_production",
+    "iris_production_item",
+    "iris_interop_query",
+    "iris_lookup_manage",
+    "iris_lookup_transfer",
+    "iris_credential_list",
+    "iris_credential_manage",
+    "extract_message_map_routing",
+    "find_subclass_implementations",
+    "iris_table_info",
+];
 
 pub const ERR_NO_TESTS_FOUND: &str = "NO_TESTS_FOUND";
 pub const ERR_NAMESPACE_NOT_FOUND: &str = "NAMESPACE_NOT_FOUND";
@@ -1406,6 +1444,16 @@ impl IrisTools {
     /// Returns the set of tool names registered for the current toolset.
     /// Used by tests and by the benchmark harness to build valid_tool_names.
     pub fn registered_tool_names(&self) -> std::collections::HashSet<String> {
+        // The Interop profile is pruned directly from the live router, so derive its
+        // names from the router itself — always in sync, no hardcoded duplicate to drift.
+        if self.toolset == Toolset::Interop {
+            return self
+                .tool_router
+                .list_all()
+                .into_iter()
+                .map(|t| t.name.to_string())
+                .collect();
+        }
         // Authoritative baseline list — 34 tools matching v0.4.x (audit 2026-04-28).
         // REST(14) + Docker(16) + Local(4) = 34
         // 34 - stubs(4) = nostub(30); 30 - merged_removed(10) + merged_added(4) = merged(24)
@@ -1488,6 +1536,7 @@ impl IrisTools {
             all_tools.iter().map(|s| s.to_string()).collect();
 
         match self.toolset {
+            Toolset::Interop => unreachable!("derived from router and returned early above"),
             Toolset::Baseline => {}
             Toolset::Nostub => {
                 for s in stub_tools {
@@ -1534,53 +1583,71 @@ impl IrisTools {
 
         // Remove tools from MCP tool list based on toolset (T017–T019, T033, FR-004–011).
         // The `#[tool_router]` macro registers all tools; we prune at construction time.
-        let stubs_to_remove: &[&str] = match toolset {
-            Toolset::Baseline => &[],
-            // iris_symbols_local is NO LONGER a stub (025-symbols-local-ts)
-            Toolset::Nostub | Toolset::Merged => &[
-                "skill_propose",           // FR-005
-                "skill_optimize",          // FR-005
-                "skill_share",             // FR-005
-                "skill_community_install", // FR-006
-            ],
-        };
-        for name in stubs_to_remove {
-            router.remove_route(name);
-        }
-
-        // For merged toolset: remove debug tools replaced by iris_debug dispatcher.
-        // 036: individual interop stubs removed entirely — iris_production/iris_interop_query
-        // are now available in all tiers, so no pruning needed for them.
-        if toolset == Toolset::Merged {
-            let merged_replaced: &[&str] = &[
-                // Replaced by iris_debug (FR-007)
-                "debug_capture_packet",
-                "debug_get_error_logs",
-                "debug_map_int_to_cls",
-                "debug_source_map",
-                // agent_info removed (FR-011)
-                "agent_info",
-                // iris_containers replaces these in merged
-                "iris_list_containers",
-                "iris_select_container",
-                "iris_start_sandbox",
-            ];
-            for name in merged_replaced {
-                router.remove_route(name);
+        if toolset == Toolset::Interop {
+            // Interop profile: keep ONLY the interop keep-list; prune everything else.
+            // Derived from the live router so an upstream rename/removal can't silently
+            // leave a stale name behind (test_interop_toolset_exact guards the keep-list).
+            let keep: std::collections::HashSet<&str> = INTEROP_TOOLS.iter().copied().collect();
+            let all: Vec<String> = router
+                .list_all()
+                .into_iter()
+                .map(|t| t.name.to_string())
+                .collect();
+            for name in all {
+                if !keep.contains(name.as_str()) {
+                    router.remove_route(&name);
+                }
             }
         } else {
-            // For baseline and nostub: remove merged-only dispatcher tools
-            // (iris_production/iris_interop_query/iris_production_item are now available everywhere)
-            let merged_only: &[&str] = &[
-                "iris_debug",
-                "iris_containers",
-                // 026-admin-tools
-                "iris_admin",
-                // 027-progressive-disclosure
-                "iris_get_log",
-            ];
-            for name in merged_only {
+            let stubs_to_remove: &[&str] = match toolset {
+                Toolset::Baseline => &[],
+                // iris_symbols_local is NO LONGER a stub (025-symbols-local-ts)
+                Toolset::Nostub | Toolset::Merged => &[
+                    "skill_propose",           // FR-005
+                    "skill_optimize",          // FR-005
+                    "skill_share",             // FR-005
+                    "skill_community_install", // FR-006
+                ],
+                Toolset::Interop => unreachable!("handled above"),
+            };
+            for name in stubs_to_remove {
                 router.remove_route(name);
+            }
+
+            // For merged toolset: remove debug tools replaced by iris_debug dispatcher.
+            // 036: individual interop stubs removed entirely — iris_production/iris_interop_query
+            // are now available in all tiers, so no pruning needed for them.
+            if toolset == Toolset::Merged {
+                let merged_replaced: &[&str] = &[
+                    // Replaced by iris_debug (FR-007)
+                    "debug_capture_packet",
+                    "debug_get_error_logs",
+                    "debug_map_int_to_cls",
+                    "debug_source_map",
+                    // agent_info removed (FR-011)
+                    "agent_info",
+                    // iris_containers replaces these in merged
+                    "iris_list_containers",
+                    "iris_select_container",
+                    "iris_start_sandbox",
+                ];
+                for name in merged_replaced {
+                    router.remove_route(name);
+                }
+            } else {
+                // For baseline and nostub: remove merged-only dispatcher tools
+                // (iris_production/iris_interop_query/iris_production_item are now available everywhere)
+                let merged_only: &[&str] = &[
+                    "iris_debug",
+                    "iris_containers",
+                    // 026-admin-tools
+                    "iris_admin",
+                    // 027-progressive-disclosure
+                    "iris_get_log",
+                ];
+                for name in merged_only {
+                    router.remove_route(name);
+                }
             }
         }
 
@@ -2065,7 +2132,9 @@ impl IrisTools {
         // HTTP path only — docker exec path removed (#46: /noload/run assumed pre-loaded
         // classes which never existed in a fresh iris session, causing false "no test classes"
         // errors; HTTP path with /verbose=1 is reliable and works with or without docker).
-        let path_label = "http";
+        // Reports which transport actually ran the tests: "docker" when an IRIS_CONTAINER is
+        // present and docker-exec succeeds, else "http" (Atelier REST). Set below.
+        let mut path_label = "http";
         let iris = self.get_iris()?;
         let client = self.http_client();
 
@@ -2114,9 +2183,18 @@ impl IrisTools {
         // After RunTest completes, ^UnitTest.Result global IS persisted (globals bypass
         // the objectgenerator transaction boundary; SQL %Save() does not).
         let run_code = if is_class_pattern {
-            // Class pattern: no filesystem directory needed; /noload finds compiled class directly.
+            // Class pattern (/noload): RunTest still walks ^UnitTestRoot/<spec-as-path>/ even though
+            // it doesn't load from disk — a stale or invalid ^UnitTestRoot makes it fail with
+            // "Directory ... is invalid" and report 0 tests. Set a valid root and pre-create the spec
+            // directory (dots -> slashes) so the already-compiled class actually runs. (A6.2)
+            // CreateDirectoryChain is idempotent (no-op if the dir exists); kept unconditional
+            // so the multi-line code pipes cleanly through the docker-exec terminal too.
             format!(
-                r#"do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
+                r#"set ^UnitTestRoot="/tmp/httest/"
+do ##class(%File).CreateDirectoryChain(^UnitTestRoot)
+set specDir=^UnitTestRoot_$translate("{pattern}",".","/")_"/"
+do ##class(%File).CreateDirectoryChain(specDir)
+do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
                 token = correlation_token,
                 pattern = safe_pattern,
                 flags = flags,
@@ -2180,7 +2258,10 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
                         }
                     }
                 }
-                Ok(Ok(out)) => out,
+                Ok(Ok(out)) => {
+                    path_label = "docker";
+                    out
+                }
             }
         } else {
             // HTTP path: works for remote IRIS without docker
@@ -2331,10 +2412,39 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
         // Treat any run with no parsed method results as NO_TESTS_FOUND.
         if total == 0 || test_cases.is_empty() {
             self.record_call("iris_test", false);
+            // A6.2 discovery probe: instead of a bare NO_TESTS_FOUND, list the compiled
+            // %UnitTest.TestCase classes that DO exist so the model can correct the pattern
+            // (the workshop's #1 iris_test failure was an unactionable "no test classes").
+            let probe_sql = "SELECT TOP 25 Name FROM %Dictionary.CompiledClass WHERE Super LIKE '%UnitTest.TestCase%' ORDER BY Name";
+            let candidates: Vec<String> = match tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                iris.query(probe_sql, vec![], &p.namespace, client),
+            )
+            .await
+            {
+                Ok(Ok(body)) => body["result"]["content"]
+                    .as_array()
+                    .map(|rows| {
+                        rows.iter()
+                            .filter_map(|r| r["Name"].as_str())
+                            .filter(|n| !n.starts_with('%'))
+                            .map(|n| n.to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                _ => vec![],
+            };
+            let hint = if candidates.is_empty() {
+                format!("No compiled %UnitTest.TestCase classes were found in namespace '{}'. Your test class must Extend %UnitTest.TestCase and be compiled. Compile it first (iris_compile), or pass a directory path to load .cls from disk.", p.namespace)
+            } else {
+                format!("Pattern '{}' matched no runnable tests, but {} compiled %UnitTest.TestCase class(es) exist in '{}': {}. Pass one of these as the pattern (class names use /noload automatically), or a directory path to load from disk.", p.pattern, candidates.len(), p.namespace, candidates.join(", "))
+            };
             return ok_json(serde_json::json!({
                 "success": false,
                 "error_code": ERR_NO_TESTS_FOUND,
                 "error": "Pattern matched no test classes",
+                "hint": hint,
+                "candidates": candidates,
                 "pattern": p.pattern,
                 "namespace": p.namespace,
                 "total": 0,
@@ -2449,6 +2559,19 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
                 });
                 if is_runtime_error {
                     resp["error_code"] = serde_json::Value::String("IRIS_RUNTIME_ERROR".into());
+                } else if trimmed.is_empty() {
+                    // Execution succeeded but produced no captured output. With the RunUser
+                    // fix the code really ran (this is no longer the objectgenerator silent
+                    // failure) — so this is a side-effecting call, or code that returned a
+                    // value via Quit/Return instead of Write. Flag it so the model doesn't
+                    // assume a value was returned and silently lose data.
+                    resp["no_output"] = serde_json::Value::Bool(true);
+                    resp["hint"] = serde_json::Value::String(
+                        "iris_execute returns only what your code Writes to the current device. \
+                         If you expected a value, use `write <expr>,!`. If this was a side-effecting \
+                         call (load/compile/save/start), it ran — verify it with a query."
+                            .into(),
+                    );
                 }
                 if let Some(ref tr) = translation {
                     if tr.found {
@@ -2536,7 +2659,7 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
     }
 
     #[tool(
-        description = "Read, write, delete, or check an IRIS document. mode='get' fetches source, mode='put' writes (with automatic SCM checkout if needed), mode='delete' removes, mode='head' checks existence. Supports batch ops via 'names' array and elicitation_id/elicitation_answer for SCM dialog resumption. No Python required."
+        description = "Read, write, delete, or check an IRIS document. mode='get' fetches source, mode='put' writes (with automatic SCM checkout if needed), mode='delete' removes, mode='head' checks existence. Supports batch ops via 'names' array and elicitation_id/elicitation_answer for SCM dialog resumption. For large source, paginate get with max_bytes + offset (response includes next_offset), or prefer docs_introspect for signatures/structure instead of full source. No Python required."
     )]
     async fn iris_doc(
         &self,
@@ -2551,13 +2674,26 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
     }
 
     #[tool(
-        description = "Execute a SQL SELECT query on IRIS via Atelier REST. Returns rows as a JSON array with column names as keys. By default, destructive SQL (DROP, DELETE, INSERT, UPDATE, ALTER, CREATE, MERGE, TRUNCATE, EXEC, EXECUTE, BULK, LOAD, KILL, LOCK, SELECT INTO) is blocked before reaching IRIS. Set force: true to bypass validation for intentional administrative queries — has no effect on production instances where write tools are disabled. No Python required."
+        description = "Execute a SQL SELECT query on IRIS via Atelier REST. Returns rows as a JSON array with column names as keys. By default, destructive SQL (DROP, DELETE, INSERT, UPDATE, ALTER, CREATE, MERGE, TRUNCATE, EXEC, EXECUTE, BULK, LOAD, KILL, LOCK, SELECT INTO) is blocked before reaching IRIS. Set force: true to bypass validation for intentional administrative queries — has no effect on production instances where write tools are disabled. For table/column discovery call iris_table_info first instead of guessing system tables; ObjectScript (set/write/do/##class/&sql/^globals) must use iris_execute, not iris_query. No Python required."
     )]
     async fn iris_query(
         &self,
         Parameters(p): Parameters<QueryParams>,
     ) -> Result<CallToolResult, McpError> {
         tracing::info!(namespace = %p.namespace, force = p.force, "iris_query");
+
+        // Pre-flight: ObjectScript typed into a SQL tool — fail fast with a clear redirect
+        // (28/447 workshop iris_query calls were ObjectScript, not SQL).
+        if let Some(reason) = sql_lint::looks_like_objectscript(&p.query) {
+            self.record_call("iris_query", false);
+            return ok_json(serde_json::json!({
+                "success": false,
+                "error_code": "NOT_SQL",
+                "error": format!("This looks like ObjectScript, not SQL ({reason})."),
+                "hint": "iris_query runs SQL SELECTs only. For ObjectScript (set/write/do/##class/&sql/^globals), use iris_execute.",
+            }));
+        }
+        let sql_warnings = sql_lint::reserved_word_warnings(&p.query);
 
         // SQL safety gate — validate before any network call
         let skip_validation = p.force && self.write_tools_enabled();
@@ -2613,7 +2749,25 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
             if !errors.is_empty() {
                 let msg = errors[0]["error"].as_str().unwrap_or("SQL error");
                 self.record_call("iris_query", false);
-                return err_json("SQL_ERROR", msg);
+                let mut resp = serde_json::json!({
+                    "success": false,
+                    "error_code": "SQL_ERROR",
+                    "error": msg,
+                });
+                // 84/447 workshop failures were guesses at nonexistent tables — route the
+                // model to real schema discovery instead of more guessing.
+                if sql_lint::is_table_not_found(msg) {
+                    resp["hint"] = serde_json::Value::String(sql_lint::TABLE_NOT_FOUND_HINT.into());
+                }
+                if !sql_warnings.is_empty() {
+                    resp["warnings"] = serde_json::Value::Array(
+                        sql_warnings
+                            .iter()
+                            .map(|w| serde_json::Value::String(w.clone()))
+                            .collect(),
+                    );
+                }
+                return ok_json(resp);
             }
         }
 
@@ -2623,9 +2777,16 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
             .unwrap_or_default();
         let count = rows.len();
         self.record_call("iris_query", true);
-        ok_json(
-            serde_json::json!({"success": true, "rows": rows, "count": count, "namespace": p.namespace}),
-        )
+        let mut resp = serde_json::json!({"success": true, "rows": rows, "count": count, "namespace": p.namespace});
+        if !sql_warnings.is_empty() {
+            resp["warnings"] = serde_json::Value::Array(
+                sql_warnings
+                    .iter()
+                    .map(|w| serde_json::Value::String(w.clone()))
+                    .collect(),
+            );
+        }
+        ok_json(resp)
     }
 
     #[tool(
@@ -3721,7 +3882,7 @@ Methods:
     }
 
     #[tool(
-        description = "Inspect a SQL table: returns whether it is a class-projected table or DDL-created, the backing data/index globals, and (optionally) an approximate row count. Works for both class-projected tables (with real storage globals from %Dictionary.CompiledStorage) and DDL tables (globals inferred by IRIS naming convention). Use include_row_count=true to add a COUNT(*) estimate."
+        description = "Inspect a SQL table: returns whether it is a class-projected table or DDL-created, the backing data/index globals, and (optionally) an approximate row count. Works for both class-projected tables (with real storage globals from %Dictionary.CompiledStorage) and DDL tables (globals inferred by IRIS naming convention). Use include_row_count=true to add a COUNT(*) estimate. Call this (or docs_introspect) to discover the real schema/table/column names BEFORE iris_query, rather than guessing catalog tables."
     )]
     async fn iris_table_info(
         &self,
@@ -4038,13 +4199,25 @@ Methods:
     }
 
     #[tool(
-        description = "Interoperability query dispatcher (merged). what: logs=recent log entries, queues=message queue depths, messages=search message archive."
+        description = "Interoperability query dispatcher (merged). what (REQUIRED): logs=recent log entries, queues=message queue depths, messages=search message archive, partners=configured Ens.Config.BusinessPartner rows. Pass namespace=<production namespace> to query a specific interop namespace (defaults to the connection's namespace). For SQL-Gateway connections (no SQL table), use iris_table_info / the introspect-dont-guess agent."
     )]
     async fn iris_interop_query(
         &self,
         Parameters(p): Parameters<AnyParams>,
     ) -> Result<CallToolResult, McpError> {
-        let what = p.get("what").and_then(|v| v.as_str()).unwrap_or("logs");
+        // B9: `what` is required-with-enum — fail fast with the valid set instead of silently
+        // defaulting (the workshop's missing-discriminator calls otherwise misfired).
+        let what = match p.get("what").and_then(|v| v.as_str()) {
+            Some(w) if !w.is_empty() => w,
+            _ => {
+                self.record_call("iris_interop_query", false);
+                return ok_json(serde_json::json!({
+                    "success": false,
+                    "error_code": "MISSING_WHAT",
+                    "error": "iris_interop_query requires 'what': one of logs, queues, messages, partners.",
+                }));
+            }
+        };
         let _iris_arc_hold = self.iris_arc();
         let iris_opt = _iris_arc_hold.as_deref();
         #[allow(unused_variables)]
@@ -4053,6 +4226,10 @@ Methods:
                 interop::interop_logs_impl(
                     iris_opt,
                     interop::LogsParams {
+                        namespace: p
+                            .get("namespace")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
                         item_name: p
                             .get("component")
                             .and_then(|v| v.as_str())
@@ -4067,11 +4244,21 @@ Methods:
                 )
                 .await
             }
-            "queues" => interop::interop_queues_impl(iris_opt).await,
+            "queues" => {
+                let ns = p
+                    .get("namespace")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                interop::interop_queues_impl(iris_opt, ns).await
+            }
             "messages" => {
                 interop::interop_message_search_impl(
                     iris_opt,
                     interop::MessageSearchParams {
+                        namespace: p
+                            .get("namespace")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
                         source: p
                             .get("source")
                             .and_then(|v| v.as_str())
@@ -4089,9 +4276,17 @@ Methods:
                 )
                 .await
             }
-            _ => err_json(
-                "INVALID_ACTION",
-                "iris_interop_query: what must be logs, queues, or messages",
+            "partners" => {
+                // B8: real Ens.Config.BusinessPartner rows instead of guessing config tables.
+                let ns = p
+                    .get("namespace")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                interop::interop_partners_impl(iris_opt, ns).await
+            }
+            other => err_json(
+                "INVALID_WHAT",
+                &format!("iris_interop_query: unknown what='{other}'. Valid: logs, queues, messages, partners."),
             ),
         };
         self.record_call("iris_interop_query", result.is_ok());
@@ -4534,11 +4729,11 @@ impl ServerHandler for IrisTools {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
-                "iris-agentic-dev".to_string(),
+                "iris-interop-dev".to_string(),
                 env!("CARGO_PKG_VERSION").to_string(),
             ))
             .with_instructions(
-                "iris-agentic-dev: composable MCP tools for ObjectScript and IRIS development."
+                "iris-interop-dev: streamlined MCP tools for IRIS Interoperability development."
                     .to_string(),
             )
     }

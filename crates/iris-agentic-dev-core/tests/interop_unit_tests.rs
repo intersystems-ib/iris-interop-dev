@@ -133,6 +133,7 @@ mod interop_logs {
         let r = rt().block_on(interop_logs_impl(
             None,
             LogsParams {
+                namespace: None,
                 item_name: None,
                 limit: 10,
                 log_type: "error".into(),
@@ -150,7 +151,7 @@ mod interop_queues {
 
     #[test]
     fn iris_unreachable() {
-        let r = rt().block_on(interop_queues_impl(None));
+        let r = rt().block_on(interop_queues_impl(None, None));
         let result = r.unwrap();
         let text = result.content[0].raw.as_text().unwrap().text.clone();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -166,6 +167,7 @@ mod interop_message_search {
         let r = rt().block_on(interop_message_search_impl(
             None,
             MessageSearchParams {
+                namespace: None,
                 source: None,
                 target: None,
                 class_name: None,

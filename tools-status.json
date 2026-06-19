@@ -1,0 +1,145 @@
+{
+  "_comment": "Per-tool validation gate for the iris-interop-dev (interop-profile) fork. A tool is 'OK' only when its named unit AND e2e tests exist and pass. scripts/validate-tools.sh checks this. Statuses: OK = unit+e2e green; unit-ok = unit green, e2e pending (needs interop-enabled namespace); profile-only = present in the 20-tool interop profile (verified by mcp_handshake) but no dedicated behaviour test yet. Both execution transports (HTTP/Atelier REST and Docker-exec) are validated by transport_e2e.",
+  "profile": "interop (20 tools, default)",
+  "transports": {
+    "http_atelier_rest": {
+      "test": "transport_e2e::http_transport_executes_and_captures_output",
+      "status": "OK"
+    },
+    "docker_exec": {
+      "test": "transport_e2e::docker_transport_executes_and_captures_output",
+      "status": "OK"
+    },
+    "agree": {
+      "test": "transport_e2e::both_transports_agree",
+      "status": "OK"
+    }
+  },
+  "profile_surface": {
+    "test": "mcp_handshake::mcp_server_tools_list_returns_interop_profile",
+    "status": "OK",
+    "note": "asserts exactly the 20 interop tools, meta tools pruned"
+  },
+  "tools": [
+    {
+      "tool": "iris_execute",
+      "unit": "connection::build_exec_class_no_objectgenerator_uses_runuser",
+      "e2e": "test_e2e::e2e_execute_* (14)",
+      "status": "OK"
+    },
+    {
+      "tool": "iris_query",
+      "unit": "sql_lint::tests::*",
+      "e2e": "test_e2e::e2e_query_* (15)",
+      "status": "OK"
+    },
+    {
+      "tool": "iris_test",
+      "unit": "test_iris_test_http (12)",
+      "e2e": "test_iris_test_e2e::test_e2e_us1/us2/us3",
+      "status": "OK"
+    },
+    {
+      "tool": "iris_doc",
+      "unit": "test_doc_params (6)",
+      "e2e": "live MCP pagination check (max_bytes -> truncated/next_offset)",
+      "status": "OK"
+    },
+    {
+      "tool": "iris_compile",
+      "unit": "test_compile_params",
+      "e2e": "test_compile_cmd / test_e2e",
+      "status": "OK"
+    },
+    {
+      "tool": "iris_interop_query",
+      "unit": "interop_unit_tests::interop_logs/queues/message_search",
+      "e2e": "interop_e2e_tests::interop_logs/queues + tools_list (licensed interop ns)",
+      "status": "OK"
+    },
+    {
+      "tool": "iris_production",
+      "unit": "interop_unit_tests::interop_production_*",
+      "e2e": "interop_e2e_tests::interop_production_status/test_production_autostart/item (licensed)",
+      "status": "OK"
+    },
+    {
+      "tool": "iris_lookup_manage",
+      "unit": "interop_unit_tests (via execute_via_generator, A2)",
+      "e2e": "interop_e2e_tests::test_lookup_crud (licensed interop ns)",
+      "status": "OK"
+    },
+    {
+      "tool": "iris_credential_manage",
+      "unit": "interop_unit_tests (via execute_via_generator, A2)",
+      "e2e": "interop_e2e_tests::test_credential_crud (licensed interop ns)",
+      "status": "OK"
+    },
+    {
+      "tool": "iris_table_info",
+      "unit": null,
+      "e2e": "exercised by iris_query table-not-found hint path",
+      "status": "profile-only"
+    },
+    {
+      "tool": "iris_symbols",
+      "unit": null,
+      "e2e": null,
+      "status": "profile-only"
+    },
+    {
+      "tool": "docs_introspect",
+      "unit": null,
+      "e2e": null,
+      "status": "profile-only"
+    },
+    {
+      "tool": "check_config",
+      "unit": "test_connection_fixes",
+      "e2e": null,
+      "status": "profile-only"
+    },
+    {
+      "tool": "iris_get_log",
+      "unit": null,
+      "e2e": null,
+      "status": "profile-only"
+    },
+    {
+      "tool": "iris_debug",
+      "unit": null,
+      "e2e": null,
+      "status": "profile-only"
+    },
+    {
+      "tool": "iris_production_item",
+      "unit": null,
+      "e2e": null,
+      "status": "profile-only"
+    },
+    {
+      "tool": "iris_lookup_transfer",
+      "unit": null,
+      "e2e": null,
+      "status": "profile-only"
+    },
+    {
+      "tool": "iris_credential_list",
+      "unit": "interop_unit_tests",
+      "e2e": null,
+      "status": "profile-only"
+    },
+    {
+      "tool": "extract_message_map_routing",
+      "unit": null,
+      "e2e": null,
+      "status": "profile-only"
+    },
+    {
+      "tool": "find_subclass_implementations",
+      "unit": null,
+      "e2e": null,
+      "status": "profile-only"
+    }
+  ]
+}

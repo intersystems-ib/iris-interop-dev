@@ -10,7 +10,7 @@ fn iris_dev_bin() -> std::path::PathBuf {
     let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.pop();
     path.pop();
-    path.push("target/debug/iris-dev");
+    path.push("target/debug/iris-interop-dev");
     path
 }
 

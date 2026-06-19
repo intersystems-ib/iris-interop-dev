@@ -9,7 +9,7 @@ fn iris_dev_bin() -> std::path::PathBuf {
     let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.pop(); // iris-dev-bin → crates
     path.pop(); // crates → workspace root
-    path.push("target/debug/iris-agentic-dev");
+    path.push("target/debug/iris-interop-dev");
     path
 }
 

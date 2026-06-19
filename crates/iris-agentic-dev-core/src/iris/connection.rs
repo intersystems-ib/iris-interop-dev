@@ -356,46 +356,60 @@ impl IrisConnection {
     }
 
     /// Build the `.cls` source lines for the temp executor class.
+    ///
+    /// Two-method design (replaces the old `CodeMode = objectgenerator` trap that silently
+    /// returned `output:"" success:true`): the user code lives in `RunUser()` and runs at
+    /// CALL time. A bare top-level `Quit`/`Return` in user code now only returns from
+    /// `RunUser` — it can no longer abort the generator before the method body is emitted.
+    /// `Execute()` (the SqlProc) redirects the device to a temp file, calls `RunUser()`,
+    /// restores the device, and returns the captured output (newlines encoded as `$C(1)`
+    /// for the existing Rust-side transport decode in `execute_via_generator_once`).
     fn build_exec_class(class_name: &str, tmpfile: &str, code: &str) -> Vec<String> {
         let mut lines: Vec<String> = vec![
             format!("Class {} [ Final ]", class_name),
             "{".into(),
             "".into(),
-            "ClassMethod Execute() As %String [ CodeMode = objectgenerator, SqlProc ]".into(),
+            "/// Holds the user-supplied code; runs at call time. A Quit/Return here only".into(),
+            "/// returns from RunUser, so Execute still captures whatever was written.".into(),
+            "ClassMethod RunUser()".into(),
+            "{".into(),
+        ];
+        for line in code.lines() {
+            lines.push(format!("  {}", line));
+        }
+        lines.extend([
+            "}".into(),
+            "".into(),
+            "ClassMethod Execute() As %String [ SqlProc ]".into(),
             "{".into(),
             format!("  Set tmpfile = \"{}\"", tmpfile),
             "  Set savedIO = $IO".into(),
             "  Open tmpfile:(\"WNS\"):5".into(),
-            "  If '$TEST { Do %code.WriteLine(\" Quit \"\"ERROR: output capture unavailable\"\"\") Quit }".into(),
+            "  If '$TEST { Quit \"ERROR: output capture unavailable\" }".into(),
             "  Use tmpfile".into(),
             "  Try {".into(),
-        ];
-        for line in code.lines() {
-            lines.push(format!("    {}", line));
-        }
-        lines.extend([
-            "    Write !".into(), // IDEV-3: sentinel ensures temp file always ends with \n
+            "    Do ..RunUser()".into(),
             "  } Catch ex {".into(),
             "    Write \"ERROR: \",ex.DisplayString(),!".into(),
             "  }".into(),
+            "  Write !".into(), // IDEV-3: sentinel ensures temp file always ends with \n
             // Surface non-exception errors (e.g. OPEN failure sets $ZERROR but doesn't throw).
-            // Only emit if nothing was written yet (out sentinel means empty output).
             "  If ($ZError'=\"\") && ($ZError'=\",\") { Write \"ERROR($ZERROR): \",$ZError,! }"
                 .into(),
             "  Close tmpfile".into(),
             "  Use savedIO".into(),
-            // Read the temp file contents using %File for reliability.
-            // Read line:0 (timeout 0) fails on some IRIS versions — %File.ReadLine is portable.
+            // Read the temp file contents using %Stream for reliability.
+            // Read line:0 (timeout 0) fails on some IRIS versions — %Stream.ReadLine is portable.
             "  Set out = \"\"".into(),
             "  Set stream = ##class(%Stream.FileCharacter).%New()".into(),
             "  Set sc = stream.LinkToFile(tmpfile)".into(),
-            "  If $$$ISOK(sc) {".into(),
+            // $SYSTEM.Status.IsOK avoids needing %occStatus.inc in a non-objectgenerator method.
+            "  If $SYSTEM.Status.IsOK(sc) {".into(),
             "    While 'stream.AtEnd { Set out = out_stream.ReadLine()_$Char(10) }".into(),
             "  }".into(),
             "  Do ##class(%Library.File).Delete(tmpfile)".into(),
-            "  Set qout = $Replace($Replace(out,$Char(34),$Char(34)_$Char(34)),$Char(10),$Char(1))"
-                .into(),
-            "  Do %code.WriteLine(\" Quit \"_$Char(34)_qout_$Char(34))".into(),
+            // Encode newlines as $C(1) for the Rust-side transport (decoded \x01 -> \n).
+            "  Quit $Replace(out,$Char(10),$Char(1))".into(),
             "}".into(),
             "".into(),
             "}".into(),
@@ -651,6 +665,43 @@ fn is_bare_prompt_line(s: &str) -> bool {
 #[cfg(test)]
 mod system_mode_tests {
     use super::*;
+
+    // ── iris_execute generated-class shape (A2 silent-loss fix) ──────────────
+    // The old class used `CodeMode = objectgenerator`, which ran user code at COMPILE
+    // time; a bare top-level Quit/Return aborted the generator and silently produced
+    // output:"" success:true. The fix puts user code in a separate RunUser() method.
+    #[test]
+    fn build_exec_class_no_objectgenerator_uses_runuser() {
+        let cls =
+            IrisConnection::build_exec_class("User.T", "/tmp/x.txt", "write 1,! quit").join("\n");
+        assert!(
+            !cls.contains("objectgenerator"),
+            "must NOT use CodeMode=objectgenerator:\n{cls}"
+        );
+        assert!(cls.contains("ClassMethod RunUser()"), "must define RunUser");
+        assert!(
+            cls.contains("Do ..RunUser()"),
+            "Execute must call RunUser so a user Quit can't abort capture"
+        );
+        assert!(cls.contains("ClassMethod Execute() As %String [ SqlProc ]"));
+        // user code must land inside RunUser, before Execute
+        let run_idx = cls.find("ClassMethod RunUser()").unwrap();
+        let exec_idx = cls.find("ClassMethod Execute()").unwrap();
+        let user_idx = cls.find("write 1,! quit").expect("user code present");
+        assert!(
+            run_idx < user_idx && user_idx < exec_idx,
+            "user code must be inside RunUser, before Execute"
+        );
+    }
+
+    #[test]
+    fn build_exec_class_encodes_newlines_for_transport() {
+        let cls = IrisConnection::build_exec_class("User.T", "/tmp/x.txt", "write 1").join("\n");
+        assert!(
+            cls.contains("$Replace(out,$Char(10),$Char(1))"),
+            "newlines must be encoded as $C(1) for the rust-side decoder"
+        );
+    }
 
     fn conn(namespace: &str, mode: SystemMode) -> IrisConnection {
         let mut c = IrisConnection::new(

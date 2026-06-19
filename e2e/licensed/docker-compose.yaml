@@ -1,0 +1,36 @@
+# Licensed IRIS for Health + WebGateway sidecar, for the interop e2e that needs an
+# interop-enabled namespace. Core-based key (no connection cap). Atelier REST is served
+# by the gateway on host port 41080 (licensed images have no built-in web server).
+# Usage: scripts/iris-up-licensed.sh  (builds, waits for Atelier, prints the e2e env).
+services:
+  iris-lic:
+    build:
+      context: ./iris
+      args:
+        IMAGE: containers.intersystems.com/intersystems/irishealth:2026.1
+    image: iris-interop-lic
+    container_name: iris-lic
+    hostname: iris-lic
+    init: true
+    ports:
+      - "41972:1972"        # SuperServer (also the docker-exec transport target)
+    volumes:
+      - ./iris.key:/usr/irissys/mgr/iris.key:ro
+    environment:
+      - ISC_CPF_MERGE_FILE=/opt/irisbuild/merge.cpf
+
+  webgateway:
+    image: containers.intersystems.com/intersystems/webgateway:2026.1
+    init: true
+    container_name: iris-lic-webgw
+    hostname: webgateway
+    ports:
+      - "41080:80"          # Atelier REST + Management Portal -> http://localhost:41080
+    environment:
+      - ISC_CSP_CONF_FILE=/webgateway-config/CSP.conf
+      - ISC_CSP_INI_FILE=/webgateway-config/CSP.ini
+    volumes:
+      - ./webgateway/CSP.ini:/webgateway-config/CSP.ini
+      - ./webgateway/CSP.conf:/webgateway-config/CSP.conf
+    depends_on:
+      - iris-lic

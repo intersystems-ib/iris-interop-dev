@@ -67,7 +67,7 @@ jobs:
         run: |
           $init = '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}'
           # Ignore exit code from iris-agentic-dev — it exits non-zero when stdin closes
-          $result = $init | & "target\debug\iris-agentic-dev.exe" mcp 2>$null
+          $result = $init | & "target\debug\iris-interop-dev.exe" mcp 2>$null
           $exitCode = $LASTEXITCODE
           Write-Host "Response: $result"
           Write-Host "Binary exit code: $exitCode (expected non-zero — stdin closed)"
@@ -170,6 +170,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo install cargo-zigbuild
       - run: cargo zigbuild --release --target x86_64-unknown-linux-musl -p iris-agentic-dev
-      - run: file target/x86_64-unknown-linux-musl/release/iris-agentic-dev
+      - run: file target/x86_64-unknown-linux-musl/release/iris-interop-dev
       - run: |
-          ldd target/x86_64-unknown-linux-musl/release/iris-agentic-dev 2>&1 | grep -q "not a dynamic executable" && echo "SC-002 PASS: static binary confirmed" || echo "NOTE: may have dynamic deps on musl"
+          ldd target/x86_64-unknown-linux-musl/release/iris-interop-dev 2>&1 | grep -q "not a dynamic executable" && echo "SC-002 PASS: static binary confirmed" || echo "NOTE: may have dynamic deps on musl"

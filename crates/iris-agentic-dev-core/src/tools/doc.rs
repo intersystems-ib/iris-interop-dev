@@ -40,6 +40,13 @@ pub struct IrisDocParams {
     /// Saves a round-trip vs calling iris_doc(put) then iris_compile separately.
     #[serde(default)]
     pub compile: bool,
+    /// For mode=get: cap returned source to this many bytes (0 = unlimited). Large class source is
+    /// the biggest iris_doc token sink — page through with `offset` + `max_bytes`.
+    #[serde(default)]
+    pub max_bytes: usize,
+    /// For mode=get: byte offset to start returning from (use with max_bytes to paginate).
+    #[serde(default)]
+    pub offset: usize,
 }
 
 fn default_namespace() -> String {
@@ -54,6 +61,19 @@ fn ok_json(v: serde_json::Value) -> Result<rmcp::model::CallToolResult, rmcp::Er
 }
 fn err_json(code: &str, msg: &str) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
     ok_json(serde_json::json!({"success": false, "error_code": code, "error": msg}))
+}
+
+/// Largest char boundary <= idx (stable-Rust stand-in for str::floor_char_boundary), so byte-offset
+/// pagination never slices through a multi-byte UTF-8 char.
+fn floor_char_boundary(s: &str, idx: usize) -> usize {
+    if idx >= s.len() {
+        return s.len();
+    }
+    let mut i = idx;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
 }
 
 pub async fn handle_iris_doc(
@@ -150,7 +170,33 @@ async fn handle_get(
         .as_str()
         .unwrap_or("")
         .to_string();
-    ok_json(serde_json::json!({"success": true, "name": name, "content": content, "timestamp": ts}))
+
+    // Pagination: cap large source to avoid huge token blowups (iris_doc was the #1 token sink —
+    // 274K tokens in the workshop, much of it re-fetching whole library classes). UTF-8 safe.
+    let total_bytes = content.len();
+    let start = floor_char_boundary(&content, p.offset.min(total_bytes));
+    let end = if p.max_bytes == 0 {
+        total_bytes
+    } else {
+        floor_char_boundary(&content, (start + p.max_bytes).min(total_bytes))
+    };
+    let slice = &content[start..end];
+    let mut out = serde_json::json!({
+        "success": true, "name": name, "content": slice, "timestamp": ts,
+    });
+    if start > 0 || end < total_bytes {
+        out["truncated"] = serde_json::Value::Bool(true);
+        out["total_bytes"] = serde_json::json!(total_bytes);
+        out["offset"] = serde_json::json!(start);
+        out["returned_bytes"] = serde_json::json!(end - start);
+        if end < total_bytes {
+            out["next_offset"] = serde_json::json!(end);
+            out["hint"] = serde_json::Value::String(format!(
+                "Truncated at {end}/{total_bytes} bytes. Fetch the rest with iris_doc(get, name='{name}', offset={end}, max_bytes=…), or use docs_introspect for signatures/structure instead of full source."
+            ));
+        }
+    }
+    ok_json(out)
 }
 
 async fn handle_put(

@@ -6,7 +6,7 @@ fn iris_dev_bin() -> std::path::PathBuf {
     let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.pop();
     p.pop();
-    p.push("target/debug/iris-dev");
+    p.push("target/debug/iris-interop-dev");
     p
 }
 
@@ -82,7 +82,7 @@ fn parse_tool_text(response: &serde_json::Value) -> serde_json::Value {
 }
 
 #[test]
-fn tools_list_returns_32_tools() {
+fn tools_list_returns_interop_profile() {
     let iris_host = std::env::var("IRIS_HOST").unwrap_or_default();
     if iris_host.is_empty() {
         eprintln!("Skipping: IRIS_HOST not set");
@@ -101,16 +101,33 @@ fn tools_list_returns_32_tools() {
         .expect("no tools array");
     let names: Vec<_> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
+    // Interop profile (fork default): 20 tools; 2 (iris_production_item, iris_credential_manage)
+    // may be write-gated off on a read-only connection, so accept 18-20.
     assert!(
-        names.len() >= 32,
-        "expected >=32 tools, got {}: {:?}",
+        (18..=20).contains(&names.len()),
+        "expected the interop profile (18-20 tools), got {}: {:?}",
         names.len(),
-        &names[..names.len().min(10)]
+        names
     );
-    assert!(names.contains(&"interop_production_status"));
-    assert!(names.contains(&"interop_logs"));
-    assert!(names.contains(&"interop_queues"));
-    assert!(names.contains(&"interop_message_search"));
+    // Consolidated interop dispatchers are present (not the old individual interop_* tools)
+    for req in [
+        "iris_production",
+        "iris_interop_query",
+        "iris_query",
+        "iris_execute",
+        "iris_test",
+    ] {
+        assert!(names.contains(&req), "interop tool '{}' missing", req);
+    }
+    // The old per-action interop tools are consolidated away in this profile
+    for gone in [
+        "interop_production_status",
+        "interop_logs",
+        "interop_queues",
+        "interop_message_search",
+    ] {
+        assert!(!names.contains(&gone), "old tool '{}' should be gone", gone);
+    }
     for name in &names {
         assert!(!name.contains('.'), "tool '{}' has dot", name);
     }
@@ -126,14 +143,16 @@ fn interop_production_status_returns_structured_json() {
     let responses = mcp_exchange(&[
         serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
         serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
-        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"interop_production_status","arguments":{}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"iris_production","arguments":{"action":"status","namespace":"USER"}}}),
     ]);
 
     let resp = find_response(&responses, 2).expect("no tool response");
     let result = parse_tool_text(&resp);
+    // Interop-enabled namespace: either a running production (state) or a clean NO_PRODUCTION —
+    // both prove the interop engine answered (not a missing-class error).
     assert!(
-        result.get("success").is_some() || result.get("error_code").is_some(),
-        "must return structured response: {}",
+        result["state"].is_string() || result["error_code"] == "NO_PRODUCTION",
+        "iris_production status must be structured (state or NO_PRODUCTION): {}",
         result
     );
 }
@@ -148,12 +167,16 @@ fn interop_logs_returns_structured_entries() {
     let responses = mcp_exchange(&[
         serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
         serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
-        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"interop_logs","arguments":{"limit":5,"log_type":"error"}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"iris_interop_query","arguments":{"what":"logs","limit":5,"log_type":"error","namespace":"USER"}}}),
     ]);
 
     let resp = find_response(&responses, 2).expect("no tool response");
     let result = parse_tool_text(&resp);
-    assert!(result.get("success").is_some() || result.get("error_code").is_some());
+    assert_eq!(
+        result["success"], true,
+        "iris_interop_query what=logs must succeed on an interop ns: {}",
+        result
+    );
 }
 
 #[test]
@@ -166,12 +189,52 @@ fn interop_queues_returns_array() {
     let responses = mcp_exchange(&[
         serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
         serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
-        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"interop_queues","arguments":{}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"iris_interop_query","arguments":{"what":"queues","namespace":"USER"}}}),
     ]);
 
     let resp = find_response(&responses, 2).expect("no tool response");
     let result = parse_tool_text(&resp);
-    assert!(result.get("success").is_some() || result.get("error_code").is_some());
+    assert_eq!(
+        result["success"], true,
+        "iris_interop_query what=queues must succeed on an interop ns: {}",
+        result
+    );
+}
+
+// B8/B9: partners introspection + required-with-enum `what`.
+#[test]
+fn interop_query_partners_and_what_enum() {
+    if std::env::var("IRIS_HOST").unwrap_or_default().is_empty() {
+        return;
+    }
+    let responses = mcp_exchange(&[
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
+        serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"iris_interop_query","arguments":{"what":"partners","namespace":"USER"}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"iris_interop_query","arguments":{"what":"bogus","namespace":"USER"}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"iris_interop_query","arguments":{"namespace":"USER"}}}),
+    ]);
+    // B8: partners returns a real (possibly empty) array on an interop ns.
+    let partners = parse_tool_text(&find_response(&responses, 2).expect("no partners response"));
+    assert_eq!(
+        partners["success"], true,
+        "partners must succeed: {}",
+        partners
+    );
+    assert!(
+        partners["partners"].is_array(),
+        "partners must be an array: {}",
+        partners
+    );
+    // B9: unknown / missing `what` fail fast with the valid set.
+    let bad = parse_tool_text(&find_response(&responses, 3).expect("no bad-what response"));
+    assert_eq!(bad["error_code"], "INVALID_WHAT", "bad what: {}", bad);
+    let missing = parse_tool_text(&find_response(&responses, 4).expect("no missing-what response"));
+    assert_eq!(
+        missing["error_code"], "MISSING_WHAT",
+        "missing what: {}",
+        missing
+    );
 }
 
 // ─── 024-interop-depth E2E stubs ───
