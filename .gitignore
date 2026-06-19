@@ -52,3 +52,7 @@ fixed_query*
 src/
 tests/Test/
 .iris-dev/
+
+# Fork: do not ignore the Rust crate sources (the generic src/ rule above hid new files)
+!crates/iris-agentic-dev-core/src/
+!crates/iris-agentic-dev-bin/src/
