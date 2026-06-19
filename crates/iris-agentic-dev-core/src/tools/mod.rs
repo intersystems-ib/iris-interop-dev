@@ -2132,7 +2132,9 @@ impl IrisTools {
         // HTTP path only — docker exec path removed (#46: /noload/run assumed pre-loaded
         // classes which never existed in a fresh iris session, causing false "no test classes"
         // errors; HTTP path with /verbose=1 is reliable and works with or without docker).
-        let path_label = "http";
+        // Reports which transport actually ran the tests: "docker" when an IRIS_CONTAINER is
+        // present and docker-exec succeeds, else "http" (Atelier REST). Set below.
+        let mut path_label = "http";
         let iris = self.get_iris()?;
         let client = self.http_client();
 
@@ -2181,9 +2183,18 @@ impl IrisTools {
         // After RunTest completes, ^UnitTest.Result global IS persisted (globals bypass
         // the objectgenerator transaction boundary; SQL %Save() does not).
         let run_code = if is_class_pattern {
-            // Class pattern: no filesystem directory needed; /noload finds compiled class directly.
+            // Class pattern (/noload): RunTest still walks ^UnitTestRoot/<spec-as-path>/ even though
+            // it doesn't load from disk — a stale or invalid ^UnitTestRoot makes it fail with
+            // "Directory ... is invalid" and report 0 tests. Set a valid root and pre-create the spec
+            // directory (dots -> slashes) so the already-compiled class actually runs. (A6.2)
+            // CreateDirectoryChain is idempotent (no-op if the dir exists); kept unconditional
+            // so the multi-line code pipes cleanly through the docker-exec terminal too.
             format!(
-                r#"do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
+                r#"set ^UnitTestRoot="/tmp/httest/"
+do ##class(%File).CreateDirectoryChain(^UnitTestRoot)
+set specDir=^UnitTestRoot_$translate("{pattern}",".","/")_"/"
+do ##class(%File).CreateDirectoryChain(specDir)
+do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
                 token = correlation_token,
                 pattern = safe_pattern,
                 flags = flags,
@@ -2247,7 +2258,10 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
                         }
                     }
                 }
-                Ok(Ok(out)) => out,
+                Ok(Ok(out)) => {
+                    path_label = "docker";
+                    out
+                }
             }
         } else {
             // HTTP path: works for remote IRIS without docker
@@ -2398,10 +2412,39 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
         // Treat any run with no parsed method results as NO_TESTS_FOUND.
         if total == 0 || test_cases.is_empty() {
             self.record_call("iris_test", false);
+            // A6.2 discovery probe: instead of a bare NO_TESTS_FOUND, list the compiled
+            // %UnitTest.TestCase classes that DO exist so the model can correct the pattern
+            // (the workshop's #1 iris_test failure was an unactionable "no test classes").
+            let probe_sql = "SELECT TOP 25 Name FROM %Dictionary.CompiledClass WHERE Super LIKE '%UnitTest.TestCase%' ORDER BY Name";
+            let candidates: Vec<String> = match tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                iris.query(probe_sql, vec![], &p.namespace, client),
+            )
+            .await
+            {
+                Ok(Ok(body)) => body["result"]["content"]
+                    .as_array()
+                    .map(|rows| {
+                        rows.iter()
+                            .filter_map(|r| r["Name"].as_str())
+                            .filter(|n| !n.starts_with('%'))
+                            .map(|n| n.to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                _ => vec![],
+            };
+            let hint = if candidates.is_empty() {
+                format!("No compiled %UnitTest.TestCase classes were found in namespace '{}'. Your test class must Extend %UnitTest.TestCase and be compiled. Compile it first (iris_compile), or pass a directory path to load .cls from disk.", p.namespace)
+            } else {
+                format!("Pattern '{}' matched no runnable tests, but {} compiled %UnitTest.TestCase class(es) exist in '{}': {}. Pass one of these as the pattern (class names use /noload automatically), or a directory path to load from disk.", p.pattern, candidates.len(), p.namespace, candidates.join(", "))
+            };
             return ok_json(serde_json::json!({
                 "success": false,
                 "error_code": ERR_NO_TESTS_FOUND,
                 "error": "Pattern matched no test classes",
+                "hint": hint,
+                "candidates": candidates,
                 "pattern": p.pattern,
                 "namespace": p.namespace,
                 "total": 0,
