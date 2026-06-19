@@ -35,6 +35,9 @@ jobs:
             [ "$code" = "200" ] && { echo "ready after ~$((i*3))s"; break; }
             sleep 3
           done
+          echo "enabling Interoperability on USER (Community edition includes the interop engine) ..."
+          printf 'do ##class(%%Library.EnsembleMgr).EnableNamespace("USER")\nhalt\n' \
+            | docker exec -i iris-e2e iris session IRIS -U %%SYS || true
       - name: e2e — both transports (HTTP/Atelier REST + Docker-exec)
         env:
           IRIS_HOST: localhost
