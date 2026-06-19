@@ -195,6 +195,30 @@ fn interop_queues_returns_array() {
     );
 }
 
+// B8/B9: partners introspection + required-with-enum `what`.
+#[test]
+fn interop_query_partners_and_what_enum() {
+    if std::env::var("IRIS_HOST").unwrap_or_default().is_empty() {
+        return;
+    }
+    let responses = mcp_exchange(&[
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
+        serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"iris_interop_query","arguments":{"what":"partners","namespace":"USER"}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"iris_interop_query","arguments":{"what":"bogus","namespace":"USER"}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"iris_interop_query","arguments":{"namespace":"USER"}}}),
+    ]);
+    // B8: partners returns a real (possibly empty) array on an interop ns.
+    let partners = parse_tool_text(&find_response(&responses, 2).expect("no partners response"));
+    assert_eq!(partners["success"], true, "partners must succeed: {}", partners);
+    assert!(partners["partners"].is_array(), "partners must be an array: {}", partners);
+    // B9: unknown / missing `what` fail fast with the valid set.
+    let bad = parse_tool_text(&find_response(&responses, 3).expect("no bad-what response"));
+    assert_eq!(bad["error_code"], "INVALID_WHAT", "bad what: {}", bad);
+    let missing = parse_tool_text(&find_response(&responses, 4).expect("no missing-what response"));
+    assert_eq!(missing["error_code"], "MISSING_WHAT", "missing what: {}", missing);
+}
+
 // ─── 024-interop-depth E2E stubs ───
 // These tests run against a live IRIS instance with Interoperability enabled.
 // They are #[ignore] by default; run with `cargo test -- --ignored` to execute.

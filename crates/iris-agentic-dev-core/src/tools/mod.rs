@@ -4200,13 +4200,25 @@ Methods:
     }
 
     #[tool(
-        description = "Interoperability query dispatcher (merged). what: logs=recent log entries, queues=message queue depths, messages=search message archive. Pass namespace=<production namespace> to query a specific interop namespace (defaults to the connection's namespace)."
+        description = "Interoperability query dispatcher (merged). what (REQUIRED): logs=recent log entries, queues=message queue depths, messages=search message archive, partners=configured Ens.Config.BusinessPartner rows. Pass namespace=<production namespace> to query a specific interop namespace (defaults to the connection's namespace). For SQL-Gateway connections (no SQL table), use iris_table_info / the introspect-dont-guess agent."
     )]
     async fn iris_interop_query(
         &self,
         Parameters(p): Parameters<AnyParams>,
     ) -> Result<CallToolResult, McpError> {
-        let what = p.get("what").and_then(|v| v.as_str()).unwrap_or("logs");
+        // B9: `what` is required-with-enum — fail fast with the valid set instead of silently
+        // defaulting (the workshop's missing-discriminator calls otherwise misfired).
+        let what = match p.get("what").and_then(|v| v.as_str()) {
+            Some(w) if !w.is_empty() => w,
+            _ => {
+                self.record_call("iris_interop_query", false);
+                return ok_json(serde_json::json!({
+                    "success": false,
+                    "error_code": "MISSING_WHAT",
+                    "error": "iris_interop_query requires 'what': one of logs, queues, messages, partners.",
+                }));
+            }
+        };
         let _iris_arc_hold = self.iris_arc();
         let iris_opt = _iris_arc_hold.as_deref();
         #[allow(unused_variables)]
@@ -4265,9 +4277,17 @@ Methods:
                 )
                 .await
             }
-            _ => err_json(
-                "INVALID_ACTION",
-                "iris_interop_query: what must be logs, queues, or messages",
+            "partners" => {
+                // B8: real Ens.Config.BusinessPartner rows instead of guessing config tables.
+                let ns = p
+                    .get("namespace")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                interop::interop_partners_impl(iris_opt, ns).await
+            }
+            other => err_json(
+                "INVALID_WHAT",
+                &format!("iris_interop_query: unknown what='{other}'. Valid: logs, queues, messages, partners."),
             ),
         };
         self.record_call("iris_interop_query", result.is_ok());

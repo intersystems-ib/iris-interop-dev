@@ -477,6 +477,45 @@ pub async fn interop_message_search_impl(
     }
 }
 
+/// B8: list configured interop Business Partners (Ens.Config.BusinessPartner) so the model gets real
+/// rows instead of guessing nonexistent config tables. (SQL-Gateway connections have no clean SQL
+/// table — that discovery path is the iris_query table-not-found hint + iris_table_info / the
+/// introspect-dont-guess agent.)
+pub async fn interop_partners_impl(
+    iris: Option<&IrisConnection>,
+    namespace: Option<String>,
+) -> Result<CallToolResult, McpError> {
+    let iris = match iris {
+        Some(i) => i,
+        None => return err_json("IRIS_UNREACHABLE", "No IRIS connection"),
+    };
+    let client = IrisConnection::http_client().map_err(|_| iris_unreachable())?;
+    let ns = namespace.as_deref().unwrap_or(iris.namespace.as_str());
+    match iris
+        .query(
+            "SELECT * FROM Ens_Config.BusinessPartner",
+            vec![],
+            ns,
+            &client,
+        )
+        .await
+    {
+        Ok(resp) => {
+            let rows = resp["result"]["content"].clone();
+            let count = rows.as_array().map(|a| a.len()).unwrap_or(0);
+            ok_json(serde_json::json!({"success": true, "partners": rows, "count": count}))
+        }
+        Err(e) => err_json(
+            if is_network_error(&e.to_string()) {
+                "IRIS_UNREACHABLE"
+            } else {
+                "INTEROP_ERROR"
+            },
+            &e.to_string(),
+        ),
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // 024-interop-depth: Production item control (US1)
 // ═══════════════════════════════════════════════════════════════════
