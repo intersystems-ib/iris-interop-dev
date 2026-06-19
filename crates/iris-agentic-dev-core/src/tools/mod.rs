@@ -60,6 +60,11 @@ pub enum Toolset {
     Nostub,
     /// 23 tools — stubs removed + 4 merger groups consolidated.
     Merged,
+    /// ~20 tools — interop-skills-focused profile (see `INTEROP_TOOLS`).
+    /// Keeps only the tools the iris-interop skills actually exercise; everything
+    /// else (skill_*/kb_*/agent_*/generate_*/individual debug_*/container/scm) is pruned.
+    /// Default for this fork. Additive: tool *code* is unchanged so upstream stays mergeable.
+    Interop,
 }
 
 impl Toolset {
@@ -68,6 +73,7 @@ impl Toolset {
         match s.trim().to_lowercase().as_str() {
             "nostub" => Toolset::Nostub,
             "merged" => Toolset::Merged,
+            "interop" => Toolset::Interop,
             _ => Toolset::Baseline,
         }
     }
@@ -77,9 +83,40 @@ impl Toolset {
             Toolset::Baseline => "baseline",
             Toolset::Nostub => "nostub",
             Toolset::Merged => "merged",
+            Toolset::Interop => "interop",
         }
     }
 }
+
+/// The interop-focused keep-list (Toolset::Interop). Source of truth for the
+/// `Interop` pruning AND the `registered_tool_names()` Interop branch. A unit test
+/// (`test_interop_toolset_exact`) asserts the live router exposes exactly these,
+/// which also guards against typos / upstream renames.
+pub const INTEROP_TOOLS: &[&str] = &[
+    // core execution
+    "iris_query",
+    "iris_doc",
+    "iris_execute",
+    "iris_compile",
+    "iris_test",
+    // diagnostics / introspection
+    "iris_symbols",
+    "docs_introspect",
+    "check_config",
+    "iris_get_log",
+    "iris_debug",
+    // interoperability
+    "iris_production",
+    "iris_production_item",
+    "iris_interop_query",
+    "iris_lookup_manage",
+    "iris_lookup_transfer",
+    "iris_credential_list",
+    "iris_credential_manage",
+    "extract_message_map_routing",
+    "find_subclass_implementations",
+    "iris_table_info",
+];
 
 pub const ERR_NO_TESTS_FOUND: &str = "NO_TESTS_FOUND";
 pub const ERR_NAMESPACE_NOT_FOUND: &str = "NAMESPACE_NOT_FOUND";
@@ -1406,6 +1443,16 @@ impl IrisTools {
     /// Returns the set of tool names registered for the current toolset.
     /// Used by tests and by the benchmark harness to build valid_tool_names.
     pub fn registered_tool_names(&self) -> std::collections::HashSet<String> {
+        // The Interop profile is pruned directly from the live router, so derive its
+        // names from the router itself — always in sync, no hardcoded duplicate to drift.
+        if self.toolset == Toolset::Interop {
+            return self
+                .tool_router
+                .list_all()
+                .into_iter()
+                .map(|t| t.name.to_string())
+                .collect();
+        }
         // Authoritative baseline list — 34 tools matching v0.4.x (audit 2026-04-28).
         // REST(14) + Docker(16) + Local(4) = 34
         // 34 - stubs(4) = nostub(30); 30 - merged_removed(10) + merged_added(4) = merged(24)
@@ -1488,6 +1535,7 @@ impl IrisTools {
             all_tools.iter().map(|s| s.to_string()).collect();
 
         match self.toolset {
+            Toolset::Interop => unreachable!("derived from router and returned early above"),
             Toolset::Baseline => {}
             Toolset::Nostub => {
                 for s in stub_tools {
@@ -1534,53 +1582,71 @@ impl IrisTools {
 
         // Remove tools from MCP tool list based on toolset (T017–T019, T033, FR-004–011).
         // The `#[tool_router]` macro registers all tools; we prune at construction time.
-        let stubs_to_remove: &[&str] = match toolset {
-            Toolset::Baseline => &[],
-            // iris_symbols_local is NO LONGER a stub (025-symbols-local-ts)
-            Toolset::Nostub | Toolset::Merged => &[
-                "skill_propose",           // FR-005
-                "skill_optimize",          // FR-005
-                "skill_share",             // FR-005
-                "skill_community_install", // FR-006
-            ],
-        };
-        for name in stubs_to_remove {
-            router.remove_route(name);
-        }
-
-        // For merged toolset: remove debug tools replaced by iris_debug dispatcher.
-        // 036: individual interop stubs removed entirely — iris_production/iris_interop_query
-        // are now available in all tiers, so no pruning needed for them.
-        if toolset == Toolset::Merged {
-            let merged_replaced: &[&str] = &[
-                // Replaced by iris_debug (FR-007)
-                "debug_capture_packet",
-                "debug_get_error_logs",
-                "debug_map_int_to_cls",
-                "debug_source_map",
-                // agent_info removed (FR-011)
-                "agent_info",
-                // iris_containers replaces these in merged
-                "iris_list_containers",
-                "iris_select_container",
-                "iris_start_sandbox",
-            ];
-            for name in merged_replaced {
-                router.remove_route(name);
+        if toolset == Toolset::Interop {
+            // Interop profile: keep ONLY the interop keep-list; prune everything else.
+            // Derived from the live router so an upstream rename/removal can't silently
+            // leave a stale name behind (test_interop_toolset_exact guards the keep-list).
+            let keep: std::collections::HashSet<&str> = INTEROP_TOOLS.iter().copied().collect();
+            let all: Vec<String> = router
+                .list_all()
+                .into_iter()
+                .map(|t| t.name.to_string())
+                .collect();
+            for name in all {
+                if !keep.contains(name.as_str()) {
+                    router.remove_route(&name);
+                }
             }
         } else {
-            // For baseline and nostub: remove merged-only dispatcher tools
-            // (iris_production/iris_interop_query/iris_production_item are now available everywhere)
-            let merged_only: &[&str] = &[
-                "iris_debug",
-                "iris_containers",
-                // 026-admin-tools
-                "iris_admin",
-                // 027-progressive-disclosure
-                "iris_get_log",
-            ];
-            for name in merged_only {
+            let stubs_to_remove: &[&str] = match toolset {
+                Toolset::Baseline => &[],
+                // iris_symbols_local is NO LONGER a stub (025-symbols-local-ts)
+                Toolset::Nostub | Toolset::Merged => &[
+                    "skill_propose",           // FR-005
+                    "skill_optimize",          // FR-005
+                    "skill_share",             // FR-005
+                    "skill_community_install", // FR-006
+                ],
+                Toolset::Interop => unreachable!("handled above"),
+            };
+            for name in stubs_to_remove {
                 router.remove_route(name);
+            }
+
+            // For merged toolset: remove debug tools replaced by iris_debug dispatcher.
+            // 036: individual interop stubs removed entirely — iris_production/iris_interop_query
+            // are now available in all tiers, so no pruning needed for them.
+            if toolset == Toolset::Merged {
+                let merged_replaced: &[&str] = &[
+                    // Replaced by iris_debug (FR-007)
+                    "debug_capture_packet",
+                    "debug_get_error_logs",
+                    "debug_map_int_to_cls",
+                    "debug_source_map",
+                    // agent_info removed (FR-011)
+                    "agent_info",
+                    // iris_containers replaces these in merged
+                    "iris_list_containers",
+                    "iris_select_container",
+                    "iris_start_sandbox",
+                ];
+                for name in merged_replaced {
+                    router.remove_route(name);
+                }
+            } else {
+                // For baseline and nostub: remove merged-only dispatcher tools
+                // (iris_production/iris_interop_query/iris_production_item are now available everywhere)
+                let merged_only: &[&str] = &[
+                    "iris_debug",
+                    "iris_containers",
+                    // 026-admin-tools
+                    "iris_admin",
+                    // 027-progressive-disclosure
+                    "iris_get_log",
+                ];
+                for name in merged_only {
+                    router.remove_route(name);
+                }
             }
         }
 
