@@ -4157,7 +4157,7 @@ Methods:
     }
 
     #[tool(
-        description = "Interoperability query dispatcher (merged). what: logs=recent log entries, queues=message queue depths, messages=search message archive."
+        description = "Interoperability query dispatcher (merged). what: logs=recent log entries, queues=message queue depths, messages=search message archive. Pass namespace=<production namespace> to query a specific interop namespace (defaults to the connection's namespace)."
     )]
     async fn iris_interop_query(
         &self,
@@ -4172,6 +4172,10 @@ Methods:
                 interop::interop_logs_impl(
                     iris_opt,
                     interop::LogsParams {
+                        namespace: p
+                            .get("namespace")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
                         item_name: p
                             .get("component")
                             .and_then(|v| v.as_str())
@@ -4186,11 +4190,21 @@ Methods:
                 )
                 .await
             }
-            "queues" => interop::interop_queues_impl(iris_opt).await,
+            "queues" => {
+                let ns = p
+                    .get("namespace")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                interop::interop_queues_impl(iris_opt, ns).await
+            }
             "messages" => {
                 interop::interop_message_search_impl(
                     iris_opt,
                     interop::MessageSearchParams {
+                        namespace: p
+                            .get("namespace")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
                         source: p
                             .get("source")
                             .and_then(|v| v.as_str())

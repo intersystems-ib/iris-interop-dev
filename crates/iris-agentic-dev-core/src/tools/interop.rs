@@ -80,6 +80,9 @@ pub struct ProductionRecoverParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct LogsParams {
+    /// Production namespace to query; falls back to the connection's namespace when None.
+    #[serde(default)]
+    pub namespace: Option<String>,
     pub item_name: Option<String>,
     #[serde(default = "default_limit")]
     pub limit: u32,
@@ -98,6 +101,9 @@ pub struct QueuesParams {}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct MessageSearchParams {
+    /// Production namespace to query; falls back to the connection's namespace when None.
+    #[serde(default)]
+    pub namespace: Option<String>,
     pub source: Option<String>,
     pub target: Option<String>,
     pub class_name: Option<String>,
@@ -378,9 +384,9 @@ pub async fn interop_logs_impl(
         .map(|n| format!("AND ConfigName = '{}'", n.replace('\'', "''")))
         .unwrap_or_default();
     let sql = format!("SELECT TOP {} ID, TimeLogged, Type, ConfigName, Text FROM Ens_Util.Log WHERE 1=1 {} {} ORDER BY ID DESC", params.limit, type_filter, item_filter);
-    match iris
-        .query(&sql, vec![], &iris.namespace.clone(), &client)
-        .await
+    // A6: query the requested production namespace, not the connection default.
+    let ns = params.namespace.as_deref().unwrap_or(iris.namespace.as_str());
+    match iris.query(&sql, vec![], ns, &client).await
     {
         Ok(resp) => ok_json(
             serde_json::json!({"success": true, "logs": resp["result"]["content"], "count": resp["result"]["content"].as_array().map(|a| a.len()).unwrap_or(0)}),
@@ -398,19 +404,17 @@ pub async fn interop_logs_impl(
 
 pub async fn interop_queues_impl(
     iris: Option<&IrisConnection>,
+    namespace: Option<String>,
 ) -> Result<CallToolResult, McpError> {
     let iris = match iris {
         Some(i) => i,
         None => return err_json("IRIS_UNREACHABLE", "No IRIS connection"),
     };
     let client = IrisConnection::http_client().map_err(|_| iris_unreachable())?;
+    // A6: query the requested production namespace, not the connection default.
+    let ns = namespace.as_deref().unwrap_or(iris.namespace.as_str());
     match iris
-        .query(
-            "SELECT * FROM Ens.Queue_Enumerate()",
-            vec![],
-            &iris.namespace.clone(),
-            &client,
-        )
+        .query("SELECT * FROM Ens.Queue_Enumerate()", vec![], ns, &client)
         .await
     {
         Ok(resp) => {
@@ -455,9 +459,9 @@ pub async fn interop_message_search_impl(
         format!("WHERE {}", filters.join(" AND "))
     };
     let sql = format!("SELECT TOP {} ID, TimeCreated, SourceConfigName, TargetConfigName, MessageBodyClassName, Status FROM Ens.MessageHeader {} ORDER BY ID DESC", params.limit, where_clause);
-    match iris
-        .query(&sql, vec![], &iris.namespace.clone(), &client)
-        .await
+    // A6: query the requested production namespace, not the connection default.
+    let ns = params.namespace.as_deref().unwrap_or(iris.namespace.as_str());
+    match iris.query(&sql, vec![], ns, &client).await
     {
         Ok(resp) => ok_json(
             serde_json::json!({"success": true, "messages": resp["result"]["content"], "count": resp["result"]["content"].as_array().map(|a| a.len()).unwrap_or(0)}),
