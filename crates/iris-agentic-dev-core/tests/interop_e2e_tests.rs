@@ -137,14 +137,16 @@ fn interop_production_status_returns_structured_json() {
     let responses = mcp_exchange(&[
         serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
         serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
-        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"interop_production_status","arguments":{}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"iris_production","arguments":{"action":"status","namespace":"USER"}}}),
     ]);
 
     let resp = find_response(&responses, 2).expect("no tool response");
     let result = parse_tool_text(&resp);
+    // Interop-enabled namespace: either a running production (state) or a clean NO_PRODUCTION —
+    // both prove the interop engine answered (not a missing-class error).
     assert!(
-        result.get("success").is_some() || result.get("error_code").is_some(),
-        "must return structured response: {}",
+        result["state"].is_string() || result["error_code"] == "NO_PRODUCTION",
+        "iris_production status must be structured (state or NO_PRODUCTION): {}",
         result
     );
 }
@@ -159,12 +161,16 @@ fn interop_logs_returns_structured_entries() {
     let responses = mcp_exchange(&[
         serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
         serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
-        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"interop_logs","arguments":{"limit":5,"log_type":"error"}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"iris_interop_query","arguments":{"what":"logs","limit":5,"log_type":"error","namespace":"USER"}}}),
     ]);
 
     let resp = find_response(&responses, 2).expect("no tool response");
     let result = parse_tool_text(&resp);
-    assert!(result.get("success").is_some() || result.get("error_code").is_some());
+    assert_eq!(
+        result["success"], true,
+        "iris_interop_query what=logs must succeed on an interop ns: {}",
+        result
+    );
 }
 
 #[test]
@@ -177,12 +183,16 @@ fn interop_queues_returns_array() {
     let responses = mcp_exchange(&[
         serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
         serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
-        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"interop_queues","arguments":{}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"iris_interop_query","arguments":{"what":"queues","namespace":"USER"}}}),
     ]);
 
     let resp = find_response(&responses, 2).expect("no tool response");
     let result = parse_tool_text(&resp);
-    assert!(result.get("success").is_some() || result.get("error_code").is_some());
+    assert_eq!(
+        result["success"], true,
+        "iris_interop_query what=queues must succeed on an interop ns: {}",
+        result
+    );
 }
 
 // ─── 024-interop-depth E2E stubs ───

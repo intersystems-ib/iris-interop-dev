@@ -1,0 +1,17 @@
+; Dev-mode setup for the licensed interop e2e instance.
+zn "%SYS"
+
+; Unexpire + never-expire the predefined users, and set _SYSTEM password = SYS
+; (the WebGateway CSP.ini authenticates to the SuperServer as _SYSTEM / SYS).
+set p("ChangePassword")=0, p("PasswordNeverExpires")=1, p("Password")="SYS"
+do ##class(Security.Users).Modify("_SYSTEM", .p)
+set p2("ChangePassword")=0, p2("PasswordNeverExpires")=1
+do ##class(Security.Users).Modify("SuperUser", .p2)
+do ##class(Security.Users).Modify("Admin", .p2)
+
+; Enable Interoperability on USER so iris_production / iris_interop_query / lookups / credentials
+; have a real interop-enabled namespace to run against.
+set sc = ##class(%Library.EnsembleMgr).EnableNamespace("USER")
+write "ENABLE-USER-INTEROP sc=", $select($$$ISOK(sc):"OK", 1:$system.Status.GetErrorText(sc)), !
+
+halt

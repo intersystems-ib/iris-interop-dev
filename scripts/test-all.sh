@@ -34,11 +34,25 @@ run_e2e() {
   cargo test -p iris-agentic-dev-core --test test_iris_test_e2e -- --ignored --test-threads=1 || rc=1
 }
 
+run_interop() {
+  # Interop tools (production/interop_query/lookup/credential) need an interop-ENABLED namespace.
+  # Boot the licensed stack:  source <(./scripts/iris-up-licensed.sh | tail -1)
+  if [ -z "${IRIS_HOST:-}" ]; then
+    echo "Point at the licensed interop stack first: source <(./scripts/iris-up-licensed.sh | tail -1)"
+    return 1
+  fi
+  cargo build -p iris-agentic-dev || rc=1
+  echo "== interop e2e (licensed, interop-enabled namespace) =="
+  cargo test -p iris-agentic-dev-core --test interop_e2e_tests -- --test-threads=1 || rc=1
+  cargo test -p iris-agentic-dev-core --test interop_e2e_tests -- --ignored --test-threads=1 || rc=1
+}
+
 case "$mode" in
-  unit) run_unit ;;
-  e2e)  run_e2e ;;
-  auto) run_unit; if [ -n "${IRIS_HOST:-}" ]; then run_e2e; else echo "(skipping e2e — IRIS_HOST unset)"; fi ;;
-  *) echo "usage: $0 [unit|e2e]"; exit 2 ;;
+  unit)    run_unit ;;
+  e2e)     run_e2e ;;
+  interop) run_interop ;;
+  auto)    run_unit; if [ -n "${IRIS_HOST:-}" ]; then run_e2e; else echo "(skipping e2e — IRIS_HOST unset)"; fi ;;
+  *) echo "usage: $0 [unit|e2e|interop]"; exit 2 ;;
 esac
 [ "$rc" = 0 ] && echo "ALL GREEN" || echo "FAILURES (rc=$rc)"
 exit "$rc"
