@@ -1,0 +1,46 @@
+name: interop-fork CI
+
+# CI for the streamlined iris-interop-dev fork. `unit` runs everywhere (no IRIS);
+# `e2e` boots a Community IRIS and exercises BOTH transports (HTTP + docker-exec).
+on:
+  push:
+    branches: [fork/interop-lean]
+  pull_request:
+    branches: [fork/interop-lean]
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Unit tests + per-tool validation gate
+        run: ./scripts/test-all.sh unit
+
+  e2e:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/fork/interop-lean'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Boot IRIS Community (with password env — else Atelier 401)
+        run: |
+          docker run -d --name iris-e2e -p 1972:1972 -p 52773:52773 \
+            -e IRIS_PASSWORD=SYS -e IRIS_USERNAME=_SYSTEM \
+            intersystemsdc/iris-community:2026.1
+          echo "waiting for Atelier API ..."
+          for i in $(seq 1 80); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -u _SYSTEM:SYS \
+              http://localhost:52773/api/atelier/ || echo 000)
+            [ "$code" = "200" ] && { echo "ready after ~$((i*3))s"; break; }
+            sleep 3
+          done
+      - name: e2e — both transports (HTTP/Atelier REST + Docker-exec)
+        env:
+          IRIS_HOST: localhost
+          IRIS_WEB_PORT: "52773"
+          IRIS_USERNAME: _SYSTEM
+          IRIS_PASSWORD: SYS
+          IRIS_NAMESPACE: USER
+          IRIS_CONTAINER: iris-e2e
+        run: ./scripts/test-all.sh e2e
