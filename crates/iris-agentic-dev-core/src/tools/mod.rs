@@ -45,6 +45,7 @@ pub mod log_store;
 pub mod scm;
 pub mod search;
 pub mod skills_tools;
+pub mod sql_lint;
 pub mod symbols_local;
 
 pub use doc::{DocMode, IrisDocParams};
@@ -2630,13 +2631,26 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
     }
 
     #[tool(
-        description = "Execute a SQL SELECT query on IRIS via Atelier REST. Returns rows as a JSON array with column names as keys. By default, destructive SQL (DROP, DELETE, INSERT, UPDATE, ALTER, CREATE, MERGE, TRUNCATE, EXEC, EXECUTE, BULK, LOAD, KILL, LOCK, SELECT INTO) is blocked before reaching IRIS. Set force: true to bypass validation for intentional administrative queries — has no effect on production instances where write tools are disabled. No Python required."
+        description = "Execute a SQL SELECT query on IRIS via Atelier REST. Returns rows as a JSON array with column names as keys. By default, destructive SQL (DROP, DELETE, INSERT, UPDATE, ALTER, CREATE, MERGE, TRUNCATE, EXEC, EXECUTE, BULK, LOAD, KILL, LOCK, SELECT INTO) is blocked before reaching IRIS. Set force: true to bypass validation for intentional administrative queries — has no effect on production instances where write tools are disabled. For table/column discovery call iris_table_info first instead of guessing system tables; ObjectScript (set/write/do/##class/&sql/^globals) must use iris_execute, not iris_query. No Python required."
     )]
     async fn iris_query(
         &self,
         Parameters(p): Parameters<QueryParams>,
     ) -> Result<CallToolResult, McpError> {
         tracing::info!(namespace = %p.namespace, force = p.force, "iris_query");
+
+        // Pre-flight: ObjectScript typed into a SQL tool — fail fast with a clear redirect
+        // (28/447 workshop iris_query calls were ObjectScript, not SQL).
+        if let Some(reason) = sql_lint::looks_like_objectscript(&p.query) {
+            self.record_call("iris_query", false);
+            return ok_json(serde_json::json!({
+                "success": false,
+                "error_code": "NOT_SQL",
+                "error": format!("This looks like ObjectScript, not SQL ({reason})."),
+                "hint": "iris_query runs SQL SELECTs only. For ObjectScript (set/write/do/##class/&sql/^globals), use iris_execute.",
+            }));
+        }
+        let sql_warnings = sql_lint::reserved_word_warnings(&p.query);
 
         // SQL safety gate — validate before any network call
         let skip_validation = p.force && self.write_tools_enabled();
@@ -2692,7 +2706,26 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
             if !errors.is_empty() {
                 let msg = errors[0]["error"].as_str().unwrap_or("SQL error");
                 self.record_call("iris_query", false);
-                return err_json("SQL_ERROR", msg);
+                let mut resp = serde_json::json!({
+                    "success": false,
+                    "error_code": "SQL_ERROR",
+                    "error": msg,
+                });
+                // 84/447 workshop failures were guesses at nonexistent tables — route the
+                // model to real schema discovery instead of more guessing.
+                if sql_lint::is_table_not_found(msg) {
+                    resp["hint"] =
+                        serde_json::Value::String(sql_lint::TABLE_NOT_FOUND_HINT.into());
+                }
+                if !sql_warnings.is_empty() {
+                    resp["warnings"] = serde_json::Value::Array(
+                        sql_warnings
+                            .iter()
+                            .map(|w| serde_json::Value::String(w.clone()))
+                            .collect(),
+                    );
+                }
+                return ok_json(resp);
             }
         }
 
@@ -2702,9 +2735,16 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
             .unwrap_or_default();
         let count = rows.len();
         self.record_call("iris_query", true);
-        ok_json(
-            serde_json::json!({"success": true, "rows": rows, "count": count, "namespace": p.namespace}),
-        )
+        let mut resp = serde_json::json!({"success": true, "rows": rows, "count": count, "namespace": p.namespace});
+        if !sql_warnings.is_empty() {
+            resp["warnings"] = serde_json::Value::Array(
+                sql_warnings
+                    .iter()
+                    .map(|w| serde_json::Value::String(w.clone()))
+                    .collect(),
+            );
+        }
+        ok_json(resp)
     }
 
     #[tool(
@@ -3800,7 +3840,7 @@ Methods:
     }
 
     #[tool(
-        description = "Inspect a SQL table: returns whether it is a class-projected table or DDL-created, the backing data/index globals, and (optionally) an approximate row count. Works for both class-projected tables (with real storage globals from %Dictionary.CompiledStorage) and DDL tables (globals inferred by IRIS naming convention). Use include_row_count=true to add a COUNT(*) estimate."
+        description = "Inspect a SQL table: returns whether it is a class-projected table or DDL-created, the backing data/index globals, and (optionally) an approximate row count. Works for both class-projected tables (with real storage globals from %Dictionary.CompiledStorage) and DDL tables (globals inferred by IRIS naming convention). Use include_row_count=true to add a COUNT(*) estimate. Call this (or docs_introspect) to discover the real schema/table/column names BEFORE iris_query, rather than guessing catalog tables."
     )]
     async fn iris_table_info(
         &self,
