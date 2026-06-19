@@ -143,6 +143,16 @@ fn docker_required_interop() -> Result<CallToolResult, McpError> {
     )
 }
 
+/// Run interop ObjectScript over HTTP (Atelier compile + SqlProc), so the production
+/// lifecycle works on native-Windows/Linux IRIS **without** a Docker container — the same
+/// path the credential/lookup impls already use. (A3: the production impls previously called
+/// `iris.execute()`, which returns DOCKER_REQUIRED when IRIS_CONTAINER is unset.) With the A2
+/// fix to the executor class, the `Write "OK"` / `Write "ERROR:..."` output is captured.
+async fn exec_http(iris: &IrisConnection, code: &str, ns: &str) -> anyhow::Result<String> {
+    let client = IrisConnection::http_client()?;
+    iris.execute_via_generator(code, ns, &client).await
+}
+
 pub async fn interop_production_status_impl(
     iris: Option<&IrisConnection>,
     params: ProductionStatusParams,
@@ -153,7 +163,7 @@ pub async fn interop_production_status_impl(
     };
     let code = r#"Set sc=##class(Ens.Director).GetProductionStatus(.n,.s) If $$$ISERR(sc) { Write "ERROR:"_$System.Status.GetErrorText(sc) } Else { Write n_":"_s }"#;
     // Bug 7: use params.namespace, not iris.namespace.
-    match iris.execute(code, &params.namespace).await {
+    match exec_http(iris,code, &params.namespace).await {
         Ok(output) => {
             let raw = output.trim().to_string();
             match parse_status_response(&raw) {
@@ -190,7 +200,7 @@ pub async fn interop_production_start_impl(
         prod
     );
     // Bug 7: use params.namespace, not iris.namespace.
-    match iris.execute(&code, &params.namespace).await {
+    match exec_http(iris,&code, &params.namespace).await {
         Ok(output) => {
             let raw = output.trim();
             if raw == "OK" {
@@ -225,7 +235,7 @@ pub async fn interop_production_stop_impl(
         if params.force { 1 } else { 0 }
     );
     // Bug 7: use params.namespace, not iris.namespace.
-    match iris.execute(&code, &params.namespace).await {
+    match exec_http(iris,&code, &params.namespace).await {
         Ok(output) => {
             let raw = output.trim();
             if raw == "OK" {
@@ -260,7 +270,7 @@ pub async fn interop_production_update_impl(
         if params.force { 1 } else { 0 }
     );
     // Bug 7: use params.namespace.
-    match iris.execute(&code, &params.namespace).await {
+    match exec_http(iris,&code, &params.namespace).await {
         Ok(output) => {
             let raw = output.trim();
             if raw == "OK" {
@@ -291,7 +301,7 @@ pub async fn interop_production_needs_update_impl(
     };
     let code = r#"Write ##class(Ens.Director).ProductionNeedsUpdate()"#;
     // Bug 7: use params.namespace.
-    match iris.execute(code, &params.namespace).await {
+    match exec_http(iris,code, &params.namespace).await {
         Ok(output) => {
             ok_json(serde_json::json!({"success": true, "needs_update": output.trim() == "1"}))
         }
@@ -317,7 +327,7 @@ pub async fn interop_production_recover_impl(
     };
     let code = r#"Set sc=##class(Ens.Director).RecoverProduction() If $$$ISERR(sc) { Write "ERROR:"_$System.Status.GetErrorText(sc) } Else { Write "OK" }"#;
     // Bug 7: use params.namespace.
-    match iris.execute(code, &params.namespace).await {
+    match exec_http(iris,code, &params.namespace).await {
         Ok(output) => {
             let raw = output.trim();
             if raw == "OK" {
