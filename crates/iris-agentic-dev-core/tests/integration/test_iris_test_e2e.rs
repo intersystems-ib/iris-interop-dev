@@ -255,7 +255,11 @@ fn test_e2e_us2_docker_path_with_container() {
     // fall back to the legacy default so the test still runs standalone.
     let container = std::env::var("IRIS_CONTAINER").unwrap_or_else(|_| "iris-dev-iris".to_string());
     write_test_fixture_to_disk(&[("IRIS_CONTAINER", container.as_str())]);
-    let result = iris_test_call(&[("IRIS_CONTAINER", container.as_str())], "IrisDevE2E.SmokeTest", "USER");
+    let result = iris_test_call(
+        &[("IRIS_CONTAINER", container.as_str())],
+        "IrisDevE2E.SmokeTest",
+        "USER",
+    );
     eprintln!(
         "T027 result: {}",
         serde_json::to_string_pretty(&result).unwrap()

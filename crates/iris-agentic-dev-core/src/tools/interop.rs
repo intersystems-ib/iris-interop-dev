@@ -169,7 +169,7 @@ pub async fn interop_production_status_impl(
     };
     let code = r#"Set sc=##class(Ens.Director).GetProductionStatus(.n,.s) If $$$ISERR(sc) { Write "ERROR:"_$System.Status.GetErrorText(sc) } Else { Write n_":"_s }"#;
     // Bug 7: use params.namespace, not iris.namespace.
-    match exec_http(iris,code, &params.namespace).await {
+    match exec_http(iris, code, &params.namespace).await {
         Ok(output) => {
             let raw = output.trim().to_string();
             match parse_status_response(&raw) {
@@ -206,7 +206,7 @@ pub async fn interop_production_start_impl(
         prod
     );
     // Bug 7: use params.namespace, not iris.namespace.
-    match exec_http(iris,&code, &params.namespace).await {
+    match exec_http(iris, &code, &params.namespace).await {
         Ok(output) => {
             let raw = output.trim();
             if raw == "OK" {
@@ -241,7 +241,7 @@ pub async fn interop_production_stop_impl(
         if params.force { 1 } else { 0 }
     );
     // Bug 7: use params.namespace, not iris.namespace.
-    match exec_http(iris,&code, &params.namespace).await {
+    match exec_http(iris, &code, &params.namespace).await {
         Ok(output) => {
             let raw = output.trim();
             if raw == "OK" {
@@ -276,7 +276,7 @@ pub async fn interop_production_update_impl(
         if params.force { 1 } else { 0 }
     );
     // Bug 7: use params.namespace.
-    match exec_http(iris,&code, &params.namespace).await {
+    match exec_http(iris, &code, &params.namespace).await {
         Ok(output) => {
             let raw = output.trim();
             if raw == "OK" {
@@ -307,7 +307,7 @@ pub async fn interop_production_needs_update_impl(
     };
     let code = r#"Write ##class(Ens.Director).ProductionNeedsUpdate()"#;
     // Bug 7: use params.namespace.
-    match exec_http(iris,code, &params.namespace).await {
+    match exec_http(iris, code, &params.namespace).await {
         Ok(output) => {
             ok_json(serde_json::json!({"success": true, "needs_update": output.trim() == "1"}))
         }
@@ -333,7 +333,7 @@ pub async fn interop_production_recover_impl(
     };
     let code = r#"Set sc=##class(Ens.Director).RecoverProduction() If $$$ISERR(sc) { Write "ERROR:"_$System.Status.GetErrorText(sc) } Else { Write "OK" }"#;
     // Bug 7: use params.namespace.
-    match exec_http(iris,code, &params.namespace).await {
+    match exec_http(iris, code, &params.namespace).await {
         Ok(output) => {
             let raw = output.trim();
             if raw == "OK" {
@@ -385,9 +385,11 @@ pub async fn interop_logs_impl(
         .unwrap_or_default();
     let sql = format!("SELECT TOP {} ID, TimeLogged, Type, ConfigName, Text FROM Ens_Util.Log WHERE 1=1 {} {} ORDER BY ID DESC", params.limit, type_filter, item_filter);
     // A6: query the requested production namespace, not the connection default.
-    let ns = params.namespace.as_deref().unwrap_or(iris.namespace.as_str());
-    match iris.query(&sql, vec![], ns, &client).await
-    {
+    let ns = params
+        .namespace
+        .as_deref()
+        .unwrap_or(iris.namespace.as_str());
+    match iris.query(&sql, vec![], ns, &client).await {
         Ok(resp) => ok_json(
             serde_json::json!({"success": true, "logs": resp["result"]["content"], "count": resp["result"]["content"].as_array().map(|a| a.len()).unwrap_or(0)}),
         ),
@@ -460,9 +462,11 @@ pub async fn interop_message_search_impl(
     };
     let sql = format!("SELECT TOP {} ID, TimeCreated, SourceConfigName, TargetConfigName, MessageBodyClassName, Status FROM Ens.MessageHeader {} ORDER BY ID DESC", params.limit, where_clause);
     // A6: query the requested production namespace, not the connection default.
-    let ns = params.namespace.as_deref().unwrap_or(iris.namespace.as_str());
-    match iris.query(&sql, vec![], ns, &client).await
-    {
+    let ns = params
+        .namespace
+        .as_deref()
+        .unwrap_or(iris.namespace.as_str());
+    match iris.query(&sql, vec![], ns, &client).await {
         Ok(resp) => ok_json(
             serde_json::json!({"success": true, "messages": resp["result"]["content"], "count": resp["result"]["content"].as_array().map(|a| a.len()).unwrap_or(0)}),
         ),

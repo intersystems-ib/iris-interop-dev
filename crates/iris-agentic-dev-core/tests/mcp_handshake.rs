@@ -175,7 +175,13 @@ fn mcp_server_tools_list_returns_interop_profile() {
     }
 
     // Meta/non-interop tools must be pruned in the interop profile.
-    for name in ["skill_list", "kb_recall", "agent_stats", "iris_search", "iris_info"] {
+    for name in [
+        "skill_list",
+        "kb_recall",
+        "agent_stats",
+        "iris_search",
+        "iris_info",
+    ] {
         assert!(
             !tool_names.contains(&name),
             "meta tool '{}' should NOT be in the interop profile",

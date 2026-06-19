@@ -1,16 +1,34 @@
 //! Lightweight, IRIS-flavoured SQL lints for `iris_query` — pure functions, unit-testable
-//! without a live IRIS. Targets the two dominant workshop failure shapes:
-//!   * ObjectScript typed into a SQL tool (28 of 447 `iris_query` calls), and
-//!   * unquoted IRIS reserved words / wrong separators (26 calls),
-//! plus a table-not-found classifier so the handler can point at `iris_table_info`
+//! without a live IRIS. Targets the two dominant workshop failure shapes (ObjectScript typed
+//! into a SQL tool, ~28 of 447 calls; and unquoted IRIS reserved words / wrong separators,
+//! ~26 calls), plus a table-not-found classifier so the handler can point at `iris_table_info`
 //! instead of letting the model guess nonexistent catalog tables (84 calls).
 
 /// IRIS SQL reserved words that commonly bite when used as *unquoted* identifiers.
 /// Not exhaustive — the high-frequency ones from the workshop logs + the IRIS SQL manual.
 const RESERVED: &[&str] = &[
-    "CONNECTION", "DEFAULT", "DOMAIN", "LANGUAGE", "OUTPUT", "USER", "VALUE", "ROLE", "WINDOW",
-    "SECTION", "SYSTEM", "DATA", "FILE", "NAME", "TIME", "ZONE", "SIZE", "PUBLIC", "PRIVATE",
-    "OPERATION", "STATEMENT", "WORK",
+    "CONNECTION",
+    "DEFAULT",
+    "DOMAIN",
+    "LANGUAGE",
+    "OUTPUT",
+    "USER",
+    "VALUE",
+    "ROLE",
+    "WINDOW",
+    "SECTION",
+    "SYSTEM",
+    "DATA",
+    "FILE",
+    "NAME",
+    "TIME",
+    "ZONE",
+    "SIZE",
+    "PUBLIC",
+    "PRIVATE",
+    "OPERATION",
+    "STATEMENT",
+    "WORK",
 ];
 
 /// If the text looks like ObjectScript rather than SQL, return a short reason.
@@ -30,7 +48,9 @@ pub fn looks_like_objectscript(query: &str) -> Option<&'static str> {
         return Some("contains ##class(...) — ObjectScript, not SQL");
     }
     if lower.contains("&sql(") {
-        return Some("contains &sql(...) — embedded SQL; run the surrounding ObjectScript via iris_execute");
+        return Some(
+            "contains &sql(...) — embedded SQL; run the surrounding ObjectScript via iris_execute",
+        );
     }
     if q.starts_with('^') {
         return Some("starts with a ^global reference — ObjectScript, not SQL");
@@ -150,7 +170,10 @@ mod tests {
         assert!(w.iter().any(|m| m.contains("DEFAULT")));
         // delimited identifiers must NOT be flagged
         let w2 = reserved_word_warnings("SELECT \"Connection\", \"Default\" FROM t");
-        assert!(w2.is_empty(), "delimited identifiers should not warn: {w2:?}");
+        assert!(
+            w2.is_empty(),
+            "delimited identifiers should not warn: {w2:?}"
+        );
         // substrings of larger identifiers must NOT be flagged
         let w3 = reserved_word_warnings("SELECT UserName, DataValue FROM t");
         assert!(w3.is_empty(), "substring matches should not warn: {w3:?}");

@@ -2757,8 +2757,7 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
                 // 84/447 workshop failures were guesses at nonexistent tables — route the
                 // model to real schema discovery instead of more guessing.
                 if sql_lint::is_table_not_found(msg) {
-                    resp["hint"] =
-                        serde_json::Value::String(sql_lint::TABLE_NOT_FOUND_HINT.into());
+                    resp["hint"] = serde_json::Value::String(sql_lint::TABLE_NOT_FOUND_HINT.into());
                 }
                 if !sql_warnings.is_empty() {
                     resp["warnings"] = serde_json::Value::Array(

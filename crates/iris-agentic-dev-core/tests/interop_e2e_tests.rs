@@ -110,7 +110,13 @@ fn tools_list_returns_interop_profile() {
         names
     );
     // Consolidated interop dispatchers are present (not the old individual interop_* tools)
-    for req in ["iris_production", "iris_interop_query", "iris_query", "iris_execute", "iris_test"] {
+    for req in [
+        "iris_production",
+        "iris_interop_query",
+        "iris_query",
+        "iris_execute",
+        "iris_test",
+    ] {
         assert!(names.contains(&req), "interop tool '{}' missing", req);
     }
     // The old per-action interop tools are consolidated away in this profile
@@ -210,13 +216,25 @@ fn interop_query_partners_and_what_enum() {
     ]);
     // B8: partners returns a real (possibly empty) array on an interop ns.
     let partners = parse_tool_text(&find_response(&responses, 2).expect("no partners response"));
-    assert_eq!(partners["success"], true, "partners must succeed: {}", partners);
-    assert!(partners["partners"].is_array(), "partners must be an array: {}", partners);
+    assert_eq!(
+        partners["success"], true,
+        "partners must succeed: {}",
+        partners
+    );
+    assert!(
+        partners["partners"].is_array(),
+        "partners must be an array: {}",
+        partners
+    );
     // B9: unknown / missing `what` fail fast with the valid set.
     let bad = parse_tool_text(&find_response(&responses, 3).expect("no bad-what response"));
     assert_eq!(bad["error_code"], "INVALID_WHAT", "bad what: {}", bad);
     let missing = parse_tool_text(&find_response(&responses, 4).expect("no missing-what response"));
-    assert_eq!(missing["error_code"], "MISSING_WHAT", "missing what: {}", missing);
+    assert_eq!(
+        missing["error_code"], "MISSING_WHAT",
+        "missing what: {}",
+        missing
+    );
 }
 
 // ─── 024-interop-depth E2E stubs ───
