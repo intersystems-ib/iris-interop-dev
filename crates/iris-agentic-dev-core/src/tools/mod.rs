@@ -4653,11 +4653,11 @@ impl ServerHandler for IrisTools {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
-                "iris-agentic-dev".to_string(),
+                "iris-interop-dev".to_string(),
                 env!("CARGO_PKG_VERSION").to_string(),
             ))
             .with_instructions(
-                "iris-agentic-dev: composable MCP tools for ObjectScript and IRIS development."
+                "iris-interop-dev: streamlined MCP tools for IRIS Interoperability development."
                     .to_string(),
             )
     }

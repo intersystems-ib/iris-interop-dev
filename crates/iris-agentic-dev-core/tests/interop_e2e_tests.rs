@@ -6,7 +6,7 @@ fn iris_dev_bin() -> std::path::PathBuf {
     let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.pop();
     p.pop();
-    p.push("target/debug/iris-dev");
+    p.push("target/debug/iris-interop-dev");
     p
 }
 
@@ -82,7 +82,7 @@ fn parse_tool_text(response: &serde_json::Value) -> serde_json::Value {
 }
 
 #[test]
-fn tools_list_returns_32_tools() {
+fn tools_list_returns_interop_profile() {
     let iris_host = std::env::var("IRIS_HOST").unwrap_or_default();
     if iris_host.is_empty() {
         eprintln!("Skipping: IRIS_HOST not set");
@@ -101,16 +101,27 @@ fn tools_list_returns_32_tools() {
         .expect("no tools array");
     let names: Vec<_> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
+    // Interop profile (fork default): 20 tools; 2 (iris_production_item, iris_credential_manage)
+    // may be write-gated off on a read-only connection, so accept 18-20.
     assert!(
-        names.len() >= 32,
-        "expected >=32 tools, got {}: {:?}",
+        (18..=20).contains(&names.len()),
+        "expected the interop profile (18-20 tools), got {}: {:?}",
         names.len(),
-        &names[..names.len().min(10)]
+        names
     );
-    assert!(names.contains(&"interop_production_status"));
-    assert!(names.contains(&"interop_logs"));
-    assert!(names.contains(&"interop_queues"));
-    assert!(names.contains(&"interop_message_search"));
+    // Consolidated interop dispatchers are present (not the old individual interop_* tools)
+    for req in ["iris_production", "iris_interop_query", "iris_query", "iris_execute", "iris_test"] {
+        assert!(names.contains(&req), "interop tool '{}' missing", req);
+    }
+    // The old per-action interop tools are consolidated away in this profile
+    for gone in [
+        "interop_production_status",
+        "interop_logs",
+        "interop_queues",
+        "interop_message_search",
+    ] {
+        assert!(!names.contains(&gone), "old tool '{}' should be gone", gone);
+    }
     for name in &names {
         assert!(!name.contains('.'), "tool '{}' has dot", name);
     }

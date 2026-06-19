@@ -17,7 +17,7 @@ fn iris_dev_bin() -> std::path::PathBuf {
     let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.pop(); // crates/iris-dev-core
     p.pop(); // crates/
-    p.push("target/debug/iris-dev");
+    p.push("target/debug/iris-interop-dev");
     if !p.exists() {
         p.pop();
         p.push("release/iris-dev");
