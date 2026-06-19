@@ -2515,6 +2515,19 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
                 });
                 if is_runtime_error {
                     resp["error_code"] = serde_json::Value::String("IRIS_RUNTIME_ERROR".into());
+                } else if trimmed.is_empty() {
+                    // Execution succeeded but produced no captured output. With the RunUser
+                    // fix the code really ran (this is no longer the objectgenerator silent
+                    // failure) — so this is a side-effecting call, or code that returned a
+                    // value via Quit/Return instead of Write. Flag it so the model doesn't
+                    // assume a value was returned and silently lose data.
+                    resp["no_output"] = serde_json::Value::Bool(true);
+                    resp["hint"] = serde_json::Value::String(
+                        "iris_execute returns only what your code Writes to the current device. \
+                         If you expected a value, use `write <expr>,!`. If this was a side-effecting \
+                         call (load/compile/save/start), it ran — verify it with a query."
+                            .into(),
+                    );
                 }
                 if let Some(ref tr) = translation {
                     if tr.found {
