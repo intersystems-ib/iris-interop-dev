@@ -3084,7 +3084,7 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
     }
 
     #[tool(
-        description = "Return the active IRIS connection state without making any IRIS network calls. Always succeeds — never returns IRIS_UNREACHABLE. Use to: (1) diagnose connection issues, (2) verify hot-reload completed, (3) confirm which container/host is active. To switch connection mid-session without restart: call check_config first to get config_watch_path, then write a .iris-agentic-dev.toml to that exact path, then call any tool — the reload fires automatically. Fields: connected, connection_source (http|docker|disconnected), host, port, namespace, container, config_file, config_watch_path, config_loaded_at, iris_version, write_tools_enabled."
+        description = "Return the active IRIS connection state + this MCP server's own version. It only reports the cached connection snapshot (no IRIS network call), so it ALWAYS succeeds — when IRIS is down it returns connected:false / connection_source:disconnected instead of erroring with IRIS_UNREACHABLE. That is the point: it's the one tool you can call to DIAGNOSE an unreachable IRIS (read the `connected` field) without the call itself failing — unlike iris_query/iris_execute/etc., which do return IRIS_UNREACHABLE. Also use to: verify hot-reload completed; confirm which container/host is active; validate the loaded MCP build (mcp_version). To switch connection mid-session without restart: call check_config first to get config_watch_path, then write a .iris-agentic-dev.toml to that exact path, then call any tool — the reload fires automatically. Fields: mcp_version, toolset, connected, connection_source (http|docker|disconnected), host, port, namespace, container, config_file, config_watch_path, config_loaded_at, iris_version, write_tools_enabled."
     )]
     async fn check_config(
         &self,
@@ -3172,6 +3172,10 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
             "iris_version": iris_version,
             "write_tools_enabled": conn.write_tools_enabled,
             "config_watch_path": config_watcher_path,
+            // The MCP server's OWN version + active toolset, so the loaded build can be validated
+            // from a tool call (the serverInfo version shown by Claude Code's /mcp is the same value).
+            "mcp_version": env!("CARGO_PKG_VERSION"),
+            "toolset": self.toolset.as_str(),
         });
 
         if let Some(ref err) = conn.config_parse_error {
