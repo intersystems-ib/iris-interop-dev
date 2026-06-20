@@ -1192,7 +1192,7 @@ Write tOut"#,
             // Write XML to temp file, import, delete
             let xml_escaped = xml.replace('\\', "\\\\").replace('"', "\\\"");
             let code = format!(
-                r#"Set tFile="/tmp/iris_lookup_import_"_$JOB_".xml"
+                r#"Set tFile=##class(%Library.File).TempFilename("xml")
 Set tStream=##class(%Stream.FileCharacter).%New()
 Set tStream.Filename=tFile
 Do tStream.Write("{}")

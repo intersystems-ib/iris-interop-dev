@@ -2190,9 +2190,10 @@ impl IrisTools {
             // CreateDirectoryChain is idempotent (no-op if the dir exists); kept unconditional
             // so the multi-line code pipes cleanly through the docker-exec terminal too.
             format!(
-                r#"set ^UnitTestRoot="/tmp/httest/"
+                r#"set tIsWin=($zcvt($system.Version.GetOS(),"U")="WINDOWS")
+set ^UnitTestRoot=$select(tIsWin:##class(%File).NormalizeDirectory("httest",##class(%File).GetDirectory(##class(%File).TempFilename())),1:"/tmp/httest/")
 do ##class(%File).CreateDirectoryChain(^UnitTestRoot)
-set specDir=^UnitTestRoot_$translate("{pattern}",".","/")_"/"
+set specDir=##class(%File).NormalizeDirectory($translate("{pattern}",".","/"),^UnitTestRoot)
 do ##class(%File).CreateDirectoryChain(specDir)
 do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
                 token = correlation_token,
@@ -2201,11 +2202,13 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
             )
         } else {
             // Directory path: set ^UnitTestRoot and pre-create the pattern subdirectory.
-            // iris_test preamble sets ^UnitTestRoot to /tmp/httest/ (IRIS community default).
+            // ^UnitTestRoot is platform-aware: a portable temp dir on Windows (mgr/Temp via
+            // %File.TempFilename), or /tmp/httest/ on Linux (matches the container e2e fixtures).
             format!(
-                r#"set utRoot="/tmp/httest/"
+                r#"set tIsWin=($zcvt($system.Version.GetOS(),"U")="WINDOWS")
+set utRoot=$select(tIsWin:##class(%File).NormalizeDirectory("httest",##class(%File).GetDirectory(##class(%File).TempFilename())),1:"/tmp/httest/")
 if '##class(%File).DirectoryExists(utRoot) {{ do ##class(%File).CreateDirectoryChain(utRoot) }}
-set pkgDir=utRoot_"{pattern}"_"/"
+set pkgDir=##class(%File).NormalizeDirectory("{pattern}",utRoot)
 if '##class(%File).DirectoryExists(pkgDir) {{ do ##class(%File).CreateDirectoryChain(pkgDir) }}
 set ^UnitTestRoot=utRoot
 do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,

@@ -285,9 +285,7 @@ impl IrisConnection {
         // SQL proc name: User package maps to SQLUser schema in IRIS SQL.
         // "output" is a reserved word in IRIS SQL — use "result" as the column alias.
         let sql_func = format!("SQLUser.IrisDevRun{}_Execute", id);
-        let tmpfile = format!("/tmp/irisd_{}.txt", id);
-
-        let content = Self::build_exec_class(&class_name, &tmpfile, code);
+        let content = Self::build_exec_class(&class_name, code);
 
         // 1. PUT the class document
         let put_url = self.versioned_ns_url(
@@ -364,7 +362,7 @@ impl IrisConnection {
     /// `Execute()` (the SqlProc) redirects the device to a temp file, calls `RunUser()`,
     /// restores the device, and returns the captured output (newlines encoded as `$C(1)`
     /// for the existing Rust-side transport decode in `execute_via_generator_once`).
-    fn build_exec_class(class_name: &str, tmpfile: &str, code: &str) -> Vec<String> {
+    fn build_exec_class(class_name: &str, code: &str) -> Vec<String> {
         let mut lines: Vec<String> = vec![
             format!("Class {} [ Final ]", class_name),
             "{".into(),
@@ -382,7 +380,11 @@ impl IrisConnection {
             "".into(),
             "ClassMethod Execute() As %String [ SqlProc ]".into(),
             "{".into(),
-            format!("  Set tmpfile = \"{}\"", tmpfile),
+            // Portable temp path resolved on the IRIS SERVER (not the client): %Library.File.TempFilename
+            // returns a path in the instance's mgr/Temp dir, correct on Windows AND Linux. The old
+            // hardcoded "/tmp/irisd_<id>.txt" only existed on Linux, so the Open below failed on a
+            // native Windows IRIS ($TEST=0 -> "output capture unavailable"). See upstream issue #56.
+            "  Set tmpfile = ##class(%Library.File).TempFilename(\"txt\")".into(),
             "  Set savedIO = $IO".into(),
             "  Open tmpfile:(\"WNS\"):5".into(),
             "  If '$TEST { Quit \"ERROR: output capture unavailable\" }".into(),
@@ -574,8 +576,8 @@ impl IrisConnection {
 
     /// Test accessor for build_exec_class. Exposed for integration tests.
     #[doc(hidden)]
-    pub fn build_exec_class_for_test(class_name: &str, tmpfile: &str, code: &str) -> Vec<String> {
-        Self::build_exec_class(class_name, tmpfile, code)
+    pub fn build_exec_class_for_test(class_name: &str, code: &str) -> Vec<String> {
+        Self::build_exec_class(class_name, code)
     }
 }
 
@@ -673,7 +675,7 @@ mod system_mode_tests {
     #[test]
     fn build_exec_class_no_objectgenerator_uses_runuser() {
         let cls =
-            IrisConnection::build_exec_class("User.T", "/tmp/x.txt", "write 1,! quit").join("\n");
+            IrisConnection::build_exec_class("User.T", "write 1,! quit").join("\n");
         assert!(
             !cls.contains("objectgenerator"),
             "must NOT use CodeMode=objectgenerator:\n{cls}"
@@ -696,7 +698,7 @@ mod system_mode_tests {
 
     #[test]
     fn build_exec_class_encodes_newlines_for_transport() {
-        let cls = IrisConnection::build_exec_class("User.T", "/tmp/x.txt", "write 1").join("\n");
+        let cls = IrisConnection::build_exec_class("User.T", "write 1").join("\n");
         assert!(
             cls.contains("$Replace(out,$Char(10),$Char(1))"),
             "newlines must be encoded as $C(1) for the rust-side decoder"

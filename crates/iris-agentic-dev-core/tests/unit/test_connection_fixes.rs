@@ -115,9 +115,7 @@ fn test_execute_captures_output_without_trailing_newline() {
     // build_exec_class must inject a sentinel Write ! after user code
     // so that Read line:0 always finds a line boundary.
     let lines = iris_agentic_dev_core::iris::connection::IrisConnection::build_exec_class_for_test(
-        "TestClass",
-        "/tmp/test.txt",
-        "Write 42",
+        "TestClass",        "Write 42",
     );
     // Find the user code line
     let user_line_pos = lines
@@ -138,9 +136,7 @@ fn test_execute_captures_output_without_trailing_newline() {
 #[test]
 fn test_build_exec_class_sentinel_not_duplicated() {
     let lines = iris_agentic_dev_core::iris::connection::IrisConnection::build_exec_class_for_test(
-        "TestClass",
-        "/tmp/test.txt",
-        "Write 42,!",
+        "TestClass",        "Write 42,!",
     );
     // Count sentinel occurrences — must be exactly one "Write !" line
     let sentinel_count = lines.iter().filter(|l| l.trim() == "Write !").count();
@@ -155,9 +151,7 @@ fn test_build_exec_class_sentinel_not_duplicated() {
 fn test_execute_captures_multiline_without_trailing_newline() {
     // FR-007: multi-line output where last line has no trailing ! must be fully captured.
     let lines = iris_agentic_dev_core::iris::connection::IrisConnection::build_exec_class_for_test(
-        "TestClass",
-        "/tmp/test.txt",
-        "Write \"line1\",!\nWrite \"line2\"",
+        "TestClass",        "Write \"line1\",!\nWrite \"line2\"",
     );
     // Sentinel must appear after all user code lines
     let sentinel_pos = lines
@@ -235,9 +229,7 @@ fn test_build_exec_class_handles_long_code() {
     let long_string: String = "A".repeat(200);
     let code = format!("Write \"{}\"", long_string);
     let lines = iris_agentic_dev_core::iris::connection::IrisConnection::build_exec_class_for_test(
-        "TestClass",
-        "/tmp/test.txt",
-        &code,
+        "TestClass",        &code,
     );
     // The full 200-char string must appear in the generated lines without truncation
     let found = lines.iter().any(|l| l.contains(&long_string));
@@ -256,9 +248,7 @@ fn test_build_exec_class_sql_proc_name_uses_underscore() {
     // Regression test for #18: was User.IrisDevRunXXX_Execute which caused
     // silent IRIS_COMPILE_FAILED with empty error message.
     let lines = IrisConnection::build_exec_class_for_test(
-        "User.IrisDevRunabc123",
-        "/tmp/test.txt",
-        "Write 1",
+        "User.IrisDevRunabc123",        "Write 1",
     );
     // The class name in the generated source should be User.IrisDevRunabc123
     assert!(
