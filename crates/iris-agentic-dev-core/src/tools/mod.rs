@@ -2218,6 +2218,28 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
             )
         };
 
+        // Capture the latest %UnitTest result-instance id BEFORE running, so afterwards we can read
+        // back exactly the instance(s) THIS run produces. RunTest's verbose stdout is unreliable over
+        // the HTTP capture path, but ^UnitTest.Result (projected as %UnitTest_Result.*) is authoritative.
+        let before_id: i64 = match tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            iris.query(
+                "SELECT MAX(ID) AS m FROM %UnitTest_Result.TestInstance",
+                vec![],
+                &p.namespace,
+                client,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(body)) => body["result"]["content"][0]["m"]
+                .as_str()
+                .and_then(|s| s.parse().ok())
+                .or_else(|| body["result"]["content"][0]["m"].as_i64())
+                .unwrap_or(0),
+            _ => 0,
+        };
+
         // Try HTTP (execute_via_generator) first. Fall back to docker exec if:
         // - IRIS_CONTAINER is set, AND
         // - HTTP returns empty output (RunTest couldn't create the pattern directory
@@ -2310,12 +2332,69 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
         let mut class_map: std::collections::HashMap<String, Vec<serde_json::Value>> =
             std::collections::HashMap::new();
 
+        // PRIMARY result source: read ^UnitTest.Result (the %UnitTest_Result.* SQL projection) for the
+        // instance(s) THIS run created (TestInstance ID > before_id). Authoritative and always persisted,
+        // unlike the verbose stdout. (Round 3: tests ran + passed but the stdout parse found 0 → false
+        // NO_TESTS_FOUND; reading the global fixes it.) Falls back to stdout parsing if the global is empty.
+        let mut from_global = false;
+        {
+            let read_sql = format!(
+                "SELECT tc.Name Class, tm.Name Method, tm.Status St, \
+                 (SELECT TOP 1 ta.Description FROM %UnitTest_Result.TestAssert ta WHERE ta.TestMethod=tm.ID AND ta.Status=0) FailMsg \
+                 FROM %UnitTest_Result.TestMethod tm, %UnitTest_Result.TestCase tc, %UnitTest_Result.TestSuite ts \
+                 WHERE tm.TestCase=tc.ID AND tc.TestSuite=ts.ID AND ts.TestInstance > {} ORDER BY tc.Name, tm.Name",
+                before_id
+            );
+            if let Ok(Ok(body)) = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                iris.query(&read_sql, vec![], &p.namespace, client),
+            )
+            .await
+            {
+                if let Some(rows) = body["result"]["content"].as_array() {
+                    if !rows.is_empty() {
+                        from_global = true;
+                        for r in rows {
+                            let cls = r["Class"].as_str().unwrap_or("").to_string();
+                            let method = r["Method"].as_str().unwrap_or("").to_string();
+                            let is_passed = match &r["St"] {
+                                serde_json::Value::String(s) => s == "1",
+                                serde_json::Value::Number(n) => n.as_i64() == Some(1),
+                                _ => false,
+                            };
+                            let failure_message = r["FailMsg"]
+                                .as_str()
+                                .filter(|s| !s.is_empty())
+                                .map(|s| serde_json::Value::String(s.to_string()))
+                                .unwrap_or(serde_json::Value::Null);
+                            if is_passed {
+                                passed += 1;
+                            } else {
+                                failed += 1;
+                            }
+                            let tc = serde_json::json!({
+                                "name": method,
+                                "class_name": cls.clone(),
+                                "status": if is_passed { "passed" } else { "failed" },
+                                "duration_ms": null,
+                                "failure_message": failure_message,
+                            });
+                            test_cases.push(tc.clone());
+                            class_map.entry(cls).or_default().push(tc);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback: parse RunTest verbose stdout, only if the result global had nothing.
         // With /verbose=1, IRIS RunTest outputs:
         //   "    ClassName begins ..."
         //   "      TestFoo() begins ..."   ← method start
         //   "      TestFoo passed"          ← method result (no parens, no timing)
         //   "      TestFoo FAILED -- <msg>" ← method failure
         //   "    ClassName passed"
+        if !from_global {
         for line in run_output.lines() {
             let trimmed = line.trim();
             // Class begin: "IrisDevE2E.SmokeTest begins ..."  (contains dot, no parens)
@@ -2392,6 +2471,7 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
                 class_map.entry(current_class.clone()).or_default().push(tc);
             }
         }
+        }
 
         let test_suites: Vec<serde_json::Value> = class_map
             .iter()
@@ -2418,7 +2498,11 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
             // A6.2 discovery probe: instead of a bare NO_TESTS_FOUND, list the compiled
             // %UnitTest.TestCase classes that DO exist so the model can correct the pattern
             // (the workshop's #1 iris_test failure was an unactionable "no test classes").
-            let probe_sql = "SELECT TOP 25 Name FROM %Dictionary.CompiledClass WHERE Super LIKE '%UnitTest.TestCase%' ORDER BY Name";
+            // PrimarySuper (full inheritance chain), not Super (direct parent only): the workshop's
+            // test classes extend %UnitTest.TestProduction (which extends %UnitTest.TestCase), so a
+            // `Super LIKE TestCase` probe missed them and only surfaced system classes. Filter out
+            // framework/HealthShare packages so the user's own test classes surface.
+            let probe_sql = "SELECT TOP 25 Name FROM %Dictionary.CompiledClass WHERE PrimarySuper LIKE '%UnitTest.TestCase%' AND Name NOT LIKE 'EnsLib.%' AND Name NOT LIKE 'HS.%' AND Name NOT LIKE 'Ens.%' AND Name NOT LIKE '\\%%' ESCAPE '\\' ORDER BY Name";
             let candidates: Vec<String> = match tokio::time::timeout(
                 std::time::Duration::from_secs(10),
                 iris.query(probe_sql, vec![], &p.namespace, client),

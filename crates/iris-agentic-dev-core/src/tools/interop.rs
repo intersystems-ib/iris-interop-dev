@@ -226,7 +226,7 @@ pub async fn interop_production_start_impl(
     match exec_http(iris, &code, &params.namespace).await {
         Ok(output) => {
             let raw = output.trim();
-            if raw == "OK" {
+            if raw.starts_with("OK") {
                 ok_json(serde_json::json!({"success": true, "state": "Running"}))
             } else {
                 err_json("INTEROP_ERROR", raw)
@@ -261,7 +261,7 @@ pub async fn interop_production_stop_impl(
     match exec_http(iris, &code, &params.namespace).await {
         Ok(output) => {
             let raw = output.trim();
-            if raw == "OK" {
+            if raw.starts_with("OK") {
                 ok_json(serde_json::json!({"success": true, "state": "Stopped"}))
             } else {
                 err_json("INTEROP_ERROR", raw)
@@ -296,7 +296,7 @@ pub async fn interop_production_update_impl(
     match exec_http(iris, &code, &params.namespace).await {
         Ok(output) => {
             let raw = output.trim();
-            if raw == "OK" {
+            if raw.starts_with("OK") {
                 ok_json(serde_json::json!({"success": true, "message": "Production updated"}))
             } else {
                 err_json("INTEROP_ERROR", raw)
@@ -353,7 +353,7 @@ pub async fn interop_production_recover_impl(
     match exec_http(iris, code, &params.namespace).await {
         Ok(output) => {
             let raw = output.trim();
-            if raw == "OK" {
+            if raw.starts_with("OK") {
                 ok_json(serde_json::json!({"success": true, "state": "Running"}))
             } else {
                 err_json("INTEROP_ERROR", raw)
@@ -583,7 +583,7 @@ Write "OK""#,
     match exec_http(iris, &code, namespace).await {
         Ok(output) => {
             let raw = output.trim();
-            if raw == "OK" {
+            if raw.starts_with("OK") {
                 ok_json(serde_json::json!({"success": true, "item": item, "state": "restarted"}))
             } else {
                 err_json("INTEROP_ERROR", raw)
