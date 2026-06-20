@@ -2195,7 +2195,9 @@ set ^UnitTestRoot=$select(tIsWin:##class(%File).NormalizeDirectory("httest",##cl
 do ##class(%File).CreateDirectoryChain(^UnitTestRoot)
 set specDir=##class(%File).NormalizeDirectory($translate("{pattern}",".","/"),^UnitTestRoot)
 do ##class(%File).CreateDirectoryChain(specDir)
-do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
+set tCls="{pattern}"
+set tCC=##class(%Dictionary.CompiledClass).%OpenId(tCls)
+if $isobject(tCC)&&(tCC.PrimarySuper["%UnitTest.TestProduction") {{ do $classmethod(tCls,"Run") }} else {{ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}") }}"#,
                 token = correlation_token,
                 pattern = safe_pattern,
                 flags = flags,
