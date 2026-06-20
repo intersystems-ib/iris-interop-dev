@@ -2758,8 +2758,12 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
                     "error": msg,
                 });
                 // 84/447 workshop failures were guesses at nonexistent tables — route the
-                // model to real schema discovery instead of more guessing.
-                if sql_lint::is_table_not_found(msg) {
+                // model to real schema discovery instead of more guessing. Prefer a TARGETED
+                // hint that names the typed tool for the specific guessed table (SQL-Gateway,
+                // namespace, production config); fall back to the generic discovery hint.
+                if let Some(h) = sql_lint::targeted_table_hint(&p.query) {
+                    resp["hint"] = serde_json::Value::String(h.into());
+                } else if sql_lint::is_table_not_found(msg) {
                     resp["hint"] = serde_json::Value::String(sql_lint::TABLE_NOT_FOUND_HINT.into());
                 }
                 if !sql_warnings.is_empty() {
@@ -4069,7 +4073,7 @@ Methods:
     // Note: iris_debug already exists above as a real tool — it IS the merged debug dispatcher.
 
     #[tool(
-        description = "Interoperability production lifecycle (merged). action: status=get current state, start=start named production, stop=stop production, update=hot-apply config, check=check if update needed, recover=recover troubled production."
+        description = "Interoperability production lifecycle (merged). action: status=get current state, start=start named production, stop=stop production, restart=recycle ONE config item (pass item=<config item name>), update=hot-apply config, check=check if update needed, recover=recover troubled production."
     )]
     async fn iris_production(
         &self,
@@ -4192,9 +4196,22 @@ Methods:
                     },
                 ).await
             }
+            "restart" => {
+                // B: recycle ONE config item (disable+enable, each with UpdateProduction).
+                let ns = p
+                    .get("namespace")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("USER");
+                let item = p
+                    .get("item")
+                    .or_else(|| p.get("component"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                interop::interop_production_restart_item_impl(iris_opt, ns, item).await
+            }
             _ => err_json(
                 "INVALID_ACTION",
-                "iris_production: action must be status, start, stop, update, check, recover, get_autostart, or set_autostart",
+                "iris_production: action must be status, start, stop, restart (item), update, check, recover, get_autostart, or set_autostart",
             ),
         };
         self.record_call("iris_production", result.is_ok());
@@ -4202,7 +4219,7 @@ Methods:
     }
 
     #[tool(
-        description = "Interoperability query dispatcher (merged). what (REQUIRED): logs=recent log entries, queues=message queue depths, messages=search message archive, partners=configured Ens.Config.BusinessPartner rows. Pass namespace=<production namespace> to query a specific interop namespace (defaults to the connection's namespace). For SQL-Gateway connections (no SQL table), use iris_table_info / the introspect-dont-guess agent."
+        description = "Interoperability query dispatcher (merged). what (REQUIRED): logs=Event Log entries, queues=message queue depths, messages=message archive (Ens.MessageHeader), trace=ALL of one session (MessageHeader chain + Event Log events) by session_id, partners=configured Ens.Config.BusinessPartner rows. Filters: component=<config item> and session_id=<n> narrow logs/messages to one item/session; since_id=<n> tails only rows after a watermark (no MAX(ID) round-trip). Pass namespace=<production namespace> for a specific interop namespace (defaults to the connection's). For SQL-Gateway connections (no SQL table), use iris_table_info / the introspect-dont-guess agent."
     )]
     async fn iris_interop_query(
         &self,
@@ -4217,7 +4234,7 @@ Methods:
                 return ok_json(serde_json::json!({
                     "success": false,
                     "error_code": "MISSING_WHAT",
-                    "error": "iris_interop_query requires 'what': one of logs, queues, messages, partners.",
+                    "error": "iris_interop_query requires 'what': one of logs, queues, messages, trace, partners.",
                 }));
             }
         };
@@ -4242,6 +4259,14 @@ Methods:
                             .and_then(|v| v.as_str())
                             .unwrap_or("error,warning")
                             .to_string(),
+                        session_id: p.get("session_id").and_then(|v| {
+                            v.as_i64()
+                                .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+                        }),
+                        since_id: p.get("since_id").and_then(|v| {
+                            v.as_i64()
+                                .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+                        }),
                         limit: p.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as u32,
                     },
                 )
@@ -4274,10 +4299,37 @@ Methods:
                             .get("message_class")
                             .and_then(|v| v.as_str())
                             .map(|s| s.to_string()),
+                        session_id: p.get("session_id").and_then(|v| {
+                            v.as_i64()
+                                .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+                        }),
+                        since_id: p.get("since_id").and_then(|v| {
+                            v.as_i64()
+                                .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+                        }),
                         limit: p.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as u32,
                     },
                 )
                 .await
+            }
+            "trace" => {
+                // A: full session trace (MessageHeader chain + Ens_Util.Log events) by SessionId.
+                match p.get("session_id").and_then(|v| {
+                    v.as_i64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+                }) {
+                    Some(sid) => {
+                        let ns = p
+                            .get("namespace")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        interop::interop_trace_impl(iris_opt, ns, sid).await
+                    }
+                    None => err_json(
+                        "MISSING_SESSION_ID",
+                        "iris_interop_query what=trace requires a numeric session_id.",
+                    ),
+                }
             }
             "partners" => {
                 // B8: real Ens.Config.BusinessPartner rows instead of guessing config tables.
@@ -4289,7 +4341,7 @@ Methods:
             }
             other => err_json(
                 "INVALID_WHAT",
-                &format!("iris_interop_query: unknown what='{other}'. Valid: logs, queues, messages, partners."),
+                &format!("iris_interop_query: unknown what='{other}'. Valid: logs, queues, messages, trace, partners."),
             ),
         };
         self.record_call("iris_interop_query", result.is_ok());
@@ -4344,7 +4396,7 @@ Methods:
     // ─── 024-interop-depth: Production item control (US1) ───
 
     #[tool(
-        description = "Enable, disable, or inspect/modify settings of an individual Interoperability production config item. action: enable|disable|get_settings|set_settings. item: exact config item name. namespace: optional. settings: key-value map (for set_settings). Works via HTTP, no Docker required."
+        description = "Enable, disable, or inspect/modify settings of an individual Interoperability production config item. action: enable|disable|get_settings|set_settings. item: exact config item name. namespace: optional. settings: key-value map (for set_settings). set_settings applies live (Ens.Director.UpdateProduction) by default; pass apply=false to batch several changes and apply once (or via iris_production action=update). Works via HTTP, no Docker required."
     )]
     async fn iris_production_item(
         &self,
@@ -4374,6 +4426,8 @@ Methods:
                     .collect()
             })
             .unwrap_or_default();
+        // C: set_settings applies live by default; apply=false batches (apply later via update).
+        let apply = p.get("apply").and_then(|v| v.as_bool()).unwrap_or(true);
         let result = interop::interop_production_item_impl(
             self.iris_arc().as_deref(),
             interop::ProductionItemParams {
@@ -4381,6 +4435,7 @@ Methods:
                 item,
                 namespace,
                 settings,
+                apply,
             },
         )
         .await;

@@ -89,6 +89,52 @@ pub const TABLE_NOT_FOUND_HINT: &str = "Table/view not found. Call iris_table_in
 list the real tables and columns before querying. IRIS SQL uses Schema.Table and maps package \
 dots to '_' (e.g. class Ens.Util.Log -> table Ens_Util.Log; Ens.MessageHeader stays Ens.MessageHeader).";
 
+/// Targeted redirect for the specific nonexistent catalog tables the model repeatedly guessed
+/// in the retest (67% of system-table guesses failed: SQL-Gateway, namespace, production
+/// config/status/settings tables). Returns a hint naming the typed tool/approach to use
+/// instead of guessing, or None when the SQL doesn't match a known guess. Checked BEFORE the
+/// generic TABLE_NOT_FOUND_HINT so the model gets the specific tool, not "go look it up".
+pub fn targeted_table_hint(sql: &str) -> Option<&'static str> {
+    let u = sql.to_ascii_uppercase();
+    // SQL-Gateway / external language gateway connections — there is no SQL catalog table.
+    if u.contains("SQLCONNECTION")
+        || u.contains("SQLGATEWAY")
+        || u.contains("OBJECTGATEWAY")
+        || u.contains("CONFIG.GATEWAYS")
+        || u.contains("CONFIG.SQLCONNECTIONS")
+    {
+        return Some("SQL-Gateway / external-gateway connections are NOT a queryable SQL table. \
+Use the introspect-dont-guess agent or iris_table_info to resolve real names; the active connection's \
+config is in check_config.");
+    }
+    // Namespace enumeration — not a SQL table in the interop toolset.
+    if u.contains("%SYS.NAMESPACE")
+        || u.contains("CONFIG.NAMESPACES")
+        || u.contains("NAMESPACE_LIST")
+        || u.contains("%SYS.NAMESPACES")
+    {
+        return Some("The namespace list is not a SQL table. The connected namespace is reported by \
+check_config; switch namespace with the tool's namespace= argument.");
+    }
+    // Production items / settings / status — use the typed production tools.
+    if u.contains("ENS_CONFIG.SETTING")
+        || u.contains("ENS_CONFIG.ITEM")
+        || u.contains("ITEMSETTINGS")
+        || u.contains("ITEM_SETTINGS")
+        || (u.contains("ENS_CONFIG.PRODUCTION") && u.contains("STATUS"))
+    {
+        return Some("Don't query Ens_Config item/setting/status tables directly — use \
+iris_production(action=status) for production state and iris_production_item(action=get_settings) \
+for an item's settings.");
+    }
+    // Search-table indexed properties.
+    if u.contains("SEARCHTABLEPROP") {
+        return Some("Use iris_table_info on the SearchTable class to see its indexed properties \
+instead of guessing Ens_Config.SearchTableProp.");
+    }
+    None
+}
+
 fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
@@ -184,5 +230,24 @@ mod tests {
         assert!(is_table_not_found("Table 'SQLUSER.FOO' not found"));
         assert!(is_table_not_found("[SQLCODE: -30] Table or view not found"));
         assert!(!is_table_not_found("Syntax error near 'FROM'"));
+    }
+
+    #[test]
+    fn targeted_hints_redirect_known_guesses() {
+        assert!(targeted_table_hint("SELECT * FROM Config.Gateways")
+            .unwrap()
+            .contains("SQL-Gateway"));
+        assert!(targeted_table_hint("SELECT * FROM %Library.SQLConnection")
+            .unwrap()
+            .contains("SQL-Gateway"));
+        assert!(targeted_table_hint("SELECT NAME FROM %SYS.Namespace")
+            .unwrap()
+            .contains("namespace"));
+        assert!(targeted_table_hint("SELECT STATUS FROM Ens_Config.Item")
+            .unwrap()
+            .contains("iris_production"));
+        // real domain tables must NOT be hinted
+        assert!(targeted_table_hint("SELECT * FROM Hospital.Patient").is_none());
+        assert!(targeted_table_hint("SELECT * FROM Ens.MessageHeader").is_none());
     }
 }

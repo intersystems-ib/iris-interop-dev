@@ -135,6 +135,8 @@ mod interop_logs {
             LogsParams {
                 namespace: None,
                 item_name: None,
+                session_id: None,
+                since_id: None,
                 limit: 10,
                 log_type: "error".into(),
             },
@@ -171,6 +173,8 @@ mod interop_message_search {
                 source: None,
                 target: None,
                 class_name: None,
+                session_id: None,
+                since_id: None,
                 limit: 20,
             },
         ));

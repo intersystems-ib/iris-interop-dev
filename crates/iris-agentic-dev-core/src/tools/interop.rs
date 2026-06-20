@@ -26,6 +26,10 @@ fn default_ns() -> String {
     "USER".to_string()
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ProductionStatusParams {
     #[serde(default = "default_ns")]
@@ -84,6 +88,13 @@ pub struct LogsParams {
     #[serde(default)]
     pub namespace: Option<String>,
     pub item_name: Option<String>,
+    /// Restrict to one interop session (SessionId column) — events of one message flow.
+    #[serde(default)]
+    pub session_id: Option<i64>,
+    /// Tail since a watermark: only rows with ID greater than this (replaces the
+    /// `SELECT MAX(ID)` then `WHERE ID > N` two-call dance the model did ~21x).
+    #[serde(default)]
+    pub since_id: Option<i64>,
     #[serde(default = "default_limit")]
     pub limit: u32,
     #[serde(default = "default_log_type")]
@@ -107,6 +118,12 @@ pub struct MessageSearchParams {
     pub source: Option<String>,
     pub target: Option<String>,
     pub class_name: Option<String>,
+    /// Restrict to one interop session (SessionId) — the messages of one message flow.
+    #[serde(default)]
+    pub session_id: Option<i64>,
+    /// Only headers with ID greater than this watermark (tail-since pattern).
+    #[serde(default)]
+    pub since_id: Option<i64>,
     #[serde(default = "default_msg_limit")]
     pub limit: u32,
 }
@@ -383,7 +400,16 @@ pub async fn interop_logs_impl(
         .as_ref()
         .map(|n| format!("AND ConfigName = '{}'", n.replace('\'', "''")))
         .unwrap_or_default();
-    let sql = format!("SELECT TOP {} ID, TimeLogged, Type, ConfigName, Text FROM Ens_Util.Log WHERE 1=1 {} {} ORDER BY ID DESC", params.limit, type_filter, item_filter);
+    // session_id / since_id are numeric (i64) — safe to inline, no injection surface.
+    let session_filter = params
+        .session_id
+        .map(|s| format!("AND SessionId = {}", s))
+        .unwrap_or_default();
+    let since_filter = params
+        .since_id
+        .map(|s| format!("AND ID > {}", s))
+        .unwrap_or_default();
+    let sql = format!("SELECT TOP {} ID, TimeLogged, Type, ConfigName, SessionId, Text FROM Ens_Util.Log WHERE 1=1 {} {} {} {} ORDER BY ID DESC", params.limit, type_filter, item_filter, session_filter, since_filter);
     // A6: query the requested production namespace, not the connection default.
     let ns = params
         .namespace
@@ -455,12 +481,19 @@ pub async fn interop_message_search_impl(
             cls.replace('\'', "''")
         ));
     }
+    // session_id / since_id are numeric (i64) — safe to inline.
+    if let Some(sid) = params.session_id {
+        filters.push(format!("SessionId = {}", sid));
+    }
+    if let Some(since) = params.since_id {
+        filters.push(format!("ID > {}", since));
+    }
     let where_clause = if filters.is_empty() {
         String::new()
     } else {
         format!("WHERE {}", filters.join(" AND "))
     };
-    let sql = format!("SELECT TOP {} ID, TimeCreated, SourceConfigName, TargetConfigName, MessageBodyClassName, Status FROM Ens.MessageHeader {} ORDER BY ID DESC", params.limit, where_clause);
+    let sql = format!("SELECT TOP {} ID, TimeCreated, SourceConfigName, TargetConfigName, MessageBodyClassName, SessionId, Status FROM Ens.MessageHeader {} ORDER BY ID DESC", params.limit, where_clause);
     // A6: query the requested production namespace, not the connection default.
     let ns = params
         .namespace
@@ -470,6 +503,93 @@ pub async fn interop_message_search_impl(
         Ok(resp) => ok_json(
             serde_json::json!({"success": true, "messages": resp["result"]["content"], "count": resp["result"]["content"].as_array().map(|a| a.len()).unwrap_or(0)}),
         ),
+        Err(e) => err_json(
+            if is_network_error(&e.to_string()) {
+                "IRIS_UNREACHABLE"
+            } else {
+                "INTEROP_ERROR"
+            },
+            &e.to_string(),
+        ),
+    }
+}
+
+/// A · what=trace: the full picture of ONE interop session (i.e. one initial message and everything
+/// it triggered) in a single call — the Ens.MessageHeader chain PLUS the Ens_Util.Log events for that
+/// SessionId. Replaces the manual MessageHeader + Ens_Util.Log reconstruction (with the `SELECT MAX(ID)`
+/// watermark dance) the model did by hand.
+pub async fn interop_trace_impl(
+    iris: Option<&IrisConnection>,
+    namespace: Option<String>,
+    session_id: i64,
+) -> Result<CallToolResult, McpError> {
+    let iris = match iris {
+        Some(i) => i,
+        None => return err_json("IRIS_UNREACHABLE", "No IRIS connection"),
+    };
+    let client = IrisConnection::http_client().map_err(|_| iris_unreachable())?;
+    let ns = namespace.as_deref().unwrap_or(iris.namespace.as_str());
+    let net_err = |e: &str| {
+        if is_network_error(e) {
+            "IRIS_UNREACHABLE"
+        } else {
+            "INTEROP_ERROR"
+        }
+    };
+    // session_id is numeric (i64) — safe to inline.
+    let msg_sql = format!("SELECT ID, TimeCreated, SourceConfigName, TargetConfigName, MessageBodyClassName, Status, IsError FROM Ens.MessageHeader WHERE SessionId = {} ORDER BY ID ASC", session_id);
+    let log_sql = format!("SELECT ID, TimeLogged, Type, ConfigName, Text FROM Ens_Util.Log WHERE SessionId = {} ORDER BY ID ASC", session_id);
+    let messages = match iris.query(&msg_sql, vec![], ns, &client).await {
+        Ok(resp) => resp["result"]["content"].clone(),
+        Err(e) => return err_json(net_err(&e.to_string()), &e.to_string()),
+    };
+    let events = match iris.query(&log_sql, vec![], ns, &client).await {
+        Ok(resp) => resp["result"]["content"].clone(),
+        Err(e) => return err_json(net_err(&e.to_string()), &e.to_string()),
+    };
+    let msg_count = messages.as_array().map(|a| a.len()).unwrap_or(0);
+    let evt_count = events.as_array().map(|a| a.len()).unwrap_or(0);
+    ok_json(serde_json::json!({
+        "success": true,
+        "session_id": session_id,
+        "messages": messages,
+        "events": events,
+        "message_count": msg_count,
+        "event_count": evt_count,
+    }))
+}
+
+/// B · iris_production action=restart: recycle ONE production config item (disable then re-enable,
+/// each with UpdateProduction) without stopping the whole production.
+pub async fn interop_production_restart_item_impl(
+    iris: Option<&IrisConnection>,
+    namespace: &str,
+    item: &str,
+) -> Result<CallToolResult, McpError> {
+    let iris = match iris {
+        Some(i) => i,
+        None => return err_json("IRIS_UNREACHABLE", "No IRIS connection"),
+    };
+    if item.trim().is_empty() {
+        return err_json("INVALID_PARAMS", "restart requires 'item' (the config item name)");
+    }
+    let item_esc = item.replace('"', "\"\"");
+    let code = format!(
+        r#"Set sc=##class(Ens.Director).EnableConfigItem("{}",0,1) If $$$ISERR(sc) {{ Write "ERROR:"_$System.Status.GetErrorText(sc) Quit }}
+Set sc=##class(Ens.Director).EnableConfigItem("{}",1,1) If $$$ISERR(sc) {{ Write "ERROR:"_$System.Status.GetErrorText(sc) Quit }}
+Write "OK""#,
+        item_esc, item_esc
+    );
+    match exec_http(iris, &code, namespace).await {
+        Ok(output) => {
+            let raw = output.trim();
+            if raw == "OK" {
+                ok_json(serde_json::json!({"success": true, "item": item, "state": "restarted"}))
+            } else {
+                err_json("INTEROP_ERROR", raw)
+            }
+        }
+        Err(e) if e.to_string() == "DOCKER_REQUIRED" => docker_required_interop(),
         Err(e) => err_json(
             if is_network_error(&e.to_string()) {
                 "IRIS_UNREACHABLE"
@@ -532,6 +652,10 @@ pub struct ProductionItemParams {
     pub namespace: String,
     #[serde(default)]
     pub settings: std::collections::HashMap<String, String>,
+    /// set_settings: apply changes live via Ens.Director.UpdateProduction (default true).
+    /// Pass false to batch several set_settings calls and apply once at the end.
+    #[serde(default = "default_true")]
+    pub apply: bool,
 }
 
 pub async fn interop_production_item_impl(
@@ -664,6 +788,13 @@ Set tS.Value="{}"
                     k_esc, k_esc, v_esc
                 ));
             }
+            // C: apply live (Ens.Director.UpdateProduction) unless apply=false, so several
+            // set_settings calls can be batched and applied once (or via iris_production update).
+            let update_line = if params.apply {
+                "Set tSC5=##class(Ens.Director).UpdateProduction(10,0)\nIf $$$ISERR(tSC5) { Write \"ERROR:UPDATE_FAILED:\"_$System.Status.GetErrorText(tSC5) Quit }\n"
+            } else {
+                ""
+            };
             let code = format!(
                 r#"Set tSC=##class(Ens.Director).GetProductionStatus(.n,.s)
 If $$$ISERR(tSC)||n="" {{ Write "ERROR:NO_PRODUCTION:No production running" Quit }}
@@ -673,18 +804,23 @@ Set tItem=tProd.FindItemByConfigName("{}",,.tSC3)
 If '$IsObject(tItem) {{ Write "ERROR:ITEM_NOT_FOUND:Item not found: {}" Quit }}
 {}Set tSC4=tProd.%Save()
 If $$$ISERR(tSC4) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC4) Quit }}
-Set tSC5=##class(Ens.Director).UpdateProduction(10,0)
-If $$$ISERR(tSC5) {{ Write "ERROR:UPDATE_FAILED:"_$System.Status.GetErrorText(tSC5) Quit }}
-Write "OK""#,
-                item, item, setting_lines
+{}Write "OK""#,
+                item, item, setting_lines, update_line
             );
             match iris.execute_via_generator(&code, ns, &client).await {
                 Ok(out) => {
                     let out = out.trim();
                     if out == "OK" {
-                        ok_json(
-                            serde_json::json!({"success":true,"item":params.item,"message":"Settings updated and production updated"}),
-                        )
+                        ok_json(serde_json::json!({
+                            "success": true,
+                            "item": params.item,
+                            "applied": params.apply,
+                            "message": if params.apply {
+                                "Settings saved and production updated (live)"
+                            } else {
+                                "Settings saved; NOT applied (apply=false) — run iris_production action=update to apply"
+                            }
+                        }))
                     } else if let Some(msg) = out.strip_prefix("ERROR:ITEM_NOT_FOUND:") {
                         err_json("ITEM_NOT_FOUND", msg)
                     } else if let Some(msg) = out.strip_prefix("ERROR:NO_PRODUCTION:") {
