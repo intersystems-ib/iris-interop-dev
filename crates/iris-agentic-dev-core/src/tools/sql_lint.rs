@@ -113,8 +113,10 @@ config is in check_config.");
         || u.contains("NAMESPACE_LIST")
         || u.contains("%SYS.NAMESPACES")
     {
-        return Some("The namespace list is not a SQL table. The connected namespace is reported by \
-check_config; switch namespace with the tool's namespace= argument.");
+        return Some(
+            "The namespace list is not a SQL table. The connected namespace is reported by \
+check_config; switch namespace with the tool's namespace= argument.",
+        );
     }
     // Production items / settings / status — use the typed production tools.
     if u.contains("ENS_CONFIG.SETTING")
@@ -123,14 +125,18 @@ check_config; switch namespace with the tool's namespace= argument.");
         || u.contains("ITEM_SETTINGS")
         || (u.contains("ENS_CONFIG.PRODUCTION") && u.contains("STATUS"))
     {
-        return Some("Don't query Ens_Config item/setting/status tables directly — use \
+        return Some(
+            "Don't query Ens_Config item/setting/status tables directly — use \
 iris_production(action=status) for production state and iris_production_item(action=get_settings) \
-for an item's settings.");
+for an item's settings.",
+        );
     }
     // Search-table indexed properties.
     if u.contains("SEARCHTABLEPROP") {
-        return Some("Use iris_table_info on the SearchTable class to see its indexed properties \
-instead of guessing Ens_Config.SearchTableProp.");
+        return Some(
+            "Use iris_table_info on the SearchTable class to see its indexed properties \
+instead of guessing Ens_Config.SearchTableProp.",
+        );
     }
     None
 }
@@ -320,7 +326,9 @@ mod tests {
         .unwrap();
         assert!(h.contains("Atelier"), "{h}");
         assert!(h.contains("iris_doc"), "{h}");
-        assert!(execute_redirect_hint("Do ##class(%Studio.Project).StudioOpenDocument(f)").is_some());
+        assert!(
+            execute_redirect_hint("Do ##class(%Studio.Project).StudioOpenDocument(f)").is_some()
+        );
     }
 
     #[test]
@@ -349,8 +357,14 @@ mod tests {
     #[test]
     fn execute_redirect_silent_on_legit_objectscript() {
         // object save, production control, globals, a writing %SQL.Statement — no redirect
-        assert!(execute_redirect_hint("set o=##class(Cocina.MSG.MenuRequest).%New() do o.%Save()").is_none());
-        assert!(execute_redirect_hint("set sc=##class(Ens.Director).StartProduction(\"Cocina.Production\")").is_none());
+        assert!(
+            execute_redirect_hint("set o=##class(Cocina.MSG.MenuRequest).%New() do o.%Save()")
+                .is_none()
+        );
+        assert!(execute_redirect_hint(
+            "set sc=##class(Ens.Director).StartProduction(\"Cocina.Production\")"
+        )
+        .is_none());
         assert!(execute_redirect_hint("write $ZVERSION,!").is_none());
         assert!(execute_redirect_hint(
             "set rs=##class(%SQL.Statement).%ExecDirect(,\"INSERT INTO public.menus VALUES (?)\",1)"

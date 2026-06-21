@@ -571,7 +571,10 @@ pub async fn interop_production_restart_item_impl(
         None => return err_json("IRIS_UNREACHABLE", "No IRIS connection"),
     };
     if item.trim().is_empty() {
-        return err_json("INVALID_PARAMS", "restart requires 'item' (the config item name)");
+        return err_json(
+            "INVALID_PARAMS",
+            "restart requires 'item' (the config item name)",
+        );
     }
     let item_esc = item.replace('"', "\"\"");
     let code = format!(
@@ -694,7 +697,10 @@ pub fn build_add_item_code(
         extra.push_str(&format!("Set tItem.PoolSize={}\n", ps));
     }
     if let Some(cat) = category {
-        extra.push_str(&format!("Set tItem.Category=\"{}\"\n", cat.replace('\'', "''")));
+        extra.push_str(&format!(
+            "Set tItem.Category=\"{}\"\n",
+            cat.replace('\'', "''")
+        ));
     }
     for (k, v) in settings {
         let (target, name) = match k.strip_prefix("Adapter.") {

@@ -498,7 +498,10 @@ impl IrisConnection {
         ];
         let mut last_err = anyhow::anyhow!("no attempts made");
         for (attempt, delay) in delays.iter().enumerate() {
-            match self.query_once(sql, params.clone(), namespace, client).await {
+            match self
+                .query_once(sql, params.clone(), namespace, client)
+                .await
+            {
                 Ok(body) => return Ok(body),
                 Err(e) => {
                     let msg = e.to_string();
@@ -721,8 +724,7 @@ mod system_mode_tests {
     // output:"" success:true. The fix puts user code in a separate RunUser() method.
     #[test]
     fn build_exec_class_no_objectgenerator_uses_runuser() {
-        let cls =
-            IrisConnection::build_exec_class("User.T", "write 1,! quit").join("\n");
+        let cls = IrisConnection::build_exec_class("User.T", "write 1,! quit").join("\n");
         assert!(
             !cls.contains("objectgenerator"),
             "must NOT use CodeMode=objectgenerator:\n{cls}"

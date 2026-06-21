@@ -2410,82 +2410,85 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
         //   "      TestFoo FAILED -- <msg>" ← method failure
         //   "    ClassName passed"
         if !from_global {
-        for line in run_output.lines() {
-            let trimmed = line.trim();
-            // Class begin: "IrisDevE2E.SmokeTest begins ..."  (contains dot, no parens)
-            if trimmed.ends_with("begins ...") && !trimmed.contains("()") && trimmed.contains('.') {
-                current_class = trimmed.trim_end_matches(" begins ...").trim().to_string();
-            }
-            // Method result: "TestFoo passed" or "TestFoo FAILED" or "TestFoo FAILED -- msg"
-            // These lines have no "()" and start with "Test"
-            else if !trimmed.contains("()") && !trimmed.ends_with("begins ...") {
-                let upper = trimmed.to_uppercase();
-                let (is_passed, is_failed) = (
-                    upper.ends_with(" PASSED") || upper.contains(" PASSED "),
-                    upper.ends_with(" FAILED") || upper.contains(" FAILED"),
-                );
-                if !is_passed && !is_failed {
-                    continue;
-                }
-                let method_name = if is_passed {
-                    trimmed
-                        .split(" passed")
-                        .next()
-                        .unwrap_or("")
-                        .split(" PASSED")
-                        .next()
-                        .unwrap_or("")
-                        .trim()
-                        .to_string()
-                } else {
-                    trimmed
-                        .split(" failed")
-                        .next()
-                        .unwrap_or("")
-                        .split(" FAILED")
-                        .next()
-                        .unwrap_or("")
-                        .trim()
-                        .to_string()
-                };
-                // Skip suite-level result lines (e.g. "MyClass\Sub FAILED") — these contain
-                // path separators and are not individual test methods.
-                // Skip if no class context (suite-level result without a class "begins" line),
-                // or if name contains path separators (suite-level lines, not method names).
-                if method_name.is_empty()
-                    || current_class.is_empty()
-                    || (!method_name.starts_with("Test") && !method_name.starts_with("test"))
-                    || method_name.contains('\\')
-                    || method_name.contains('/')
-                    || method_name.contains('.')
+            for line in run_output.lines() {
+                let trimmed = line.trim();
+                // Class begin: "IrisDevE2E.SmokeTest begins ..."  (contains dot, no parens)
+                if trimmed.ends_with("begins ...")
+                    && !trimmed.contains("()")
+                    && trimmed.contains('.')
                 {
-                    continue;
+                    current_class = trimmed.trim_end_matches(" begins ...").trim().to_string();
                 }
-                let failure_message = if is_failed {
-                    trimmed
-                        .split_once(" -- ")
-                        .map(|x| x.1)
-                        .map(|s| serde_json::Value::String(s.trim().to_string()))
-                        .unwrap_or(serde_json::Value::Null)
-                } else {
-                    serde_json::Value::Null
-                };
-                if is_passed {
-                    passed += 1;
-                } else {
-                    failed += 1;
+                // Method result: "TestFoo passed" or "TestFoo FAILED" or "TestFoo FAILED -- msg"
+                // These lines have no "()" and start with "Test"
+                else if !trimmed.contains("()") && !trimmed.ends_with("begins ...") {
+                    let upper = trimmed.to_uppercase();
+                    let (is_passed, is_failed) = (
+                        upper.ends_with(" PASSED") || upper.contains(" PASSED "),
+                        upper.ends_with(" FAILED") || upper.contains(" FAILED"),
+                    );
+                    if !is_passed && !is_failed {
+                        continue;
+                    }
+                    let method_name = if is_passed {
+                        trimmed
+                            .split(" passed")
+                            .next()
+                            .unwrap_or("")
+                            .split(" PASSED")
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .to_string()
+                    } else {
+                        trimmed
+                            .split(" failed")
+                            .next()
+                            .unwrap_or("")
+                            .split(" FAILED")
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .to_string()
+                    };
+                    // Skip suite-level result lines (e.g. "MyClass\Sub FAILED") — these contain
+                    // path separators and are not individual test methods.
+                    // Skip if no class context (suite-level result without a class "begins" line),
+                    // or if name contains path separators (suite-level lines, not method names).
+                    if method_name.is_empty()
+                        || current_class.is_empty()
+                        || (!method_name.starts_with("Test") && !method_name.starts_with("test"))
+                        || method_name.contains('\\')
+                        || method_name.contains('/')
+                        || method_name.contains('.')
+                    {
+                        continue;
+                    }
+                    let failure_message = if is_failed {
+                        trimmed
+                            .split_once(" -- ")
+                            .map(|x| x.1)
+                            .map(|s| serde_json::Value::String(s.trim().to_string()))
+                            .unwrap_or(serde_json::Value::Null)
+                    } else {
+                        serde_json::Value::Null
+                    };
+                    if is_passed {
+                        passed += 1;
+                    } else {
+                        failed += 1;
+                    }
+                    let tc = serde_json::json!({
+                        "name": method_name,
+                        "class_name": current_class,
+                        "status": if is_passed { "passed" } else { "failed" },
+                        "duration_ms": null,
+                        "failure_message": failure_message,
+                    });
+                    test_cases.push(tc.clone());
+                    class_map.entry(current_class.clone()).or_default().push(tc);
                 }
-                let tc = serde_json::json!({
-                    "name": method_name,
-                    "class_name": current_class,
-                    "status": if is_passed { "passed" } else { "failed" },
-                    "duration_ms": null,
-                    "failure_message": failure_message,
-                });
-                test_cases.push(tc.clone());
-                class_map.entry(current_class.clone()).or_default().push(tc);
             }
-        }
         }
 
         let test_suites: Vec<serde_json::Value> = class_map
