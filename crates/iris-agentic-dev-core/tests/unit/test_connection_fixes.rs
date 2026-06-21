@@ -112,25 +112,26 @@ fn test_http_client_succeeds_normally() {
 
 #[test]
 fn test_execute_captures_output_without_trailing_newline() {
-    // build_exec_class must inject a sentinel Write ! after user code
-    // so that Read line:0 always finds a line boundary.
+    // build_exec_class must inject a sentinel `Write !` in Execute() AFTER the RunUser()
+    // call, so the captured temp file always ends on a line boundary. (User code lives in
+    // RunUser(); the sentinel lives in Execute() after `Do ..RunUser()` — the two-method design.)
     let lines = iris_agentic_dev_core::iris::connection::IrisConnection::build_exec_class_for_test(
-        "TestClass",
+        "IrisDevTmp.RunTest",
         "Write 42",
     );
-    // Find the user code line
-    let user_line_pos = lines
+    let runuser_pos = lines
         .iter()
-        .position(|l| l.contains("Write 42"))
-        .expect("should contain user code");
-    // The line immediately after user code must be the sentinel
-    let sentinel_line = lines
-        .get(user_line_pos + 1)
-        .expect("should have line after user code");
+        .position(|l| l.contains("Do ..RunUser()"))
+        .expect("Execute() should call ..RunUser()");
+    let sentinel_pos = lines
+        .iter()
+        .position(|l| l.trim() == "Write !")
+        .expect("sentinel 'Write !' must be present");
     assert!(
-        sentinel_line.contains("Write !"),
-        "sentinel 'Write !' must follow user code, got: {:?}",
-        sentinel_line
+        sentinel_pos > runuser_pos,
+        "sentinel 'Write !' must follow the RunUser() call (pos {} vs {})",
+        sentinel_pos,
+        runuser_pos
     );
 }
 
@@ -243,44 +244,34 @@ fn test_build_exec_class_handles_long_code() {
     );
 }
 
-// ── SQL proc name: must use underscore not dot (#18) ─────────────────────────
+// ── Temp executor lives in the dedicated IrisDevTmp scratch package ───────────
 
 #[test]
-fn test_build_exec_class_sql_proc_name_uses_underscore() {
-    // The generated class User.IrisDevRunXXX with method Execute [SqlProc]
-    // maps to SQL proc User_IrisDevRunXXX_Execute (underscore, not dot).
-    // Regression test for #18: was User.IrisDevRunXXX_Execute which caused
-    // silent IRIS_COMPILE_FAILED with empty error message.
-    let lines = IrisConnection::build_exec_class_for_test("User.IrisDevRunabc123", "Write 1");
-    // The class name in the generated source should be User.IrisDevRunabc123
+fn test_build_exec_class_uses_dedicated_scratch_package() {
+    // The temp executor class is `IrisDevTmp.Run<id>` — a dedicated, disposable scratch
+    // package, NOT `User.*` (where real application data like User.PatientData lives).
+    let lines = IrisConnection::build_exec_class_for_test("IrisDevTmp.Runabc123", "Write 1");
     assert!(
-        lines.iter().any(|l| l.contains("User.IrisDevRunabc123")),
+        lines.iter().any(|l| l.contains("IrisDevTmp.Runabc123")),
         "class name should appear in generated source"
     );
-    // The SQL proc is built separately in execute_via_generator_once as:
-    // format!("User_IrisDevRun{}_Execute", id)
-    // We verify the naming rule: dots → underscores in SQL identifiers.
-    // Test the format string directly:
-    let id = "abc123";
-    let sql_func = format!("User_IrisDevRun{}_Execute", id);
-    assert_eq!(sql_func, "User_IrisDevRunabc123_Execute");
     assert!(
-        !sql_func.contains('.'),
-        "SQL proc name must not contain dots: {}",
-        sql_func
+        !lines.iter().any(|l| l.contains("User.IrisDevRun")),
+        "temp executor must NOT use the User package"
     );
 }
 
 #[test]
-fn test_sql_proc_name_not_dot_form() {
-    // Explicitly assert the wrong form is NOT used
-    let id = "testid";
-    let wrong = format!("User.IrisDevRun{}_Execute", id);
-    let correct = format!("User_IrisDevRun{}_Execute", id);
-    assert_ne!(wrong, correct, "dot form and underscore form must differ");
-    assert!(
-        correct.starts_with("User_"),
-        "correct form starts with User_"
-    );
-    assert!(wrong.starts_with("User."), "wrong form starts with User.");
+fn test_sql_proc_name_is_schema_dot_classmethod() {
+    // The SqlProc projection of class `IrisDevTmp.Run<id>` method `Execute` is
+    // `IrisDevTmp.Run<id>_Execute` — schema (the package name) + '.' + Class_Method.
+    // Live-verified on IRIS-for-Health 2026.1: `SELECT IrisDevTmp.RunSMOKE_Execute()` works,
+    // while the all-underscore form `IrisDevTmp_RunSMOKE_Execute` errors SQLCODE -359.
+    let id = "abc123";
+    let sql_func = format!("IrisDevTmp.Run{}_Execute", id);
+    assert_eq!(sql_func, "IrisDevTmp.Runabc123_Execute");
+    // dedicated schema, not SQLUser; one dot (schema.proc), the rest underscores.
+    assert!(sql_func.starts_with("IrisDevTmp."));
+    assert!(!sql_func.contains("SQLUser"));
+    assert_eq!(sql_func.matches('.').count(), 1, "exactly one schema dot");
 }

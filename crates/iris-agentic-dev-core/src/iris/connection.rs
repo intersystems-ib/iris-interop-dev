@@ -280,11 +280,17 @@ impl IrisConnection {
             .chars()
             .take(12)
             .collect();
-        let class_name = format!("User.IrisDevRun{}", id);
+        // Dedicated scratch package `IrisDevTmp` — NOT `User.*`. The temp executor class must not
+        // land in the User package, where real application data lives (e.g. the `User.PatientData`
+        // seed in the workshop): a leaked temp class there pollutes a real namespace and can be
+        // mistaken for / collide with application classes. `IrisDevTmp` is obviously-disposable and
+        // never in use. The package name IS the SQL schema (the `User`->`SQLUser` special-case does
+        // not apply), so the SqlProc is `IrisDevTmp.Run<id>_Execute`. This also covers iris_test,
+        // which runs through the same generator.
+        let class_name = format!("IrisDevTmp.Run{}", id);
         let doc_name = format!("{}.cls", class_name);
-        // SQL proc name: User package maps to SQLUser schema in IRIS SQL.
-        // "output" is a reserved word in IRIS SQL — use "result" as the column alias.
-        let sql_func = format!("SQLUser.IrisDevRun{}_Execute", id);
+        // "output" is a reserved word in IRIS SQL — Execute() aliases its column as "result".
+        let sql_func = format!("IrisDevTmp.Run{}_Execute", id);
         let content = Self::build_exec_class(&class_name, code);
 
         // 1. PUT the class document
