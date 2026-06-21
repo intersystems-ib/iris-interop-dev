@@ -947,6 +947,9 @@ pub fn build_test_run_from_sql(suites: &[SuiteRow], methods: &[MethodRow]) -> se
     if suites.is_empty() {
         return serde_json::json!({
             "success": false,
+            "completed": false,
+            "outcome": "no_tests",
+            "tests_passed": false,
             "error_code": ERR_NO_TESTS_FOUND,
             "error": "Pattern matched no test classes",
             "total": 0,
@@ -998,8 +1001,18 @@ pub fn build_test_run_from_sql(suites: &[SuiteRow], methods: &[MethodRow]) -> se
     }
 
     let success = failed == 0 && errors == 0;
+    let outcome = if errors > 0 {
+        "errors"
+    } else if failed > 0 {
+        "failed"
+    } else {
+        "passed"
+    };
     serde_json::json!({
         "success": success,
+        "completed": true,
+        "outcome": outcome,
+        "tests_passed": success,
         "total": total,
         "passed": passed,
         "failed": failed,
@@ -2120,7 +2133,7 @@ impl IrisTools {
     }
 
     #[tool(
-        description = "Run %UnitTest.Manager tests on IRIS and return structured pass/fail results. Uses pure-HTTP execution via Atelier REST — works with or without IRIS_CONTAINER. Pass a class name pattern like 'MyApp.Tests' or 'ISC.sql.TestFoo' to run already-compiled test classes (uses /noload automatically). Pass a directory path like 'MyApp/Tests' to load from disk. Returns suite-level summary inline plus log_id for per-test-case detail via iris_get_log."
+        description = "Run %UnitTest.Manager tests on IRIS and return structured pass/fail results. Uses pure-HTTP execution via Atelier REST — works with or without IRIS_CONTAINER. Pass a class name pattern like 'MyApp.Tests' or 'ISC.sql.TestFoo' to run already-compiled test classes (uses /noload automatically). Pass a directory path like 'MyApp/Tests' to load from disk. Returns suite-level summary inline plus log_id for per-test-case detail via iris_get_log. Result fields: `completed` (the suite ran — the tool worked), `outcome` ('passed'|'failed'|'errors'|'no_tests'), `tests_passed`, and `success` (==tests_passed, kept for back-compat). A completed run with failed>0 is a REAL test result, NOT a tool failure — fix the test/code, don't retry the tool."
     )]
     async fn iris_test(
         &self,
@@ -2544,7 +2557,19 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
             }));
         }
 
+        // `success` keeps its historical meaning (all tests green) for back-compat, but we reached
+        // this point only because the suite actually RAN and produced parsed method results — so the
+        // tool itself worked. Surface that distinction explicitly (issue #8): a run with failed>0 is
+        // a real test result, not a tool failure. `outcome` separates the three states.
         let success = failed == 0 && errors == 0;
+        let completed = true;
+        let outcome = if errors > 0 {
+            "errors"
+        } else if failed > 0 {
+            "failed"
+        } else {
+            "passed"
+        };
 
         // Store full per-case detail in log store.
         let log_id = {
@@ -2576,9 +2601,14 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
             id
         };
 
-        self.record_call("iris_test", success);
+        // Record the TOOL call by whether the tool worked (the suite ran), not by whether the
+        // tests passed — otherwise red tests inflate the tool's failure rate (issue #8).
+        self.record_call("iris_test", completed);
         ok_json(serde_json::json!({
             "success": success,
+            "completed": completed,
+            "outcome": outcome,
+            "tests_passed": success,
             "total": total,
             "passed": passed,
             "failed": failed,
@@ -2594,7 +2624,7 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
     }
 
     #[tool(
-        description = "Execute arbitrary ObjectScript code on IRIS and return stdout. Uses pure-HTTP execution via CodeMode=objectgenerator (write temp class, compile, query result, delete). Falls back to docker exec if IRIS_CONTAINER env var is set and HTTP fails. &sql(...) embedded SQL macros are automatically translated to %SQL.Statement calls (set translate_sql: false to disable). When translation fires, response includes sql_translated: true and translated_code. Example: code='write $ZVERSION,!' returns the IRIS version string."
+        description = "Execute arbitrary ObjectScript code on IRIS and return stdout. Uses pure-HTTP execution via CodeMode=objectgenerator (write temp class, compile, query result, delete). Falls back to docker exec if IRIS_CONTAINER env var is set and HTTP fails. &sql(...) embedded SQL macros are automatically translated to %SQL.Statement calls (set translate_sql: false to disable). When translation fires, response includes sql_translated: true and translated_code. Example: code='write $ZVERSION,!' returns the IRIS version string. Use this for side-effecting ObjectScript only — for SELECTs use iris_query, for class/table introspection use docs_introspect/iris_symbols/iris_table_info, for production state use iris_production/iris_interop_query, and to create+compile a class use iris_doc(put,compile) over Atelier (never $SYSTEM.OBJ.Load from a file path — that needs IRIS to share this host's disk). When the code matches one of those, the response includes a `hint` naming the typed tool."
     )]
     async fn iris_execute(
         &self,
@@ -2604,6 +2634,11 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
         tracing::info!(namespace = %p.namespace, translate_sql = p.translate_sql, "iris_execute");
         let client = self.http_client();
         let timeout = std::time::Duration::from_secs(p.timeout);
+
+        // Advisory: if this code is really a SELECT, class introspection, production-config read,
+        // or a load-from-file, the typed tools do it in one round-trip (and avoid the
+        // <SYNTAX>errdone+2^%qaqqt failures). Non-blocking — attached as `hint` to the result.
+        let redirect_hint = sql_lint::execute_redirect_hint(&p.code);
 
         // &sql macro translation — rewrite before sending to IRIS (035)
         let translation = if p.translate_sql {
@@ -2677,6 +2712,11 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
                         }
                     }
                 }
+                if resp.get("hint").is_none() {
+                    if let Some(h) = redirect_hint {
+                        resp["hint"] = serde_json::Value::String(h.into());
+                    }
+                }
                 return ok_json(resp);
             }
             Ok(Err(_)) => {
@@ -2740,6 +2780,11 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
                                     .collect(),
                             );
                         }
+                    }
+                }
+                if resp.get("hint").is_none() {
+                    if let Some(h) = redirect_hint {
+                        resp["hint"] = serde_json::Value::String(h.into());
                     }
                 }
                 ok_json(resp)
@@ -4486,7 +4531,7 @@ Methods:
     // ─── 024-interop-depth: Production item control (US1) ───
 
     #[tool(
-        description = "Enable, disable, or inspect/modify settings of an individual Interoperability production config item. action: enable|disable|get_settings|set_settings. item: exact config item name. namespace: optional. settings: key-value map (for set_settings). set_settings applies live (Ens.Director.UpdateProduction) by default; pass apply=false to batch several changes and apply once (or via iris_production action=update). Works via HTTP, no Docker required."
+        description = "Add, remove, enable, disable, or inspect/modify settings of an Interoperability production config item — the typed way to build/manipulate a production without hand-rolling ##class(Ens.Config.*) ObjectScript. action: add|remove|enable|disable|get_settings|set_settings. item: exact config item name. For add: class_name (the BS/BO/BP/adapter class the item runs, required), optional enabled (default true), production (defaults to the running one), pool_size, category, and settings (key-value; prefix a key with 'Adapter.' to target the adapter, e.g. 'Adapter.FilePath', otherwise it targets the Host). For remove: item (+ optional production). settings: key-value map for set_settings. Changes apply live via Ens.Director.UpdateProduction when the target production is running (set_settings honours apply=false to batch). Works via HTTP, no Docker required."
     )]
     async fn iris_production_item(
         &self,
@@ -4518,6 +4563,21 @@ Methods:
             .unwrap_or_default();
         // C: set_settings applies live by default; apply=false batches (apply later via update).
         let apply = p.get("apply").and_then(|v| v.as_bool()).unwrap_or(true);
+        // add/remove fields.
+        let class_name = p
+            .get("class_name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let enabled = p.get("enabled").and_then(|v| v.as_bool());
+        let production = p
+            .get("production")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let pool_size = p.get("pool_size").and_then(|v| v.as_i64());
+        let category = p
+            .get("category")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         let result = interop::interop_production_item_impl(
             self.iris_arc().as_deref(),
             interop::ProductionItemParams {
@@ -4526,6 +4586,11 @@ Methods:
                 namespace,
                 settings,
                 apply,
+                class_name,
+                enabled,
+                production,
+                pool_size,
+                category,
             },
         )
         .await;

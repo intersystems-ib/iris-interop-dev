@@ -29,6 +29,73 @@ mod interop_production_status {
     }
 }
 
+mod production_item_codegen {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn add_item_code_has_canonical_api_and_settings() {
+        let mut settings = HashMap::new();
+        settings.insert("Adapter.FilePath".to_string(), "/data/in".to_string());
+        settings.insert("TargetConfigNames".to_string(), "Router.Censo".to_string());
+        let code = build_add_item_code(
+            "Cocina.Production",
+            "BS.Censo",
+            "EnsLib.RecordMap.Service.FileService",
+            true,
+            Some(1),
+            Some("Cocina"),
+            &settings,
+        );
+        // Uses the supported Ens.Config API, not raw global pokes.
+        assert!(code.contains("##class(Ens.Config.Production).%OpenId"));
+        assert!(code.contains("##class(Ens.Config.Item).%New()"));
+        assert!(code.contains("Set tItem.ClassName=\"EnsLib.RecordMap.Service.FileService\""));
+        assert!(code.contains("Set tItem.Enabled=1"));
+        assert!(code.contains("Set tItem.PoolSize=1"));
+        assert!(code.contains("Do tProd.Items.Insert(tItem)"));
+        // duplicate guard + live apply only when running.
+        assert!(code.contains("ERROR:ITEM_EXISTS"));
+        assert!(code.contains("If tRun=tProdName"));
+        // adapter-targeted vs host-targeted settings.
+        assert!(code.contains("Set tS.Name=\"FilePath\" Set tS.Target=\"Adapter\""));
+        assert!(code.contains("Set tS.Name=\"TargetConfigNames\" Set tS.Target=\"Host\""));
+    }
+
+    #[test]
+    fn add_item_disabled_and_default_production() {
+        let code = build_add_item_code(
+            "",
+            "BO.SQL",
+            "Cocina.BO.SQL",
+            false,
+            None,
+            None,
+            &HashMap::new(),
+        );
+        assert!(code.contains("Set tItem.Enabled=0"));
+        // empty production -> resolve the running one at runtime.
+        assert!(code.contains("GetProductionStatus(.tProdName"));
+        assert!(!code.contains("Set tItem.PoolSize"));
+    }
+
+    #[test]
+    fn remove_item_code_finds_and_removes_by_name() {
+        let code = build_remove_item_code("Cocina.Production", "BS.Censo");
+        assert!(code.contains("##class(Ens.Config.Production).%OpenId"));
+        assert!(code.contains("tProd.Items.RemoveAt(tIdx)"));
+        assert!(code.contains("ERROR:ITEM_NOT_FOUND"));
+    }
+
+    #[test]
+    fn codegen_escapes_single_quotes() {
+        let code = build_add_item_code("P'x", "It'm", "Cls'", true, None, None, &HashMap::new());
+        assert!(code.contains("It''m"));
+        assert!(code.contains("Cls''"));
+        assert!(code.contains("P''x"));
+    }
+}
+
 mod interop_production_start {
     use super::*;
 

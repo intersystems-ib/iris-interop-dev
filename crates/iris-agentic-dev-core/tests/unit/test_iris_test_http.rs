@@ -57,6 +57,9 @@ fn test_build_test_run_all_passing() {
     ];
     let result = build_test_run_from_sql(&suites, &methods);
     assert_eq!(result["success"], true);
+    assert_eq!(result["completed"], true);
+    assert_eq!(result["outcome"], "passed");
+    assert_eq!(result["tests_passed"], true);
     assert_eq!(result["total"], 2);
     assert_eq!(result["passed"], 2);
     assert_eq!(result["failed"], 0);
@@ -99,7 +102,11 @@ fn test_build_test_run_one_failure() {
         },
     ];
     let result = build_test_run_from_sql(&suites, &methods);
+    // A run WITH failing assertions still completed — the tool worked (issue #8).
     assert_eq!(result["success"], false);
+    assert_eq!(result["completed"], true);
+    assert_eq!(result["outcome"], "failed");
+    assert_eq!(result["tests_passed"], false);
     assert_eq!(result["total"], 2);
     assert_eq!(result["passed"], 1);
     assert_eq!(result["failed"], 1);

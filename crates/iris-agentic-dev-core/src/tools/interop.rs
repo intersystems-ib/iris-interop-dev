@@ -656,6 +656,102 @@ pub struct ProductionItemParams {
     /// Pass false to batch several set_settings calls and apply once at the end.
     #[serde(default = "default_true")]
     pub apply: bool,
+    /// add: the ObjectScript class the new item runs (e.g. "EnsLib.HL7.Service.FileService" or a
+    /// custom BS/BO/BP class). Required for action=add.
+    #[serde(default)]
+    pub class_name: Option<String>,
+    /// add: enable the item on creation (default true).
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// add/remove: target production by name. Defaults to the currently running production.
+    #[serde(default)]
+    pub production: Option<String>,
+    /// add: optional PoolSize for the item.
+    #[serde(default)]
+    pub pool_size: Option<i64>,
+    /// add: optional Category for portal grouping.
+    #[serde(default)]
+    pub category: Option<String>,
+}
+
+/// Build the ObjectScript that adds a config item to a production (pure → unit-testable).
+/// `production` empty ⇒ resolve the running production. Settings keys prefixed `Adapter.` target
+/// the adapter; otherwise the Host. Applies live only if the target production is the one running.
+pub fn build_add_item_code(
+    production: &str,
+    item: &str,
+    class_name: &str,
+    enabled: bool,
+    pool_size: Option<i64>,
+    category: Option<&str>,
+    settings: &std::collections::HashMap<String, String>,
+) -> String {
+    let item_e = item.replace('\'', "''");
+    let class_e = class_name.replace('\'', "''");
+    let prod_e = production.replace('\'', "''");
+    let mut extra = String::new();
+    if let Some(ps) = pool_size {
+        extra.push_str(&format!("Set tItem.PoolSize={}\n", ps));
+    }
+    if let Some(cat) = category {
+        extra.push_str(&format!("Set tItem.Category=\"{}\"\n", cat.replace('\'', "''")));
+    }
+    for (k, v) in settings {
+        let (target, name) = match k.strip_prefix("Adapter.") {
+            Some(rest) => ("Adapter", rest),
+            None => ("Host", k.strip_prefix("Host.").unwrap_or(k)),
+        };
+        extra.push_str(&format!(
+            "Set tS=##class(Ens.Config.Setting).%New() Set tS.Name=\"{}\" Set tS.Target=\"{}\" Set tS.Value=\"{}\" Do tItem.Settings.Insert(tS)\n",
+            name.replace('"', "\"\""),
+            target,
+            v.replace('"', "\"\"")
+        ));
+    }
+    format!(
+        r#"Set tProdName="{prod}"
+If tProdName="" {{ Set tSC=##class(Ens.Director).GetProductionStatus(.tProdName,.s) If tProdName="" {{ Write "ERROR:NO_PRODUCTION:No production running and no production= given" Quit }} }}
+Set tProd=##class(Ens.Config.Production).%OpenId(tProdName,,.tSC2)
+If '$IsObject(tProd) {{ Write "ERROR:INTEROP_ERROR:Cannot open production "_tProdName Quit }}
+If $IsObject(tProd.FindItemByConfigName("{item}")) {{ Write "ERROR:ITEM_EXISTS:Item already exists: {item}" Quit }}
+Set tItem=##class(Ens.Config.Item).%New()
+Set tItem.Name="{item}"
+Set tItem.ClassName="{class}"
+Set tItem.Enabled={enabled}
+{extra}Do tProd.Items.Insert(tItem)
+Set tSC4=tProd.%Save()
+If $$$ISERR(tSC4) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC4) Quit }}
+Set tRun="" Do ##class(Ens.Director).GetProductionStatus(.tRun,.s2)
+If tRun=tProdName {{ Set tSC5=##class(Ens.Director).UpdateProduction(10,0) If $$$ISERR(tSC5) {{ Write "ERROR:UPDATE_FAILED:"_$System.Status.GetErrorText(tSC5) Quit }} }}
+Write "OK:"_tProdName"#,
+        prod = prod_e,
+        item = item_e,
+        class = class_e,
+        enabled = if enabled { 1 } else { 0 },
+        extra = extra
+    )
+}
+
+/// Build the ObjectScript that removes a config item from a production (pure → unit-testable).
+pub fn build_remove_item_code(production: &str, item: &str) -> String {
+    let item_e = item.replace('\'', "''");
+    let prod_e = production.replace('\'', "''");
+    format!(
+        r#"Set tProdName="{prod}"
+If tProdName="" {{ Set tSC=##class(Ens.Director).GetProductionStatus(.tProdName,.s) If tProdName="" {{ Write "ERROR:NO_PRODUCTION:No production running and no production= given" Quit }} }}
+Set tProd=##class(Ens.Config.Production).%OpenId(tProdName,,.tSC2)
+If '$IsObject(tProd) {{ Write "ERROR:INTEROP_ERROR:Cannot open production "_tProdName Quit }}
+Set tIdx=0 For i=1:1:tProd.Items.Count() {{ If tProd.Items.GetAt(i).Name="{item}" {{ Set tIdx=i Quit }} }}
+If tIdx=0 {{ Write "ERROR:ITEM_NOT_FOUND:Item not found: {item}" Quit }}
+Do tProd.Items.RemoveAt(tIdx)
+Set tSC4=tProd.%Save()
+If $$$ISERR(tSC4) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC4) Quit }}
+Set tRun="" Do ##class(Ens.Director).GetProductionStatus(.tRun,.s2)
+If tRun=tProdName {{ Set tSC5=##class(Ens.Director).UpdateProduction(10,0) If $$$ISERR(tSC5) {{ Write "ERROR:UPDATE_FAILED:"_$System.Status.GetErrorText(tSC5) Quit }} }}
+Write "OK:"_tProdName"#,
+        prod = prod_e,
+        item = item_e
+    )
 }
 
 pub async fn interop_production_item_impl(
@@ -841,9 +937,92 @@ If $$$ISERR(tSC4) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tS
                 ),
             }
         }
+        "add" => {
+            let class_name = match params.class_name.as_deref() {
+                Some(c) if !c.is_empty() => c,
+                _ => {
+                    return err_json(
+                        "INVALID_PARAMS",
+                        "add requires class_name (the ObjectScript class the item runs)",
+                    )
+                }
+            };
+            let enabled = params.enabled.unwrap_or(true);
+            let code = build_add_item_code(
+                params.production.as_deref().unwrap_or(""),
+                &params.item,
+                class_name,
+                enabled,
+                params.pool_size,
+                params.category.as_deref(),
+                &params.settings,
+            );
+            match iris.execute_via_generator(&code, ns, &client).await {
+                Ok(out) => {
+                    let out = out.trim();
+                    if let Some(prod) = out.strip_prefix("OK:") {
+                        ok_json(serde_json::json!({
+                            "success": true,
+                            "item": params.item,
+                            "class_name": class_name,
+                            "enabled": enabled,
+                            "production": prod,
+                        }))
+                    } else if let Some(msg) = out.strip_prefix("ERROR:ITEM_EXISTS:") {
+                        err_json("ITEM_EXISTS", msg)
+                    } else if let Some(msg) = out.strip_prefix("ERROR:NO_PRODUCTION:") {
+                        err_json("NO_PRODUCTION", msg)
+                    } else if let Some(msg) = out.strip_prefix("ERROR:UPDATE_FAILED:") {
+                        err_json("UPDATE_FAILED", msg)
+                    } else {
+                        err_json("INTEROP_ERROR", out.strip_prefix("ERROR:INTEROP_ERROR:").unwrap_or(out))
+                    }
+                }
+                Err(e) => err_json(
+                    if is_network_error(&e.to_string()) {
+                        "IRIS_UNREACHABLE"
+                    } else {
+                        "INTEROP_ERROR"
+                    },
+                    &e.to_string(),
+                ),
+            }
+        }
+        "remove" => {
+            let code = build_remove_item_code(params.production.as_deref().unwrap_or(""), &params.item);
+            match iris.execute_via_generator(&code, ns, &client).await {
+                Ok(out) => {
+                    let out = out.trim();
+                    if let Some(prod) = out.strip_prefix("OK:") {
+                        ok_json(serde_json::json!({
+                            "success": true,
+                            "item": params.item,
+                            "removed": true,
+                            "production": prod,
+                        }))
+                    } else if let Some(msg) = out.strip_prefix("ERROR:ITEM_NOT_FOUND:") {
+                        err_json("ITEM_NOT_FOUND", msg)
+                    } else if let Some(msg) = out.strip_prefix("ERROR:NO_PRODUCTION:") {
+                        err_json("NO_PRODUCTION", msg)
+                    } else if let Some(msg) = out.strip_prefix("ERROR:UPDATE_FAILED:") {
+                        err_json("UPDATE_FAILED", msg)
+                    } else {
+                        err_json("INTEROP_ERROR", out.strip_prefix("ERROR:INTEROP_ERROR:").unwrap_or(out))
+                    }
+                }
+                Err(e) => err_json(
+                    if is_network_error(&e.to_string()) {
+                        "IRIS_UNREACHABLE"
+                    } else {
+                        "INTEROP_ERROR"
+                    },
+                    &e.to_string(),
+                ),
+            }
+        }
         _ => err_json(
             "INVALID_ACTION",
-            "iris_production_item: action must be enable, disable, get_settings, or set_settings",
+            "iris_production_item: action must be add, remove, enable, disable, get_settings, or set_settings",
         ),
     }
 }

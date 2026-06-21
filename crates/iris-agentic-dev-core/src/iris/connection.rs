@@ -479,7 +479,54 @@ impl IrisConnection {
 
     /// FR-004: Run a SQL query via the Atelier query endpoint.
     /// Takes an explicit `namespace` parameter rather than always using `self.namespace`.
+    /// SELECT via Atelier `/action/query`, with transparent retry on transient transport drops.
+    /// SELECTs are idempotent, so retrying is safe. This is what makes long-running iris_test
+    /// result reads survive a dropped connection ("error sending request for url .../action/query")
+    /// instead of failing the whole run (issue #7). Atelier-level SQL errors (status.errors) are
+    /// NOT retried — those are deterministic and bubble up on the first attempt.
     pub async fn query(
+        &self,
+        sql: &str,
+        params: Vec<serde_json::Value>,
+        namespace: &str,
+        client: &reqwest::Client,
+    ) -> anyhow::Result<serde_json::Value> {
+        let delays = [
+            std::time::Duration::from_millis(150),
+            std::time::Duration::from_millis(350),
+            std::time::Duration::from_millis(700),
+        ];
+        let mut last_err = anyhow::anyhow!("no attempts made");
+        for (attempt, delay) in delays.iter().enumerate() {
+            match self.query_once(sql, params.clone(), namespace, client).await {
+                Ok(body) => return Ok(body),
+                Err(e) => {
+                    let msg = e.to_string();
+                    // Only transport-level failures are retryable; a SQL error is deterministic.
+                    let is_retryable = msg.contains("error sending request")
+                        || msg.contains("connection refused")
+                        || msg.contains("connection reset")
+                        || msg.contains("timed out")
+                        || msg.contains("HTTP 5");
+                    if !is_retryable || attempt == delays.len() - 1 {
+                        return Err(e);
+                    }
+                    tracing::warn!(
+                        "query attempt {} failed ({}), retrying in {:?}",
+                        attempt + 1,
+                        msg,
+                        delay
+                    );
+                    last_err = e;
+                    tokio::time::sleep(*delay).await;
+                }
+            }
+        }
+        Err(last_err)
+    }
+
+    /// Single attempt of `query` (no retry).
+    async fn query_once(
         &self,
         sql: &str,
         params: Vec<serde_json::Value>,

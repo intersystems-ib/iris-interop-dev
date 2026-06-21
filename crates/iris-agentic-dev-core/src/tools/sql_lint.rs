@@ -135,6 +135,67 @@ instead of guessing Ens_Config.SearchTableProp.");
     None
 }
 
+/// Advisory redirect for `iris_execute` payloads that should have used a typed tool.
+/// Pure, non-blocking: the handler runs the code anyway and only attaches the returned hint.
+/// Targets the dominant Round-4 waste shapes — ~60% of iris_execute calls were introspection
+/// or ad-hoc SQL the typed tools answer in one round-trip, plus the load-from-file anti-pattern.
+/// Priority: filesystem-load (worst, host-coupling) > production/catalog config > class
+/// dictionary introspection > bare SELECT. Returns None for legitimate side-effecting ObjectScript
+/// (object %New/%Save, production control, globals, etc.).
+pub fn execute_redirect_hint(code: &str) -> Option<&'static str> {
+    let u = code.to_ascii_uppercase();
+
+    // 1. Loading/compiling classes from a filesystem path. Only works when IRIS shares the MCP
+    //    host's disk — an anti-pattern. iris_doc/iris_compile push source over Atelier instead.
+    if u.contains("$SYSTEM.OBJ.LOAD")
+        || u.contains("$SYSTEM.OBJ.IMPORT")
+        || u.contains("STUDIOOPENDOCUMENT")
+        || u.contains(".OBJ.LOADDIR")
+        || u.contains(".OBJ.LOADSTREAM")
+    {
+        return Some(
+            "Loading/compiling a class from a filesystem path makes IRIS read THIS host's disk — \
+it only works when IRIS and the MCP share a filesystem (anti-pattern; breaks once they're on \
+different hosts). Send the source over Atelier instead: iris_doc(action=put, compile=true) writes \
+and compiles a class in-memory, or iris_compile compiles an existing document by name. \
+Host-independent and the supported path.",
+        );
+    }
+
+    // 2. Production / interop config read as ad-hoc SQL — reuse the typed-tool redirects.
+    if let Some(h) = targeted_table_hint(code) {
+        return Some(h);
+    }
+
+    // 3. Class/dictionary introspection via %Dictionary.* SQL — typed tools do this in one call.
+    if u.contains("%DICTIONARY.") {
+        return Some(
+            "Introspect classes with typed tools, not %Dictionary SQL: docs_introspect(class=...) \
+for methods/properties, iris_symbols(pattern=...) to find classes, iris_table_info(schema=...) for \
+projected tables. One typed call, no guessing at catalog table/column names.",
+        );
+    }
+
+    // 4. A bare SELECT, or %SQL.Statement used only to READ rows — that's iris_query's job.
+    //    Excludes writes (INSERT/UPDATE/DELETE/MERGE/CALL) which iris_query blocks by design.
+    let is_write = u.contains("INSERT ")
+        || u.contains("UPDATE ")
+        || u.contains("DELETE ")
+        || u.contains("MERGE ")
+        || u.contains(" CALL ");
+    let reads_via_sql = u.trim_start().starts_with("SELECT ")
+        || (u.contains("%SQL.STATEMENT") && u.contains("SELECT "));
+    if reads_via_sql && !is_write {
+        return Some(
+            "This reads rows via SQL — use iris_query(query=...) instead of hand-rolling \
+%SQL.Statement inside iris_execute. iris_query returns typed rows directly and avoids the \
+<SYNTAX>errdone+2^%qaqqt failures that malformed dynamic SQL throws through iris_execute.",
+        );
+    }
+
+    None
+}
+
 fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
@@ -249,5 +310,51 @@ mod tests {
         // real domain tables must NOT be hinted
         assert!(targeted_table_hint("SELECT * FROM Hospital.Patient").is_none());
         assert!(targeted_table_hint("SELECT * FROM Ens.MessageHeader").is_none());
+    }
+
+    #[test]
+    fn execute_redirect_flags_load_from_file() {
+        let h = execute_redirect_hint(
+            "set sc = $System.OBJ.Load(\"C:\\src\\Cocina\\Production.cls\",\"cuk\")",
+        )
+        .unwrap();
+        assert!(h.contains("Atelier"), "{h}");
+        assert!(h.contains("iris_doc"), "{h}");
+        assert!(execute_redirect_hint("Do ##class(%Studio.Project).StudioOpenDocument(f)").is_some());
+    }
+
+    #[test]
+    fn execute_redirect_flags_adhoc_sql_and_introspection() {
+        // bare SELECT pasted into iris_execute
+        assert!(execute_redirect_hint("SELECT Name FROM Hospital.Patient")
+            .unwrap()
+            .contains("iris_query"));
+        // %SQL.Statement read
+        assert!(execute_redirect_hint(
+            "set rs=##class(%SQL.Statement).%ExecDirect(,\"SELECT Nsp FROM %SYS.Namespace_List()\")"
+        )
+        .is_some());
+        // %Dictionary introspection -> typed tools
+        assert!(execute_redirect_hint(
+            "set rs=##class(%SQL.Statement).%ExecDirect(,\"SELECT Name FROM %Dictionary.ClassDefinition WHERE Name LIKE 'Cocina.%'\")"
+        )
+        .unwrap()
+        .contains("docs_introspect"));
+        // Ens_Config catalog -> production tools (via targeted_table_hint)
+        assert!(execute_redirect_hint("SELECT Name FROM Ens_Config.Item")
+            .unwrap()
+            .contains("iris_production"));
+    }
+
+    #[test]
+    fn execute_redirect_silent_on_legit_objectscript() {
+        // object save, production control, globals, a writing %SQL.Statement — no redirect
+        assert!(execute_redirect_hint("set o=##class(Cocina.MSG.MenuRequest).%New() do o.%Save()").is_none());
+        assert!(execute_redirect_hint("set sc=##class(Ens.Director).StartProduction(\"Cocina.Production\")").is_none());
+        assert!(execute_redirect_hint("write $ZVERSION,!").is_none());
+        assert!(execute_redirect_hint(
+            "set rs=##class(%SQL.Statement).%ExecDirect(,\"INSERT INTO public.menus VALUES (?)\",1)"
+        )
+        .is_none());
     }
 }
