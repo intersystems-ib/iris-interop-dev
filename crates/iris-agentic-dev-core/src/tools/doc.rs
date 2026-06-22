@@ -63,6 +63,55 @@ fn err_json(code: &str, msg: &str) -> Result<rmcp::model::CallToolResult, rmcp::
     ok_json(serde_json::json!({"success": false, "error_code": code, "error": msg}))
 }
 
+/// Map a non-success Atelier HTTP status to an accurate error_code. `IRIS_UNREACHABLE` is reserved for
+/// real transport failures (reqwest `send()` errors) and the no-connection guard — an HTTP *response*
+/// means IRIS is reachable, so a 4xx/5xx must never be reported as "unreachable".
+fn http_error_code(status: reqwest::StatusCode) -> &'static str {
+    match status.as_u16() {
+        400 => "IRIS_BAD_REQUEST",
+        401 | 403 => "IRIS_AUTH",
+        404 => "NOT_FOUND",
+        409 => "IRIS_CONFLICT",
+        423 => "IRIS_LOCKED",
+        s if s >= 500 => "IRIS_SERVER_ERROR",
+        _ => "IRIS_HTTP_ERROR",
+    }
+}
+
+/// Build an error result from a non-success Atelier response: accurate `error_code`, the response body
+/// (previously discarded, which made these failures undiagnosable), and a retry `hint` for the transient
+/// concurrency conflicts Atelier raises under parallel writes/compiles — a document lock (423/409) or an
+/// empty-body 400 returned when a compile overlaps another. These are NOT unreachability.
+async fn http_err(resp: reqwest::Response) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+    let status = resp.status();
+    let code = http_error_code(status);
+    let body: String = resp
+        .text()
+        .await
+        .unwrap_or_default()
+        .trim()
+        .chars()
+        .take(500)
+        .collect();
+    let msg = if body.is_empty() {
+        format!("HTTP {status}")
+    } else {
+        format!("HTTP {status}: {body}")
+    };
+    let transient =
+        matches!(status.as_u16(), 409 | 423) || (status.as_u16() == 400 && body.is_empty());
+    let mut v = serde_json::json!({"success": false, "error_code": code, "error": msg});
+    if transient {
+        v["hint"] = serde_json::Value::String(
+            "Transient concurrency conflict (document lock or overlapping compile) — IRIS is up. \
+             Retry the same call after a short backoff, and avoid issuing many parallel \
+             iris_doc(compile=true) writes at once."
+                .to_string(),
+        );
+    }
+    ok_json(v)
+}
+
 /// Largest char boundary <= idx (stable-Rust stand-in for str::floor_char_boundary), so byte-offset
 /// pagination never slices through a multi-byte UTF-8 char.
 fn floor_char_boundary(s: &str, idx: usize) -> usize {
@@ -161,7 +210,7 @@ async fn handle_get(
         return err_json("NOT_FOUND", &format!("Document not found: {name}"));
     }
     if !resp.status().is_success() {
-        return err_json("IRIS_UNREACHABLE", &format!("HTTP {}", resp.status()));
+        return http_err(resp).await;
     }
 
     let body: serde_json::Value = resp.json().await.unwrap_or_default();
@@ -325,7 +374,7 @@ async fn do_write(
         .map_err(|e| rmcp::ErrorData::internal_error(format!("HTTP error: {e}"), None))?;
 
     if !resp.status().is_success() {
-        return err_json("IRIS_UNREACHABLE", &format!("HTTP {}", resp.status()));
+        return http_err(resp).await;
     }
     // Check body for Atelier-level errors (200 OK with status.errors, e.g. build 110
     // SetTextFromString NULL namespace bug via web gateway).
@@ -355,6 +404,30 @@ async fn do_write(
 
         let (compile_ok, compile_errors, compile_console) = match compile_resp {
             Err(e) => (false, vec![e.to_string()], vec![]),
+            // A non-2xx compile response is a FAILURE, not success. Previously the code fell straight to
+            // `r.json().unwrap_or_default()`, and Atelier's empty-body 400 (returned when a compile
+            // overlaps another under concurrency) parsed to null → no errors → `compiled: true`, a silent
+            // false positive. Surface it honestly with the status + body and a retry hint.
+            Ok(r) if !r.status().is_success() => {
+                let status = r.status();
+                let body: String = r
+                    .text()
+                    .await
+                    .unwrap_or_default()
+                    .trim()
+                    .chars()
+                    .take(500)
+                    .collect();
+                let msg = if body.is_empty() {
+                    format!(
+                        "compile HTTP {status} (empty body — likely an overlapping concurrent compile; \
+                         retry after a short backoff)"
+                    )
+                } else {
+                    format!("compile HTTP {status}: {body}")
+                };
+                (false, vec![msg], vec![])
+            }
             Ok(r) => {
                 let body: serde_json::Value = r.json().await.unwrap_or_default();
                 let console: Vec<String> = body["console"]
@@ -444,7 +517,7 @@ async fn handle_delete(
         return err_json("NOT_FOUND", &format!("Document not found: {name}"));
     }
     if !resp.status().is_success() {
-        return err_json("IRIS_UNREACHABLE", &format!("HTTP {}", resp.status()));
+        return http_err(resp).await;
     }
     ok_json(serde_json::json!({"success": true, "name": name}))
 }
@@ -550,6 +623,28 @@ fn doc_content_to_string(body: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_http_error_code_is_accurate_not_unreachable() {
+        use reqwest::StatusCode;
+        // Concurrency conflicts and client errors must NOT be reported as "unreachable".
+        assert_eq!(http_error_code(StatusCode::BAD_REQUEST), "IRIS_BAD_REQUEST");
+        assert_eq!(http_error_code(StatusCode::LOCKED), "IRIS_LOCKED");
+        assert_eq!(http_error_code(StatusCode::CONFLICT), "IRIS_CONFLICT");
+        assert_eq!(http_error_code(StatusCode::UNAUTHORIZED), "IRIS_AUTH");
+        assert_eq!(http_error_code(StatusCode::FORBIDDEN), "IRIS_AUTH");
+        assert_eq!(http_error_code(StatusCode::NOT_FOUND), "NOT_FOUND");
+        assert_eq!(
+            http_error_code(StatusCode::INTERNAL_SERVER_ERROR),
+            "IRIS_SERVER_ERROR"
+        );
+        assert_eq!(http_error_code(StatusCode::IM_A_TEAPOT), "IRIS_HTTP_ERROR");
+        // The whole point: no HTTP status maps to IRIS_UNREACHABLE (that's transport-only).
+        for code in [400u16, 401, 403, 404, 409, 423, 500, 502, 503, 418] {
+            let s = StatusCode::from_u16(code).unwrap();
+            assert_ne!(http_error_code(s), "IRIS_UNREACHABLE");
+        }
+    }
 
     #[test]
     fn test_doc_content_to_string_flat_array() {
