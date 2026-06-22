@@ -37,6 +37,7 @@ impl std::ops::Deref for AnyParams {
     }
 }
 pub mod admin;
+pub mod concurrency;
 pub mod dict;
 pub mod doc;
 pub mod info;
@@ -1999,13 +2000,20 @@ impl IrisTools {
             })
             .collect();
 
-        let resp = client
-            .post(&compile_url)
-            .basic_auth(&iris.username, Some(&iris.password))
-            .json(&targets_with_ext)
-            .send()
-            .await
-            .map_err(|e| McpError::internal_error(format!("HTTP error: {e}"), None))?;
+        // Serialize compiles in-process and retry transient conflicts: Atelier 400s any overlapping
+        // /action/compile (empty body), and a busy doc can 423/409. See tools::concurrency.
+        let _compile_permit = crate::tools::concurrency::compile_gate().acquire().await;
+        let resp = crate::tools::concurrency::send_with_retry(
+            || {
+                client
+                    .post(&compile_url)
+                    .basic_auth(&iris.username, Some(&iris.password))
+                    .json(&targets_with_ext)
+            },
+            true,
+        )
+        .await
+        .map_err(|e| McpError::internal_error(format!("HTTP error: {e}"), None))?;
 
         // Bug 17: `&& != 200` was dead code since 200 is always is_success().
         if !resp.status().is_success() {

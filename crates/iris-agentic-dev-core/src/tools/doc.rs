@@ -365,13 +365,22 @@ async fn do_write(
         &format!("/doc/{}?ignoreConflict=1", urlencoding::encode(name)),
     );
 
-    let resp = client
-        .put(&url)
-        .basic_auth(&iris.username, Some(&iris.password))
-        .json(&serde_json::json!({"enc": false, "content": lines}))
-        .send()
-        .await
-        .map_err(|e| rmcp::ErrorData::internal_error(format!("HTTP error: {e}"), None))?;
+    // Retry transient same-document locks (423) / conflicts (409). The `?ignoreConflict=1` flag avoids
+    // 409 version conflicts but NOT the 423 lock taken when another write/compile of the same doc is in
+    // flight (reproduced under concurrency), so a bounded retry is still needed — also for the
+    // cross-process case (multiple MCP processes) the in-process compile gate cannot coordinate.
+    let put_body = serde_json::json!({"enc": false, "content": lines});
+    let resp = crate::tools::concurrency::send_with_retry(
+        || {
+            client
+                .put(&url)
+                .basic_auth(&iris.username, Some(&iris.password))
+                .json(&put_body)
+        },
+        false,
+    )
+    .await
+    .map_err(|e| rmcp::ErrorData::internal_error(format!("HTTP error: {e}"), None))?;
 
     if !resp.status().is_success() {
         return http_err(resp).await;
@@ -395,12 +404,21 @@ async fn do_write(
 
     if compile_after {
         let compile_url = iris.versioned_ns_url(namespace, "/action/compile?flags=cuk");
-        let compile_resp = client
-            .post(&compile_url)
-            .basic_auth(&iris.username, Some(&iris.password))
-            .json(&serde_json::json!([name]))
-            .send()
-            .await;
+        let compile_body = serde_json::json!([name]);
+        // Atelier 400s ANY overlapping compile, so serialize compiles in-process (the gate) and retry
+        // the transient empty-body 400 / locks (covers cross-process collisions the gate can't see).
+        // The permit is held until the end of this block.
+        let _compile_permit = crate::tools::concurrency::compile_gate().acquire().await;
+        let compile_resp = crate::tools::concurrency::send_with_retry(
+            || {
+                client
+                    .post(&compile_url)
+                    .basic_auth(&iris.username, Some(&iris.password))
+                    .json(&compile_body)
+            },
+            true,
+        )
+        .await;
 
         let (compile_ok, compile_errors, compile_console) = match compile_resp {
             Err(e) => (false, vec![e.to_string()], vec![]),
