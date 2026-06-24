@@ -191,15 +191,20 @@ fn webapp_type_inference() {
 
 // ── admin_write_allowed helper ────────────────────────────────────────────────
 
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn write_allowed_with_env_set() {
-    std::env::set_var("IRIS_ADMIN_TOOLS", "1");
-    assert!(admin_write_allowed());
-    std::env::remove_var("IRIS_ADMIN_TOOLS");
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe { std::env::set_var("IRIS_ADMIN_TOOLS", "1") };
+    let result = admin_write_allowed();
+    unsafe { std::env::remove_var("IRIS_ADMIN_TOOLS") };
+    assert!(result);
 }
 
 #[test]
 fn write_not_allowed_without_env() {
-    std::env::remove_var("IRIS_ADMIN_TOOLS");
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe { std::env::remove_var("IRIS_ADMIN_TOOLS") };
     assert!(!admin_write_allowed());
 }

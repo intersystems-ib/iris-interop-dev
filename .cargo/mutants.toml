@@ -1,0 +1,16 @@
+# cargo-mutants configuration
+# Run: cargo mutants --package iris-agentic-dev-core [--file src/path/to/file.rs]
+# Full suite (slow, ~hours): cargo mutants --package iris-agentic-dev-core
+# Scoped run (fast, ~minutes): cargo mutants --package iris-agentic-dev-core --file crates/iris-agentic-dev-core/src/iris/connection.rs
+
+# Require env vars for IRIS integration tests
+# (set these in your shell before running)
+
+# Skip mutations that are known false positives or untestable:
+# - tracing/logging calls don't affect correctness
+# - timeout constants can't be tested without time injection
+skip_calls = ["tracing::debug", "tracing::info", "tracing::warn", "tracing::error"]
+
+# Exclude the docker_discovery_e2e test binary — it requires a built iris-dev
+# binary on PATH which is only available in CI with a full release build.
+# Pass via: cargo mutants ... -- --test admin_unit_tests --test test_handlers_live
