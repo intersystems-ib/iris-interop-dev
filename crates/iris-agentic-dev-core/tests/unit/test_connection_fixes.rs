@@ -1,6 +1,8 @@
 // Tests for connection.rs fixes: query() namespace, Debug redaction, container caching, banner stripping.
 
-use iris_agentic_dev_core::iris::connection::{DiscoverySource, IrisConnection};
+use iris_agentic_dev_core::iris::connection::{DiscoverySource, IrisConnection, SystemMode};
+
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn make_conn(password: &str) -> IrisConnection {
     IrisConnection::new(
@@ -10,6 +12,18 @@ fn make_conn(password: &str) -> IrisConnection {
         password,
         DiscoverySource::ExplicitFlag,
     )
+}
+
+fn make_conn_with_ns_and_mode(ns: &str, mode: SystemMode) -> IrisConnection {
+    let mut c = IrisConnection::new(
+        "http://localhost:52773",
+        ns,
+        "_SYSTEM",
+        "SYS",
+        DiscoverySource::ExplicitFlag,
+    );
+    c.system_mode = mode;
+    c
 }
 
 // ── T009: Debug redaction ────────────────────────────────────────────────────
@@ -274,4 +288,86 @@ fn test_sql_proc_name_is_schema_dot_classmethod() {
     assert!(sql_func.starts_with("IrisDevTmp."));
     assert!(!sql_func.contains("SQLUser"));
     assert_eq!(sql_func.matches('.').count(), 1, "exactly one schema dot");
+}
+
+// ── is_write_allowed: IRIS_ALLOW_PROD override (issue #26) ───────────────────
+
+#[test]
+fn test_is_write_allowed_allow_prod_overrides_live() {
+    // IRIS_ALLOW_PROD=1 must return true even on a Live system.
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe { std::env::set_var("IRIS_ALLOW_PROD", "1") };
+    let conn = make_conn_with_ns_and_mode("USER", SystemMode::Live);
+    let result = conn.is_write_allowed();
+    unsafe { std::env::remove_var("IRIS_ALLOW_PROD") };
+    assert!(result, "IRIS_ALLOW_PROD=1 must allow writes on Live system");
+}
+
+#[test]
+fn test_is_write_allowed_live_blocks_without_override() {
+    // Without override, Live mode must block writes.
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe { std::env::remove_var("IRIS_ALLOW_PROD") };
+    let conn = make_conn_with_ns_and_mode("USER", SystemMode::Live);
+    assert!(!conn.is_write_allowed(), "Live mode must block writes");
+}
+
+#[test]
+fn test_is_write_allowed_development_allows() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe { std::env::remove_var("IRIS_ALLOW_PROD") };
+    let conn = make_conn_with_ns_and_mode("USER", SystemMode::Development);
+    assert!(
+        conn.is_write_allowed(),
+        "Development mode must allow writes"
+    );
+}
+
+#[test]
+fn test_is_write_allowed_test_mode_allows() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe { std::env::remove_var("IRIS_ALLOW_PROD") };
+    let conn = make_conn_with_ns_and_mode("USER", SystemMode::Test);
+    assert!(conn.is_write_allowed(), "Test mode must allow writes");
+}
+
+// ── is_write_allowed: Unknown mode delegates to is_production_namespace ───────
+
+#[test]
+fn test_is_write_allowed_unknown_non_prod_namespace_allows() {
+    // Unknown + non-production namespace (USER, DEV, STAGING) → writes allowed.
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe { std::env::remove_var("IRIS_ALLOW_PROD") };
+    for ns in ["USER", "DEV", "STAGING", "TEST", "SANDBOX"] {
+        let conn = make_conn_with_ns_and_mode(ns, SystemMode::Unknown);
+        assert!(
+            conn.is_write_allowed(),
+            "Unknown mode + namespace {ns} should allow writes"
+        );
+    }
+}
+
+#[test]
+fn test_is_write_allowed_unknown_prod_namespace_blocks() {
+    // Unknown + production namespace name (PROD, PRODUCTION, LIVE, PRD) → writes blocked.
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe { std::env::remove_var("IRIS_ALLOW_PROD") };
+    for ns in ["PROD", "PRODUCTION", "LIVE", "PRD", "prod", "Prod"] {
+        let conn = make_conn_with_ns_and_mode(ns, SystemMode::Unknown);
+        assert!(
+            !conn.is_write_allowed(),
+            "Unknown mode + namespace {ns} should block writes"
+        );
+    }
+}
+
+#[test]
+fn test_is_write_allowed_allow_prod_true_string() {
+    // IRIS_ALLOW_PROD=true (case-insensitive) also overrides.
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe { std::env::set_var("IRIS_ALLOW_PROD", "true") };
+    let conn = make_conn_with_ns_and_mode("PROD", SystemMode::Live);
+    let result = conn.is_write_allowed();
+    unsafe { std::env::remove_var("IRIS_ALLOW_PROD") };
+    assert!(result, "IRIS_ALLOW_PROD=true must allow writes");
 }
