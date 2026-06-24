@@ -93,8 +93,10 @@ impl LlmClient {
             //   - max_tokens field (required, causes 400 if absent)
             //   - system as top-level field (not in messages[])
             //   - response is content[].text (not choices[].message.content)
+            let anthropic_base = std::env::var("ANTHROPIC_BASE_URL")
+                .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
             let resp = client
-                .post("https://api.anthropic.com/v1/messages")
+                .post(format!("{}/v1/messages", anthropic_base))
                 .header("x-api-key", &self.api_key)
                 .header("anthropic-version", "2023-06-01")
                 .header("content-type", "application/json")
@@ -128,8 +130,10 @@ impl LlmClient {
         }
 
         // OpenAI-compatible path
+        let openai_base = std::env::var("OPENAI_BASE_URL")
+            .unwrap_or_else(|_| "https://api.openai.com".to_string());
         let resp = client
-            .post("https://api.openai.com/v1/chat/completions")
+            .post(format!("{}/v1/chat/completions", openai_base))
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
             .json(&OpenAiRequest {

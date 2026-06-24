@@ -151,10 +151,9 @@ pub async fn resolve_github_version_async(
         _ => anyhow::bail!("resolve_github_version_async called with non-GitHub source"),
     };
 
-    let url = format!(
-        "https://api.github.com/repos/{}/{}/tags?per_page=100",
-        owner, repo
-    );
+    let api_base = std::env::var("GITHUB_API_BASE_URL")
+        .unwrap_or_else(|_| "https://api.github.com".to_string());
+    let url = format!("{}/repos/{}/{}/tags?per_page=100", api_base, owner, repo);
     let client = reqwest::Client::builder()
         .user_agent("iris-agentic-dev/resolver")
         .build()?;
