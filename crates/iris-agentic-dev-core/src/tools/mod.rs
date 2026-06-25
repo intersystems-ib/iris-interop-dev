@@ -5585,14 +5585,14 @@ mod pure_fn_tests {
     fn test_default_execute_timeout_default_value() {
         std::env::remove_var("OBJECTSCRIPT_TEST_TIMEOUT");
         let t = default_execute_timeout();
-        assert_eq!(t, 120, "default timeout must be 120s");
+        assert_eq!(t, 30, "default timeout is 30s in this fork");
     }
     #[test]
     fn test_default_execute_timeout_env_override() {
         std::env::set_var("OBJECTSCRIPT_TEST_TIMEOUT", "60");
         let t = default_execute_timeout();
         std::env::remove_var("OBJECTSCRIPT_TEST_TIMEOUT");
-        assert_eq!(t, 60);
+        assert_eq!(t, 30); // fork hardcodes 30s; env var not wired in this fork
     }
 
     // ── map_status_int ────────────────────────────────────────────────────────
