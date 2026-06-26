@@ -411,7 +411,6 @@ impl IrisConnection {
             "  Set out = \"\"".into(),
             "  Set stream = ##class(%Stream.FileCharacter).%New()".into(),
             "  Set sc = stream.LinkToFile(tmpfile)".into(),
-
             // $SYSTEM.Status.IsOK avoids needing %occStatus.inc in a non-objectgenerator method.
             "  If $SYSTEM.Status.IsOK(sc) {".into(),
             "    While 'stream.AtEnd { Set out = out _ stream.ReadLine() _ $Char(10) }".into(),

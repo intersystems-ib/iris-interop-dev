@@ -6049,4 +6049,3 @@ mod pure_fn_tests {
         assert!(sorted.is_empty());
     }
 }
-
