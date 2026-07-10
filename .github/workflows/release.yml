@@ -76,3 +76,5 @@ jobs:
             claude mcp add --scope user iris-interop-dev --env IRIS_HOST=localhost --env IRIS_WEB_PORT=80 --env IRIS_WEB_PREFIX=irishealth --env IRIS_USERNAME=_SYSTEM --env IRIS_PASSWORD=SYS --env IRIS_NAMESPACE=USER -- C:/iris-interop-dev/iris-interop-dev.exe mcp
             ```
             Tool names are identical to iris-agentic-dev, so the iris-interop-skills work unchanged.
+
+# (workflow registered under intersystems-ib/iris-interop-dev)

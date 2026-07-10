@@ -47,3 +47,5 @@ jobs:
           IRIS_NAMESPACE: USER
           IRIS_CONTAINER: iris-e2e
         run: ./scripts/test-all.sh e2e
+
+# (workflow registered under intersystems-ib/iris-interop-dev)

@@ -173,3 +173,5 @@ jobs:
       - run: file target/x86_64-unknown-linux-musl/release/iris-interop-dev
       - run: |
           ldd target/x86_64-unknown-linux-musl/release/iris-interop-dev 2>&1 | grep -q "not a dynamic executable" && echo "SC-002 PASS: static binary confirmed" || echo "NOTE: may have dynamic deps on musl"
+
+# (workflow registered under intersystems-ib/iris-interop-dev)
