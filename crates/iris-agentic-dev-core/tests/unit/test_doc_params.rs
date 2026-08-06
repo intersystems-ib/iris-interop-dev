@@ -14,7 +14,9 @@ fn doc_params_elicitation_fields() {
     }"#,
     )
     .unwrap();
-    assert!(matches!(p.mode, DocMode::Put));
+    // mode is a plain string now (issue #18: enum schema shipped a $ref some
+    // MCP clients reject); DocMode::parse is the typed view.
+    assert!(matches!(DocMode::parse(&p.mode), Some(DocMode::Put)));
     assert_eq!(p.elicitation_id.as_deref(), Some("abc-123"));
     assert_eq!(p.elicitation_answer.as_deref(), Some("yes"));
 }
