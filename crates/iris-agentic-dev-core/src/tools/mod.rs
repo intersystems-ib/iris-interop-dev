@@ -4349,7 +4349,7 @@ Methods:
     }
 
     #[tool(
-        description = "Interoperability query dispatcher (merged). what (REQUIRED): logs=Event Log entries, queues=message queue depths, messages=message archive (Ens.MessageHeader), trace=ALL of one session (MessageHeader chain + Event Log events) by session_id, partners=configured Ens.Config.BusinessPartner rows. Filters: component=<config item> and session_id=<n> narrow logs/messages to one item/session; since_id=<n> tails only rows after a watermark (no MAX(ID) round-trip). Pass namespace=<production namespace> for a specific interop namespace (defaults to the connection's). For SQL-Gateway connections (no SQL table), use iris_table_info / the introspect-dont-guess agent."
+        description = "Interoperability query dispatcher (merged). what (REQUIRED): logs=Event Log entries, queues=message queue depths, messages=message archive (Ens.MessageHeader), trace=ALL of one session (MessageHeader chain + Event Log events) by session_id, partners=configured Ens.Config.BusinessPartner rows. Filters: component=<config item> and session_id=<n> narrow logs/messages to one item/session; since_id=<n> tails only rows after a watermark (no MAX(ID) round-trip). what=messages can also search message CONTENT — the typed replacement for hand SQL against Ens.MessageHeader: (a) body_class=<msg class> + body_where=<SQL fragment on the body table> + body_select=[cols] joins the body table server-side (SQL name resolved for you); (b) search_table={prop, value|value_like, class?, extent?} searches an indexed Search Table field (extent default EnsLib.HL7.SearchTable; errors list the searchable props). Pass namespace=<production namespace> for a specific interop namespace (defaults to the connection's). For SQL-Gateway connections (no SQL table), use iris_table_info / the introspect-dont-guess agent."
     )]
     async fn iris_interop_query(
         &self,
@@ -4437,6 +4437,27 @@ Methods:
                                 .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
                         }),
                         limit: p.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as u32,
+                        body_class: p
+                            .get("body_class")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                        body_where: p
+                            .get("body_where")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                        body_select: p
+                            .get("body_select")
+                            .and_then(|v| v.as_array())
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                        search_table: p
+                            .get("search_table")
+                            .cloned()
+                            .and_then(|v| serde_json::from_value(v).ok()),
                     },
                 )
                 .await

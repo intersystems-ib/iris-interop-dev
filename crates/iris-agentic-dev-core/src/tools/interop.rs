@@ -234,6 +234,38 @@ pub struct MessageSearchParams {
     pub since_id: Option<i64>,
     #[serde(default = "default_msg_limit")]
     pub limit: u32,
+    /// Issue #4: body-class join — search on what the message SAYS. The body
+    /// class whose table is joined on h.MessageBodyId = r.ID; required when
+    /// body_where / body_select are used.
+    pub body_class: Option<String>,
+    /// SQL WHERE fragment over the body table's columns, e.g. "PacienteId = '4003'".
+    pub body_where: Option<String>,
+    /// Body columns to return alongside the header fields.
+    #[serde(default)]
+    pub body_select: Vec<String>,
+    /// Issue #4: search by indexed Search Table field.
+    pub search_table: Option<SearchTableFilter>,
+}
+
+/// Search-Table filter (issue #4). Every subclass of a virtual-document search
+/// table shares its BASE extent's SQL table (rows are told apart by PropId), so
+/// `class` scopes props via Ens_Config.SearchTableProp.ClassDerivation — never
+/// via a table name of its own.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SearchTableFilter {
+    /// Search-table subclass (e.g. "Hospital.Search.HL7") — scopes props to
+    /// the ones that subclass defines or inherits.
+    pub class: Option<String>,
+    /// Base extent class (default "EnsLib.HL7.SearchTable"; other families:
+    /// EnsLib.EDI.X12.SearchTable, EnsLib.EDI.XML.SearchTable, …, or an
+    /// Ens.CustomSearchTable subclass, which is its own extent).
+    pub extent: Option<String>,
+    /// Search Table property name, e.g. "PatientID".
+    pub prop: String,
+    /// Exact PropValue match. Exactly one of value / value_like is required.
+    pub value: Option<String>,
+    /// LIKE pattern for PropValue, e.g. "AMOX%".
+    pub value_like: Option<String>,
 }
 fn default_msg_limit() -> u32 {
     20
@@ -567,6 +599,162 @@ pub async fn interop_queues_impl(
     }
 }
 
+/// Header-level filters, prefixed so they survive a JOIN (`pfx` = "h." there,
+/// "" for the plain query).
+fn header_filters(params: &MessageSearchParams, pfx: &str) -> Vec<String> {
+    let mut filters = vec![];
+    if let Some(src) = &params.source {
+        filters.push(format!(
+            "{pfx}SourceConfigName = '{}'",
+            src.replace('\'', "''")
+        ));
+    }
+    if let Some(tgt) = &params.target {
+        filters.push(format!(
+            "{pfx}TargetConfigName = '{}'",
+            tgt.replace('\'', "''")
+        ));
+    }
+    if let Some(cls) = &params.class_name {
+        filters.push(format!(
+            "{pfx}MessageBodyClassName = '{}'",
+            cls.replace('\'', "''")
+        ));
+    }
+    // session_id / since_id are numeric (i64) — safe to inline.
+    if let Some(sid) = params.session_id {
+        filters.push(format!("{pfx}SessionId = {}", sid));
+    }
+    if let Some(since) = params.since_id {
+        filters.push(format!("{pfx}ID > {}", since));
+    }
+    filters
+}
+
+const HEADER_COLS: &str =
+    "ID, TimeCreated, SourceConfigName, TargetConfigName, MessageBodyClassName, SessionId, Status";
+
+/// A plausible SQL column/identifier — the only thing body_select accepts.
+fn is_sql_identifier(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '%')
+}
+
+/// Body-class join (issue #4). The join also pins h.MessageBodyClassName to
+/// the body class: MessageBodyId is only unique per body table, so without it
+/// same-numbered rows of OTHER body classes would match.
+fn build_body_join_sql(
+    limit: u32,
+    mut filters: Vec<String>,
+    body_class: &str,
+    body_table: &str,
+    body_where: Option<&str>,
+    body_select: &[String],
+) -> String {
+    filters.push(format!(
+        "h.MessageBodyClassName = '{}'",
+        body_class.replace('\'', "''")
+    ));
+    if let Some(w) = body_where {
+        filters.push(format!("({w})"));
+    }
+    let header_cols = HEADER_COLS
+        .split(", ")
+        .map(|c| format!("h.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let body_cols = body_select
+        .iter()
+        .map(|c| format!(", r.{c}"))
+        .collect::<String>();
+    format!(
+        "SELECT TOP {limit} {header_cols}{body_cols} FROM Ens.MessageHeader h JOIN {body_table} r ON h.MessageBodyId = r.ID WHERE {} ORDER BY h.ID DESC",
+        filters.join(" AND ")
+    )
+}
+
+/// Search-Table join (issue #4) — the canonical shape from the issue: DocId IS
+/// MessageBodyId, and PropId must be resolved through Ens_Config.SearchTableProp
+/// first (PropId is only unique within one extent).
+fn build_search_table_sql(
+    limit: u32,
+    mut filters: Vec<String>,
+    extent_table: &str,
+    prop_ids: &[i64],
+    value: Option<&str>,
+    value_like: Option<&str>,
+) -> String {
+    let ids = prop_ids
+        .iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    filters.push(format!("st.PropId IN ({ids})"));
+    if let Some(v) = value {
+        filters.push(format!("st.PropValue = '{}'", v.replace('\'', "''")));
+    } else if let Some(v) = value_like {
+        filters.push(format!("st.PropValue LIKE '{}'", v.replace('\'', "''")));
+    }
+    let header_cols = HEADER_COLS
+        .split(", ")
+        .map(|c| format!("h.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "SELECT TOP {limit} {header_cols}, st.PropValue FROM Ens.MessageHeader h JOIN {extent_table} st ON st.DocId = h.MessageBodyId WHERE {} ORDER BY h.ID DESC",
+        filters.join(" AND ")
+    )
+}
+
+/// SQL projection of a class via the dictionary (handles SqlTableName
+/// overrides the dots→underscores rule would get wrong). Ok(None) = class not
+/// compiled in that namespace.
+async fn resolve_sql_table(
+    iris: &IrisConnection,
+    ns: &str,
+    client: &reqwest::Client,
+    class: &str,
+) -> Result<Option<String>, String> {
+    let sql = format!(
+        "SELECT SqlSchemaName, SqlTableName FROM %Dictionary.CompiledClass WHERE Name = '{}'",
+        class.replace('\'', "''")
+    );
+    let resp = iris
+        .query(&sql, vec![], ns, client)
+        .await
+        .map_err(|e| e.to_string())?;
+    let row = &resp["result"]["content"][0];
+    match (row["SqlSchemaName"].as_str(), row["SqlTableName"].as_str()) {
+        (Some(s), Some(t)) if !s.is_empty() && !t.is_empty() => Ok(Some(format!("{s}.{t}"))),
+        _ => Ok(None),
+    }
+}
+
+/// Distinct body classes present in the namespace — the discovery hint when a
+/// body_class is missing or wrong.
+async fn list_body_classes(
+    iris: &IrisConnection,
+    ns: &str,
+    client: &reqwest::Client,
+) -> Option<Vec<String>> {
+    // %EXACT beats the column's SQLUPPER collation — the hint must show the
+    // case-sensitive class name the body_class parameter needs.
+    let sql = "SELECT DISTINCT TOP 20 %EXACT(MessageBodyClassName) AS MessageBodyClassName FROM Ens.MessageHeader WHERE MessageBodyClassName IS NOT NULL ORDER BY 1";
+    let resp = iris.query(sql, vec![], ns, client).await.ok()?;
+    let names: Vec<String> = resp["result"]["content"]
+        .as_array()?
+        .iter()
+        .filter_map(|r| r["MessageBodyClassName"].as_str())
+        .map(str::to_string)
+        .collect();
+    if names.is_empty() {
+        None
+    } else {
+        Some(names)
+    }
+}
+
 pub async fn interop_message_search_impl(
     iris: Option<&IrisConnection>,
     params: MessageSearchParams,
@@ -576,49 +764,268 @@ pub async fn interop_message_search_impl(
         None => return err_json("IRIS_UNREACHABLE", "No IRIS connection"),
     };
     let client = IrisConnection::http_client().map_err(|_| iris_unreachable())?;
-    let mut filters = vec![];
-    if let Some(src) = &params.source {
-        filters.push(format!("SourceConfigName = '{}'", src.replace('\'', "''")));
-    }
-    if let Some(tgt) = &params.target {
-        filters.push(format!("TargetConfigName = '{}'", tgt.replace('\'', "''")));
-    }
-    if let Some(cls) = &params.class_name {
-        filters.push(format!(
-            "MessageBodyClassName = '{}'",
-            cls.replace('\'', "''")
-        ));
-    }
-    // session_id / since_id are numeric (i64) — safe to inline.
-    if let Some(sid) = params.session_id {
-        filters.push(format!("SessionId = {}", sid));
-    }
-    if let Some(since) = params.since_id {
-        filters.push(format!("ID > {}", since));
-    }
-    let where_clause = if filters.is_empty() {
-        String::new()
-    } else {
-        format!("WHERE {}", filters.join(" AND "))
-    };
-    let sql = format!("SELECT TOP {} ID, TimeCreated, SourceConfigName, TargetConfigName, MessageBodyClassName, SessionId, Status FROM Ens.MessageHeader {} ORDER BY ID DESC", params.limit, where_clause);
     // A6: query the requested production namespace, not the connection default.
     let ns = params
         .namespace
         .as_deref()
         .unwrap_or(iris.namespace.as_str());
+    let net_err = |e: &str| {
+        if is_network_error(e) {
+            "IRIS_UNREACHABLE"
+        } else {
+            "INTEROP_ERROR"
+        }
+    };
+
+    let body_mode = params.body_class.is_some()
+        || params.body_where.is_some()
+        || !params.body_select.is_empty();
+    if body_mode && params.search_table.is_some() {
+        return err_json(
+            "INVALID_PARAMS",
+            "body_class/body_where and search_table are separate search modes — pass one or the other",
+        );
+    }
+
+    // ── Mode 1 (issue #4): body-class join ───────────────────────────────
+    if body_mode {
+        let body_class = match &params.body_class {
+            Some(c) => c.clone(),
+            None => {
+                let known = list_body_classes(iris, ns, &client).await;
+                let hint = match known {
+                    Some(names) => format!(
+                        "body_where/body_select need body_class. Body classes present in '{}': {}.",
+                        ns,
+                        names.join(", ")
+                    ),
+                    None => format!(
+                        "body_where/body_select need body_class (no messages found in '{}' to list candidates from).",
+                        ns
+                    ),
+                };
+                return crate::tools::envelope::fail_with(
+                    "INVALID_PARAMS",
+                    "body_where/body_select require body_class",
+                    serde_json::json!({"hint": hint}),
+                );
+            }
+        };
+        if let Some(w) = &params.body_where {
+            if w.contains(';') {
+                return err_json(
+                    "INVALID_PARAMS",
+                    "body_where must be a WHERE fragment, not a statement (no ';')",
+                );
+            }
+        }
+        if let Some(bad) = params.body_select.iter().find(|c| !is_sql_identifier(c)) {
+            return err_json(
+                "INVALID_PARAMS",
+                &format!("body_select entries must be plain column names; '{bad}' is not"),
+            );
+        }
+        let body_table = match resolve_sql_table(iris, ns, &client, &body_class).await {
+            Err(e) => return err_json(net_err(&e), &e),
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                let known = list_body_classes(iris, ns, &client).await;
+                let hint = match known {
+                    Some(names) => format!(
+                        "Body classes actually present in '{}': {}. Class names are case-sensitive and must be compiled in the namespace.",
+                        ns,
+                        names.join(", ")
+                    ),
+                    None => "Class names are case-sensitive and must be compiled in the namespace."
+                        .to_string(),
+                };
+                return crate::tools::envelope::fail_with(
+                    "BODY_CLASS_NOT_FOUND",
+                    &format!(
+                        "Class '{}' is not compiled in namespace '{}'",
+                        body_class, ns
+                    ),
+                    serde_json::json!({"hint": hint, "body_class": body_class, "namespace": ns}),
+                );
+            }
+        };
+        let sql = build_body_join_sql(
+            params.limit,
+            header_filters(&params, "h."),
+            &body_class,
+            &body_table,
+            params.body_where.as_deref(),
+            &params.body_select,
+        );
+        return match iris.query(&sql, vec![], ns, &client).await {
+            Ok(resp) => ok_json(serde_json::json!({
+                "success": true,
+                "messages": resp["result"]["content"],
+                "count": resp["result"]["content"].as_array().map(|a| a.len()).unwrap_or(0),
+                "body_table": body_table,
+                "sql": sql,
+            })),
+            Err(e) => crate::tools::envelope::fail_with(
+                net_err(&e.to_string()),
+                &e.to_string(),
+                serde_json::json!({"hint": format!(
+                    "body_where/body_select must use the SQL column names of {} (the SQL projection of {}). Check them with iris_table_info.",
+                    body_table, body_class
+                ), "sql": sql}),
+            ),
+        };
+    }
+
+    // ── Mode 2 (issue #4): Search-Table filter ───────────────────────────
+    if let Some(st) = &params.search_table {
+        if st.value.is_some() == st.value_like.is_some() {
+            return err_json(
+                "INVALID_PARAMS",
+                "search_table needs exactly one of value (exact) or value_like (LIKE pattern)",
+            );
+        }
+        // Resolve the base extent: explicit > derived from `class` > HL7 default.
+        let extent = match (&st.extent, &st.class) {
+            (Some(e), _) => e.clone(),
+            (None, Some(class)) => {
+                let c = class.replace('\'', "''");
+                let sql = format!(
+                    "SELECT TOP 1 ClassExtent FROM Ens_Config.SearchTableProp WHERE ClassDerivation = '{c}' OR ClassDerivation LIKE '{c}~%'"
+                );
+                match iris.query(&sql, vec![], ns, &client).await {
+                    Err(e) => return err_json(net_err(&e.to_string()), &e.to_string()),
+                    Ok(resp) => match resp["result"]["content"][0]["ClassExtent"].as_str() {
+                        Some(e) => e.to_string(),
+                        None => {
+                            return crate::tools::envelope::fail_with(
+                                "SEARCH_TABLE_NOT_FOUND",
+                                &format!(
+                                    "No Search Table class '{}' is registered in namespace '{}'",
+                                    class, ns
+                                ),
+                                serde_json::json!({"hint": "The class must extend a search-table family (EnsLib.HL7.SearchTable, …) and be compiled; registration happens on first index build. Check Ens_Config.SearchTableProp."}),
+                            )
+                        }
+                    },
+                }
+            }
+            (None, None) => "EnsLib.HL7.SearchTable".to_string(),
+        };
+        // Resolve prop name -> PropId set within the extent (PropId is only
+        // unique per extent; `class` additionally scopes via ClassDerivation).
+        let e_esc = extent.replace('\'', "''");
+        let scope = match &st.class {
+            Some(class) => {
+                let c = class.replace('\'', "''");
+                format!(" AND (ClassDerivation = '{c}' OR ClassDerivation LIKE '{c}~%')")
+            }
+            None => String::new(),
+        };
+        let prop_sql = format!(
+            "SELECT PropId FROM Ens_Config.SearchTableProp WHERE ClassExtent = '{e_esc}' AND Name = '{}'{scope}",
+            st.prop.replace('\'', "''")
+        );
+        let prop_ids: Vec<i64> = match iris.query(&prop_sql, vec![], ns, &client).await {
+            Err(e) => return err_json(net_err(&e.to_string()), &e.to_string()),
+            Ok(resp) => resp["result"]["content"]
+                .as_array()
+                .map(|rows| rows.iter().filter_map(|r| r["PropId"].as_i64()).collect())
+                .unwrap_or_default(),
+        };
+        if prop_ids.is_empty() {
+            // Issue #4 hint: list what IS searchable instead of returning empty.
+            let names_sql = format!(
+                "SELECT DISTINCT Name FROM Ens_Config.SearchTableProp WHERE ClassExtent = '{e_esc}' ORDER BY Name"
+            );
+            let names = iris
+                .query(&names_sql, vec![], ns, &client)
+                .await
+                .ok()
+                .and_then(|resp| {
+                    resp["result"]["content"].as_array().map(|rows| {
+                        rows.iter()
+                            .filter_map(|r| r["Name"].as_str().map(str::to_string))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .unwrap_or_default();
+            return crate::tools::envelope::fail_with(
+                "SEARCH_PROP_NOT_FOUND",
+                &format!(
+                    "No Search Table property '{}' in extent '{}'",
+                    st.prop, extent
+                ),
+                serde_json::json!({
+                    "hint": if names.is_empty() {
+                        format!("Extent '{}' has no registered properties in namespace '{}' — is a SearchTableClass configured on any item?", extent, ns)
+                    } else {
+                        format!("Searchable properties of '{}': {}.", extent, names.join(", "))
+                    },
+                    "available_props": names,
+                }),
+            );
+        }
+        let extent_table = match resolve_sql_table(iris, ns, &client, &extent).await {
+            Err(e) => return err_json(net_err(&e), &e),
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                return err_json(
+                    "SEARCH_TABLE_NOT_FOUND",
+                    &format!(
+                        "Extent class '{}' is not compiled in namespace '{}'",
+                        extent, ns
+                    ),
+                )
+            }
+        };
+        let sql = build_search_table_sql(
+            params.limit,
+            header_filters(&params, "h."),
+            &extent_table,
+            &prop_ids,
+            st.value.as_deref(),
+            st.value_like.as_deref(),
+        );
+        return match iris.query(&sql, vec![], ns, &client).await {
+            Ok(resp) => {
+                let rows = resp["result"]["content"].clone();
+                let count = rows.as_array().map(|a| a.len()).unwrap_or(0);
+                let mut out = serde_json::json!({
+                    "success": true,
+                    "messages": rows,
+                    "count": count,
+                    "extent": extent,
+                    "prop_ids": prop_ids,
+                    "sql": sql,
+                });
+                if count == 0 {
+                    // Issue #4: valid prop + zero rows is usually a config-time effect.
+                    out["hint"] = serde_json::Value::String(
+                        "A Search Table indexes only messages received AFTER SearchTableClass was configured on the item — existing messages are not back-indexed. Also check the value: PropValue matching is exact unless value_like is used.".into(),
+                    );
+                }
+                ok_json(out)
+            }
+            Err(e) => err_json(net_err(&e.to_string()), &e.to_string()),
+        };
+    }
+
+    // ── Plain header search (unchanged behavior) ─────────────────────────
+    let filters = header_filters(&params, "");
+    let where_clause = if filters.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", filters.join(" AND "))
+    };
+    let sql = format!(
+        "SELECT TOP {} {HEADER_COLS} FROM Ens.MessageHeader {} ORDER BY ID DESC",
+        params.limit, where_clause
+    );
     match iris.query(&sql, vec![], ns, &client).await {
         Ok(resp) => ok_json(
             serde_json::json!({"success": true, "messages": resp["result"]["content"], "count": resp["result"]["content"].as_array().map(|a| a.len()).unwrap_or(0)}),
         ),
-        Err(e) => err_json(
-            if is_network_error(&e.to_string()) {
-                "IRIS_UNREACHABLE"
-            } else {
-                "INTEROP_ERROR"
-            },
-            &e.to_string(),
-        ),
+        Err(e) => err_json(net_err(&e.to_string()), &e.to_string()),
     }
 }
 
@@ -1851,6 +2258,96 @@ mod tests {
     fn resolve_namespace_user_only_without_connection() {
         assert_eq!(resolve_namespace(None, None), "USER");
         assert_eq!(resolve_namespace(Some("EJ3"), None), "EJ3");
+    }
+
+    // ─── issue #4: typed message-content search ───
+
+    fn msg_params(source: Option<&str>) -> MessageSearchParams {
+        MessageSearchParams {
+            namespace: None,
+            source: source.map(str::to_string),
+            target: None,
+            class_name: None,
+            session_id: None,
+            since_id: None,
+            limit: 5,
+            body_class: None,
+            body_where: None,
+            body_select: vec![],
+            search_table: None,
+        }
+    }
+
+    #[test]
+    fn body_join_sql_matches_issue_shape() {
+        let p = msg_params(Some("Router.Censo"));
+        let sql = build_body_join_sql(
+            5,
+            header_filters(&p, "h."),
+            "Ejercicio3.MSG.MenuReq",
+            "Ejercicio3_MSG.MenuReq",
+            Some("PacienteId = '4003'"),
+            &["PacienteId".to_string(), "FechaNacimiento".to_string()],
+        );
+        assert!(sql.starts_with("SELECT TOP 5 h.ID, h.TimeCreated"));
+        assert!(sql.contains(", r.PacienteId, r.FechaNacimiento"));
+        assert!(sql.contains("JOIN Ejercicio3_MSG.MenuReq r ON h.MessageBodyId = r.ID"));
+        assert!(sql.contains("h.SourceConfigName = 'Router.Censo'"));
+        // MessageBodyId is only unique per body table — the class pin is what
+        // stops same-numbered rows of other classes matching.
+        assert!(sql.contains("h.MessageBodyClassName = 'Ejercicio3.MSG.MenuReq'"));
+        assert!(sql.contains("(PacienteId = '4003')"));
+        assert!(sql.ends_with("ORDER BY h.ID DESC"));
+    }
+
+    #[test]
+    fn search_table_sql_matches_issue_shape() {
+        let sql = build_search_table_sql(
+            10,
+            header_filters(&msg_params(None), "h."),
+            "EnsLib_HL7.SearchTable",
+            &[4],
+            Some("16284718"),
+            None,
+        );
+        assert!(sql.contains("JOIN EnsLib_HL7.SearchTable st ON st.DocId = h.MessageBodyId"));
+        assert!(sql.contains("st.PropId IN (4)"));
+        assert!(sql.contains("st.PropValue = '16284718'"));
+        assert!(sql.contains(", st.PropValue FROM"));
+        let like = build_search_table_sql(
+            10,
+            vec![],
+            "EnsLib_HL7.SearchTable",
+            &[12, 14],
+            None,
+            Some("AMOX%"),
+        );
+        assert!(like.contains("st.PropId IN (12,14)"));
+        assert!(like.contains("st.PropValue LIKE 'AMOX%'"));
+    }
+
+    #[test]
+    fn sql_identifier_gate() {
+        assert!(is_sql_identifier("PacienteId"));
+        assert!(is_sql_identifier("%ID"));
+        assert!(!is_sql_identifier("a b"));
+        assert!(!is_sql_identifier("x; DROP"));
+        assert!(!is_sql_identifier(""));
+    }
+
+    #[test]
+    fn search_params_deserialize_new_filters() {
+        let p: MessageSearchParams = serde_json::from_str(
+            r#"{"body_class":"E.MSG.R","body_where":"X=1","body_select":["X"],
+                "search_table":{"prop":"PatientID","value":"1"}}"#,
+        )
+        .unwrap();
+        assert_eq!(p.body_class.as_deref(), Some("E.MSG.R"));
+        assert_eq!(p.body_select, vec!["X"]);
+        let st = p.search_table.unwrap();
+        assert_eq!(st.prop, "PatientID");
+        assert_eq!(st.value.as_deref(), Some("1"));
+        assert!(st.extent.is_none());
     }
 
     // ─── issue #6: lookup import died with <SYNTAX> on quote-heavy XML ───
