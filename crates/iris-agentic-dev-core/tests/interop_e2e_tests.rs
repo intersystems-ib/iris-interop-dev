@@ -469,3 +469,55 @@ fn test_production_autostart() {
         );
     }
 }
+
+#[test]
+#[ignore = "requires live IRIS with Interoperability"]
+fn test_namespace_default_and_interop_hint() {
+    // Issue #5: omitting `namespace` failed 95% of the time because it fell
+    // back to a hardcoded "USER" instead of the connection namespace, and the
+    // failure surfaced as raw internals ("Table 'ENS_CONFIG.CREDENTIALS' not
+    // found") that never named the cause.
+    let iris_host = std::env::var("IRIS_HOST").unwrap_or_default();
+    assert!(!iris_host.is_empty(), "IRIS_HOST must be set");
+    let conn_ns = std::env::var("IRIS_NAMESPACE").unwrap_or_else(|_| "USER".to_string());
+    assert_ne!(
+        conn_ns, "USER",
+        "run with IRIS_NAMESPACE pointing at an interop-enabled namespace"
+    );
+
+    // 1. No namespace argument at all → must target the connection namespace
+    //    and succeed (this exact call failed 14/14 in the workshop data).
+    let responses = mcp_exchange(&[
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
+        serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"iris_credential_list","arguments":{}}}),
+    ]);
+    let r = parse_tool_text(&find_response(&responses, 2).expect("no response"));
+    assert_eq!(r["success"], true, "credential_list without namespace: {r}");
+
+    // 2. Explicit non-interop namespace → self-describing error with a hint,
+    //    not a raw SQL/table error.
+    let responses = mcp_exchange(&[
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
+        serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"iris_credential_list","arguments":{"namespace":"USER"}}}),
+    ]);
+    let r = parse_tool_text(&find_response(&responses, 2).expect("no response"));
+    assert_eq!(r["success"], false, "USER must be rejected: {r}");
+    assert_eq!(
+        r["error_code"], "NAMESPACE_NOT_INTEROP",
+        "self-describing code, got: {r}"
+    );
+    let hint = r["hint"].as_str().unwrap_or("");
+    assert!(
+        hint.contains("namespace="),
+        "hint must name the parameter: {hint}"
+    );
+    assert!(
+        r["interop_namespaces"]
+            .as_array()
+            .map(|a| a.iter().any(|v| v.as_str() == Some(conn_ns.as_str())))
+            .unwrap_or(false),
+        "hint must list the interop namespaces: {r}"
+    );
+}

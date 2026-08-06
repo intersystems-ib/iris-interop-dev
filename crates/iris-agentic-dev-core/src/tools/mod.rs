@@ -4219,7 +4219,7 @@ Methods:
     // Note: iris_debug already exists above as a real tool — it IS the merged debug dispatcher.
 
     #[tool(
-        description = "Interoperability production lifecycle (merged). action: status=get current state, start=start named production, stop=stop production, restart=recycle ONE config item (pass item=<config item name>), update=hot-apply config, check=check if update needed, recover=recover troubled production."
+        description = "Interoperability production lifecycle (merged). action: status=get current state, start=start named production, stop=stop production, restart=recycle ONE config item (pass item=<config item name>), update=hot-apply config, check=check if update needed, recover=recover troubled production. namespace: optional — defaults to the connection namespace (IRIS_NAMESPACE); must be an interop-enabled namespace."
     )]
     async fn iris_production(
         &self,
@@ -4228,16 +4228,20 @@ Methods:
         let action = p.get("action").and_then(|v| v.as_str()).unwrap_or("status");
         let _iris_arc_hold = self.iris_arc();
         let iris_opt = _iris_arc_hold.as_deref();
+        let namespace =
+            interop::resolve_namespace(p.get("namespace").and_then(|v| v.as_str()), iris_opt);
+        if let Some(iris) = iris_opt {
+            if let Some(blocked) = interop::ensure_interop_namespace(iris, &namespace).await {
+                self.record_call("iris_production", false);
+                return blocked;
+            }
+        }
         let result = match action {
             "status" => {
                 interop::interop_production_status_impl(
                     iris_opt,
                     interop::ProductionStatusParams {
-                        namespace: p
-                            .get("namespace")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("USER")
-                            .to_string(),
+                        namespace: namespace.clone(),
                         full_status: p.get("full").and_then(|v| v.as_bool()).unwrap_or(false),
                     },
                 )
@@ -4251,11 +4255,7 @@ Methods:
                             .get("production_name")
                             .and_then(|v| v.as_str())
                             .map(|s| s.to_string()),
-                        namespace: p
-                            .get("namespace")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("USER")
-                            .to_string(),
+                        namespace: namespace.clone(),
                     },
                 )
                 .await
@@ -4268,11 +4268,7 @@ Methods:
                             .get("production_name")
                             .and_then(|v| v.as_str())
                             .map(|s| s.to_string()),
-                        namespace: p
-                            .get("namespace")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("USER")
-                            .to_string(),
+                        namespace: namespace.clone(),
                         timeout: p.get("timeout").and_then(|v| v.as_u64()).unwrap_or(30) as u32,
                         force: p.get("force").and_then(|v| v.as_bool()).unwrap_or(false),
                     },
@@ -4283,11 +4279,7 @@ Methods:
                 interop::interop_production_update_impl(
                     iris_opt,
                     interop::ProductionUpdateParams {
-                        namespace: p
-                            .get("namespace")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("USER")
-                            .to_string(),
+                        namespace: namespace.clone(),
                         timeout: 30,
                         force: false,
                     },
@@ -4298,11 +4290,7 @@ Methods:
                 interop::interop_production_needs_update_impl(
                     iris_opt,
                     interop::ProductionNeedsUpdateParams {
-                        namespace: p
-                            .get("namespace")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("USER")
-                            .to_string(),
+                        namespace: namespace.clone(),
                     },
                 )
                 .await
@@ -4311,11 +4299,7 @@ Methods:
                 interop::interop_production_recover_impl(
                     iris_opt,
                     interop::ProductionRecoverParams {
-                        namespace: p
-                            .get("namespace")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("USER")
-                            .to_string(),
+                        namespace: namespace.clone(),
                     },
                 )
                 .await
@@ -4325,7 +4309,7 @@ Methods:
                     iris_opt,
                     &interop::ProductionAutostartParams {
                         action: "get_autostart".into(),
-                        namespace: p.get("namespace").and_then(|v| v.as_str()).unwrap_or("USER").to_string(),
+                        namespace: namespace.clone(),
                         enabled: None,
                         production: None,
                     },
@@ -4336,7 +4320,7 @@ Methods:
                     iris_opt,
                     &interop::ProductionAutostartParams {
                         action: "set_autostart".into(),
-                        namespace: p.get("namespace").and_then(|v| v.as_str()).unwrap_or("USER").to_string(),
+                        namespace: namespace.clone(),
                         enabled: p.get("enabled").and_then(|v| v.as_bool()),
                         production: p.get("production").and_then(|v| v.as_str()).map(|s| s.to_string()),
                     },
@@ -4344,10 +4328,7 @@ Methods:
             }
             "restart" => {
                 // B: recycle ONE config item (disable+enable, each with UpdateProduction).
-                let ns = p
-                    .get("namespace")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("USER");
+                let ns = namespace.as_str();
                 let item = p
                     .get("item")
                     .or_else(|| p.get("component"))
@@ -4542,7 +4523,7 @@ Methods:
     // ─── 024-interop-depth: Production item control (US1) ───
 
     #[tool(
-        description = "Add, remove, enable, disable, or inspect/modify settings of an Interoperability production config item — the typed way to build/manipulate a production without hand-rolling ##class(Ens.Config.*) ObjectScript. action: add|remove|enable|disable|get_settings|set_settings. item: exact config item name. For add: class_name (the BS/BO/BP/adapter class the item runs, required), optional enabled (default true), production (defaults to the running one), pool_size, category, and settings (key-value; prefix a key with 'Adapter.' to target the adapter, e.g. 'Adapter.FilePath', otherwise it targets the Host). For remove: item (+ optional production). settings: key-value map for set_settings. Changes apply live via Ens.Director.UpdateProduction when the target production is running (set_settings honours apply=false to batch). Works via HTTP, no Docker required."
+        description = "Add, remove, enable, disable, or inspect/modify settings of an Interoperability production config item — the typed way to build/manipulate a production without hand-rolling ##class(Ens.Config.*) ObjectScript. action: add|remove|enable|disable|get_settings|set_settings. item: exact config item name. For add: class_name (the BS/BO/BP/adapter class the item runs, required), optional enabled (default true), production (defaults to the running one), pool_size, category, and settings (key-value; prefix a key with 'Adapter.' to target the adapter, e.g. 'Adapter.FilePath', otherwise it targets the Host). For remove: item (+ optional production). settings: key-value map for set_settings. namespace: optional — defaults to the connection namespace (IRIS_NAMESPACE); must be an interop-enabled namespace, and it is the parameter that matters when an item is 'not found'. Changes apply live via Ens.Director.UpdateProduction when the target production is running (set_settings honours apply=false to batch). Works via HTTP, no Docker required."
     )]
     async fn iris_production_item(
         &self,
@@ -4558,11 +4539,17 @@ Methods:
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let namespace = p
-            .get("namespace")
-            .and_then(|v| v.as_str())
-            .unwrap_or("USER")
-            .to_string();
+        let _iris_arc_hold = self.iris_arc();
+        let namespace = interop::resolve_namespace(
+            p.get("namespace").and_then(|v| v.as_str()),
+            _iris_arc_hold.as_deref(),
+        );
+        if let Some(iris) = _iris_arc_hold.as_deref() {
+            if let Some(blocked) = interop::ensure_interop_namespace(iris, &namespace).await {
+                self.record_call("iris_production_item", false);
+                return blocked;
+            }
+        }
         let settings: std::collections::HashMap<String, String> = p
             .get("settings")
             .and_then(|v| v.as_object())
@@ -4612,19 +4599,25 @@ Methods:
     // ─── 024-interop-depth: Ensemble credentials (US2) ───
 
     #[tool(
-        description = "List all Ensemble credentials (IDs and usernames only — passwords never returned). namespace: optional."
+        description = "List all Ensemble credentials (IDs and usernames only — passwords never returned). namespace: optional — defaults to the connection namespace (IRIS_NAMESPACE); must be an interop-enabled namespace."
     )]
     async fn iris_credential_list(
         &self,
         Parameters(p): Parameters<AnyParams>,
     ) -> Result<CallToolResult, McpError> {
-        let namespace = p
-            .get("namespace")
-            .and_then(|v| v.as_str())
-            .unwrap_or("USER")
-            .to_string();
+        let _iris_arc_hold = self.iris_arc();
+        let namespace = interop::resolve_namespace(
+            p.get("namespace").and_then(|v| v.as_str()),
+            _iris_arc_hold.as_deref(),
+        );
+        if let Some(iris) = _iris_arc_hold.as_deref() {
+            if let Some(blocked) = interop::ensure_interop_namespace(iris, &namespace).await {
+                self.record_call("iris_credential_list", false);
+                return blocked;
+            }
+        }
         let result = interop::interop_credential_list_impl(
-            self.iris_arc().as_deref(),
+            _iris_arc_hold.as_deref(),
             interop::CredentialListParams { namespace },
         )
         .await;
@@ -4633,14 +4626,25 @@ Methods:
     }
 
     #[tool(
-        description = "Create, update, or delete an Ensemble credential. action: create|update|delete. id: credential ID (required). username/password: required for create, optional for update. namespace: optional. Write-gated: suppressed on Live instances unless IRIS_ALLOW_PROD=1."
+        description = "Create, update, or delete an Ensemble credential. action: create|update|delete. id: credential ID (required). username/password: required for create, optional for update. namespace: optional — defaults to the connection namespace (IRIS_NAMESPACE); must be an interop-enabled namespace. Write-gated: suppressed on Live instances unless IRIS_ALLOW_PROD=1."
     )]
     async fn iris_credential_manage(
         &self,
         Parameters(p): Parameters<AnyParams>,
     ) -> Result<CallToolResult, McpError> {
+        let _iris_arc_hold = self.iris_arc();
+        let namespace = interop::resolve_namespace(
+            p.get("namespace").and_then(|v| v.as_str()),
+            _iris_arc_hold.as_deref(),
+        );
+        if let Some(iris) = _iris_arc_hold.as_deref() {
+            if let Some(blocked) = interop::ensure_interop_namespace(iris, &namespace).await {
+                self.record_call("iris_credential_manage", false);
+                return blocked;
+            }
+        }
         let result = interop::interop_credential_manage_impl(
-            self.iris_arc().as_deref(),
+            _iris_arc_hold.as_deref(),
             interop::CredentialManageParams {
                 action: p
                     .get("action")
@@ -4660,11 +4664,7 @@ Methods:
                     .get("password")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string()),
-                namespace: p
-                    .get("namespace")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("USER")
-                    .to_string(),
+                namespace: namespace.clone(),
             },
         )
         .await;
@@ -4675,14 +4675,25 @@ Methods:
     // ─── 024-interop-depth: Lookup tables (US3) ───
 
     #[tool(
-        description = "Read, write, delete, or list Ensemble lookup table entries. action: get|set|delete|list_keys|list_tables. table: table name (required except list_tables). key: required for get/set/delete. value: required for set. namespace: optional. get/list_keys/list_tables always available; set/delete write-gated."
+        description = "Read, write, delete, or list Ensemble lookup table entries. action: get|set|delete|list_keys|list_tables. table: table name (required except list_tables). key: required for get/set/delete. value: required for set. namespace: optional — defaults to the connection namespace (IRIS_NAMESPACE); must be an interop-enabled namespace. get/list_keys/list_tables always available; set/delete write-gated."
     )]
     async fn iris_lookup_manage(
         &self,
         Parameters(p): Parameters<AnyParams>,
     ) -> Result<CallToolResult, McpError> {
+        let _iris_arc_hold = self.iris_arc();
+        let namespace = interop::resolve_namespace(
+            p.get("namespace").and_then(|v| v.as_str()),
+            _iris_arc_hold.as_deref(),
+        );
+        if let Some(iris) = _iris_arc_hold.as_deref() {
+            if let Some(blocked) = interop::ensure_interop_namespace(iris, &namespace).await {
+                self.record_call("iris_lookup_manage", false);
+                return blocked;
+            }
+        }
         let result = interop::interop_lookup_manage_impl(
-            self.iris_arc().as_deref(),
+            _iris_arc_hold.as_deref(),
             interop::LookupManageParams {
                 action: p
                     .get("action")
@@ -4698,11 +4709,7 @@ Methods:
                     .get("value")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string()),
-                namespace: p
-                    .get("namespace")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("USER")
-                    .to_string(),
+                namespace: namespace.clone(),
             },
         )
         .await;
@@ -4711,14 +4718,25 @@ Methods:
     }
 
     #[tool(
-        description = "Export or import an Ensemble lookup table as XML. action: export|import. table: table name. xml: XML string (required for import). namespace: optional. export always available; import write-gated."
+        description = "Export or import an Ensemble lookup table as XML. action: export|import. table: table name. xml: XML string (required for import). namespace: optional — defaults to the connection namespace (IRIS_NAMESPACE); must be an interop-enabled namespace. export always available; import write-gated."
     )]
     async fn iris_lookup_transfer(
         &self,
         Parameters(p): Parameters<AnyParams>,
     ) -> Result<CallToolResult, McpError> {
+        let _iris_arc_hold = self.iris_arc();
+        let namespace = interop::resolve_namespace(
+            p.get("namespace").and_then(|v| v.as_str()),
+            _iris_arc_hold.as_deref(),
+        );
+        if let Some(iris) = _iris_arc_hold.as_deref() {
+            if let Some(blocked) = interop::ensure_interop_namespace(iris, &namespace).await {
+                self.record_call("iris_lookup_transfer", false);
+                return blocked;
+            }
+        }
         let result = interop::interop_lookup_transfer_impl(
-            self.iris_arc().as_deref(),
+            _iris_arc_hold.as_deref(),
             interop::LookupTransferParams {
                 action: p
                     .get("action")
@@ -4731,11 +4749,7 @@ Methods:
                     .unwrap_or("")
                     .to_string(),
                 xml: p.get("xml").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                namespace: p
-                    .get("namespace")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("USER")
-                    .to_string(),
+                namespace: namespace.clone(),
             },
         )
         .await;

@@ -31,6 +31,112 @@ fn default_true() -> bool {
     true
 }
 
+// ═══ issue #5: namespace resolution + self-describing interop preflight ═══
+
+/// `namespace` is optional on the interop tools: an omitted or empty value
+/// resolves to the CONNECTION's namespace (IRIS_NAMESPACE / discovery), never
+/// a hardcoded "USER" — on interop-configured servers "USER" is almost never
+/// the namespace the caller means, which made omission fail 95% of the time.
+pub fn resolve_namespace(requested: Option<&str>, iris: Option<&IrisConnection>) -> String {
+    match requested {
+        Some(ns) if !ns.trim().is_empty() => ns.to_string(),
+        _ => iris
+            .map(|i| i.namespace.clone())
+            .unwrap_or_else(|| "USER".to_string()),
+    }
+}
+
+/// Positive probe results, keyed "base_url|namespace". Never invalidated: a
+/// namespace does not lose Interoperability within a server process lifetime.
+/// Negatives are NOT cached — a namespace can gain interop (or be created)
+/// while the server runs.
+static INTEROP_NS_CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+/// Enumerate interop-enabled namespaces for the error hint (best effort).
+/// `$EXTRACT(tNs)'="%"` skips system namespaces; `Continue` is deliberately
+/// avoided — it must be the last command on its line, which a one-line For
+/// body cannot honor.
+async fn list_interop_namespaces(
+    iris: &IrisConnection,
+    ns: &str,
+    client: &reqwest::Client,
+) -> Option<String> {
+    const CODE: &str = r#"Set tSaved=$NAMESPACE,tOut=""
+Try { Do ##class(%SYS.Namespace).ListAll(.arr) } Catch ex {}
+Set tNs="" For { Set tNs=$ORDER(arr(tNs)) Quit:tNs=""  If $EXTRACT(tNs)'="%" { Try { Set $NAMESPACE=tNs If ##class(%Dictionary.CompiledClass).%ExistsId("Ens.Director") { Set tOut=tOut_$SELECT(tOut="":"",1:",")_tNs } } Catch ex {} } }
+Set $NAMESPACE=tSaved
+Write tOut"#;
+    iris.execute_via_generator(CODE, ns, client)
+        .await
+        .ok()
+        .map(|out| out.trim().to_string())
+        .filter(|out| !out.is_empty())
+}
+
+/// Issue #5: fail fast and self-describing when the target namespace has no
+/// Interoperability. Without this, the underlying calls surface raw internals
+/// ("Table 'ENS_CONFIG.CREDENTIALS' not found", <CLASS DOES NOT EXIST>) that
+/// never name the cause. Probes %Dictionary.CompiledClass for Ens.Director —
+/// one SELECT round trip, positives cached per process. Returns Some(error)
+/// only on a definitive "no interop here"; any probe failure returns None so
+/// the tool's own error surfaces instead.
+pub async fn ensure_interop_namespace(
+    iris: &IrisConnection,
+    ns: &str,
+) -> Option<Result<CallToolResult, McpError>> {
+    let key = format!("{}|{}", iris.base_url, ns);
+    let cache = INTEROP_NS_CACHE.get_or_init(Default::default);
+    if cache.lock().map(|c| c.contains(&key)).unwrap_or(false) {
+        return None;
+    }
+    let client = IrisConnection::http_client().ok()?;
+    let probe = iris
+        .query(
+            "SELECT COUNT(*) AS n FROM %Dictionary.CompiledClass WHERE Name = 'Ens.Director'",
+            vec![],
+            ns,
+            &client,
+        )
+        .await;
+    let n = match &probe {
+        Ok(resp) => resp["result"]["content"][0]["n"].as_i64()?,
+        Err(_) => return None,
+    };
+    if n >= 1 {
+        if let Ok(mut c) = cache.lock() {
+            c.insert(key);
+        }
+        return None;
+    }
+    let available = list_interop_namespaces(iris, ns, &client).await;
+    let hint = match &available {
+        Some(list) => format!(
+            "Pass namespace= one of the interop-enabled namespaces on this instance: {list}. \
+             Omitting namespace targets the connection namespace '{}'.",
+            iris.namespace
+        ),
+        None => format!(
+            "Pass namespace= an interop-enabled namespace. \
+             Omitting namespace targets the connection namespace '{}'.",
+            iris.namespace
+        ),
+    };
+    Some(ok_json(serde_json::json!({
+        "success": false,
+        "error_code": "NAMESPACE_NOT_INTEROP",
+        "error": format!(
+            "Namespace '{ns}' has no Interoperability enabled — the Ens.* classes and \
+             Ens_* tables do not exist there, so interop tools cannot run in it."
+        ),
+        "hint": hint,
+        "namespace": ns,
+        "interop_namespaces": available
+            .map(|l| l.split(',').map(str::to_string).collect::<Vec<_>>())
+            .unwrap_or_default(),
+    })))
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ProductionStatusParams {
     #[serde(default = "default_ns")]
@@ -1708,6 +1814,42 @@ mod tests {
             !code.contains("\\\""),
             "generated code must never use C-style quote escaping"
         );
+    }
+
+    // ─── issue #5: omitted namespace resolves to the connection's, not "USER" ───
+
+    fn test_connection(ns: &str) -> IrisConnection {
+        IrisConnection {
+            base_url: "http://localhost:43080".into(),
+            namespace: ns.into(),
+            username: "_SYSTEM".into(),
+            password: "SYS".into(),
+            version: None,
+            atelier_version: crate::iris::connection::AtelierVersion::V1,
+            source: crate::iris::connection::DiscoverySource::EnvVar,
+            port_superserver: None,
+            system_mode: crate::iris::connection::SystemMode::Development,
+        }
+    }
+
+    #[test]
+    fn resolve_namespace_prefers_explicit_param() {
+        let conn = test_connection("APP");
+        assert_eq!(resolve_namespace(Some("EJ3"), Some(&conn)), "EJ3");
+    }
+
+    #[test]
+    fn resolve_namespace_falls_back_to_connection() {
+        let conn = test_connection("APP");
+        assert_eq!(resolve_namespace(None, Some(&conn)), "APP");
+        assert_eq!(resolve_namespace(Some(""), Some(&conn)), "APP");
+        assert_eq!(resolve_namespace(Some("  "), Some(&conn)), "APP");
+    }
+
+    #[test]
+    fn resolve_namespace_user_only_without_connection() {
+        assert_eq!(resolve_namespace(None, None), "USER");
+        assert_eq!(resolve_namespace(Some("EJ3"), None), "EJ3");
     }
 
     // ─── issue #6: lookup import died with <SYNTAX> on quote-heavy XML ───
