@@ -120,11 +120,14 @@ impl McpCommand {
                 ws_root.display()
             );
         }
-        let explicit = iris_agentic_dev_core::iris::workspace_config::apply_workspace_config(
-            explicit,
-            Some(&self.workspace),
-            &self.namespace,
-        );
+        // _with_path returns the loaded config path so it can be recorded in
+        // ConnectionState at startup (not just after hot-reload). Issue #21 / upstream #82.
+        let (explicit, startup_config_path) =
+            iris_agentic_dev_core::iris::workspace_config::apply_workspace_config_with_path(
+                explicit,
+                Some(&self.workspace),
+                &self.namespace,
+            );
 
         tokio::spawn(async move {
             let conn = match discover_iris(explicit).await {
@@ -182,8 +185,25 @@ impl McpCommand {
         }
 
         // Build ConfigWatcher for .iris-agentic-dev.toml hot-reload (034-live-connection-reload).
-        let config_watcher = ConfigWatcher::new(ws_root.join(".iris-agentic-dev.toml"));
-        let tools = IrisTools::with_registry_and_toolset(iris, registry, toolset, config_watcher)?;
+        // When spawned from a launcher (e.g. Claude Desktop/Code) the CWD is often "/" —
+        // fall back to $HOME so the watch path is usable without OBJECTSCRIPT_WORKSPACE
+        // (issue #21, upstream 0c922ec).
+        let config_root = if ws_root == std::path::Path::new("/") {
+            std::env::var("HOME")
+                .ok()
+                .map(std::path::PathBuf::from)
+                .unwrap_or(ws_root)
+        } else {
+            ws_root
+        };
+        let config_watcher = ConfigWatcher::new(config_root.join(".iris-agentic-dev.toml"));
+        let tools = IrisTools::with_registry_and_toolset(
+            iris,
+            registry,
+            toolset,
+            config_watcher,
+            startup_config_path,
+        )?;
 
         // FR-007: periodically sweep expired elicitation entries.
         {

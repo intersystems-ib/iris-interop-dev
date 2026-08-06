@@ -148,7 +148,7 @@ impl IrisConnection {
 
     /// Probe this connection: fetch IRIS version, Atelier API level, and SystemMode.
     pub async fn probe(&mut self) {
-        let client = match Self::http_client() {
+        let client = match Self::probe_client() {
             Ok(c) => c,
             Err(_) => return,
         };
@@ -242,7 +242,15 @@ impl IrisConnection {
                 .execute_via_generator_once(code, namespace, client)
                 .await
             {
-                Ok(output) => return Ok(output),
+                Ok(output) => {
+                    if attempt > 0 {
+                        tracing::info!(
+                            "execute_via_generator succeeded on attempt {}",
+                            attempt + 1
+                        );
+                    }
+                    return Ok(output);
+                }
                 Err(e) => {
                     let msg = e.to_string();
                     // Only retry on network errors or 5xx; 4xx are client errors, don't retry.
@@ -253,7 +261,9 @@ impl IrisConnection {
                     if !is_retryable || attempt == delays.len() - 1 {
                         return Err(e);
                     }
-                    tracing::warn!(
+                    // Transient on cold-start (private web server still warming up) — debug only;
+                    // the success path logs at info so a recovery is still visible.
+                    tracing::debug!(
                         "execute_via_generator attempt {} failed ({}), retrying in {:?}",
                         attempt + 1,
                         msg,
@@ -520,7 +530,7 @@ impl IrisConnection {
                     if !is_retryable || attempt == delays.len() - 1 {
                         return Err(e);
                     }
-                    tracing::warn!(
+                    tracing::debug!(
                         "query attempt {} failed ({}), retrying in {:?}",
                         attempt + 1,
                         msg,
@@ -608,6 +618,25 @@ impl IrisConnection {
             }
         }
         Ok(CompileResult { errors, console })
+    }
+
+    /// Short-timeout client used only for the startup probe — a down/unreachable IRIS
+    /// should fail fast (5s connect / 10s total) instead of stalling startup for the
+    /// 30s general-client timeout (issue #21, upstream #85).
+    pub fn probe_client() -> anyhow::Result<reqwest::Client> {
+        let insecure = std::env::var("IRIS_INSECURE")
+            .ok()
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or_else(|| {
+                std::env::var("IRIS_TLS_VERIFY")
+                    .map(|v| v == "false" || v == "0")
+                    .unwrap_or(false)
+            });
+        Ok(reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(10))
+            .danger_accept_invalid_certs(insecure)
+            .build()?)
     }
 
     /// Build a reqwest Client suitable for Atelier REST calls.

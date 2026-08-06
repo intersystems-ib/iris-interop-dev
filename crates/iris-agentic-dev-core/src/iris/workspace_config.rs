@@ -12,6 +12,7 @@ pub struct WorkspaceConfig {
     pub container: Option<String>,
     pub namespace: Option<String>,
     pub host: Option<String>,
+    #[serde(alias = "port")]
     pub web_port: Option<u16>,
     /// URL path prefix for the IRIS web gateway, e.g. "irisaicore" when the
     /// Atelier API is served at http://host:port/irisaicore/api/atelier/...
@@ -65,6 +66,43 @@ pub fn workspace_root(workspace_path: Option<&str>) -> PathBuf {
     }
     // If no .iris-agentic-dev.toml found but legacy .iris-dev.toml exists, use that dir.
     legacy_root.unwrap_or(cwd)
+}
+
+/// Like [`load_workspace_config`] but also returns the path of the file that was loaded,
+/// so callers can record it in `ConnectionState` at startup (issue #21, upstream #82).
+pub fn load_workspace_config_with_path(
+    workspace_path: Option<&str>,
+) -> Option<(WorkspaceConfig, std::path::PathBuf)> {
+    let root = workspace_root(workspace_path);
+    let config_path = if root.join(".iris-agentic-dev.toml").exists() {
+        root.join(".iris-agentic-dev.toml")
+    } else if root.join(".iris-dev.toml").exists() {
+        root.join(".iris-dev.toml")
+    } else {
+        return None;
+    };
+    let contents = std::fs::read_to_string(&config_path).ok()?;
+    match toml::from_str::<WorkspaceConfig>(&contents) {
+        Ok(cfg) => Some((cfg, config_path)),
+        Err(_) => None,
+    }
+}
+
+/// Like [`apply_workspace_config`] but also returns the path of the config file that was
+/// loaded, so callers can record it in `ConnectionState` at startup rather than only
+/// after the first hot-reload cycle.
+pub fn apply_workspace_config_with_path(
+    explicit: Option<IrisConnection>,
+    workspace_path: Option<&str>,
+    namespace: &str,
+) -> (Option<IrisConnection>, Option<std::path::PathBuf>) {
+    if explicit.is_some() {
+        return (explicit, None);
+    }
+    match load_workspace_config_with_path(workspace_path) {
+        Some((cfg, path)) => (workspace_config_to_connection(&cfg, namespace), Some(path)),
+        None => (None, None),
+    }
 }
 
 /// Load `.iris-agentic-dev.toml` from the resolved workspace root.
@@ -163,9 +201,20 @@ pub fn workspace_config_to_connection(
             .or_else(|| std::env::var("IRIS_PASSWORD").ok())
             .unwrap_or_else(|| "SYS".to_string());
         // If container is also specified alongside host, update IRIS_CONTAINER so docker
-        // exec tools (iris_execute fallback, iris_test, etc.) target the right container.
+        // exec tools (iris_execute fallback, iris_test, etc.) target the right container,
+        // and use DiscoverySource::Docker so check_config exposes the container name
+        // instead of reporting container: null (issue #21, upstream #89).
         if let Some(ref container) = cfg.container {
             std::env::set_var("IRIS_CONTAINER", container);
+            return Some(IrisConnection::new(
+                base_url,
+                namespace,
+                username,
+                password,
+                DiscoverySource::Docker {
+                    container_name: container.clone(),
+                },
+            ));
         }
         return Some(IrisConnection::new(
             base_url,
@@ -280,6 +329,63 @@ namespace = "{namespace}"
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── issue #21: config path threading + Docker source ─────────────────────
+    #[test]
+    fn apply_with_path_returns_loaded_path_and_none_when_explicit() {
+        use crate::iris::connection::DiscoverySource;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".iris-agentic-dev.toml"),
+            "host = \"path-host\"\nweb_port = 52773\n",
+        )
+        .unwrap();
+        let ws = dir.path().to_str().unwrap();
+
+        let (conn, path) = apply_workspace_config_with_path(None, Some(ws), "USER");
+        let conn = conn.expect("connection from config");
+        assert!(conn.base_url.contains("path-host"));
+        assert!(
+            path.expect("config path")
+                .ends_with(".iris-agentic-dev.toml"),
+            "returned path must point at the loaded file"
+        );
+
+        // Explicit connection wins and returns no path.
+        let explicit = IrisConnection::new(
+            "http://explicit:52773",
+            "USER",
+            "_SYSTEM",
+            "SYS",
+            DiscoverySource::EnvVar,
+        );
+        let (conn, path) = apply_workspace_config_with_path(Some(explicit), Some(ws), "USER");
+        assert!(conn.unwrap().base_url.contains("explicit"));
+        assert!(path.is_none());
+    }
+
+    #[test]
+    fn host_plus_container_reports_docker_source() {
+        use crate::iris::connection::DiscoverySource;
+        let cfg = WorkspaceConfig {
+            host: Some("localhost".into()),
+            container: Some("my-iris".into()),
+            ..Default::default()
+        };
+        let conn = workspace_config_to_connection(&cfg, "USER").expect("connection");
+        match conn.source {
+            DiscoverySource::Docker { ref container_name } => {
+                assert_eq!(container_name, "my-iris")
+            }
+            ref other => panic!("expected Docker source exposing the container, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn web_port_accepts_port_alias() {
+        let cfg: WorkspaceConfig = toml::from_str("host = \"h\"\nport = 43080\n").unwrap();
+        assert_eq!(cfg.web_port, Some(43080));
+    }
 
     #[test]
     fn toml_template_native_section_before_container() {
