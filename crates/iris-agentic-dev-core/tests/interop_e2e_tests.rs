@@ -523,6 +523,63 @@ fn test_namespace_default_and_interop_hint() {
 }
 
 #[test]
+#[ignore = "requires live IRIS"]
+fn test_execute_and_query_namespace_defaults_to_connection() {
+    // Issue #15: iris_execute (and the other general tools) with no `namespace`
+    // argument ran in a hardcoded USER — never the server's configured
+    // IRIS_NAMESPACE — and succeeded silently against the wrong database.
+    let iris_host = std::env::var("IRIS_HOST").unwrap_or_default();
+    assert!(!iris_host.is_empty(), "IRIS_HOST must be set");
+    let conn_ns = std::env::var("IRIS_NAMESPACE").unwrap_or_else(|_| "USER".to_string());
+    assert_ne!(
+        conn_ns, "USER",
+        "run with IRIS_NAMESPACE pointing at a non-USER namespace"
+    );
+
+    let exchange = |args: serde_json::Value, tool: &str| {
+        let responses = mcp_exchange(&[
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
+            serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":tool,"arguments":args}}),
+        ]);
+        find_response(&responses, 2).expect("no response")
+    };
+
+    // 1. iris_execute without namespace → runs in the connection namespace,
+    //    and the response names the namespace it ran in.
+    let v = parse_tool_text(&exchange(
+        serde_json::json!({"code":"WRITE $NAMESPACE"}),
+        "iris_execute",
+    ));
+    assert_eq!(v["success"], true, "{v}");
+    assert_eq!(
+        v["output"],
+        conn_ns.as_str(),
+        "iris_execute ran in the wrong namespace: {v}"
+    );
+    assert_eq!(
+        v["namespace"],
+        conn_ns.as_str(),
+        "response must name the namespace it ran in: {v}"
+    );
+
+    // 2. iris_query without namespace → connection namespace too. The probe
+    //    class Ens.Director exists in the (interop-enabled) connection
+    //    namespace and not in USER, so the count distinguishes them.
+    let v = parse_tool_text(&exchange(
+        serde_json::json!({"query":"SELECT COUNT(*) AS n FROM %Dictionary.CompiledClass WHERE Name = 'Ens.Director'"}),
+        "iris_query",
+    ));
+    assert_eq!(v["success"], true, "{v}");
+    assert_eq!(v["namespace"], conn_ns.as_str(), "{v}");
+    let n = v["rows"][0]["n"]
+        .as_i64()
+        .or_else(|| v["rows"][0]["n"].as_str().and_then(|s| s.parse().ok()))
+        .unwrap_or(-1);
+    assert_eq!(n, 1, "iris_query ran in the wrong namespace: {v}");
+}
+
+#[test]
 #[ignore = "requires live IRIS with Interoperability"]
 fn test_error_envelope_and_is_error_flag() {
     // Issue #2: genuine tool failures must set isError on the CallToolResult

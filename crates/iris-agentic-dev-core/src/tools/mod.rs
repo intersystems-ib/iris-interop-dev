@@ -689,8 +689,8 @@ pub struct CompileParams {
     pub target: String,
     #[serde(default = "default_flags")]
     pub flags: String,
-    #[serde(default = "default_namespace")]
-    pub namespace: String,
+    #[serde(default)]
+    pub namespace: Option<String>,
     #[serde(default)]
     pub force_writable: bool,
     /// If true, bypass the log store and return all errors/warnings inline regardless of count.
@@ -700,8 +700,8 @@ pub struct CompileParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct TestParams {
     pub pattern: String,
-    #[serde(default = "default_namespace")]
-    pub namespace: String,
+    #[serde(default)]
+    pub namespace: Option<String>,
     #[serde(default = "default_test_timeout")]
     pub timeout: u64,
 }
@@ -714,14 +714,14 @@ pub struct SymbolsParams {
     pub query: String,
     #[serde(default = "default_limit")]
     pub limit: usize,
-    #[serde(default = "default_namespace")]
-    pub namespace: String,
+    #[serde(default)]
+    pub namespace: Option<String>,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct IntrospectParams {
     pub class_name: String,
-    #[serde(default = "default_namespace")]
-    pub namespace: String,
+    #[serde(default)]
+    pub namespace: Option<String>,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DebugMapParams {
@@ -731,22 +731,22 @@ pub struct DebugMapParams {
     pub offset: i64,
     #[serde(default)]
     pub error_string: String,
-    #[serde(default = "default_namespace")]
-    pub namespace: String,
+    #[serde(default)]
+    pub namespace: Option<String>,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GenerateClassParams {
     pub description: String,
     #[serde(default)]
     pub overwrite: bool,
-    #[serde(default = "default_namespace")]
-    pub namespace: String,
+    #[serde(default)]
+    pub namespace: Option<String>,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GenerateTestParams {
     pub class_name: String,
-    #[serde(default = "default_namespace")]
-    pub namespace: String,
+    #[serde(default)]
+    pub namespace: Option<String>,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SkillNameParams {
@@ -785,13 +785,13 @@ fn default_symbols_local_limit() -> usize {
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CapturePacketParams {
-    #[serde(default = "default_namespace")]
-    pub namespace: String,
+    #[serde(default)]
+    pub namespace: Option<String>,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ErrorLogsParams {
-    #[serde(default = "default_namespace")]
-    pub namespace: String,
+    #[serde(default)]
+    pub namespace: Option<String>,
     #[serde(default = "default_max_entries")]
     pub max_entries: usize,
     /// If true, bypass the log store and return all entries inline regardless of count.
@@ -824,14 +824,14 @@ pub struct SourceMapParams {
     #[serde(default)]
     pub cls_text: Option<String>,
     pub workspace_path: Option<String>,
-    #[serde(default = "default_namespace")]
-    pub namespace: String,
+    #[serde(default)]
+    pub namespace: Option<String>,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ExecuteParams {
     pub code: String,
-    #[serde(default = "default_namespace")]
-    pub namespace: String,
+    #[serde(default)]
+    pub namespace: Option<String>,
     #[serde(default = "default_execute_timeout")]
     pub timeout: u64,
     #[serde(default)]
@@ -850,8 +850,8 @@ pub struct QueryParams {
     /// Query parameters as strings (e.g. ["Alice", "42"])
     #[serde(default)]
     pub parameters: Vec<String>,
-    #[serde(default = "default_namespace")]
-    pub namespace: String,
+    #[serde(default)]
+    pub namespace: Option<String>,
     /// If true, bypass SQL safety validation. Use only for intentional administrative queries.
     /// Has no effect on production IRIS instances (where write tools are disabled).
     #[serde(default)]
@@ -864,8 +864,8 @@ pub struct ListContainersParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SelectContainerParams {
     pub name: String,
-    #[serde(default = "default_namespace")]
-    pub namespace: String,
+    #[serde(default)]
+    pub namespace: Option<String>,
     #[serde(default = "default_username")]
     pub username: String,
     #[serde(default = "default_password")]
@@ -881,9 +881,6 @@ pub struct StartSandboxParams {
 
 fn default_flags() -> String {
     "cuk".to_string()
-}
-fn default_namespace() -> String {
-    "USER".to_string()
 }
 fn default_limit() -> usize {
     20
@@ -1844,7 +1841,8 @@ impl IrisTools {
         Parameters(p): Parameters<CompileParams>,
     ) -> Result<CallToolResult, McpError> {
         let iris = self.get_iris_reloaded().await?;
-        tracing::info!(namespace = %p.namespace, target = %p.target, "iris_compile");
+        let namespace = interop::resolve_namespace(p.namespace.as_deref(), Some(&iris));
+        tracing::info!(namespace = %namespace, target = %p.target, "iris_compile");
         let client = self.http_client();
 
         // Local file path support: if target looks like a file path (contains / or \,
@@ -1878,7 +1876,7 @@ impl IrisTools {
                     });
                 // Upload via Atelier PUT
                 let put_url = iris.versioned_ns_url(
-                    &p.namespace,
+                    &namespace,
                     &format!("/doc/{}?ignoreConflict=1", urlencoding::encode(&doc_name)),
                 );
                 let lines: Vec<&str> = content.lines().collect();
@@ -1909,7 +1907,7 @@ impl IrisTools {
                 // Compile via shared compile_document helper
                 let local_src = p.target.clone();
                 let cr = iris
-                    .compile_document(&doc_name, &p.namespace, &p.flags, client)
+                    .compile_document(&doc_name, &namespace, &p.flags, client)
                     .await
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
                 let errors: Vec<serde_json::Value> = cr
@@ -1929,7 +1927,7 @@ impl IrisTools {
                     "target": doc_name,
                     "uploaded_from": local_src,
                     "targets_compiled": 1,
-                    "namespace": p.namespace,
+                    "namespace": namespace,
                     "errors": errors,
                     "warnings": [],
                     "console": console,
@@ -1938,9 +1936,9 @@ impl IrisTools {
         }
 
         // Expand wildcards: resolve "MyApp.*.cls" to a list of matching class names.
-        // Bug 8: use p.namespace (not iris.namespace) and the correct /docnames/CLS endpoint.
+        // Bug 8: use namespace (not iris.namespace) and the correct /docnames/CLS endpoint.
         let targets: Vec<String> = if p.target.contains('*') {
-            let list_url = iris.versioned_ns_url(&p.namespace, "/docnames/CLS");
+            let list_url = iris.versioned_ns_url(&namespace, "/docnames/CLS");
             match client
                 .get(&list_url)
                 .basic_auth(&iris.username, Some(&iris.password))
@@ -1979,15 +1977,15 @@ impl IrisTools {
         if p.force_writable {
             let code = format!(
                 "do ##class(%Library.EnsembleMgr).EnableNamespace(\"{}\",1)",
-                p.namespace
+                namespace
             );
-            let _ = iris.execute(&code, &p.namespace).await;
+            let _ = iris.execute(&code, &namespace).await;
         }
 
         // Atelier compile: POST with JSON array of document names (with extensions)
         // e.g. ["MyApp.Patient.cls", "MyApp.Utils.cls"]
         let compile_url = iris.versioned_ns_url(
-            &p.namespace,
+            &namespace,
             &format!("/action/compile?flags={}", urlencoding::encode(&p.flags)),
         );
 
@@ -2107,8 +2105,8 @@ impl IrisTools {
 
         // Write open hint for single non-wildcard successful compile
         let open_uri = if success && !p.target.contains('*') && targets.len() == 1 {
-            write_open_hint(&p.namespace, &p.target);
-            Some(format!("isfs://{}/{}", p.namespace, p.target))
+            write_open_hint(&namespace, &p.target);
+            Some(format!("isfs://{}/{}", namespace, p.target))
         } else {
             None
         };
@@ -2117,7 +2115,7 @@ impl IrisTools {
             "success": success,
             "target": p.target,
             "targets_compiled": targets.len(),
-            "namespace": p.namespace,
+            "namespace": namespace,
             "errors": errors,
             "warnings": warnings,
             "console": console,
@@ -2156,7 +2154,7 @@ impl IrisTools {
         &self,
         Parameters(p): Parameters<TestParams>,
     ) -> Result<CallToolResult, McpError> {
-        tracing::info!(namespace = %p.namespace, pattern = %p.pattern, "iris_test");
+        tracing::info!(requested_namespace = ?p.namespace, pattern = %p.pattern, "iris_test");
         let timeout = std::time::Duration::from_secs(p.timeout);
 
         // HTTP path only — docker exec path removed (#46: /noload/run assumed pre-loaded
@@ -2166,12 +2164,13 @@ impl IrisTools {
         // present and docker-exec succeeds, else "http" (Atelier REST). Set below.
         let mut path_label = "http";
         let iris = self.get_iris()?;
+        let namespace = interop::resolve_namespace(p.namespace.as_deref(), Some(&iris));
         let client = self.http_client();
 
         // US3: namespace existence check before running tests.
         let ns_check_code = format!(
             "write ##class(%SYS.Namespace).Exists(\"{}\")",
-            p.namespace.replace('"', "\\\"")
+            namespace.replace('"', "\\\"")
         );
         let ns_exists = tokio::time::timeout(
             std::time::Duration::from_secs(10),
@@ -2189,9 +2188,9 @@ impl IrisTools {
                 ERR_NAMESPACE_NOT_FOUND,
                 &format!(
                     "Namespace '{}' does not exist on this IRIS instance",
-                    p.namespace
+                    namespace
                 ),
-                serde_json::json!({"namespace": p.namespace}),
+                serde_json::json!({"namespace": namespace}),
             );
         }
 
@@ -2260,7 +2259,7 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
             iris.query(
                 "SELECT MAX(ID) AS m FROM %UnitTest_Result.TestInstance",
                 vec![],
-                &p.namespace,
+                &namespace,
                 client,
             ),
         )
@@ -2289,7 +2288,7 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
 
         let run_output = if has_container {
             // Docker exec: full filesystem access, captures terminal output from RunTest
-            match tokio::time::timeout(timeout, iris.execute(&run_code, &p.namespace)).await {
+            match tokio::time::timeout(timeout, iris.execute(&run_code, &namespace)).await {
                 Err(_) => {
                     self.record_call("iris_test", false);
                     return envelope::fail(
@@ -2301,7 +2300,7 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
                     // Docker exec unavailable — fall through to HTTP
                     match tokio::time::timeout(
                         timeout,
-                        iris.execute_via_generator(&run_code, &p.namespace, client),
+                        iris.execute_via_generator(&run_code, &namespace, client),
                     )
                     .await
                     {
@@ -2324,7 +2323,7 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
             // HTTP path: works for remote IRIS without docker
             match tokio::time::timeout(
                 timeout,
-                iris.execute_via_generator(&run_code, &p.namespace, client),
+                iris.execute_via_generator(&run_code, &namespace, client),
             )
             .await
             {
@@ -2374,7 +2373,7 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
             );
             if let Ok(Ok(body)) = tokio::time::timeout(
                 std::time::Duration::from_secs(10),
-                iris.query(&read_sql, vec![], &p.namespace, client),
+                iris.query(&read_sql, vec![], &namespace, client),
             )
             .await
             {
@@ -2535,7 +2534,7 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
             let probe_sql = "SELECT TOP 25 Name FROM %Dictionary.CompiledClass WHERE PrimarySuper LIKE '%UnitTest.TestCase%' AND Name NOT LIKE 'EnsLib.%' AND Name NOT LIKE 'HS.%' AND Name NOT LIKE 'Ens.%' AND Name NOT LIKE '\\%%' ESCAPE '\\' ORDER BY Name";
             let candidates: Vec<String> = match tokio::time::timeout(
                 std::time::Duration::from_secs(10),
-                iris.query(probe_sql, vec![], &p.namespace, client),
+                iris.query(probe_sql, vec![], &namespace, client),
             )
             .await
             {
@@ -2552,9 +2551,9 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
                 _ => vec![],
             };
             let hint = if candidates.is_empty() {
-                format!("No compiled %UnitTest.TestCase classes were found in namespace '{}'. Your test class must Extend %UnitTest.TestCase and be compiled. Compile it first (iris_compile), or pass a directory path to load .cls from disk.", p.namespace)
+                format!("No compiled %UnitTest.TestCase classes were found in namespace '{}'. Your test class must Extend %UnitTest.TestCase and be compiled. Compile it first (iris_compile), or pass a directory path to load .cls from disk.", namespace)
             } else {
-                format!("Pattern '{}' matched no runnable tests, but {} compiled %UnitTest.TestCase class(es) exist in '{}': {}. Pass one of these as the pattern (class names use /noload automatically), or a directory path to load from disk.", p.pattern, candidates.len(), p.namespace, candidates.join(", "))
+                format!("Pattern '{}' matched no runnable tests, but {} compiled %UnitTest.TestCase class(es) exist in '{}': {}. Pass one of these as the pattern (class names use /noload automatically), or a directory path to load from disk.", p.pattern, candidates.len(), namespace, candidates.join(", "))
             };
             // Issue #2: NO_TESTS_FOUND is a genuine tool failure (nothing ran),
             // unlike a red run below, which is a valid result and stays non-error.
@@ -2565,7 +2564,7 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
                     "hint": hint,
                     "candidates": candidates,
                     "pattern": p.pattern,
-                    "namespace": p.namespace,
+                    "namespace": namespace,
                     "total": 0,
                     "passed": 0,
                     "failed": 0,
@@ -2636,20 +2635,21 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
             "path": path_label,
             "log_id": log_id,
             "pattern": p.pattern,
-            "namespace": p.namespace,
+            "namespace": namespace,
             "test_suites": test_suites,
         }))
     }
 
     #[tool(
-        description = "Execute arbitrary ObjectScript code on IRIS and return stdout. Uses pure-HTTP execution via CodeMode=objectgenerator (write temp class, compile, query result, delete). Falls back to docker exec if IRIS_CONTAINER env var is set and HTTP fails. &sql(...) embedded SQL macros are automatically translated to %SQL.Statement calls (set translate_sql: false to disable). When translation fires, response includes sql_translated: true and translated_code. Example: code='write $ZVERSION,!' returns the IRIS version string. Use this for side-effecting ObjectScript only — for SELECTs use iris_query, for class/table introspection use docs_introspect/iris_symbols/iris_table_info, for production state use iris_production/iris_interop_query, and to create+compile a class use iris_doc(put,compile) over Atelier (never $SYSTEM.OBJ.Load from a file path — that needs IRIS to share this host's disk). When the code matches one of those, the response includes a `hint` naming the typed tool."
+        description = "Execute arbitrary ObjectScript code on IRIS and return stdout. Uses pure-HTTP execution via CodeMode=objectgenerator (write temp class, compile, query result, delete). Falls back to docker exec if IRIS_CONTAINER env var is set and HTTP fails. &sql(...) embedded SQL macros are automatically translated to %SQL.Statement calls (set translate_sql: false to disable). When translation fires, response includes sql_translated: true and translated_code. Example: code='write $ZVERSION,!' returns the IRIS version string. Use this for side-effecting ObjectScript only — for SELECTs use iris_query, for class/table introspection use docs_introspect/iris_symbols/iris_table_info, for production state use iris_production/iris_interop_query, and to create+compile a class use iris_doc(put,compile) over Atelier (never $SYSTEM.OBJ.Load from a file path — that needs IRIS to share this host's disk). When the code matches one of those, the response includes a `hint` naming the typed tool. namespace: optional — defaults to the connection namespace (IRIS_NAMESPACE), never a hardcoded USER; the response echoes the namespace it ran in."
     )]
     async fn iris_execute(
         &self,
         Parameters(p): Parameters<ExecuteParams>,
     ) -> Result<CallToolResult, McpError> {
         let iris = self.get_iris_reloaded().await?;
-        tracing::info!(namespace = %p.namespace, translate_sql = p.translate_sql, "iris_execute");
+        let namespace = interop::resolve_namespace(p.namespace.as_deref(), Some(&iris));
+        tracing::info!(namespace = %namespace, translate_sql = p.translate_sql, "iris_execute");
         let client = self.http_client();
         let timeout = std::time::Duration::from_secs(p.timeout);
 
@@ -2674,7 +2674,7 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
         // Try pure-HTTP execution first (write-compile-query via CodeMode=objectgenerator).
         let gen_result = tokio::time::timeout(
             timeout,
-            iris.execute_via_generator(code_to_run, &p.namespace, client),
+            iris.execute_via_generator(code_to_run, &namespace, client),
         )
         .await;
 
@@ -2695,7 +2695,7 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
                 let mut resp = serde_json::json!({
                     "success": !is_runtime_error,
                     "output": trimmed,
-                    "namespace": p.namespace,
+                    "namespace": namespace,
                     "method": "http",
                 });
                 if is_runtime_error {
@@ -2748,7 +2748,7 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
 
         // Fallback: docker exec (requires IRIS_CONTAINER env var).
         let docker_result =
-            tokio::time::timeout(timeout, iris.execute(code_to_run, &p.namespace)).await;
+            tokio::time::timeout(timeout, iris.execute(code_to_run, &namespace)).await;
         match docker_result {
             Err(_) => {
                 self.record_call("iris_execute", false);
@@ -2777,7 +2777,7 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
                 let mut resp = serde_json::json!({
                     "success": !is_runtime_error,
                     "output": trimmed,
-                    "namespace": p.namespace,
+                    "namespace": namespace,
                     "method": "docker",
                 });
                 if is_runtime_error {
@@ -2819,7 +2819,8 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
         Parameters(p): Parameters<IrisDocParams>,
     ) -> Result<CallToolResult, McpError> {
         let iris = self.get_iris_reloaded().await?;
-        tracing::info!(namespace = %p.namespace, "iris_doc");
+        let namespace = interop::resolve_namespace(p.namespace.as_deref(), Some(&iris));
+        tracing::info!(namespace = %namespace, "iris_doc");
         let client = self.http_client();
         let result = doc::handle_iris_doc(&iris, client, p, &self.elicitation_store).await;
         self.record_call("iris_doc", Self::call_ok(&result));
@@ -2827,13 +2828,13 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
     }
 
     #[tool(
-        description = "Execute a SQL SELECT query on IRIS via Atelier REST. Returns rows as a JSON array with column names as keys. By default, destructive SQL (DROP, DELETE, INSERT, UPDATE, ALTER, CREATE, MERGE, TRUNCATE, EXEC, EXECUTE, BULK, LOAD, KILL, LOCK, SELECT INTO) is blocked before reaching IRIS. Set force: true to bypass validation for intentional administrative queries — has no effect on production instances where write tools are disabled. For table/column discovery call iris_table_info first instead of guessing system tables; ObjectScript (set/write/do/##class/&sql/^globals) must use iris_execute, not iris_query. No Python required."
+        description = "Execute a SQL SELECT query on IRIS via Atelier REST. Returns rows as a JSON array with column names as keys. By default, destructive SQL (DROP, DELETE, INSERT, UPDATE, ALTER, CREATE, MERGE, TRUNCATE, EXEC, EXECUTE, BULK, LOAD, KILL, LOCK, SELECT INTO) is blocked before reaching IRIS. Set force: true to bypass validation for intentional administrative queries — has no effect on production instances where write tools are disabled. For table/column discovery call iris_table_info first instead of guessing system tables; ObjectScript (set/write/do/##class/&sql/^globals) must use iris_execute, not iris_query. No Python required. namespace: optional — defaults to the connection namespace (IRIS_NAMESPACE), never a hardcoded USER; the response echoes the namespace it ran in."
     )]
     async fn iris_query(
         &self,
         Parameters(p): Parameters<QueryParams>,
     ) -> Result<CallToolResult, McpError> {
-        tracing::info!(namespace = %p.namespace, force = p.force, "iris_query");
+        tracing::info!(requested_namespace = ?p.namespace, force = p.force, "iris_query");
 
         // Pre-flight: ObjectScript typed into a SQL tool — fail fast with a clear redirect
         // (28/447 workshop iris_query calls were ObjectScript, not SQL).
@@ -2875,8 +2876,9 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
         }
 
         let iris = self.get_iris_reloaded().await?;
+        let namespace = interop::resolve_namespace(p.namespace.as_deref(), Some(&iris));
         let client = self.http_client();
-        let query_url = iris.versioned_ns_url(&p.namespace, "/action/query");
+        let query_url = iris.versioned_ns_url(&namespace, "/action/query");
         let resp = client
             .post(&query_url)
             .basic_auth(&iris.username, Some(&iris.password))
@@ -2928,7 +2930,7 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
             .unwrap_or_default();
         let count = rows.len();
         self.record_call("iris_query", true);
-        let mut resp = serde_json::json!({"success": true, "rows": rows, "count": count, "namespace": p.namespace});
+        let mut resp = serde_json::json!({"success": true, "rows": rows, "count": count, "namespace": namespace});
         if !sql_warnings.is_empty() {
             resp["warnings"] = serde_json::Value::Array(
                 sql_warnings
@@ -3067,6 +3069,8 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
     ) -> Result<CallToolResult, McpError> {
         self.check_reload().await;
         let workspace_basename = String::new();
+        let namespace =
+            interop::resolve_namespace(p.namespace.as_deref(), self.iris_arc().as_deref());
 
         let containers = list_iris_containers(&workspace_basename).await;
         let found = containers
@@ -3094,7 +3098,7 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
 
         let mut new_conn = crate::iris::connection::IrisConnection::new(
             &base_url,
-            &p.namespace,
+            &namespace,
             &p.username,
             &p.password,
             crate::iris::connection::DiscoverySource::Docker {
@@ -3132,7 +3136,7 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
             "container": p.name,
             "port_superserver": port_superserver,
             "port_web": port_web,
-            "namespace": p.namespace,
+            "namespace": namespace,
             "version": version,
             "write_tools_enabled": write_tools_enabled,
         }))
@@ -3328,7 +3332,8 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
         let iris = self.get_iris_reloaded().await?;
         let client = self.http_client();
         let (sql, params) = translate_symbols_query(p.limit, &p.query);
-        match iris.query(&sql, params, &p.namespace, client).await {
+        let namespace = interop::resolve_namespace(p.namespace.as_deref(), Some(&iris));
+        match iris.query(&sql, params, &namespace, client).await {
             Ok(resp) => ok_json(serde_json::json!({
                 "source": "iris_dictionary",
                 "symbols": resp["result"]["content"],
@@ -3400,17 +3405,18 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
         let iris = self.get_iris_reloaded().await?;
         let client = self.http_client();
         // Bug 15: use parameterized queries instead of manual string escaping.
+        let namespace = interop::resolve_namespace(p.namespace.as_deref(), Some(&iris));
         let methods = iris.query(
             "SELECT Name,FormalSpec,ReturnType FROM %Dictionary.CompiledMethod WHERE parent=? ORDER BY Name",
             vec![serde_json::Value::String(p.class_name.clone())],
-            &p.namespace,
+            &namespace,
             client,
         ).await.unwrap_or_default();
         let props = iris
             .query(
                 "SELECT Name,Type FROM %Dictionary.CompiledProperty WHERE parent=? ORDER BY Name",
                 vec![serde_json::Value::String(p.class_name.clone())],
-                &p.namespace,
+                &namespace,
                 client,
             )
             .await
@@ -3434,13 +3440,14 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
             }
         }
         let iris = self.get_iris_reloaded().await?;
+        let namespace = interop::resolve_namespace(p.namespace.as_deref(), Some(&iris));
         let _client = self.http_client();
         let code = format!(
             "Write ##class(%Studio.Debugger).SourceLine(\"{}\",{})",
             p.routine.replace('"', "\\\""),
             p.offset
         );
-        match iris.execute(&code, &p.namespace).await {
+        match iris.execute(&code, &namespace).await {
             Ok(raw) => {
                 let (cls_name, cls_line) = parse_source_line(raw.trim());
                 ok_json(
@@ -3461,8 +3468,9 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
         Parameters(_p): Parameters<CapturePacketParams>,
     ) -> Result<CallToolResult, McpError> {
         let iris = self.get_iris_reloaded().await?;
+        let namespace = interop::resolve_namespace(_p.namespace.as_deref(), Some(&iris));
         let client = self.http_client();
-        match iris.query("SELECT TOP 20 ErrorCode,ErrorText,TimeStamp FROM %SYSTEM.Error ORDER BY TimeStamp DESC", vec![], &_p.namespace, client).await {
+        match iris.query("SELECT TOP 20 ErrorCode,ErrorText,TimeStamp FROM %SYSTEM.Error ORDER BY TimeStamp DESC", vec![], &namespace, client).await {
             Ok(resp) => ok_json(serde_json::json!({"success": true, "errors": resp["result"]["content"]})),
             Err(e) => {
                 let msg = e.to_string();
@@ -3484,9 +3492,10 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
         let iris = self.get_iris_reloaded().await?;
         let client = self.http_client();
         // FR-012: cap max_entries to prevent runaway queries.
+        let namespace = interop::resolve_namespace(p.namespace.as_deref(), Some(&iris));
         let max_entries = p.max_entries.min(1000);
         let sql = format!("SELECT TOP {} ErrorCode,ErrorText,TimeStamp FROM %SYSTEM.Error ORDER BY TimeStamp DESC", max_entries);
-        match iris.query(&sql, vec![], &p.namespace, client).await {
+        match iris.query(&sql, vec![], &namespace, client).await {
             Ok(resp) => {
                 let mut result =
                     serde_json::json!({"success": true, "logs": resp["result"]["content"]});
@@ -3528,13 +3537,14 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
         let iris = self.get_iris_reloaded().await?;
         let _client = self.http_client();
         let cls_name = p.cls_name.trim_end_matches(".cls");
+        let namespace = interop::resolve_namespace(p.namespace.as_deref(), Some(&iris));
         // Build source map by querying %Studio.Debugger for each .INT method
         let code = format!(
             "set cls=\"{}\" set rtn=$translate(cls,\".\",\".\") set map=\"{{\" set first=1 set method=\"\" for {{ set method=$order(^rIndex(rtn,method)) quit:method=\"\"  set intline=$get(^rIndex(rtn,method)) if 'first {{ set map=map_\",\" }} set map=map_\"\\\"\"_method_\"\\\":\\\"\"_intline_\"\\\"\" set first=0 }} set map=map_\"}}\" write map",
             cls_name.replace('"', "\\\"")
         );
-        // Bug 23: use p.namespace, not the hardcoded "USER".
-        match iris.execute(&code, &p.namespace).await {
+        // Bug 23: use namespace, not the hardcoded "USER".
+        match iris.execute(&code, &namespace).await {
             Ok(output) => {
                 let map: serde_json::Value =
                     serde_json::from_str(output.trim()).unwrap_or(serde_json::json!({}));
@@ -3589,12 +3599,13 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
 
         if let Some(iris) = self.iris_arc().as_deref() {
             let _client = self.http_client();
+            let namespace = interop::resolve_namespace(p.namespace.as_deref(), Some(iris));
             let code = format!(
                 "Set sc=$SYSTEM.OBJ.Compile(\"{}\",\"ck-d\") Write $System.Status.IsOK(sc)",
                 class_name
             );
             let compile_ok = iris
-                .execute(&code, &p.namespace)
+                .execute(&code, &namespace)
                 .await
                 .map(|o| o.trim() == "1")
                 .unwrap_or(false);
@@ -3619,7 +3630,7 @@ Original: {}",
                         fixed_name
                     );
                     let ok2 = iris
-                        .execute(&code2, &p.namespace)
+                        .execute(&code2, &namespace)
                         .await
                         .map(|o| o.trim() == "1")
                         .unwrap_or(false);
@@ -3655,12 +3666,13 @@ Original: {}",
         })?;
 
         let introspection_context = if let Some(iris) = self.iris_arc().as_deref() {
+            let namespace = interop::resolve_namespace(p.namespace.as_deref(), Some(iris));
             let client = self.http_client();
             // FR-001/C1: use parameterized query to prevent SQL injection via class_name.
             iris.query(
                 "SELECT Name,FormalSpec,ReturnType FROM %Dictionary.CompiledMethod WHERE parent=? ORDER BY Name",
                 vec![serde_json::Value::String(p.class_name.clone())],
-                &p.namespace,
+                &namespace,
                 client,
             )
                 .await
@@ -4521,7 +4533,7 @@ Methods:
             "select" => {
                 let params = SelectContainerParams {
                     name: name.unwrap_or_default(),
-                    namespace: default_namespace(),
+                    namespace: None,
                     username: default_username(),
                     password: default_password(),
                 };

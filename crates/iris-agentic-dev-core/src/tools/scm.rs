@@ -13,9 +13,6 @@ fn ok_json(v: serde_json::Value) -> Result<rmcp::model::CallToolResult, rmcp::Er
 fn err_json(code: &str, msg: &str) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
     crate::tools::envelope::fail(code, msg)
 }
-fn default_namespace() -> String {
-    "USER".to_string()
-}
 
 /// Known menu item names to probe via OnMenuItem.
 pub const KNOWN_MENU_ITEMS: &[&str] = &[
@@ -38,8 +35,8 @@ pub struct ScmParams {
     /// Elicitation resume answer
     pub answer: Option<String>,
     pub elicitation_id: Option<String>,
-    #[serde(default = "default_namespace")]
-    pub namespace: String,
+    #[serde(default)]
+    pub namespace: Option<String>,
 }
 
 async fn xecute(
@@ -76,8 +73,9 @@ pub async fn handle_iris_source_control(
     p: ScmParams,
     elicitation_store: &ElicitationStore,
 ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+    let namespace = crate::tools::interop::resolve_namespace(p.namespace.as_deref(), Some(iris));
     let doc = p.document.as_deref().unwrap_or("");
-    let ns = &p.namespace;
+    let ns = &namespace;
 
     // Handle elicitation resume
     if let (Some(eid), Some(answer)) = (&p.elicitation_id, &p.answer) {

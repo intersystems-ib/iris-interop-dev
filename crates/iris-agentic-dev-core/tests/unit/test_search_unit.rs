@@ -7,8 +7,8 @@ fn test_search_params_minimal() {
     let p: SearchParams = serde_json::from_str(r#"{"query": "test"}"#).unwrap();
     assert_eq!(p.query, "test");
     // namespace defaults to "USER"
-    assert_eq!(p.namespace, "USER");
-    // bool fields default to false
+    assert_eq!(p.namespace, None); // omitted -> resolved to the connection namespace at call time
+                                   // bool fields default to false
     assert!(!p.regex);
     assert!(!p.case_sensitive);
     // optional fields default to empty/None
@@ -30,7 +30,7 @@ fn test_search_params_full() {
     )
     .unwrap();
     assert_eq!(p.query, "Director");
-    assert_eq!(p.namespace, "USER");
+    assert_eq!(p.namespace, None); // omitted -> resolved to the connection namespace at call time
     assert!(p.regex);
     assert!(!p.case_sensitive);
     assert_eq!(p.category.as_deref(), Some("CLS"));
@@ -49,7 +49,7 @@ fn test_search_params_case_sensitive_flag() {
 fn test_search_params_custom_namespace() {
     let p: SearchParams =
         serde_json::from_str(r#"{"query": "foo", "namespace": "IRISAPP"}"#).unwrap();
-    assert_eq!(p.namespace, "IRISAPP");
+    assert_eq!(p.namespace.as_deref(), Some("IRISAPP"));
 }
 
 #[test]

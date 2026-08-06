@@ -9,7 +9,7 @@ mod tests {
         let p: CompileParams = serde_json::from_str(r#"{"target":"MyApp.Patient.cls"}"#).unwrap();
         assert_eq!(p.target, "MyApp.Patient.cls");
         assert_eq!(p.flags, "cuk");
-        assert_eq!(p.namespace, "USER");
+        assert_eq!(p.namespace, None); // omitted -> resolved to the connection namespace at call time
         assert!(!p.force_writable);
     }
 
@@ -28,7 +28,7 @@ mod tests {
             r#"{"target":"HS.FHIR.*.cls","flags":"cuk","namespace":"HSLIB","force_writable":true}"#,
         )
         .unwrap();
-        assert_eq!(p.namespace, "HSLIB");
+        assert_eq!(p.namespace.as_deref(), Some("HSLIB"));
         assert!(p.force_writable);
     }
 }

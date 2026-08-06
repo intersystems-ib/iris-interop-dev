@@ -30,8 +30,8 @@ pub struct IrisDocParams {
     pub names: Vec<String>,
     /// Source content (required for mode=put)
     pub content: Option<String>,
-    #[serde(default = "default_namespace")]
-    pub namespace: String,
+    #[serde(default)]
+    pub namespace: Option<String>,
     /// Elicitation resume ID (from a prior elicitation_required response)
     pub elicitation_id: Option<String>,
     /// User's answer to the elicitation question ("yes" or "no")
@@ -49,9 +49,6 @@ pub struct IrisDocParams {
     pub offset: usize,
 }
 
-fn default_namespace() -> String {
-    "USER".to_string()
-}
 use crate::iris::connection::IrisConnection;
 
 fn ok_json(v: serde_json::Value) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
@@ -144,6 +141,7 @@ async fn handle_get(
     client: &reqwest::Client,
     p: IrisDocParams,
 ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+    let namespace = crate::tools::interop::resolve_namespace(p.namespace.as_deref(), Some(iris));
     // Batch get — Bug 19: fetch concurrently instead of sequentially.
     if !p.names.is_empty() {
         // Build a fresh client for batch gets with a shorter timeout so concurrent
@@ -160,7 +158,7 @@ async fn handle_get(
         let mut set = tokio::task::JoinSet::new();
         for name in &p.names {
             let url =
-                iris.versioned_ns_url(&p.namespace, &format!("/doc/{}", urlencoding::encode(name)));
+                iris.versioned_ns_url(&namespace, &format!("/doc/{}", urlencoding::encode(name)));
             let username = iris.username.clone();
             let password = iris.password.clone();
             let name = name.clone();
@@ -198,7 +196,7 @@ async fn handle_get(
     }
 
     let name = p.name.as_deref().unwrap_or("");
-    let url = iris.versioned_ns_url(&p.namespace, &format!("/doc/{}", urlencoding::encode(name)));
+    let url = iris.versioned_ns_url(&namespace, &format!("/doc/{}", urlencoding::encode(name)));
     let resp = client
         .get(&url)
         .basic_auth(&iris.username, Some(&iris.password))
@@ -255,7 +253,8 @@ async fn handle_put(
     elicitation_store: &crate::elicitation::ElicitationStore,
 ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
     let name = p.name.as_deref().unwrap_or("");
-    let ns = &p.namespace;
+    let namespace = crate::tools::interop::resolve_namespace(p.namespace.as_deref(), Some(iris));
+    let ns = &namespace;
 
     // Elicitation resume — user answered a prior SCM dialog
     if let (Some(eid), Some(answer)) = (&p.elicitation_id, &p.elicitation_answer) {
@@ -516,13 +515,14 @@ async fn handle_delete(
     client: &reqwest::Client,
     p: IrisDocParams,
 ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+    let namespace = crate::tools::interop::resolve_namespace(p.namespace.as_deref(), Some(iris));
     // Batch delete
     if !p.names.is_empty() {
         let mut deleted = vec![];
         let mut errors = vec![];
         for name in &p.names {
             let url =
-                iris.versioned_ns_url(&p.namespace, &format!("/doc/{}", urlencoding::encode(name)));
+                iris.versioned_ns_url(&namespace, &format!("/doc/{}", urlencoding::encode(name)));
             match client
                 .delete(&url)
                 .basic_auth(&iris.username, Some(&iris.password))
@@ -542,7 +542,7 @@ async fn handle_delete(
     }
 
     let name = p.name.as_deref().unwrap_or("");
-    let url = iris.versioned_ns_url(&p.namespace, &format!("/doc/{}", urlencoding::encode(name)));
+    let url = iris.versioned_ns_url(&namespace, &format!("/doc/{}", urlencoding::encode(name)));
     let resp = client
         .delete(&url)
         .basic_auth(&iris.username, Some(&iris.password))
@@ -564,8 +564,9 @@ async fn handle_head(
     client: &reqwest::Client,
     p: IrisDocParams,
 ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+    let namespace = crate::tools::interop::resolve_namespace(p.namespace.as_deref(), Some(iris));
     let name = p.name.as_deref().unwrap_or("");
-    let url = iris.versioned_ns_url(&p.namespace, &format!("/doc/{}", urlencoding::encode(name)));
+    let url = iris.versioned_ns_url(&namespace, &format!("/doc/{}", urlencoding::encode(name)));
     let resp = client
         .head(&url)
         .basic_auth(&iris.username, Some(&iris.password))
