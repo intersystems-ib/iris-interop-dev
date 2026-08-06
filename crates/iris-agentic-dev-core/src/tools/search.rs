@@ -143,12 +143,11 @@ async fn poll_async_search(
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
         if std::time::Instant::now() > deadline {
-            return ok_json(serde_json::json!({
-                "success": false,
-                "error_code": "SEARCH_TIMEOUT",
-                "error": "Async search did not complete within 5 minutes",
-                "query": query,
-            }));
+            return crate::tools::envelope::fail_with(
+                "SEARCH_TIMEOUT",
+                "Async search did not complete within 5 minutes",
+                serde_json::json!({"query": query}),
+            );
         }
 
         let resp = client

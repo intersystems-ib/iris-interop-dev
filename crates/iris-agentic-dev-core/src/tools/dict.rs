@@ -43,7 +43,7 @@ fn ok_json(v: serde_json::Value) -> Result<rmcp::model::CallToolResult, rmcp::Er
 }
 
 fn err_json(code: &str, msg: &str) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
-    ok_json(serde_json::json!({"success": false, "error_code": code, "error": msg}))
+    crate::tools::envelope::fail(code, msg)
 }
 
 fn default_namespace() -> String {

@@ -11,7 +11,7 @@ fn ok_json(v: serde_json::Value) -> Result<rmcp::model::CallToolResult, rmcp::Er
     ]))
 }
 fn err_json(code: &str, msg: &str) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
-    ok_json(serde_json::json!({"success": false, "error_code": code, "error": msg}))
+    crate::tools::envelope::fail(code, msg)
 }
 fn default_namespace() -> String {
     "USER".to_string()
@@ -109,9 +109,7 @@ pub async fn handle_iris_source_control(
                 } else {
                     ("SCM_UNAVAILABLE", msg)
                 };
-                return ok_json(
-                    serde_json::json!({"success": false, "error_code": ec, "error": emsg}),
-                );
+                return crate::tools::envelope::fail(ec, &emsg);
             }
         };
         if out.is_empty() || out.starts_with('$') {
@@ -181,9 +179,7 @@ pub async fn handle_iris_source_control(
                     } else {
                         ("SCM_UNAVAILABLE", msg)
                     };
-                    return ok_json(
-                        serde_json::json!({"success": false, "error_code": ec, "error": emsg}),
-                    );
+                    return crate::tools::envelope::fail(ec, &emsg);
                 }
             };
             let (action_code, msg) = parse_action_msg(&out);
@@ -222,9 +218,7 @@ pub async fn handle_iris_source_control(
                     } else {
                         ("SCM_UNAVAILABLE", msg)
                     };
-                    return ok_json(
-                        serde_json::json!({"success": false, "error_code": ec, "error": emsg}),
-                    );
+                    return crate::tools::envelope::fail(ec, &emsg);
                 }
             };
             let (action_code, msg) = parse_action_msg(&out);

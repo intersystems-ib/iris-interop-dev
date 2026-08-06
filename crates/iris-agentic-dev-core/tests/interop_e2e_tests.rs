@@ -521,3 +521,95 @@ fn test_namespace_default_and_interop_hint() {
         "hint must list the interop namespaces: {r}"
     );
 }
+
+#[test]
+#[ignore = "requires live IRIS with Interoperability"]
+fn test_error_envelope_and_is_error_flag() {
+    // Issue #2: genuine tool failures must set isError on the CallToolResult
+    // and carry one envelope {success:false, error_code, error [, hint]} —
+    // 38/38 workshop failures came back unflagged, in per-tool shapes.
+    let iris_host = std::env::var("IRIS_HOST").unwrap_or_default();
+    assert!(!iris_host.is_empty(), "IRIS_HOST must be set");
+    let ns = std::env::var("IRIS_NAMESPACE").unwrap_or_else(|_| "USER".to_string());
+
+    let exchange = |args: serde_json::Value, tool: &str| {
+        let responses = mcp_exchange(&[
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
+            serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":tool,"arguments":args}}),
+        ]);
+        find_response(&responses, 2).expect("no response")
+    };
+
+    // 1. iris_query with bad SQL → isError + SQL_ERROR envelope
+    let frame = exchange(
+        serde_json::json!({"query":"SELECT COUNT(*) AS n FROM public.menus","namespace":ns}),
+        "iris_query",
+    );
+    assert_eq!(
+        frame["result"]["isError"], true,
+        "SQL failure unflagged: {frame}"
+    );
+    let v = parse_tool_text(&frame);
+    assert_eq!(v["success"], false);
+    assert_eq!(v["error_code"], "SQL_ERROR");
+    assert!(
+        !v["error"].as_str().unwrap_or("").is_empty(),
+        "message must live in `error`"
+    );
+
+    // 2. a good query stays non-error
+    let frame = exchange(
+        serde_json::json!({"query":"SELECT 1 AS one","namespace":ns}),
+        "iris_query",
+    );
+    assert_ne!(
+        frame["result"]["isError"], true,
+        "success wrongly flagged: {frame}"
+    );
+
+    // 3. iris_execute runtime error → isError, message in `error`, raw kept in `output`
+    let frame = exchange(
+        serde_json::json!({"code":"Set x=oref.Nope()","namespace":ns}),
+        "iris_execute",
+    );
+    assert_eq!(
+        frame["result"]["isError"], true,
+        "runtime error unflagged: {frame}"
+    );
+    let v = parse_tool_text(&frame);
+    assert_eq!(v["error_code"], "IRIS_RUNTIME_ERROR");
+    assert!(v["error"].as_str().unwrap_or("").contains("ERROR"), "{v}");
+    assert!(
+        v["output"].as_str().is_some(),
+        "raw output must stay as detail: {v}"
+    );
+
+    // 4. iris_doc compile failure → COMPILE_ERROR + hint + console kept (issue repro 3)
+    let broken =
+        "Class IrisDevE2E.Broken\n{\nClassMethod X()\n{\n    this is not objectscript\n}\n}\n";
+    let frame = exchange(
+        serde_json::json!({"mode":"put","name":"IrisDevE2E.Broken.cls","content":broken,"compile":true,"namespace":ns}),
+        "iris_doc",
+    );
+    assert_eq!(
+        frame["result"]["isError"], true,
+        "compile failure unflagged: {frame}"
+    );
+    let v = parse_tool_text(&frame);
+    assert_eq!(v["error_code"], "COMPILE_ERROR", "{v}");
+    assert!(!v["error"].as_str().unwrap_or("").is_empty());
+    assert!(
+        v["hint"].as_str().unwrap_or("").contains("compile_console"),
+        "{v}"
+    );
+    assert!(
+        v["compile_console"].is_array(),
+        "console must stay as detail: {v}"
+    );
+    // clean up the broken class
+    let _ = exchange(
+        serde_json::json!({"mode":"delete","name":"IrisDevE2E.Broken.cls","namespace":ns}),
+        "iris_doc",
+    );
+}

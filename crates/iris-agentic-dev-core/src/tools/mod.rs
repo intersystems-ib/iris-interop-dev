@@ -40,6 +40,7 @@ pub mod admin;
 pub mod concurrency;
 pub mod dict;
 pub mod doc;
+pub mod envelope;
 pub mod info;
 pub mod interop;
 pub mod log_store;
@@ -1067,7 +1068,7 @@ fn ok_json(v: serde_json::Value) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![Content::text(v.to_string())]))
 }
 fn err_json(code: &str, msg: &str) -> Result<CallToolResult, McpError> {
-    ok_json(serde_json::json!({"success": false, "error_code": code, "error": msg}))
+    crate::tools::envelope::fail(code, msg)
 }
 pub fn write_open_hint(namespace: &str, document: &str) {
     if let Some(home) = dirs::home_dir() {
@@ -1236,13 +1237,14 @@ fn err_json_with_url(
     msg: &str,
     attempted_url: &str,
 ) -> Result<CallToolResult, McpError> {
-    ok_json(serde_json::json!({
-        "success": false,
-        "error_code": code,
-        "error": msg,
-        "attempted_url": attempted_url,
-        "hint": "Check IRIS_HOST and IRIS_WEB_PORT (and IRIS_WEB_PREFIX if using a non-root gateway)"
-    }))
+    envelope::fail_with(
+        code,
+        msg,
+        serde_json::json!({
+            "attempted_url": attempted_url,
+            "hint": "Check IRIS_HOST and IRIS_WEB_PORT (and IRIS_WEB_PREFIX if using a non-root gateway)"
+        }),
+    )
 }
 // Bug 20: delegate to the canonical implementation in iris::discovery instead of duplicating.
 fn score_container(name: &str, workspace_basename: &str) -> i64 {
@@ -1814,6 +1816,13 @@ impl IrisTools {
     fn http_client(&self) -> &reqwest::Client {
         &self.client
     }
+    /// Issue #2: telemetry keyed on Result::is_ok() undercounted failures —
+    /// tool errors travel as Ok(CallToolResult{is_error: true}). This is the
+    /// success predicate history/stats must use.
+    fn call_ok(result: &Result<CallToolResult, McpError>) -> bool {
+        matches!(result, Ok(r) if r.is_error != Some(true))
+    }
+
     fn record_call(&self, tool: &str, success: bool) {
         if let Ok(mut h) = self.history.lock() {
             if h.len() == 50 {
@@ -2176,12 +2185,14 @@ impl IrisTools {
 
         if !ns_exists {
             self.record_call("iris_test", false);
-            return ok_json(serde_json::json!({
-                "success": false,
-                "error_code": ERR_NAMESPACE_NOT_FOUND,
-                "error": format!("Namespace '{}' does not exist on this IRIS instance", p.namespace),
-                "namespace": p.namespace,
-            }));
+            return envelope::fail_with(
+                ERR_NAMESPACE_NOT_FOUND,
+                &format!(
+                    "Namespace '{}' does not exist on this IRIS instance",
+                    p.namespace
+                ),
+                serde_json::json!({"namespace": p.namespace}),
+            );
         }
 
         // Generate a UUID correlation token; used as UserParam in RunTest.
@@ -2281,11 +2292,10 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
             match tokio::time::timeout(timeout, iris.execute(&run_code, &p.namespace)).await {
                 Err(_) => {
                     self.record_call("iris_test", false);
-                    return ok_json(serde_json::json!({
-                        "success": false,
-                        "error_code": "TIMEOUT",
-                        "error": format!("Test run timed out after {}s", p.timeout),
-                    }));
+                    return envelope::fail(
+                        "TIMEOUT",
+                        &format!("Test run timed out after {}s", p.timeout),
+                    );
                 }
                 Ok(Err(_)) => {
                     // Docker exec unavailable — fall through to HTTP
@@ -2298,11 +2308,10 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
                         Ok(Ok(out)) => out,
                         _ => {
                             self.record_call("iris_test", false);
-                            return ok_json(serde_json::json!({
-                                "success": false,
-                                "error_code": "DOCKER_REQUIRED",
-                                "error": format!("iris_test: IRIS_CONTAINER set but docker exec failed and HTTP fallback also failed.{DOCKER_REQUIRED_HINT}"),
-                            }));
+                            return envelope::fail(
+                                "DOCKER_REQUIRED",
+                                &format!("iris_test: IRIS_CONTAINER set but docker exec failed and HTTP fallback also failed.{DOCKER_REQUIRED_HINT}"),
+                            );
                         }
                     }
                 }
@@ -2321,19 +2330,14 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
             {
                 Err(_) => {
                     self.record_call("iris_test", false);
-                    return ok_json(serde_json::json!({
-                        "success": false,
-                        "error_code": "TIMEOUT",
-                        "error": format!("Test run timed out after {}s", p.timeout),
-                    }));
+                    return envelope::fail(
+                        "TIMEOUT",
+                        &format!("Test run timed out after {}s", p.timeout),
+                    );
                 }
                 Ok(Err(e)) => {
                     self.record_call("iris_test", false);
-                    return ok_json(serde_json::json!({
-                        "success": false,
-                        "error_code": ERR_TEST_EXECUTION_ERROR,
-                        "error": e.to_string(),
-                    }));
+                    return envelope::fail(ERR_TEST_EXECUTION_ERROR, &e.to_string());
                 }
                 Ok(Ok(out)) => out,
             }
@@ -2552,20 +2556,23 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
             } else {
                 format!("Pattern '{}' matched no runnable tests, but {} compiled %UnitTest.TestCase class(es) exist in '{}': {}. Pass one of these as the pattern (class names use /noload automatically), or a directory path to load from disk.", p.pattern, candidates.len(), p.namespace, candidates.join(", "))
             };
-            return ok_json(serde_json::json!({
-                "success": false,
-                "error_code": ERR_NO_TESTS_FOUND,
-                "error": "Pattern matched no test classes",
-                "hint": hint,
-                "candidates": candidates,
-                "pattern": p.pattern,
-                "namespace": p.namespace,
-                "total": 0,
-                "passed": 0,
-                "failed": 0,
-                "path": path_label,
-                "source": "stdout_parse",
-            }));
+            // Issue #2: NO_TESTS_FOUND is a genuine tool failure (nothing ran),
+            // unlike a red run below, which is a valid result and stays non-error.
+            return envelope::fail_with(
+                ERR_NO_TESTS_FOUND,
+                "Pattern matched no test classes",
+                serde_json::json!({
+                    "hint": hint,
+                    "candidates": candidates,
+                    "pattern": p.pattern,
+                    "namespace": p.namespace,
+                    "total": 0,
+                    "passed": 0,
+                    "failed": 0,
+                    "path": path_label,
+                    "source": "stdout_parse",
+                }),
+            );
         }
 
         // `success` keeps its historical meaning (all tests green) for back-compat, but we reached
@@ -2674,11 +2681,10 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
         match gen_result {
             Err(_) => {
                 self.record_call("iris_execute", false);
-                return ok_json(serde_json::json!({
-                    "success": false,
-                    "error_code": "TIMEOUT",
-                    "error": format!("execution timed out after {}s", p.timeout),
-                }));
+                return envelope::fail(
+                    "TIMEOUT",
+                    &format!("execution timed out after {}s", p.timeout),
+                );
             }
             Ok(Ok(output)) => {
                 let trimmed = output.trim();
@@ -2728,6 +2734,11 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
                         resp["hint"] = serde_json::Value::String(h.into());
                     }
                 }
+                // Issue #2: the runtime-error message must live in `error` (not only
+                // `output`) and the result must be flagged isError on the wire.
+                if is_runtime_error {
+                    return envelope::fail_with("IRIS_RUNTIME_ERROR", trimmed, resp);
+                }
                 return ok_json(resp);
             }
             Ok(Err(_)) => {
@@ -2741,27 +2752,21 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
         match docker_result {
             Err(_) => {
                 self.record_call("iris_execute", false);
-                ok_json(serde_json::json!({
-                    "success": false,
-                    "error_code": "TIMEOUT",
-                    "error": format!("execution timed out after {}s", p.timeout),
-                }))
+                envelope::fail(
+                    "TIMEOUT",
+                    &format!("execution timed out after {}s", p.timeout),
+                )
             }
             Ok(Err(e)) => {
                 let msg = e.to_string();
                 self.record_call("iris_execute", false);
                 if msg == "DOCKER_REQUIRED" {
-                    ok_json(serde_json::json!({
-                        "success": false,
-                        "error_code": "DOCKER_REQUIRED",
-                        "error": format!("iris_execute: HTTP execution failed and IRIS_CONTAINER is not set for docker exec fallback.{DOCKER_REQUIRED_HINT}"),
-                    }))
+                    envelope::fail(
+                        "DOCKER_REQUIRED",
+                        &format!("iris_execute: HTTP execution failed and IRIS_CONTAINER is not set for docker exec fallback.{DOCKER_REQUIRED_HINT}"),
+                    )
                 } else {
-                    ok_json(serde_json::json!({
-                        "success": false,
-                        "error_code": "EXECUTION_FAILED",
-                        "error": msg,
-                    }))
+                    envelope::fail("EXECUTION_FAILED", &msg)
                 }
             }
             Ok(Ok(output)) => {
@@ -2798,6 +2803,9 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
                         resp["hint"] = serde_json::Value::String(h.into());
                     }
                 }
+                if is_runtime_error {
+                    return envelope::fail_with("IRIS_RUNTIME_ERROR", trimmed, resp);
+                }
                 ok_json(resp)
             }
         }
@@ -2814,7 +2822,7 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
         tracing::info!(namespace = %p.namespace, "iris_doc");
         let client = self.http_client();
         let result = doc::handle_iris_doc(&iris, client, p, &self.elicitation_store).await;
-        self.record_call("iris_doc", result.is_ok());
+        self.record_call("iris_doc", Self::call_ok(&result));
         result
     }
 
@@ -2831,12 +2839,11 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
         // (28/447 workshop iris_query calls were ObjectScript, not SQL).
         if let Some(reason) = sql_lint::looks_like_objectscript(&p.query) {
             self.record_call("iris_query", false);
-            return ok_json(serde_json::json!({
-                "success": false,
-                "error_code": "NOT_SQL",
-                "error": format!("This looks like ObjectScript, not SQL ({reason})."),
-                "hint": "iris_query runs SQL SELECTs only. For ObjectScript (set/write/do/##class/&sql/^globals), use iris_execute.",
-            }));
+            return envelope::fail_with(
+                "NOT_SQL",
+                &format!("This looks like ObjectScript, not SQL ({reason})."),
+                serde_json::json!({"hint": "iris_query runs SQL SELECTs only. For ObjectScript (set/write/do/##class/&sql/^globals), use iris_execute."}),
+            );
         }
         let sql_warnings = sql_lint::reserved_word_warnings(&p.query);
 
@@ -2846,24 +2853,22 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
             match validate_read_only_sql(&p.query) {
                 Err(ref kw) if kw == "EMPTY" => {
                     self.record_call("iris_query", false);
-                    return ok_json(serde_json::json!({
-                        "success": false,
-                        "error_code": "EMPTY_QUERY",
-                        "error": "SQL query is empty after removing comments.",
-                    }));
+                    return envelope::fail(
+                        "EMPTY_QUERY",
+                        "SQL query is empty after removing comments.",
+                    );
                 }
                 Err(kw) => {
                     self.record_call("iris_query", false);
-                    let mut resp = serde_json::json!({
-                        "success": false,
-                        "error_code": "SQL_WRITE_BLOCKED",
-                        "error": format!("Destructive SQL keyword '{}' is not allowed. Use force: true to override.", kw),
-                        "blocked_keyword": kw,
-                    });
+                    let mut extra = serde_json::json!({"blocked_keyword": kw});
                     if p.force && !self.write_tools_enabled() {
-                        resp["force_ignored"] = serde_json::Value::Bool(true);
+                        extra["force_ignored"] = serde_json::Value::Bool(true);
                     }
-                    return ok_json(resp);
+                    return envelope::fail_with(
+                        "SQL_WRITE_BLOCKED",
+                        &format!("Destructive SQL keyword '{}' is not allowed. Use force: true to override.", kw),
+                        extra,
+                    );
                 }
                 Ok(()) => {}
             }
@@ -2894,29 +2899,26 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
             if !errors.is_empty() {
                 let msg = errors[0]["error"].as_str().unwrap_or("SQL error");
                 self.record_call("iris_query", false);
-                let mut resp = serde_json::json!({
-                    "success": false,
-                    "error_code": "SQL_ERROR",
-                    "error": msg,
-                });
+                let mut extra = serde_json::json!({});
                 // 84/447 workshop failures were guesses at nonexistent tables — route the
                 // model to real schema discovery instead of more guessing. Prefer a TARGETED
                 // hint that names the typed tool for the specific guessed table (SQL-Gateway,
                 // namespace, production config); fall back to the generic discovery hint.
                 if let Some(h) = sql_lint::targeted_table_hint(&p.query) {
-                    resp["hint"] = serde_json::Value::String(h.into());
+                    extra["hint"] = serde_json::Value::String(h.into());
                 } else if sql_lint::is_table_not_found(msg) {
-                    resp["hint"] = serde_json::Value::String(sql_lint::TABLE_NOT_FOUND_HINT.into());
+                    extra["hint"] =
+                        serde_json::Value::String(sql_lint::TABLE_NOT_FOUND_HINT.into());
                 }
                 if !sql_warnings.is_empty() {
-                    resp["warnings"] = serde_json::Value::Array(
+                    extra["warnings"] = serde_json::Value::Array(
                         sql_warnings
                             .iter()
                             .map(|w| serde_json::Value::String(w.clone()))
                             .collect(),
                     );
                 }
-                return ok_json(resp);
+                return envelope::fail_with("SQL_ERROR", msg, extra);
             }
         }
 
@@ -3078,12 +3080,11 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
                     .iter()
                     .filter_map(|c| c["name"].as_str())
                     .collect();
-                return ok_json(serde_json::json!({
-                    "success": false,
-                    "error": "CONTAINER_NOT_FOUND",
-                    "requested": p.name,
-                    "available": available,
-                }));
+                return envelope::fail_with(
+                    "CONTAINER_NOT_FOUND",
+                    &format!("No container matching '{}' found", p.name),
+                    serde_json::json!({"requested": p.name, "available": available}),
+                );
             }
         };
 
@@ -3105,13 +3106,11 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
 
         // Check if probe succeeded (version populated means reachable)
         if new_conn.version.is_none() {
-            return ok_json(serde_json::json!({
-                "success": false,
-                "error": "CONTAINER_UNREACHABLE",
-                "container": p.name,
-                "port_web": port_web,
-                "message": "Container found but Atelier REST API did not respond. Check that the container is running and the web server is accessible.",
-            }));
+            return envelope::fail_with(
+                "CONTAINER_UNREACHABLE",
+                "Container found but Atelier REST API did not respond. Check that the container is running and the web server is accessible.",
+                serde_json::json!({"container": p.name, "port_web": port_web}),
+            );
         }
 
         let version = new_conn.version.clone();
@@ -3448,10 +3447,10 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
                     serde_json::json!({"success": true, "mapping_available": cls_name.is_some(), "cls_name": cls_name, "cls_line": cls_line, "routine": p.routine, "offset": p.offset, "raw_error": if p.error_string.is_empty() { serde_json::Value::Null } else { p.error_string.into() }}),
                 )
             }
-            Err(e) if e.to_string() == "DOCKER_REQUIRED" => ok_json(serde_json::json!({
-                "success": false, "error_code": "DOCKER_REQUIRED",
-                "error": format!("debug_map_int requires docker exec. Set IRIS_CONTAINER=<container_name>.{DOCKER_REQUIRED_HINT}"),
-            })),
+            Err(e) if e.to_string() == "DOCKER_REQUIRED" => envelope::fail(
+                "DOCKER_REQUIRED",
+                &format!("debug_map_int requires docker exec. Set IRIS_CONTAINER=<container_name>.{DOCKER_REQUIRED_HINT}"),
+            ),
             Err(e) => err_json("IRIS_UNREACHABLE", &e.to_string()),
         }
     }
@@ -3543,10 +3542,10 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
                     serde_json::json!({"success": true, "cls_name": cls_name, "source_map": map}),
                 )
             }
-            Err(e) if e.to_string() == "DOCKER_REQUIRED" => ok_json(serde_json::json!({
-                "success": false, "error_code": "DOCKER_REQUIRED",
-                "error": format!("debug_source_map requires docker exec. Set IRIS_CONTAINER=<container_name>.{DOCKER_REQUIRED_HINT}"),
-            })),
+            Err(e) if e.to_string() == "DOCKER_REQUIRED" => envelope::fail(
+                "DOCKER_REQUIRED",
+                &format!("debug_source_map requires docker exec. Set IRIS_CONTAINER=<container_name>.{DOCKER_REQUIRED_HINT}"),
+            ),
             Err(e) => err_json("IRIS_UNREACHABLE", &e.to_string()),
         }
     }
@@ -3579,8 +3578,10 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
             })?;
 
         if !validate_cls_syntax(&class_text) {
-            return ok_json(
-                serde_json::json!({"success": false, "error_code": "INVALID_OUTPUT", "raw_llm_output": class_text}),
+            return envelope::fail_with(
+                "INVALID_OUTPUT",
+                "Generated output is not a valid ObjectScript class",
+                serde_json::json!({"raw_llm_output": class_text}),
             );
         }
         let class_name =
@@ -3696,8 +3697,10 @@ Methods:
             })?;
 
         if !validate_cls_syntax(&test_text) {
-            return ok_json(
-                serde_json::json!({"success": false, "error_code": "INVALID_OUTPUT", "raw_llm_output": test_text}),
+            return envelope::fail_with(
+                "INVALID_OUTPUT",
+                "Generated output is not a valid ObjectScript test class",
+                serde_json::json!({"raw_llm_output": test_text}),
             );
         }
         let test_class_name =
@@ -4016,7 +4019,7 @@ Methods:
         let result =
             search::handle_iris_search(&iris, self.http_client(), p, Arc::clone(&self.log_store))
                 .await;
-        self.record_call("iris_search", result.is_ok());
+        self.record_call("iris_search", Self::call_ok(&result));
         result
     }
 
@@ -4030,7 +4033,7 @@ Methods:
         let iris = self.get_iris_reloaded().await?;
         let result =
             info::handle_iris_info(&iris, self.http_client(), p, Arc::clone(&self.log_store)).await;
-        self.record_call("iris_info", result.is_ok());
+        self.record_call("iris_info", Self::call_ok(&result));
         result
     }
 
@@ -4043,7 +4046,7 @@ Methods:
     ) -> Result<CallToolResult, McpError> {
         let iris = self.get_iris_reloaded().await?;
         let result = info::handle_iris_table_info(&iris, self.http_client(), p).await;
-        self.record_call("iris_table_info", result.is_ok());
+        self.record_call("iris_table_info", Self::call_ok(&result));
         result
     }
 
@@ -4062,7 +4065,7 @@ Methods:
             &self.metadata_cache,
         )
         .await;
-        self.record_call("resolve_dynamic_dispatch", result.is_ok());
+        self.record_call("resolve_dynamic_dispatch", Self::call_ok(&result));
         result
     }
 
@@ -4081,7 +4084,7 @@ Methods:
             &self.metadata_cache,
         )
         .await;
-        self.record_call("extract_message_map_routing", result.is_ok());
+        self.record_call("extract_message_map_routing", Self::call_ok(&result));
         result
     }
 
@@ -4100,7 +4103,7 @@ Methods:
             &self.metadata_cache,
         )
         .await;
-        self.record_call("find_subclass_implementations", result.is_ok());
+        self.record_call("find_subclass_implementations", Self::call_ok(&result));
         result
     }
 
@@ -4113,7 +4116,7 @@ Methods:
     ) -> Result<CallToolResult, McpError> {
         let iris = self.get_iris_reloaded().await?;
         let result = info::handle_iris_macro(&iris, self.http_client(), p).await;
-        self.record_call("iris_macro", result.is_ok());
+        self.record_call("iris_macro", Self::call_ok(&result));
         result
     }
 
@@ -4126,7 +4129,7 @@ Methods:
     ) -> Result<CallToolResult, McpError> {
         let iris = self.get_iris_reloaded().await?;
         let result = info::handle_iris_debug(&iris, self.http_client(), p).await;
-        self.record_call("iris_debug", result.is_ok());
+        self.record_call("iris_debug", Self::call_ok(&result));
         result
     }
 
@@ -4139,7 +4142,7 @@ Methods:
     ) -> Result<CallToolResult, McpError> {
         let iris = self.get_iris_reloaded().await?;
         let result = info::handle_iris_generate(&iris, self.http_client(), p).await;
-        self.record_call("iris_generate", result.is_ok());
+        self.record_call("iris_generate", Self::call_ok(&result));
         result
     }
 
@@ -4152,7 +4155,7 @@ Methods:
     ) -> Result<CallToolResult, McpError> {
         let iris = self.get_iris_reloaded().await?;
         let result = skills_tools::handle_skill(&iris, self.http_client(), p, &self.history).await;
-        self.record_call("skill", result.is_ok());
+        self.record_call("skill", Self::call_ok(&result));
         result
     }
 
@@ -4167,7 +4170,7 @@ Methods:
         let result =
             skills_tools::handle_skill_community(&iris, self.http_client(), p, &self.registry)
                 .await;
-        self.record_call("skill_community", result.is_ok());
+        self.record_call("skill_community", Self::call_ok(&result));
         result
     }
 
@@ -4180,7 +4183,7 @@ Methods:
     ) -> Result<CallToolResult, McpError> {
         let iris = self.get_iris_reloaded().await?;
         let result = skills_tools::handle_kb(&iris, self.http_client(), p).await;
-        self.record_call("kb", result.is_ok());
+        self.record_call("kb", Self::call_ok(&result));
         result
     }
 
@@ -4194,7 +4197,7 @@ Methods:
         let iris = self.get_iris_reloaded().await?;
         let result =
             skills_tools::handle_agent_info(&iris, self.http_client(), p, &self.history).await;
-        self.record_call("agent_info", result.is_ok());
+        self.record_call("agent_info", Self::call_ok(&result));
         result
     }
 
@@ -4209,7 +4212,7 @@ Methods:
         let result =
             scm::handle_iris_source_control(&iris, self.http_client(), p, &self.elicitation_store)
                 .await;
-        self.record_call("iris_source_control", result.is_ok());
+        self.record_call("iris_source_control", Self::call_ok(&result));
         result
     }
 
@@ -4341,7 +4344,7 @@ Methods:
                 "iris_production: action must be status, start, stop, restart (item), update, check, recover, get_autostart, or set_autostart",
             ),
         };
-        self.record_call("iris_production", result.is_ok());
+        self.record_call("iris_production", Self::call_ok(&result));
         result
     }
 
@@ -4358,11 +4361,10 @@ Methods:
             Some(w) if !w.is_empty() => w,
             _ => {
                 self.record_call("iris_interop_query", false);
-                return ok_json(serde_json::json!({
-                    "success": false,
-                    "error_code": "MISSING_WHAT",
-                    "error": "iris_interop_query requires 'what': one of logs, queues, messages, trace, partners.",
-                }));
+                return envelope::fail(
+                    "MISSING_WHAT",
+                    "iris_interop_query requires 'what': one of logs, queues, messages, trace, partners.",
+                );
             }
         };
         let _iris_arc_hold = self.iris_arc();
@@ -4471,7 +4473,7 @@ Methods:
                 &format!("iris_interop_query: unknown what='{other}'. Valid: logs, queues, messages, trace, partners."),
             ),
         };
-        self.record_call("iris_interop_query", result.is_ok());
+        self.record_call("iris_interop_query", Self::call_ok(&result));
         result
     }
 
@@ -4516,7 +4518,7 @@ Methods:
                 "iris_containers: action must be list, select, or start",
             ),
         };
-        self.record_call("iris_containers", result.is_ok());
+        self.record_call("iris_containers", Self::call_ok(&result));
         result
     }
 
@@ -4592,7 +4594,7 @@ Methods:
             },
         )
         .await;
-        self.record_call("iris_production_item", result.is_ok());
+        self.record_call("iris_production_item", Self::call_ok(&result));
         result
     }
 
@@ -4621,7 +4623,7 @@ Methods:
             interop::CredentialListParams { namespace },
         )
         .await;
-        self.record_call("iris_credential_list", result.is_ok());
+        self.record_call("iris_credential_list", Self::call_ok(&result));
         result
     }
 
@@ -4668,7 +4670,7 @@ Methods:
             },
         )
         .await;
-        self.record_call("iris_credential_manage", result.is_ok());
+        self.record_call("iris_credential_manage", Self::call_ok(&result));
         result
     }
 
@@ -4713,7 +4715,7 @@ Methods:
             },
         )
         .await;
-        self.record_call("iris_lookup_manage", result.is_ok());
+        self.record_call("iris_lookup_manage", Self::call_ok(&result));
         result
     }
 
@@ -4753,7 +4755,7 @@ Methods:
             },
         )
         .await;
-        self.record_call("iris_lookup_transfer", result.is_ok());
+        self.record_call("iris_lookup_transfer", Self::call_ok(&result));
         result
     }
 
@@ -4871,7 +4873,7 @@ Methods:
                 "iris_admin: action must be one of: list_namespaces, list_databases, list_users, list_roles, list_user_roles, check_permission, list_webapps, get_webapp, create_user, update_user, delete_user, create_namespace, delete_namespace, create_webapp, delete_webapp",
             ),
         };
-        self.record_call("iris_admin", result.is_ok());
+        self.record_call("iris_admin", Self::call_ok(&result));
         result
     }
 

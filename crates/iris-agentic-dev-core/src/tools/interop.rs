@@ -8,7 +8,7 @@ fn ok_json(v: serde_json::Value) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![Content::text(v.to_string())]))
 }
 fn err_json(code: &str, msg: &str) -> Result<CallToolResult, McpError> {
-    ok_json(serde_json::json!({"success": false, "error_code": code, "error": msg}))
+    crate::tools::envelope::fail(code, msg)
 }
 fn iris_unreachable() -> McpError {
     McpError::invalid_request("IRIS_UNREACHABLE", None)
@@ -122,19 +122,20 @@ pub async fn ensure_interop_namespace(
             iris.namespace
         ),
     };
-    Some(ok_json(serde_json::json!({
-        "success": false,
-        "error_code": "NAMESPACE_NOT_INTEROP",
-        "error": format!(
+    Some(crate::tools::envelope::fail_with(
+        "NAMESPACE_NOT_INTEROP",
+        &format!(
             "Namespace '{ns}' has no Interoperability enabled — the Ens.* classes and \
              Ens_* tables do not exist there, so interop tools cannot run in it."
         ),
-        "hint": hint,
-        "namespace": ns,
-        "interop_namespaces": available
-            .map(|l| l.split(',').map(str::to_string).collect::<Vec<_>>())
-            .unwrap_or_default(),
-    })))
+        serde_json::json!({
+            "hint": hint,
+            "namespace": ns,
+            "interop_namespaces": available
+                .map(|l| l.split(',').map(str::to_string).collect::<Vec<_>>())
+                .unwrap_or_default(),
+        }),
+    ))
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

@@ -10,7 +10,7 @@ fn ok_json(v: serde_json::Value) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![Content::text(v.to_string())]))
 }
 fn err_json(code: &str, msg: &str) -> Result<CallToolResult, McpError> {
-    ok_json(serde_json::json!({"success": false, "error_code": code, "error": msg}))
+    crate::tools::envelope::fail(code, msg)
 }
 fn iris_unreachable() -> McpError {
     McpError::invalid_request("IRIS_UNREACHABLE", None)
