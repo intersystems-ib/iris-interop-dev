@@ -613,3 +613,122 @@ fn test_error_envelope_and_is_error_flag() {
         "iris_doc",
     );
 }
+
+#[test]
+#[ignore = "requires live IRIS with Interoperability"]
+fn test_message_content_search() {
+    // Issue #4: typed search on message CONTENT — body-class join and Search
+    // Tables — replacing the hand SQL that produced 57 <SYNTAX> errors in one
+    // workshop day.
+    let iris_host = std::env::var("IRIS_HOST").unwrap_or_default();
+    assert!(!iris_host.is_empty(), "IRIS_HOST must be set");
+    let ns = std::env::var("IRIS_NAMESPACE").unwrap_or_else(|_| "USER".to_string());
+
+    let call = |tool: &str, args: serde_json::Value| {
+        let responses = mcp_exchange(&[
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
+            serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":tool,"arguments":args}}),
+        ]);
+        parse_tool_text(&find_response(&responses, 2).expect("no response"))
+    };
+
+    // Seed one header+body fixture (no production needed — plain %Persistent rows).
+    let needle = "e2e-needle-content-search";
+    let seed = format!(
+        "Set body=##class(Ens.StringContainer).%New()\n\
+         Set body.StringValue=\"{needle}\"\n\
+         Set tSC=body.%Save()\n\
+         If $$$ISERR(tSC) {{ Write \"BODYFAIL\" Quit }}\n\
+         Set hdr=##class(Ens.MessageHeader).%New()\n\
+         Set hdr.MessageBodyClassName=\"Ens.StringContainer\"\n\
+         Set hdr.MessageBodyId=body.%Id()\n\
+         Set hdr.SourceConfigName=\"E2E.Source\"\n\
+         Set tSC2=hdr.%Save()\n\
+         If $$$ISERR(tSC2) {{ Write \"HDRFAIL\" Quit }}\n\
+         Write \"OK:\"_hdr.%Id()_\":\"_body.%Id()"
+    );
+    let r = call(
+        "iris_execute",
+        serde_json::json!({"namespace": ns, "code": seed}),
+    );
+    let out = r["output"].as_str().unwrap_or("");
+    assert!(out.starts_with("OK:"), "fixture seed failed: {r}");
+    let ids: Vec<&str> = out.trim_start_matches("OK:").split(':').collect();
+    let (hdr_id, body_id) = (ids[0].to_string(), ids[1].to_string());
+
+    // 1. body-class join finds the needle and returns the body column.
+    let r = call(
+        "iris_interop_query",
+        serde_json::json!({"what":"messages","namespace":ns,
+            "body_class":"Ens.StringContainer",
+            "body_where": format!("StringValue = '{needle}'"),
+            "body_select":["StringValue"]}),
+    );
+    assert_eq!(r["success"], true, "body join failed: {r}");
+    assert_eq!(r["count"], 1, "expected exactly the fixture: {r}");
+    assert_eq!(r["messages"][0]["StringValue"], needle, "{r}");
+    assert!(r["messages"][0]["SourceConfigName"].is_string(), "{r}");
+
+    // 2. body_where without body_class → error that lists the real classes.
+    let r = call(
+        "iris_interop_query",
+        serde_json::json!({"what":"messages","namespace":ns,"body_where":"X=1"}),
+    );
+    assert_eq!(r["error_code"], "INVALID_PARAMS", "{r}");
+    assert!(
+        r["hint"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Ens.StringContainer"),
+        "hint must list case-exact body classes: {r}"
+    );
+
+    // 3. unknown body class → BODY_CLASS_NOT_FOUND.
+    let r = call(
+        "iris_interop_query",
+        serde_json::json!({"what":"messages","namespace":ns,
+            "body_class":"No.Such.Class","body_where":"X=1"}),
+    );
+    assert_eq!(r["error_code"], "BODY_CLASS_NOT_FOUND", "{r}");
+
+    // 4. unknown search-table prop → the searchable props are listed.
+    let r = call(
+        "iris_interop_query",
+        serde_json::json!({"what":"messages","namespace":ns,
+            "search_table":{"prop":"NoSuchProp","value":"x"}}),
+    );
+    assert_eq!(r["error_code"], "SEARCH_PROP_NOT_FOUND", "{r}");
+    assert!(
+        r["available_props"]
+            .as_array()
+            .map(|a| a.iter().any(|v| v.as_str() == Some("PatientID")))
+            .unwrap_or(false),
+        "available_props must list the extent's fields: {r}"
+    );
+
+    // 5. valid prop, zero rows → success with the config-time indexing hint.
+    let r = call(
+        "iris_interop_query",
+        serde_json::json!({"what":"messages","namespace":ns,
+            "search_table":{"prop":"MSHControlID","value":"e2e-no-such-value"}}),
+    );
+    assert_eq!(r["success"], true, "{r}");
+    assert_eq!(r["count"], 0, "{r}");
+    assert!(
+        r["hint"].as_str().unwrap_or("").contains("back-indexed"),
+        "zero rows must explain config-time indexing: {r}"
+    );
+
+    // Clean up the fixture.
+    let cleanup = format!(
+        "Do ##class(Ens.MessageHeader).%DeleteId({hdr_id})\n\
+         Do ##class(Ens.StringContainer).%DeleteId({body_id})\n\
+         Write \"CLEAN\""
+    );
+    let r = call(
+        "iris_execute",
+        serde_json::json!({"namespace": ns, "code": cleanup}),
+    );
+    assert_eq!(r["output"].as_str(), Some("CLEAN"), "cleanup failed: {r}");
+}

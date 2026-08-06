@@ -243,6 +243,10 @@ mod interop_message_search {
                 session_id: None,
                 since_id: None,
                 limit: 20,
+                body_class: None,
+                body_where: None,
+                body_select: vec![],
+                search_table: None,
             },
         ));
         let result = r.unwrap();
