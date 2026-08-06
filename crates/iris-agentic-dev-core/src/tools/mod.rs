@@ -1411,6 +1411,9 @@ pub struct IrisTools {
     pub history: Arc<std::sync::Mutex<VecDeque<ToolCallEntry>>>,
     /// Pending elicitation state for SCM dialogs.
     pub elicitation_store: Arc<ElicitationStore>,
+    /// Session-scoped cache of documents already checked out by us — lets chained
+    /// iris_doc writes skip the pre-write SCM probe (invalidated by SCM actions).
+    pub checkout_cache: Arc<crate::elicitation::CheckoutCache>,
     /// UUID-keyed in-memory log store for progressive disclosure (027).
     pub log_store: Arc<std::sync::Mutex<log_store::LogStore>>,
     /// Session-scoped TTL cache for %Dictionary introspection results (037).
@@ -1444,6 +1447,7 @@ impl IrisTools {
             client,
             history: Arc::new(std::sync::Mutex::new(VecDeque::with_capacity(50))),
             elicitation_store: Arc::new(ElicitationStore::new()),
+            checkout_cache: Arc::new(crate::elicitation::CheckoutCache::new()),
             log_store: Arc::new(std::sync::Mutex::new(log_store::LogStore::new(
                 log_max, log_ttl,
             ))),
@@ -1725,6 +1729,7 @@ impl IrisTools {
             client,
             history: Arc::new(std::sync::Mutex::new(VecDeque::with_capacity(50))),
             elicitation_store: Arc::new(ElicitationStore::new()),
+            checkout_cache: Arc::new(crate::elicitation::CheckoutCache::new()),
             log_store: Arc::new(std::sync::Mutex::new(log_store::LogStore::new(
                 log_max, log_ttl,
             ))),
@@ -2845,7 +2850,14 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
         let namespace = interop::resolve_namespace(p.namespace.as_deref(), Some(&iris));
         tracing::info!(namespace = %namespace, "iris_doc");
         let client = self.http_client();
-        let result = doc::handle_iris_doc(&iris, client, p, &self.elicitation_store).await;
+        let result = doc::handle_iris_doc(
+            &iris,
+            client,
+            p,
+            &self.elicitation_store,
+            &self.checkout_cache,
+        )
+        .await;
         self.record_call("iris_doc", Self::call_ok(&result));
         result
     }
@@ -4260,9 +4272,14 @@ Methods:
         Parameters(p): Parameters<ScmParams>,
     ) -> Result<CallToolResult, McpError> {
         let iris = self.get_iris_reloaded().await?;
-        let result =
-            scm::handle_iris_source_control(&iris, self.http_client(), p, &self.elicitation_store)
-                .await;
+        let result = scm::handle_iris_source_control(
+            &iris,
+            self.http_client(),
+            p,
+            &self.elicitation_store,
+            &self.checkout_cache,
+        )
+        .await;
         self.record_call("iris_source_control", Self::call_ok(&result));
         result
     }

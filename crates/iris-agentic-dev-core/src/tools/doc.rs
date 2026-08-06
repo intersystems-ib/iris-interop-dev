@@ -170,10 +170,11 @@ pub async fn handle_iris_doc(
     client: &reqwest::Client,
     p: IrisDocParams,
     elicitation_store: &crate::elicitation::ElicitationStore,
+    checkout_cache: &crate::elicitation::CheckoutCache,
 ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
     match DocMode::parse(&p.mode) {
         Some(DocMode::Get) => handle_get(iris, client, p).await,
-        Some(DocMode::Put) => handle_put(iris, client, p, elicitation_store).await,
+        Some(DocMode::Put) => handle_put(iris, client, p, elicitation_store, checkout_cache).await,
         Some(DocMode::Delete) => handle_delete(iris, client, p).await,
         Some(DocMode::Head) => handle_head(iris, client, p).await,
         None => crate::tools::envelope::fail_with(
@@ -303,6 +304,7 @@ async fn handle_put(
     client: &reqwest::Client,
     p: IrisDocParams,
     elicitation_store: &crate::elicitation::ElicitationStore,
+    checkout_cache: &crate::elicitation::CheckoutCache,
 ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
     let namespace = crate::tools::interop::resolve_namespace(p.namespace.as_deref(), Some(iris));
     let ns = &namespace;
@@ -314,6 +316,33 @@ async fn handle_put(
             if answer.to_lowercase() != "yes" {
                 return crate::tools::envelope::fail("WRITE_ABORTED", "User declined checkout");
             }
+            // Finalize the checkout the user just approved. The pre-write check only
+            // ran UserAction (which *offers* the dialog); the checkout is not actually
+            // committed until AfterUserAction is called. Because do_write is a separate
+            // HTTP job, the in-memory %SourceControl session from the pre-write check is
+            // already gone — so without this the write hits ERROR #5865 "not checked out
+            // of source control". AfterUserAction persists the checkout server-side.
+            let after_code = crate::tools::scm::after_user_action_code(
+                "%CheckOut",
+                &pending.document,
+                "yes",
+                &iris.username,
+                &iris.password,
+            );
+            if let Ok(out) = iris
+                .execute_via_generator(&after_code, &pending.namespace, client)
+                .await
+            {
+                let out = out.lines().next().unwrap_or("").trim().to_string();
+                // Non-empty output from after_user_action_code is an SCM error string.
+                if !out.is_empty() && out != "SCM_UNAVAILABLE" {
+                    return err_json("SCM_CHECKOUT_FAILED", &out);
+                }
+            }
+            // Checkout is now committed server-side — cache it so writes that follow
+            // in quick succession skip the redundant pre-write probe.
+            checkout_cache.mark(&pending.namespace, &pending.document);
+
             // User said yes — proceed with the stored content directly
             let resume_content = pending.content.as_deref().unwrap_or("");
             return do_write(
@@ -360,14 +389,82 @@ async fn handle_put(
         _ => raw_content,
     };
 
-    // SCM OnBeforeSave — check if write is allowed (requires docker exec; skipped if unavailable)
+    write_with_scm(
+        iris,
+        client,
+        name,
+        content,
+        ns,
+        p.compile,
+        p.allow_storage_regeneration,
+        elicitation_store,
+        checkout_cache,
+    )
+    .await
+}
+
+/// Run the SCM pre-write check, then write. `content` is the full document body to write.
+// Args are all distinct scalars/handles threaded straight through from the tool entry point;
+// bundling them into a struct would add indirection without clarifying anything.
+#[allow(clippy::too_many_arguments)]
+async fn write_with_scm(
+    iris: &IrisConnection,
+    client: &reqwest::Client,
+    name: &str,
+    content: &str,
+    ns: &str,
+    compile: bool,
+    allow_storage_regeneration: bool,
+    elicitation_store: &crate::elicitation::ElicitationStore,
+    checkout_cache: &crate::elicitation::CheckoutCache,
+) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+    // Fast path: if we already checked this doc out earlier this session (cache hit), skip the
+    // pre-write SCM probe entirely — it is one IRIS round-trip that returns the same "proceed"
+    // answer every time on a chained write. A stale entry self-heals: the write below still
+    // goes through IRIS, and if it is rejected we invalidate so the retry re-probes.
+    if checkout_cache.is_checked_out(ns, name) {
+        let result = do_write(
+            iris,
+            client,
+            name,
+            content,
+            ns,
+            compile,
+            allow_storage_regeneration,
+        )
+        .await?;
+        if !write_result_succeeded(&result) {
+            // Cache was stale (checkout lost out-of-band) — drop it so the next call re-probes.
+            checkout_cache.invalidate(ns, name);
+        }
+        return Ok(result);
+    }
+
+    // SCM pre-write check — uses SourceControlCreate for a proper session (HTTP-compatible).
+    // %GetImplementationObject does not exist on any IRIS version; use Interface API instead.
+    //
+    // First inspect the MenuItems: if %UndoCheckout is offered, WE already hold the checkout,
+    // so we must NOT re-run the %CheckOut probe. Re-invoking %CheckOut on a doc we already hold
+    // returns action=1 ("needs confirmation dialog"), which made every chained edit on an
+    // already-checked-out doc re-elicit "requires checkout" forever.
+    // In that case emit a PROCEED sentinel and write directly.
+    let n = name.replace('"', "\"\""); // ObjectScript double-quote escaping
     let scm_check = format!(
-        "set scmObj=##class(%Studio.SourceControl.Base).%GetImplementationObject(\"{n}\") if '$IsObject(scmObj) {{ write \"NO_SCM\" }} else {{ set action=0 set msg=\"\" set target=\"\" set reload=0 set sc=scmObj.UserAction(0,\"%SourceMenu,CheckOut\",\"{n}\",\"\",.action,.target,.msg,.reload) write action_\"|\"_msg }}",
-        n = name.replace('"', "\\\"")
+        "set scmClass=##class(%Studio.SourceControl.Interface).SourceControlClassGet() if scmClass=\"\" {{ write \"NO_SCM\" }} else {{ set sc=##class(%Studio.SourceControl.Interface).SourceControlCreate(\"{u}\",\"{p}\",.c,.f,.o) set obj=$get(%SourceControl) if '$IsObject(obj) {{ write \"NO_SCM\" }} else {{ set hasUndoCheckout=0 try {{ set rset=##class(%ResultSet).%New(\"%Studio.SourceControl.Interface:MenuItems\") set sc=rset.Execute(\"%SourceMenu\",\"{n}\",\"\") while rset.Next() {{ if rset.GetData(2)&&(rset.GetData(1)=\"%UndoCheckout\") {{ set hasUndoCheckout=1 }} }} }} catch {{}} if hasUndoCheckout {{ write \"PROCEED|\" }} else {{ set action=0 set msg=\"\" set target=\"\" set reload=0 set sc=obj.UserAction(0,\"%SourceMenu,%CheckOut\",\"{n}\",\"\",.action,.target,.msg,.reload) write action_\"|\"_msg }} }} }}",
+        u = iris.username.replace('"', "\"\""),
+        p = iris.password.replace('"', "\"\""),
     );
-    if let Ok(out) = iris.execute(&scm_check, ns).await {
+    // Whether the probe told us the doc is already writable by us (PROCEED / already checked out).
+    // Only such a "we hold it" outcome is safe to cache — NOT NO_SCM (no source control at all),
+    // where there is no checkout to remember.
+    let mut we_hold_checkout = false;
+    if let Ok(out) = iris.execute_via_generator(&scm_check, ns, client).await {
         let out = out.trim().to_string();
-        if out != "NO_SCM" && !out.is_empty() {
+        // "NO_SCM"/empty → no source control; "PROCEED" → we already hold the checkout.
+        // Both skip the checkout dialog and fall through to do_write below.
+        if out.starts_with("PROCEED") {
+            we_hold_checkout = true;
+        } else if out != "NO_SCM" && !out.is_empty() {
             let parts: Vec<&str> = out.splitn(2, '|').collect();
             let action_code = parts
                 .first()
@@ -381,7 +478,7 @@ async fn handle_put(
                     crate::elicitation::ElicitationAction::Put,
                     Some(content.to_string()),
                     None,
-                    ns.clone(),
+                    ns.to_string(),
                 );
                 return ok_json(serde_json::json!({
                     "success": false,
@@ -397,16 +494,33 @@ async fn handle_put(
         }
     }
 
-    do_write(
+    let result = do_write(
         iris,
         client,
         name,
         content,
         ns,
-        p.compile,
-        p.allow_storage_regeneration,
+        compile,
+        allow_storage_regeneration,
     )
-    .await
+    .await?;
+    // Remember the checkout only when the probe confirmed we hold it AND the write landed, so
+    // the next chained edit skips the probe. Never cache when there is no SCM (nothing to hold).
+    if we_hold_checkout && write_result_succeeded(&result) {
+        checkout_cache.mark(ns, name);
+    }
+    Ok(result)
+}
+
+/// Inspect a `do_write` result and report whether the write succeeded (JSON `success:true`).
+fn write_result_succeeded(result: &rmcp::model::CallToolResult) -> bool {
+    result
+        .content
+        .first()
+        .and_then(|c| c.raw.as_text())
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t.text).ok())
+        .map(|v| v["success"] == serde_json::Value::Bool(true))
+        .unwrap_or(false)
 }
 
 async fn do_write(
