@@ -1,0 +1,15 @@
+# Dependabot was previously blind to the Rust workspace: with no cargo entry the
+# only alerts ever raised here were npm devDependencies of the (now removed)
+# vscode extension subproject, while a compiled CVE (serde_with via bollard 0.17,
+# see issue #23) went unreported. Scan what we actually ship.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
