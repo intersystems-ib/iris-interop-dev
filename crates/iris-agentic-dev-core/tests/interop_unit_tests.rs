@@ -88,11 +88,14 @@ mod production_item_codegen {
     }
 
     #[test]
-    fn codegen_escapes_single_quotes() {
-        let code = build_add_item_code("P'x", "It'm", "Cls'", true, None, None, &HashMap::new());
-        assert!(code.contains("It''m"));
-        assert!(code.contains("Cls''"));
-        assert!(code.contains("P''x"));
+    fn codegen_escapes_quotes_objectscript_style() {
+        // ObjectScript literals escape `"` by doubling; `'` needs no escaping (#6).
+        let code =
+            build_add_item_code("P\"x", "It'\"m", "Cls\"", true, None, None, &HashMap::new());
+        assert!(code.contains(r#""It'""m""#));
+        assert!(code.contains(r#""Cls""""#));
+        assert!(code.contains(r#""P""x""#));
+        assert!(!code.contains("''"));
     }
 }
 
