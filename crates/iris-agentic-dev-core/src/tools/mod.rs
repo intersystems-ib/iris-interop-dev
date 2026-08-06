@@ -4021,7 +4021,7 @@ Methods:
     }
 
     #[tool(
-        description = "Full-text search across IRIS documents via Atelier REST v2. Auto-upgrades to async polling for large namespaces. Supports regex, case sensitivity, category filter (CLS/MAC/INT/INC/ALL), and wildcard document scopes."
+        description = "Full-text search across IRIS documents via Atelier REST v2. documents: REQUIRED wildcard scope (e.g. [\"MyPkg.*.cls\"]) — Atelier greps sequentially, so an unscoped search is refused (SCOPE_REQUIRED) rather than timing out server-side. Case-INsensitive by default (case_sensitive: true for exact case). Supports regex and category filter (CLS/MAC/INT/INC/ALL). Auto-upgrades to async polling when the server defers via workId. namespace: optional — defaults to the connection namespace (IRIS_NAMESPACE)."
     )]
     async fn iris_search(
         &self,
