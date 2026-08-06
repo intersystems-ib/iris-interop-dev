@@ -60,7 +60,7 @@ fn ok_json(v: serde_json::Value) -> Result<rmcp::model::CallToolResult, rmcp::Er
     ]))
 }
 fn err_json(code: &str, msg: &str) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
-    ok_json(serde_json::json!({"success": false, "error_code": code, "error": msg}))
+    crate::tools::envelope::fail(code, msg)
 }
 
 /// Map a non-success Atelier HTTP status to an accurate error_code. `IRIS_UNREACHABLE` is reserved for
@@ -100,16 +100,16 @@ async fn http_err(resp: reqwest::Response) -> Result<rmcp::model::CallToolResult
     };
     let transient =
         matches!(status.as_u16(), 409 | 423) || (status.as_u16() == 400 && body.is_empty());
-    let mut v = serde_json::json!({"success": false, "error_code": code, "error": msg});
+    let mut extra = serde_json::json!({});
     if transient {
-        v["hint"] = serde_json::Value::String(
+        extra["hint"] = serde_json::Value::String(
             "Transient concurrency conflict (document lock or overlapping compile) — IRIS is up. \
              Retry the same call after a short backoff, and avoid issuing many parallel \
              iris_doc(compile=true) writes at once."
                 .to_string(),
         );
     }
-    ok_json(v)
+    crate::tools::envelope::fail_with(code, &msg, extra)
 }
 
 /// Largest char boundary <= idx (stable-Rust stand-in for str::floor_char_boundary), so byte-offset
@@ -262,9 +262,7 @@ async fn handle_put(
         if let Some(pending) = elicitation_store.lookup(eid) {
             elicitation_store.clear(eid);
             if answer.to_lowercase() != "yes" {
-                return ok_json(
-                    serde_json::json!({"success": false, "error_code": "WRITE_ABORTED", "error": "User declined checkout"}),
-                );
+                return crate::tools::envelope::fail("WRITE_ABORTED", "User declined checkout");
             }
             // User said yes — proceed with the stored content directly
             let resume_content = pending.content.as_deref().unwrap_or("");
@@ -476,12 +474,33 @@ async fn do_write(
             }
         };
 
+        // Issue #2: a compile failure is a genuine tool failure — it gets an
+        // error_code, the first compiler error as `error`, and isError on the
+        // wire; the full console stays as detail.
+        if !compile_ok {
+            let first = compile_errors
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "compile failed — see compile_console".to_string());
+            return crate::tools::envelope::fail_with(
+                "COMPILE_ERROR",
+                &first,
+                serde_json::json!({
+                    "name": name,
+                    "open_uri": open_uri,
+                    "storage_stripped": storage_stripped,
+                    "compiled": false,
+                    "compile_errors": compile_errors,
+                    "compile_console": compile_console,
+                }),
+            );
+        }
         return ok_json(serde_json::json!({
-            "success": compile_ok,
+            "success": true,
             "name": name,
             "open_uri": open_uri,
             "storage_stripped": storage_stripped,
-            "compiled": compile_ok,
+            "compiled": true,
             "compile_errors": compile_errors,
             "compile_console": compile_console,
         }));
