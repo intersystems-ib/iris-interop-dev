@@ -33,6 +33,20 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      # Provenance guard (issue #3): a release where the tag name, Cargo.toml and the
+      # binary's --version disagree must never publish. Check tag vs Cargo.toml before
+      # spending a build; the built binary is checked in "guard: binary --version" below.
+      - name: "guard: tag matches Cargo.toml version"
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"; tag_version="${tag_version%%-*}"
+          cargo_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          echo "tag=$GITHUB_REF_NAME → $tag_version, Cargo.toml=$cargo_version"
+          if [ "$tag_version" != "$cargo_version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME declares $tag_version but Cargo.toml says $cargo_version — refusing to release"
+            exit 1
+          fi
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -47,6 +61,17 @@ jobs:
       - name: ad-hoc codesign (macOS — avoids Gatekeeper quarantine hang)
         if: runner.os == 'macOS'
         run: codesign --force --deep --sign - "${{ matrix.asset }}"
+      # All three targets are native to their runner, so the staged asset is executable here.
+      - name: "guard: binary --version matches Cargo.toml"
+        shell: bash
+        run: |
+          cargo_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          bin_version=$("./${{ matrix.asset }}" --version | awk '{print $NF}')
+          echo "binary=$bin_version, Cargo.toml=$cargo_version"
+          if [ "$bin_version" != "$cargo_version" ]; then
+            echo "::error::built binary reports $bin_version but Cargo.toml says $cargo_version — refusing to release"
+            exit 1
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
