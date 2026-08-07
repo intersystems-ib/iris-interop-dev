@@ -13,6 +13,12 @@ pub struct CompileCommand {
     pub host: Option<String>,
     #[arg(long, env = "IRIS_WEB_PORT", default_value = "52773")]
     pub web_port: u16,
+    /// URL path prefix for webgateway/IIS-fronted instances (e.g. irishealth)
+    #[arg(long, env = "IRIS_WEB_PREFIX", default_value = "")]
+    pub web_prefix: String,
+    /// URL scheme: http or https
+    #[arg(long, env = "IRIS_SCHEME", default_value = "http")]
+    pub scheme: String,
     #[arg(long, env = "IRIS_NAMESPACE", default_value = "USER")]
     pub namespace: String,
     #[arg(long, env = "IRIS_USERNAME")]
@@ -30,7 +36,15 @@ pub struct CompileCommand {
 impl CompileCommand {
     pub async fn run(self) -> Result<()> {
         let explicit = self.host.as_ref().map(|host| {
-            let base_url = format!("http://{}:{}", host, self.web_port);
+            // Honor prefix + scheme — behind a webgateway (IRIS_WEB_PREFIX) the bare
+            // http://host:port form can't reach Atelier at all (issue #21, upstream #85).
+            let scheme = self.scheme.trim_matches('/');
+            let prefix = self.web_prefix.trim_matches('/');
+            let base_url = if prefix.is_empty() {
+                format!("{}://{}:{}", scheme, host, self.web_port)
+            } else {
+                format!("{}://{}:{}/{}", scheme, host, self.web_port, prefix)
+            };
             let username = self.username.as_deref().unwrap_or("_SYSTEM");
             let password = self.password.as_deref().unwrap_or("SYS");
             IrisConnection::new(

@@ -1451,7 +1451,13 @@ impl IrisTools {
         iris: Option<IrisConnection>,
         toolset: Toolset,
     ) -> anyhow::Result<Self> {
-        Self::with_registry_and_toolset(iris, crate::skills::SkillRegistry::new(), toolset, None)
+        Self::with_registry_and_toolset(
+            iris,
+            crate::skills::SkillRegistry::new(),
+            toolset,
+            None,
+            None,
+        )
     }
 
     /// Returns the set of tool names registered for the current toolset.
@@ -1583,13 +1589,14 @@ impl IrisTools {
         iris: Option<IrisConnection>,
         registry: crate::skills::SkillRegistry,
     ) -> anyhow::Result<Self> {
-        Self::with_registry_and_toolset(iris, registry, Toolset::Baseline, None)
+        Self::with_registry_and_toolset(iris, registry, Toolset::Baseline, None, None)
     }
     pub fn with_registry_and_toolset(
         iris: Option<IrisConnection>,
         registry: crate::skills::SkillRegistry,
         toolset: Toolset,
         config_watcher: Option<ConfigWatcher>,
+        config_path: Option<std::path::PathBuf>,
     ) -> anyhow::Result<Self> {
         let client = Arc::new(IrisConnection::http_client()?);
         let mut router = Self::tool_router();
@@ -1681,7 +1688,17 @@ impl IrisTools {
                         router.remove_route(name);
                     }
                 }
-                ConnectionState::from_iris(c, ConnectionSource::AutoDiscovered, None)
+                {
+                    // Record ConfigFile source (and the path) when the connection came from
+                    // a .iris-agentic-dev.toml — so check_config shows config_file at
+                    // startup, not just after the first hot-reload (issue #21, upstream #82).
+                    let (source, file) = if config_path.is_some() {
+                        (ConnectionSource::ConfigFile, config_path)
+                    } else {
+                        (ConnectionSource::AutoDiscovered, None)
+                    };
+                    ConnectionState::from_iris(c, source, file)
+                }
             }
             None => ConnectionState::new_disconnected(ConnectionSource::EnvVars),
         };
@@ -3239,6 +3256,22 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
 
         if let Some(ref err) = conn.config_parse_error {
             response["config_parse_error"] = serde_json::Value::String(err.clone());
+        }
+
+        // Surface fallback discovery explicitly: a connection with no config file and a
+        // non-explicit source came from Docker/port-scan discovery, which can silently
+        // target the wrong instance (issue #21, upstream #82).
+        let is_explicit = matches!(
+            conn.source,
+            ConnectionSource::ConfigFile | ConnectionSource::EnvVars
+        );
+        if conn.config_file.is_none() && !is_explicit && conn.iris.is_some() {
+            response["fallback_warning"] = serde_json::Value::String(
+                "No .iris-agentic-dev.toml config file found. Connection established via \
+                 fallback discovery (Docker/port scan). Set OBJECTSCRIPT_WORKSPACE or create \
+                 a .iris-agentic-dev.toml in your project root to pin the target instance."
+                    .to_string(),
+            );
         }
 
         ok_json(response)
