@@ -707,7 +707,13 @@ pub struct TestParams {
 }
 
 fn default_test_timeout() -> u64 {
-    60
+    // %UnitTest.TestProduction suites (the TDD workshop pattern) routinely exceed 60s.
+    // OBJECTSCRIPT_TEST_TIMEOUT overrides for slower instances (issue #22, upstream #59).
+    std::env::var("OBJECTSCRIPT_TEST_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(120)
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SymbolsParams {

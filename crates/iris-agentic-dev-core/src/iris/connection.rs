@@ -380,6 +380,11 @@ impl IrisConnection {
     /// for the existing Rust-side transport decode in `execute_via_generator_once`).
     fn build_exec_class(class_name: &str, code: &str) -> Vec<String> {
         let mut lines: Vec<String> = vec![
+            // $$$macros in USER code ($$$OK, $$$ISERR, $$$ThrowOnError...) must resolve
+            // regardless of whether this IRIS version implicitly includes %occInclude
+            // for class compiles (issue #22, upstream 713c23c).
+            "Include %occInclude".into(),
+            "".into(),
             format!("Class {} [ Final ]", class_name),
             "{".into(),
             "".into(),
@@ -423,7 +428,7 @@ impl IrisConnection {
             "  Set sc = stream.LinkToFile(tmpfile)".into(),
             // $SYSTEM.Status.IsOK avoids needing %occStatus.inc in a non-objectgenerator method.
             "  If $SYSTEM.Status.IsOK(sc) {".into(),
-            "    While 'stream.AtEnd { Set out = out_stream.ReadLine()_$Char(10) }".into(),
+            "    While 'stream.AtEnd { Set out = out _ stream.ReadLine() _ $Char(10) }".into(),
             "  }".into(),
             "  Do ##class(%Library.File).Delete(tmpfile)".into(),
             // Encode newlines as $C(1) for the Rust-side transport (decoded \x01 -> \n).
@@ -688,16 +693,26 @@ fn is_production_namespace(ns: &str) -> bool {
 pub fn strip_iris_banner(output: &str) -> String {
     let mut result_lines: Vec<&str> = Vec::new();
 
+    // Banner-text rules only apply before the first prompt is seen — after that, a line
+    // like "IRIS for UNIX ..." is legitimate `Write $ZVersion` output, not the
+    // connect-time banner, and must not be stripped (issue #20, upstream 37fdc95).
+    let mut seen_prompt = false;
+
     for line in output.lines() {
         let trimmed = line.trim();
 
-        // Unconditionally strip well-known banner lines.
-        if trimmed.starts_with("Copyright")
-            || trimmed.contains("InterSystems Corporation")
-            || trimmed.starts_with("All rights reserved")
-            || trimmed.starts_with("IRIS for ")
-            || trimmed.starts_with("Cache for ")
-            || trimmed.starts_with("Ensemble for ")
+        if !seen_prompt
+            && (trimmed.starts_with("Copyright")
+                || trimmed.contains("InterSystems Corporation")
+                || trimmed.starts_with("All rights reserved")
+                || trimmed.starts_with("IRIS for ")
+                || trimmed.starts_with("Cache for ")
+                || trimmed.starts_with("Ensemble for ")
+                // IRIS 2026.2+ prints "Node: <hostname>, Instance: IRIS" on session
+                // connect. Without this, its embedded ':' gets misparsed as a name:code
+                // pair by callers like parse_status_response ("Node" became the
+                // production name).
+                || (trimmed.starts_with("Node: ") && trimmed.contains(", Instance:")))
         {
             continue;
         }
@@ -705,6 +720,7 @@ pub fn strip_iris_banner(output: &str) -> String {
         // Strip bare prompt-only lines: lines that are just "USER>", "IRIS>", "%SYS>", etc.
         // A bare prompt line has no content beyond the prompt token.
         if is_bare_prompt_line(trimmed) {
+            seen_prompt = true;
             continue;
         }
 
@@ -752,6 +768,43 @@ fn is_bare_prompt_line(s: &str) -> bool {
 #[cfg(test)]
 mod system_mode_tests {
     use super::*;
+
+    // ── strip_iris_banner (issue #20, upstream 37fdc95) ──────────────────────
+    #[test]
+    fn strip_iris_banner_removes_node_instance_line() {
+        // IRIS 2026.2+ prints this on every `iris session` connect. Its embedded ':'
+        // previously got misparsed as a name:code pair by callers like
+        // interop::parse_status_response (production name came back as "Node").
+        let raw = "\nNode: de17f22ad88c, Instance: IRIS\n\nUSER>\nIrisDevTest.CoverageProduction:1\n\nUSER>\n";
+        let stripped = strip_iris_banner(raw);
+        assert!(!stripped.contains("Node:"), "{stripped:?}");
+        assert_eq!(stripped.trim(), "IrisDevTest.CoverageProduction:1");
+    }
+
+    #[test]
+    fn strip_iris_banner_keeps_iris_for_line_after_first_prompt() {
+        // `Write $ZVersion` legitimately outputs a string starting with "IRIS for
+        // UNIX ..." — that must NOT be treated as the connect-time banner just
+        // because it shares the prefix. Banner rules apply only before the first
+        // prompt is seen.
+        let raw = "\nNode: de17f22ad88c, Instance: IRIS\n\nUSER>\nIRIS for UNIX (Ubuntu Server LTS for ARM64 Containers) 2026.2.0L\n\nUSER>\n";
+        let stripped = strip_iris_banner(raw);
+        assert!(
+            stripped.trim().starts_with("IRIS for UNIX"),
+            "$ZVersion output must survive: {stripped:?}"
+        );
+    }
+
+    // ── build_exec_class: $$$macros must resolve (issue #22, upstream 713c23c) ─
+    #[test]
+    fn build_exec_class_includes_occinclude() {
+        let cls = IrisConnection::build_exec_class("User.T", "write $$$OK,!").join("\n");
+        let inc = cls
+            .find("Include %occInclude")
+            .expect("Include line missing");
+        let class_kw = cls.find("Class User.T").expect("Class line missing");
+        assert!(inc < class_kw, "Include must precede the Class line");
+    }
 
     // ── iris_execute generated-class shape (A2 silent-loss fix) ──────────────
     // The old class used `CodeMode = objectgenerator`, which ran user code at COMPILE
