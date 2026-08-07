@@ -340,7 +340,7 @@ pub fn score_container_name(container_name: &str, workspace_basename: &str) -> u
 /// Resolve a specific named container to its web port and probe it.
 /// Returns a structured `DiscoveryResult` — never emits log messages itself.
 async fn discover_via_docker_named(target: &str) -> DiscoveryResult {
-    use bollard::container::ListContainersOptions;
+    use bollard::query_parameters::ListContainersOptionsBuilder;
     use bollard::Docker;
 
     let docker = match Docker::connect_with_defaults() {
@@ -349,10 +349,9 @@ async fn discover_via_docker_named(target: &str) -> DiscoveryResult {
     };
     let containers = match tokio::time::timeout(
         Duration::from_secs(3),
-        docker.list_containers(Some(ListContainersOptions::<String> {
-            all: false,
-            ..Default::default()
-        })),
+        docker.list_containers(Some(
+            ListContainersOptionsBuilder::default().all(false).build(),
+        )),
     )
     .await
     {
@@ -492,7 +491,7 @@ async fn probe_atelier_for_container(
 }
 
 async fn discover_via_docker() -> Option<IrisConnection> {
-    use bollard::container::ListContainersOptions;
+    use bollard::query_parameters::ListContainersOptionsBuilder;
     use bollard::Docker;
 
     let workspace_basename = std::env::current_dir()
@@ -503,10 +502,9 @@ async fn discover_via_docker() -> Option<IrisConnection> {
     let docker = Docker::connect_with_defaults().ok()?;
     let containers = tokio::time::timeout(
         Duration::from_secs(3),
-        docker.list_containers(Some(ListContainersOptions::<String> {
-            all: false,
-            ..Default::default()
-        })),
+        docker.list_containers(Some(
+            ListContainersOptionsBuilder::default().all(false).build(),
+        )),
     )
     .await
     .ok()?
@@ -610,4 +608,31 @@ async fn discover_via_vscode_settings() -> Option<IrisConnection> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Live guard for the bollard 0.21 migration (issue #23): the parts bollard
+    /// touches are list_containers + name match + port map. Any running container
+    /// named by IRIS_DISCOVERY_TEST_CONTAINER must NOT come back NotFound —
+    /// Connected or FoundUnhealthy both prove the Docker API path works.
+    #[tokio::test]
+    #[ignore = "requires a running docker daemon and IRIS_DISCOVERY_TEST_CONTAINER"]
+    async fn discover_via_docker_named_finds_running_container() {
+        let target = match std::env::var("IRIS_DISCOVERY_TEST_CONTAINER") {
+            Ok(t) if !t.is_empty() => t,
+            _ => {
+                eprintln!("Skipping: IRIS_DISCOVERY_TEST_CONTAINER not set");
+                return;
+            }
+        };
+        match discover_via_docker_named(&target).await {
+            DiscoveryResult::NotFound => {
+                panic!("bollard did not find running container '{target}'")
+            }
+            other => eprintln!("container '{target}' found: {other:?}"),
+        }
+    }
 }
