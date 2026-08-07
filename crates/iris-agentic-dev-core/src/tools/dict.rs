@@ -46,10 +46,6 @@ fn err_json(code: &str, msg: &str) -> Result<rmcp::model::CallToolResult, rmcp::
     crate::tools::envelope::fail(code, msg)
 }
 
-fn default_namespace() -> String {
-    "USER".to_string()
-}
-
 // ── Tool 1: resolve_dynamic_dispatch ─────────────────────────────────────────
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -58,9 +54,9 @@ pub struct ResolveDynamicDispatchParams {
     pub method_name: String,
     /// Optional package prefix to restrict search (e.g. "EnsLib", "HS").
     pub package_prefix: Option<String>,
-    /// IRIS namespace. Defaults to "USER".
-    #[serde(default = "default_namespace")]
-    pub namespace: String,
+    /// IRIS namespace. Defaults to the connection namespace (IRIS_NAMESPACE).
+    #[serde(default)]
+    pub namespace: Option<String>,
     /// Max candidates to return. Defaults to 50.
     pub limit: Option<usize>,
 }
@@ -71,11 +67,12 @@ pub async fn handle_resolve_dynamic_dispatch(
     p: ResolveDynamicDispatchParams,
     cache: &MetadataCache,
 ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+    let namespace = crate::tools::interop::resolve_namespace(p.namespace.as_deref(), Some(iris));
     let prefix = p.package_prefix.as_deref().unwrap_or("");
     let limit = p.limit.unwrap_or(50);
     let cache_key = format!(
         "resolve_dynamic_dispatch:{}:{}:{}",
-        p.method_name, prefix, p.namespace
+        p.method_name, prefix, namespace
     );
     if let Some(cached) = metadata_cache_get(cache, &cache_key) {
         return ok_json(cached);
@@ -117,7 +114,7 @@ pub async fn handle_resolve_dynamic_dispatch(
     let code = lines.join("\n");
 
     let output = iris
-        .execute_via_generator(&code, &p.namespace, client)
+        .execute_via_generator(&code, &namespace, client)
         .await
         .map_err(|e| rmcp::ErrorData::internal_error(format!("execute failed: {e}"), None))?;
     let trimmed = output.trim();
@@ -142,7 +139,7 @@ pub async fn handle_resolve_dynamic_dispatch(
             c
         })
         .collect();
-    let r = serde_json::json!({"success":true,"method_name":p.method_name,"package_prefix":p.package_prefix,"namespace":p.namespace,"candidates":annotated,"candidate_count":n,"confidence":confidence,"truncated":n==limit});
+    let r = serde_json::json!({"success":true,"method_name":p.method_name,"package_prefix":p.package_prefix,"namespace":namespace,"candidates":annotated,"candidate_count":n,"confidence":confidence,"truncated":n==limit});
     metadata_cache_set(cache, cache_key, r.clone());
     ok_json(r)
 }
@@ -153,9 +150,9 @@ pub async fn handle_resolve_dynamic_dispatch(
 pub struct ExtractMessageMapParams {
     /// Fully qualified Ensemble class name (e.g. "HS.Flash.Router").
     pub class_name: String,
-    /// IRIS namespace. Defaults to "USER".
-    #[serde(default = "default_namespace")]
-    pub namespace: String,
+    /// IRIS namespace. Defaults to the connection namespace (IRIS_NAMESPACE).
+    #[serde(default)]
+    pub namespace: Option<String>,
 }
 
 fn build_message_map_code(cls: &str) -> String {
@@ -197,14 +194,15 @@ pub async fn handle_extract_message_map_routing(
     p: ExtractMessageMapParams,
     cache: &MetadataCache,
 ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
-    let cache_key = format!("extract_message_map:{}:{}", p.class_name, p.namespace);
+    let namespace = crate::tools::interop::resolve_namespace(p.namespace.as_deref(), Some(iris));
+    let cache_key = format!("extract_message_map:{}:{}", p.class_name, namespace);
     if let Some(cached) = metadata_cache_get(cache, &cache_key) {
         return ok_json(cached);
     }
 
     let code = build_message_map_code(&p.class_name);
     let output = iris
-        .execute_via_generator(&code, &p.namespace, client)
+        .execute_via_generator(&code, &namespace, client)
         .await
         .map_err(|e| rmcp::ErrorData::internal_error(format!("execute failed: {e}"), None))?;
     let trimmed = output.trim();
@@ -223,7 +221,7 @@ pub async fn handle_extract_message_map_routing(
     let has_mm = inner["has_message_map"].as_bool().unwrap_or(false);
     let routes = inner["routes"].as_array().cloned().unwrap_or_default();
     let route_count = routes.len();
-    let r = serde_json::json!({"success":true,"class_name":p.class_name,"namespace":p.namespace,"has_message_map":has_mm,"routes":routes,"route_count":route_count});
+    let r = serde_json::json!({"success":true,"class_name":p.class_name,"namespace":namespace,"has_message_map":has_mm,"routes":routes,"route_count":route_count});
     metadata_cache_set(cache, cache_key, r.clone());
     ok_json(r)
 }
@@ -236,9 +234,9 @@ pub struct FindSubclassImplementationsParams {
     pub method_name: String,
     /// Base classes to expand — all descendants searched (e.g. ["Ens.BusinessProcess"]).
     pub base_classes: Vec<String>,
-    /// IRIS namespace. Defaults to "USER".
-    #[serde(default = "default_namespace")]
-    pub namespace: String,
+    /// IRIS namespace. Defaults to the connection namespace (IRIS_NAMESPACE).
+    #[serde(default)]
+    pub namespace: Option<String>,
     /// Max results. Defaults to 100.
     pub limit: Option<usize>,
 }
@@ -275,6 +273,7 @@ pub async fn handle_find_subclass_implementations(
     p: FindSubclassImplementationsParams,
     cache: &MetadataCache,
 ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+    let namespace = crate::tools::interop::resolve_namespace(p.namespace.as_deref(), Some(iris));
     if p.base_classes.is_empty() {
         return err_json("INVALID_PARAMS", "base_classes must not be empty");
     }
@@ -285,7 +284,7 @@ pub async fn handle_find_subclass_implementations(
         "find_subclass:{}:{}:{}",
         p.method_name,
         sorted.join(","),
-        p.namespace
+        namespace
     );
     if let Some(cached) = metadata_cache_get(cache, &cache_key) {
         return ok_json(cached);
@@ -294,7 +293,7 @@ pub async fn handle_find_subclass_implementations(
     let limit = p.limit.unwrap_or(100);
     let expand_code = build_expand_hierarchy_code(&p.base_classes);
     let desc_raw = iris
-        .execute_via_generator(&expand_code, &p.namespace, client)
+        .execute_via_generator(&expand_code, &namespace, client)
         .await
         .map_err(|e| {
             rmcp::ErrorData::internal_error(format!("hierarchy expansion failed: {e}"), None)
@@ -307,7 +306,7 @@ pub async fn handle_find_subclass_implementations(
         .map(|s| s.to_string())
         .collect();
     if descendants.is_empty() {
-        let r = serde_json::json!({"success":true,"method_name":p.method_name,"base_classes":p.base_classes,"namespace":p.namespace,"implementations":[],"implementation_count":0,"confidence":0.0});
+        let r = serde_json::json!({"success":true,"method_name":p.method_name,"base_classes":p.base_classes,"namespace":namespace,"implementations":[],"implementation_count":0,"confidence":0.0});
         metadata_cache_set(cache, cache_key, r.clone());
         return ok_json(r);
     }
@@ -334,7 +333,7 @@ pub async fn handle_find_subclass_implementations(
     let code = lines.join("\n");
 
     let output = iris
-        .execute_via_generator(&code, &p.namespace, client)
+        .execute_via_generator(&code, &namespace, client)
         .await
         .map_err(|e| rmcp::ErrorData::internal_error(format!("method query failed: {e}"), None))?;
     let trimmed = output.trim();
@@ -353,7 +352,7 @@ pub async fn handle_find_subclass_implementations(
             i
         })
         .collect();
-    let r = serde_json::json!({"success":true,"method_name":p.method_name,"base_classes":p.base_classes,"namespace":p.namespace,"implementations":annotated,"implementation_count":n,"confidence":confidence});
+    let r = serde_json::json!({"success":true,"method_name":p.method_name,"base_classes":p.base_classes,"namespace":namespace,"implementations":annotated,"implementation_count":n,"confidence":confidence});
     metadata_cache_set(cache, cache_key, r.clone());
     ok_json(r)
 }

@@ -44,7 +44,7 @@ fn test_known_menu_items_contains_standard_actions() {
 fn test_scm_params_action_required() {
     let p: ScmParams = serde_json::from_str(r#"{"action": "status"}"#).unwrap();
     assert_eq!(p.action, "status");
-    assert_eq!(p.namespace, "USER"); // default_namespace
+    assert_eq!(p.namespace, None); // omitted -> resolved to the connection namespace at call time
     assert!(p.document.is_none());
     assert!(p.action_id.is_none());
     assert!(p.answer.is_none());
@@ -65,7 +65,7 @@ fn test_scm_params_full() {
     assert_eq!(p.action, "execute");
     assert_eq!(p.document.as_deref(), Some("MyClass.cls"));
     assert_eq!(p.action_id.as_deref(), Some("CheckOut"));
-    assert_eq!(p.namespace, "MYNAMESPACE");
+    assert_eq!(p.namespace.as_deref(), Some("MYNAMESPACE"));
 }
 
 #[test]
@@ -81,7 +81,7 @@ fn test_scm_params_with_elicitation_fields() {
     assert_eq!(p.action, "execute");
     assert_eq!(p.answer.as_deref(), Some("yes"));
     assert_eq!(p.elicitation_id.as_deref(), Some("eid-abc123"));
-    assert_eq!(p.namespace, "USER");
+    assert_eq!(p.namespace, None);
 }
 
 #[test]

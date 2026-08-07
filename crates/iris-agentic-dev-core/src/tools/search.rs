@@ -18,15 +18,11 @@ pub struct SearchParams {
     /// Wildcard document scopes e.g. ["HS.FHIR.*.cls"]
     #[serde(default)]
     pub documents: Vec<String>,
-    #[serde(default = "default_namespace")]
-    pub namespace: String,
+    #[serde(default)]
+    pub namespace: Option<String>,
     /// If true, bypass the log store and return all results inline regardless of count.
     #[serde(default)]
     pub inline: bool,
-}
-
-fn default_namespace() -> String {
-    "USER".to_string()
 }
 
 fn ok_json(v: serde_json::Value) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
@@ -41,6 +37,7 @@ pub async fn handle_iris_search(
     p: SearchParams,
     log_store: Arc<Mutex<log_store::LogStore>>,
 ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+    let namespace = crate::tools::interop::resolve_namespace(p.namespace.as_deref(), Some(iris));
     let category = p.category.as_deref().unwrap_or("ALL");
     let mut query_string = format!(
         "query={}&regex={}&sys=false&category={}",
@@ -52,7 +49,7 @@ pub async fn handle_iris_search(
         query_string.push_str("&case=1");
     }
 
-    let sync_url = iris.versioned_ns_url(&p.namespace, &format!("/action/search?{}", query_string));
+    let sync_url = iris.versioned_ns_url(&namespace, &format!("/action/search?{}", query_string));
 
     // Try sync search with 2s timeout
     let sync_client = reqwest::Client::builder()
@@ -76,19 +73,13 @@ pub async fn handle_iris_search(
             }
             let work_id = body["result"]["workId"].as_str().unwrap_or("").to_string();
             poll_async_search(
-                iris,
-                client,
-                &work_id,
-                &p.namespace,
-                &p.query,
-                p.inline,
-                &log_store,
+                iris, client, &work_id, &namespace, &p.query, p.inline, &log_store,
             )
             .await
         }
         _ => {
             // Timeout or error — fall back to async POST
-            let post_url = iris.versioned_ns_url(&p.namespace, "/action/search");
+            let post_url = iris.versioned_ns_url(&namespace, "/action/search");
             let post_body = serde_json::json!({
                 "query": p.query,
                 "regex": p.regex,
@@ -108,13 +99,7 @@ pub async fn handle_iris_search(
             let body: serde_json::Value = resp.json().await.unwrap_or_default();
             if let Some(work_id) = body["result"]["workId"].as_str() {
                 poll_async_search(
-                    iris,
-                    client,
-                    work_id,
-                    &p.namespace,
-                    &p.query,
-                    p.inline,
-                    &log_store,
+                    iris, client, work_id, &namespace, &p.query, p.inline, &log_store,
                 )
                 .await
             } else {
@@ -228,11 +213,14 @@ mod tests {
     // ── parse_search_results ──────────────────────────────────────────────────
     // parse_search_results is private — test indirectly via known behaviour
     #[test]
-    fn test_search_params_namespace_required_field() {
-        // namespace has no serde default in search.rs — it's required or has default
+    fn test_search_params_namespace_optional_field() {
+        // Explicit namespace is kept; omitted resolves to the connection
+        // namespace at call time (issue #15).
         let result: Result<SearchParams, _> =
             serde_json::from_str(r#"{"query":"x","namespace":"MYNS"}"#);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap().namespace, "MYNS");
+        assert_eq!(result.unwrap().namespace.as_deref(), Some("MYNS"));
+        let omitted: SearchParams = serde_json::from_str(r#"{"query":"x"}"#).unwrap();
+        assert_eq!(omitted.namespace, None);
     }
 }

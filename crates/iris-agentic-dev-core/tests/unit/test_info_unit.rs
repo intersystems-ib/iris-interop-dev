@@ -14,14 +14,14 @@ fn test_info_params_what_field_metadata() {
 #[test]
 fn test_info_params_namespace_default() {
     let p: InfoParams = serde_json::from_str(r#"{"what": "documents"}"#).unwrap();
-    assert_eq!(p.namespace, "USER");
+    assert_eq!(p.namespace, None); // omitted -> resolved to the connection namespace at call time
 }
 
 #[test]
 fn test_info_params_namespace_override() {
     let p: InfoParams =
         serde_json::from_str(r#"{"what": "namespace", "namespace": "MYNS"}"#).unwrap();
-    assert_eq!(p.namespace, "MYNS");
+    assert_eq!(p.namespace.as_deref(), Some("MYNS"));
 }
 
 #[test]
@@ -93,14 +93,14 @@ fn test_macro_params_action_signature() {
 #[test]
 fn test_macro_params_namespace_default() {
     let p: MacroParams = serde_json::from_str(r#"{"action": "list"}"#).unwrap();
-    assert_eq!(p.namespace, "USER");
+    assert_eq!(p.namespace, None); // omitted -> resolved to the connection namespace at call time
 }
 
 #[test]
 fn test_macro_params_namespace_override() {
     let p: MacroParams =
         serde_json::from_str(r#"{"action": "list", "namespace": "PROD"}"#).unwrap();
-    assert_eq!(p.namespace, "PROD");
+    assert_eq!(p.namespace.as_deref(), Some("PROD"));
 }
 
 #[test]
@@ -150,7 +150,7 @@ fn test_debug_params_action_map_int() {
 #[test]
 fn test_debug_params_namespace_default() {
     let p: DebugParams = serde_json::from_str(r#"{"action": "error_logs"}"#).unwrap();
-    assert_eq!(p.namespace, "USER");
+    assert_eq!(p.namespace, None); // omitted -> resolved to the connection namespace at call time
 }
 
 #[test]
@@ -231,14 +231,14 @@ fn test_generate_params_gen_type_test() {
 #[test]
 fn test_generate_params_namespace_default() {
     let p: GenerateParams = serde_json::from_str(r#"{"description": "something"}"#).unwrap();
-    assert_eq!(p.namespace, "USER");
+    assert_eq!(p.namespace, None); // omitted -> resolved to the connection namespace at call time
 }
 
 #[test]
 fn test_generate_params_namespace_override() {
     let p: GenerateParams =
         serde_json::from_str(r#"{"description": "x", "namespace": "PROD"}"#).unwrap();
-    assert_eq!(p.namespace, "PROD");
+    assert_eq!(p.namespace.as_deref(), Some("PROD"));
 }
 
 #[test]
