@@ -580,6 +580,90 @@ fn test_execute_and_query_namespace_defaults_to_connection() {
 }
 
 #[test]
+#[ignore = "requires live IRIS"]
+fn test_search_scope_and_case_insensitive_default() {
+    // Issue #17: iris_search never sent a `files=` scope (Atelier greps nothing
+    // without one) and omitted `case=`, which Atelier treats as case-SENSITIVE —
+    // so the natural lowercase search missed mixed-case code.
+    let iris_host = std::env::var("IRIS_HOST").unwrap_or_default();
+    assert!(!iris_host.is_empty(), "IRIS_HOST must be set");
+
+    let exchange = |args: serde_json::Value, tool: &str| {
+        let responses = mcp_exchange(&[
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
+            serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":tool,"arguments":args}}),
+        ]);
+        find_response(&responses, 2).expect("no response")
+    };
+
+    // Marker class with a MiXeD-case token; searched lowercase below.
+    let marker =
+        "Class IrisDevE2E.SearchMarker\n{\n/// carries the SeArChMaRkEr17 token\nClassMethod Noop()\n{\n    Quit\n}\n}\n";
+    let frame = exchange(
+        serde_json::json!({"mode":"put","name":"IrisDevE2E.SearchMarker.cls","content":marker,"compile":false}),
+        "iris_doc",
+    );
+    assert_ne!(
+        frame["result"]["isError"], true,
+        "marker PUT failed: {frame}"
+    );
+
+    // 1. No `documents` scope → explicit SCOPE_REQUIRED error, not empty results.
+    let frame = exchange(serde_json::json!({"query":"searchmarker17"}), "iris_search");
+    assert_eq!(
+        frame["result"]["isError"], true,
+        "scopeless search must be refused: {frame}"
+    );
+    let v = parse_tool_text(&frame);
+    assert_eq!(v["error_code"], "SCOPE_REQUIRED", "{v}");
+
+    // 2. Lowercase query + scope → finds the MiXeD-case token (case-insensitive
+    //    default). The pre-fix code returned 0 results here (no files= param).
+    let frame = exchange(
+        serde_json::json!({"query":"searchmarker17","documents":["IrisDevE2E.*.cls"]}),
+        "iris_search",
+    );
+    assert_ne!(frame["result"]["isError"], true, "{frame}");
+    let v = parse_tool_text(&frame);
+    assert_eq!(v["success"], true, "{v}");
+    let total = v["total_found"].as_i64().unwrap_or(0);
+    assert!(
+        total >= 1,
+        "case-insensitive scoped search found nothing: {v}"
+    );
+    let hits = v["results"].as_array().cloned().unwrap_or_default();
+    assert!(
+        hits.iter().any(|r| r["document"]
+            .as_str()
+            .unwrap_or("")
+            .contains("SearchMarker")),
+        "marker class not in results: {v}"
+    );
+
+    // 3. case_sensitive:true with the wrong case → no hits for the marker.
+    let frame = exchange(
+        serde_json::json!({"query":"searchmarker17","documents":["IrisDevE2E.*.cls"],"case_sensitive":true}),
+        "iris_search",
+    );
+    let v = parse_tool_text(&frame);
+    let hits = v["results"].as_array().cloned().unwrap_or_default();
+    assert!(
+        !hits.iter().any(|r| r["document"]
+            .as_str()
+            .unwrap_or("")
+            .contains("SearchMarker")),
+        "case-sensitive search must miss the mixed-case token: {v}"
+    );
+
+    // Cleanup (best-effort).
+    let _ = exchange(
+        serde_json::json!({"mode":"delete","name":"IrisDevE2E.SearchMarker.cls"}),
+        "iris_doc",
+    );
+}
+
+#[test]
 #[ignore = "requires live IRIS with Interoperability"]
 fn test_error_envelope_and_is_error_flag() {
     // Issue #2: genuine tool failures must set isError on the CallToolResult
