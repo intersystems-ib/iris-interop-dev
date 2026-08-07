@@ -416,9 +416,11 @@ impl IrisConnection {
             "    Write \"ERROR: \",ex.DisplayString(),!".into(),
             "  }".into(),
             "  Write !".into(), // IDEV-3: sentinel ensures temp file always ends with \n
-            // Surface non-exception errors (e.g. OPEN failure sets $ZERROR but doesn't throw).
-            "  If ($ZError'=\"\") && ($ZError'=\",\") { Write \"ERROR($ZERROR): \",$ZError,! }"
-                .into(),
+            // Snapshot $ZERROR now, before Close/Use/stream operations below can clobber
+            // it. This captures non-exception errors (e.g. an OPEN failure that sets
+            // $ZERROR without throwing) so we can surface them if the body produced no
+            // output — but WITHOUT writing to tmpfile yet (see the out="" test below).
+            "  Set ze = $ZError".into(),
             "  Close tmpfile".into(),
             "  Use savedIO".into(),
             // Read the temp file contents using %Stream for reliability.
@@ -431,6 +433,12 @@ impl IrisConnection {
             "    While 'stream.AtEnd { Set out = out _ stream.ReadLine() _ $Char(10) }".into(),
             "  }".into(),
             "  Do ##class(%Library.File).Delete(tmpfile)".into(),
+            // Only surface a non-exception $ZERROR when the body produced NO output.
+            // A residual like <ENDOFFILE> is often left as a benign side effect of an
+            // SCM provider's internal Read even when the operation fully succeeded;
+            // appending it to a non-empty result corrupted otherwise-valid output.
+            "  If (out=\"\") && (ze'=\"\") && (ze'=\",\") { Set out = \"ERROR($ZERROR): \"_ze_$Char(10) }"
+                .into(),
             // Encode newlines as $C(1) for the Rust-side transport (decoded \x01 -> \n).
             "  Quit $Replace(out,$Char(10),$Char(1))".into(),
             "}".into(),

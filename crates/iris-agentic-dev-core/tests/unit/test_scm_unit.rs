@@ -1,43 +1,37 @@
-// Unit tests for scm.rs internal logic (no IRIS needed).
-// Tests KNOWN_MENU_ITEMS and ScmParams deserialization.
+// Unit tests for scm.rs public surface (no IRIS needed).
+// Tests ScmAction/SCM_MENU and ScmParams deserialization.
 
-use iris_agentic_dev_core::tools::scm::{ScmParams, KNOWN_MENU_ITEMS};
+use iris_agentic_dev_core::tools::scm::{ScmAction, ScmParams, SCM_MENU};
 
 #[test]
-fn test_known_menu_items_not_empty() {
-    assert!(
-        !KNOWN_MENU_ITEMS.is_empty(),
-        "KNOWN_MENU_ITEMS must have entries"
-    );
-    assert!(
-        KNOWN_MENU_ITEMS.contains(&"CheckOut"),
-        "must contain CheckOut"
-    );
-    assert!(
-        KNOWN_MENU_ITEMS.contains(&"CheckIn"),
-        "must contain CheckIn"
+fn test_scm_menu_is_source_menu() {
+    assert_eq!(SCM_MENU, "%SourceMenu");
+}
+
+#[test]
+fn test_scm_action_from_id_standard_actions() {
+    assert_eq!(ScmAction::from_id("CheckOut"), ScmAction::CheckOut);
+    assert_eq!(ScmAction::from_id("UndoCheckout"), ScmAction::UndoCheckout);
+    assert_eq!(ScmAction::from_id("CheckIn"), ScmAction::CheckIn);
+    assert_eq!(ScmAction::from_id("GetLatest"), ScmAction::GetLatest);
+    assert_eq!(
+        ScmAction::from_id("AddToSourceControl"),
+        ScmAction::AddToSourceControl
     );
 }
 
 #[test]
-fn test_known_menu_items_count() {
-    assert!(
-        KNOWN_MENU_ITEMS.len() >= 5,
-        "expect at least 5 known menu items, got {}",
-        KNOWN_MENU_ITEMS.len()
-    );
+fn test_scm_action_from_id_strips_percent_prefix() {
+    assert_eq!(ScmAction::from_id("%CheckOut"), ScmAction::CheckOut);
+    assert_eq!(ScmAction::from_id("%CheckIn"), ScmAction::CheckIn);
 }
 
 #[test]
-fn test_known_menu_items_contains_standard_actions() {
-    let expected = ["CheckOut", "UndoCheckOut", "CheckIn", "GetLatest", "Status"];
-    for item in &expected {
-        assert!(
-            KNOWN_MENU_ITEMS.contains(item),
-            "KNOWN_MENU_ITEMS missing: {}",
-            item
-        );
-    }
+fn test_scm_action_from_id_unknown_preserved() {
+    assert_eq!(
+        ScmAction::from_id("SomethingElse"),
+        ScmAction::Unknown("SomethingElse".to_string())
+    );
 }
 
 #[test]
