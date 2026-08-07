@@ -20,6 +20,8 @@ pub struct SearchParams {
     /// and times out server-side, so at least one scope must be provided.
     #[serde(default)]
     pub documents: Vec<String>,
+    /// IRIS namespace. OMIT this field to use the connection's configured namespace
+    /// (IRIS_NAMESPACE) — only pass a value to deliberately target a different namespace.
     #[serde(default)]
     pub namespace: Option<String>,
     /// If true, bypass the log store and return all results inline regardless of count.

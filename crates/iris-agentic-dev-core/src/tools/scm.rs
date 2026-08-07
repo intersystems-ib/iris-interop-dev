@@ -60,6 +60,8 @@ pub struct ScmParams {
     /// Elicitation resume answer
     pub answer: Option<String>,
     pub elicitation_id: Option<String>,
+    /// IRIS namespace. OMIT this field to use the connection's configured namespace
+    /// (IRIS_NAMESPACE) — only pass a value to deliberately target a different namespace.
     #[serde(default)]
     pub namespace: Option<String>,
 }

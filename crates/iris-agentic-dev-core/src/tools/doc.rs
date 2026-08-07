@@ -46,6 +46,8 @@ pub struct IrisDocParams {
     pub names: Vec<String>,
     /// Source content (required for mode=put)
     pub content: Option<String>,
+    /// IRIS namespace. OMIT this field to use the connection's configured namespace
+    /// (IRIS_NAMESPACE) — only pass a value to deliberately target a different namespace.
     #[serde(default)]
     pub namespace: Option<String>,
     /// Elicitation resume ID (from a prior elicitation_required response)

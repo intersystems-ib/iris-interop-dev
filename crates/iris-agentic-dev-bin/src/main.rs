@@ -6,7 +6,7 @@ mod cmd;
 
 #[derive(Parser)]
 #[command(
-    name = "iris-agentic-dev",
+    name = "iris-interop-dev",
     version,
     about = "CLI and package manager for InterSystems IRIS developer ecosystem",
     long_about = None,

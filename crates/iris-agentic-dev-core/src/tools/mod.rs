@@ -689,6 +689,8 @@ pub struct CompileParams {
     pub target: String,
     #[serde(default = "default_flags")]
     pub flags: String,
+    /// IRIS namespace. OMIT this field to use the connection's configured namespace
+    /// (IRIS_NAMESPACE) — only pass a value to deliberately target a different namespace.
     #[serde(default)]
     pub namespace: Option<String>,
     #[serde(default)]
@@ -700,6 +702,8 @@ pub struct CompileParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct TestParams {
     pub pattern: String,
+    /// IRIS namespace. OMIT this field to use the connection's configured namespace
+    /// (IRIS_NAMESPACE) — only pass a value to deliberately target a different namespace.
     #[serde(default)]
     pub namespace: Option<String>,
     #[serde(default = "default_test_timeout")]
@@ -720,12 +724,16 @@ pub struct SymbolsParams {
     pub query: String,
     #[serde(default = "default_limit")]
     pub limit: usize,
+    /// IRIS namespace. OMIT this field to use the connection's configured namespace
+    /// (IRIS_NAMESPACE) — only pass a value to deliberately target a different namespace.
     #[serde(default)]
     pub namespace: Option<String>,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct IntrospectParams {
     pub class_name: String,
+    /// IRIS namespace. OMIT this field to use the connection's configured namespace
+    /// (IRIS_NAMESPACE) — only pass a value to deliberately target a different namespace.
     #[serde(default)]
     pub namespace: Option<String>,
 }
@@ -737,6 +745,8 @@ pub struct DebugMapParams {
     pub offset: i64,
     #[serde(default)]
     pub error_string: String,
+    /// IRIS namespace. OMIT this field to use the connection's configured namespace
+    /// (IRIS_NAMESPACE) — only pass a value to deliberately target a different namespace.
     #[serde(default)]
     pub namespace: Option<String>,
 }
@@ -745,12 +755,16 @@ pub struct GenerateClassParams {
     pub description: String,
     #[serde(default)]
     pub overwrite: bool,
+    /// IRIS namespace. OMIT this field to use the connection's configured namespace
+    /// (IRIS_NAMESPACE) — only pass a value to deliberately target a different namespace.
     #[serde(default)]
     pub namespace: Option<String>,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GenerateTestParams {
     pub class_name: String,
+    /// IRIS namespace. OMIT this field to use the connection's configured namespace
+    /// (IRIS_NAMESPACE) — only pass a value to deliberately target a different namespace.
     #[serde(default)]
     pub namespace: Option<String>,
 }
@@ -791,11 +805,15 @@ fn default_symbols_local_limit() -> usize {
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CapturePacketParams {
+    /// IRIS namespace. OMIT this field to use the connection's configured namespace
+    /// (IRIS_NAMESPACE) — only pass a value to deliberately target a different namespace.
     #[serde(default)]
     pub namespace: Option<String>,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ErrorLogsParams {
+    /// IRIS namespace. OMIT this field to use the connection's configured namespace
+    /// (IRIS_NAMESPACE) — only pass a value to deliberately target a different namespace.
     #[serde(default)]
     pub namespace: Option<String>,
     #[serde(default = "default_max_entries")]
@@ -830,12 +848,16 @@ pub struct SourceMapParams {
     #[serde(default)]
     pub cls_text: Option<String>,
     pub workspace_path: Option<String>,
+    /// IRIS namespace. OMIT this field to use the connection's configured namespace
+    /// (IRIS_NAMESPACE) — only pass a value to deliberately target a different namespace.
     #[serde(default)]
     pub namespace: Option<String>,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ExecuteParams {
     pub code: String,
+    /// IRIS namespace. OMIT this field to use the connection's configured namespace
+    /// (IRIS_NAMESPACE) — only pass a value to deliberately target a different namespace.
     #[serde(default)]
     pub namespace: Option<String>,
     #[serde(default = "default_execute_timeout")]
@@ -856,6 +878,8 @@ pub struct QueryParams {
     /// Query parameters as strings (e.g. ["Alice", "42"])
     #[serde(default)]
     pub parameters: Vec<String>,
+    /// IRIS namespace. OMIT this field to use the connection's configured namespace
+    /// (IRIS_NAMESPACE) — only pass a value to deliberately target a different namespace.
     #[serde(default)]
     pub namespace: Option<String>,
     /// If true, bypass SQL safety validation. Use only for intentional administrative queries.
@@ -870,6 +894,8 @@ pub struct ListContainersParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SelectContainerParams {
     pub name: String,
+    /// IRIS namespace. OMIT this field to use the connection's configured namespace
+    /// (IRIS_NAMESPACE) — only pass a value to deliberately target a different namespace.
     #[serde(default)]
     pub namespace: Option<String>,
     #[serde(default = "default_username")]
