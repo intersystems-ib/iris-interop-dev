@@ -31,6 +31,8 @@ pub struct InfoParams {
     pub doc_type: Option<String>,
     /// Schema/cube name for what=sa_schema
     pub name: Option<String>,
+    /// IRIS namespace. OMIT this field to use the connection's configured namespace
+    /// (IRIS_NAMESPACE) — only pass a value to deliberately target a different namespace.
     #[serde(default)]
     pub namespace: Option<String>,
     /// If true, bypass the log store and return all results inline regardless of count.
@@ -114,6 +116,8 @@ pub struct MacroParams {
     pub name: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
+    /// IRIS namespace. OMIT this field to use the connection's configured namespace
+    /// (IRIS_NAMESPACE) — only pass a value to deliberately target a different namespace.
     #[serde(default)]
     pub namespace: Option<String>,
 }
@@ -196,6 +200,8 @@ pub struct DebugParams {
     pub class_name: Option<String>,
     #[serde(default = "default_limit")]
     pub limit: usize,
+    /// IRIS namespace. OMIT this field to use the connection's configured namespace
+    /// (IRIS_NAMESPACE) — only pass a value to deliberately target a different namespace.
     #[serde(default)]
     pub namespace: Option<String>,
 }
@@ -281,6 +287,8 @@ pub struct GenerateParams {
     pub gen_type: String,
     /// Existing class name to generate tests for (gen_type=test only)
     pub class_name: Option<String>,
+    /// IRIS namespace. OMIT this field to use the connection's configured namespace
+    /// (IRIS_NAMESPACE) — only pass a value to deliberately target a different namespace.
     #[serde(default)]
     pub namespace: Option<String>,
 }

@@ -334,7 +334,15 @@ pub async fn interop_production_status_impl(
                     serde_json::json!({"success": true, "production": name, "state": state, "state_code": code}),
                 ),
                 Err(e) if e.starts_with("INTEROP_ERROR") => err_json("INTEROP_ERROR", &e[14..]),
-                Err(_) => err_json("NO_PRODUCTION", "No production is running"),
+                // "No production running" answered to a STATUS question is a normal
+                // state, not a failure (issue #32) — fresh instances live here. Genuine
+                // failures (unreachable, non-interop ns) still route through err_json.
+                Err(_) => ok_json(serde_json::json!({
+                    "success": true,
+                    "state": "stopped",
+                    "production": serde_json::Value::Null,
+                    "note": "No production is running in this namespace",
+                })),
             }
         }
         Err(e) if e.to_string() == "DOCKER_REQUIRED" => docker_required_interop(),
