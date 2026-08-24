@@ -812,6 +812,62 @@ fn test_error_envelope_and_is_error_flag() {
         serde_json::json!({"mode":"delete","name":"IrisDevE2E.Broken.cls","namespace":ns}),
         "iris_doc",
     );
+
+    // 5. iris_compile on a class that does not compile → isError + COMPILE_ERROR.
+    //    Issue #46: this branch returned ok_json with success:false and no isError,
+    //    so a spec-compliant client read a failed compile as a successful call and
+    //    the agent kept iterating against a class it believed it had compiled.
+    let broken_src = "Class IrisDevE2E.BrokenCompile\n{\nClassMethod X()\n{\n    this is not objectscript\n}\n}\n";
+    let _ = exchange(
+        serde_json::json!({"mode":"put","name":"IrisDevE2E.BrokenCompile.cls","content":broken_src,"namespace":ns}),
+        "iris_doc",
+    );
+    let frame = exchange(
+        serde_json::json!({"target":"IrisDevE2E.BrokenCompile.cls","namespace":ns}),
+        "iris_compile",
+    );
+    assert_eq!(
+        frame["result"]["isError"], true,
+        "failed compile unflagged: {frame}"
+    );
+    let v = parse_tool_text(&frame);
+    assert_eq!(v["success"], false, "{v}");
+    assert_eq!(v["error_code"], "COMPILE_ERROR", "{v}");
+    assert!(
+        !v["error"].as_str().unwrap_or("").is_empty(),
+        "message must live in `error`: {v}"
+    );
+    assert!(
+        v["errors"]
+            .as_array()
+            .map(|a| !a.is_empty())
+            .unwrap_or(false),
+        "diagnostics must stay as detail: {v}"
+    );
+
+    // 6. a compile that succeeds must NOT be flagged
+    let good_src =
+        "Class IrisDevE2E.GoodCompile\n{\nClassMethod X() As %String\n{\n    Return \"ok\"\n}\n}\n";
+    let _ = exchange(
+        serde_json::json!({"mode":"put","name":"IrisDevE2E.GoodCompile.cls","content":good_src,"namespace":ns}),
+        "iris_doc",
+    );
+    let frame = exchange(
+        serde_json::json!({"target":"IrisDevE2E.GoodCompile.cls","namespace":ns}),
+        "iris_compile",
+    );
+    assert_ne!(
+        frame["result"]["isError"], true,
+        "successful compile wrongly flagged: {frame}"
+    );
+    assert_eq!(parse_tool_text(&frame)["success"], true, "{frame}");
+
+    for name in ["IrisDevE2E.BrokenCompile.cls", "IrisDevE2E.GoodCompile.cls"] {
+        let _ = exchange(
+            serde_json::json!({"mode":"delete","name":name,"namespace":ns}),
+            "iris_doc",
+        );
+    }
 }
 
 #[test]
