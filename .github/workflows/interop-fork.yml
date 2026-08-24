@@ -25,16 +25,30 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Boot IRIS Community (with password env — else Atelier 401)
         run: |
+          # --shm-size/--ulimit: the community image fails to start reliably on
+          # GitHub runners with Docker's 64m default shm (upstream 0308344, afea706).
           docker run -d --name iris-e2e -p 1972:1972 -p 52773:52773 \
+            --shm-size 1g --ulimit nofile=65536:65536 \
             -e IRIS_PASSWORD=SYS -e IRIS_USERNAME=_SYSTEM \
             intersystemsdc/iris-community:2026.1
+          sleep 15
+          docker ps -a | grep iris-e2e
+          echo "=== Early container logs ==="
+          docker logs iris-e2e 2>&1 | head -40 || true
           echo "waiting for Atelier API ..."
+          ready=""
           for i in $(seq 1 80); do
             code=$(curl -s -o /dev/null -w '%{http_code}' -u _SYSTEM:SYS \
               http://localhost:52773/api/atelier/ || echo 000)
-            [ "$code" = "200" ] && { echo "ready after ~$((i*3))s"; break; }
+            [ "$code" = "200" ] && { echo "ready after ~$((i*3))s"; ready=1; break; }
             sleep 3
           done
+          if [ -z "$ready" ]; then
+            echo "::error::Atelier API never returned 200 — IRIS did not come up"
+            echo "=== Full container logs ==="
+            docker logs iris-e2e 2>&1 | tail -80
+            exit 1
+          fi
           echo "enabling Interoperability on USER (Community edition includes the interop engine) ..."
           printf 'do ##class(%%Library.EnsembleMgr).EnableNamespace("USER")\nhalt\n' \
             | docker exec -i iris-e2e iris session IRIS -U %%SYS || true
