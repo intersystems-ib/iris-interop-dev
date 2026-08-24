@@ -12,7 +12,7 @@ jobs:
   unit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Unit tests + per-tool validation gate
         run: ./scripts/test-all.sh unit
@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/fork/interop-lean'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Boot IRIS Community (with password env — else Atelier 401)
         run: |

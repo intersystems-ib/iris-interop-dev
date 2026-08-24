@@ -32,7 +32,7 @@ jobs:
             bin: iris-interop-dev
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Provenance guard (issue #3): a release where the tag name, Cargo.toml and the
       # binary's --version disagree must never publish. Check tag vs Cargo.toml before
       # spending a build; the built binary is checked in "guard: binary --version" below.
@@ -72,7 +72,7 @@ jobs:
             echo "::error::built binary reports $bin_version but Cargo.toml says $cargo_version — refusing to release"
             exit 1
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.asset }}
           path: ${{ matrix.asset }}
@@ -84,11 +84,11 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: dist/*
           generate_release_notes: true
