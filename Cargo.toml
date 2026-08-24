@@ -24,7 +24,7 @@ repository = "https://github.com/intersystems-community/iris-agentic-dev"
 rmcp = { version = "1.4", features = ["server", "macros", "schemars", "transport-io"] }
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
-which = "6"
+which = "8"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 # IRIS HTTP client
@@ -42,6 +42,6 @@ semver = { version = "1", features = ["serde"] }
 anyhow = "1"
 regex = "1"
 tempfile = "3"
-thiserror = "1"
+thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
