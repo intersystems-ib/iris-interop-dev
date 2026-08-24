@@ -32,7 +32,7 @@ jobs:
             bin: iris-interop-dev
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Provenance guard (issue #3): a release where the tag name, Cargo.toml and the
       # binary's --version disagree must never publish. Check tag vs Cargo.toml before
       # spending a build; the built binary is checked in "guard: binary --version" below.
