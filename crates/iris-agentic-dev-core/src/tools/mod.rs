@@ -122,6 +122,65 @@ pub const INTEROP_TOOLS: &[&str] = &[
 ];
 
 pub const ERR_NO_TESTS_FOUND: &str = "NO_TESTS_FOUND";
+
+/// Issue #47: what a caller must be told when a pattern matched nothing.
+///
+/// `NO_TESTS_FOUND` is a correct answer, but a bare one cannot distinguish its two
+/// causes — the class was never compiled, or the pattern is a near miss. Workshop
+/// telemetry: 44 hits across 16/18 students, on patterns one segment away from the
+/// real class (`Ejercicio3.Test` for `Ejercicio3.Tests.BO.SQLTest`).
+///
+/// Returns `(hint, did_you_mean)`. `did_you_mean` holds the candidates that are a
+/// prefix of the pattern or have it as a prefix — the near-miss family — so the
+/// caller's next call is a correction, not another guess.
+pub fn no_tests_found_guidance(
+    pattern: &str,
+    namespace: &str,
+    candidates: &[String],
+    more_than_listed: bool,
+) -> (String, Vec<String>) {
+    let pat = pattern.to_lowercase();
+    let did_you_mean: Vec<String> = candidates
+        .iter()
+        .filter(|c| {
+            let c = c.to_lowercase();
+            c.starts_with(&pat) || pat.starts_with(&c)
+        })
+        .cloned()
+        .collect();
+
+    let count = if more_than_listed {
+        format!("{}+", candidates.len())
+    } else {
+        candidates.len().to_string()
+    };
+
+    let hint = if candidates.is_empty() {
+        format!(
+            "No compiled test classes (%UnitTest.TestCase or %UnitTest.TestProduction subclasses) \
+             exist in namespace '{namespace}' — so nothing could have matched. Either the class \
+             is not compiled yet (compile it with iris_compile, or pass a directory path to load \
+             .cls from disk), or your tests live in a different namespace than '{namespace}' — \
+             pass `namespace` explicitly to check another one."
+        )
+    } else if !did_you_mean.is_empty() {
+        format!(
+            "Pattern '{pattern}' matched no runnable tests, but it is one segment away from a \
+             compiled test class in '{namespace}'. Did you mean: {}? Pass the exact class name \
+             (class names use /noload automatically). {count} test class(es) exist in this namespace.",
+            did_you_mean.join(", ")
+        )
+    } else {
+        format!(
+            "Pattern '{pattern}' matched no runnable tests. {count} compiled test class(es) exist \
+             in '{namespace}': {}. Pass one of these exact class names (class names use /noload \
+             automatically), or a directory path to load from disk.",
+            candidates.join(", ")
+        )
+    };
+    (hint, did_you_mean)
+}
+
 pub const ERR_NAMESPACE_NOT_FOUND: &str = "NAMESPACE_NOT_FOUND";
 pub const ERR_TEST_EXECUTION_ERROR: &str = "TEST_EXECUTION_ERROR";
 
@@ -2622,7 +2681,9 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
             // test classes extend %UnitTest.TestProduction (which extends %UnitTest.TestCase), so a
             // `Super LIKE TestCase` probe missed them and only surfaced system classes. Filter out
             // framework/HealthShare packages so the user's own test classes surface.
-            let probe_sql = "SELECT TOP 25 Name FROM %Dictionary.CompiledClass WHERE PrimarySuper LIKE '%UnitTest.TestCase%' AND Name NOT LIKE 'EnsLib.%' AND Name NOT LIKE 'HS.%' AND Name NOT LIKE 'Ens.%' AND Name NOT LIKE '\\%%' ESCAPE '\\' ORDER BY Name";
+            // TOP 26, not 25: a full page means there are more than we list, and the
+            // guidance says "25+" rather than silently implying that is all of them.
+            let probe_sql = "SELECT TOP 26 Name FROM %Dictionary.CompiledClass WHERE PrimarySuper LIKE '%UnitTest.TestCase%' AND Name NOT LIKE 'EnsLib.%' AND Name NOT LIKE 'HS.%' AND Name NOT LIKE 'Ens.%' AND Name NOT LIKE '\\%%' ESCAPE '\\' ORDER BY Name";
             let candidates: Vec<String> = match tokio::time::timeout(
                 std::time::Duration::from_secs(10),
                 iris.query(probe_sql, vec![], &namespace, client),
@@ -2641,19 +2702,28 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
                     .unwrap_or_default(),
                 _ => vec![],
             };
-            let hint = if candidates.is_empty() {
-                format!("No compiled %UnitTest.TestCase classes were found in namespace '{}'. Your test class must Extend %UnitTest.TestCase and be compiled. Compile it first (iris_compile), or pass a directory path to load .cls from disk.", namespace)
-            } else {
-                format!("Pattern '{}' matched no runnable tests, but {} compiled %UnitTest.TestCase class(es) exist in '{}': {}. Pass one of these as the pattern (class names use /noload automatically), or a directory path to load from disk.", p.pattern, candidates.len(), namespace, candidates.join(", "))
-            };
+            let mut candidates = candidates;
+            let more_than_listed = candidates.len() > 25;
+            candidates.truncate(25);
+            let (hint, did_you_mean) =
+                no_tests_found_guidance(&p.pattern, &namespace, &candidates, more_than_listed);
             // Issue #2: NO_TESTS_FOUND is a genuine tool failure (nothing ran),
             // unlike a red run below, which is a valid result and stays non-error.
+            // The message carries the pattern and namespace, not just the fact of the
+            // miss: clients that surface only `error` used to show a sentence that was
+            // true of every failure and specific to none (issue #47).
+            let msg = format!(
+                "Pattern '{}' matched no test classes in namespace '{}'",
+                p.pattern, namespace
+            );
             return envelope::fail_with(
                 ERR_NO_TESTS_FOUND,
-                "Pattern matched no test classes",
+                &msg,
                 serde_json::json!({
                     "hint": hint,
                     "candidates": candidates,
+                    "did_you_mean": did_you_mean,
+                    "more_candidates_than_listed": more_than_listed,
                     "pattern": p.pattern,
                     "namespace": namespace,
                     "total": 0,
@@ -5667,5 +5737,94 @@ mod compile_envelope_tests {
             v["error"].as_str().unwrap().contains("MyApp.Silent.cls"),
             "fallback message must name the target: {v}"
         );
+    }
+}
+
+#[cfg(test)]
+mod no_tests_found_guidance_tests {
+    use super::no_tests_found_guidance;
+
+    fn v(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The workshop's actual shape: pattern one segment short of the real class.
+    #[test]
+    fn near_miss_is_named_as_did_you_mean() {
+        let cands = v(&[
+            "Ejercicio3.Tests.BO.SQLTest",
+            "Ejercicio3.Tests.DTL.MapTest",
+            "Otro.Tests.Thing",
+        ]);
+        let (hint, dym) = no_tests_found_guidance("Ejercicio3.Test", "Ejercicio3", &cands, false);
+        assert_eq!(
+            dym,
+            v(&[
+                "Ejercicio3.Tests.BO.SQLTest",
+                "Ejercicio3.Tests.DTL.MapTest"
+            ]),
+            "both near misses must be offered, the unrelated class must not"
+        );
+        assert!(hint.contains("Did you mean"), "{hint}");
+        assert!(hint.contains("Ejercicio3.Tests.BO.SQLTest"), "{hint}");
+    }
+
+    /// A package prefix of a compiled class is a near miss too — the tool's own
+    /// description advertises 'MyApp.Tests' as a pattern, so this must self-correct.
+    #[test]
+    fn package_prefix_of_a_test_class_is_a_near_miss() {
+        let cands = v(&["Wk47.Tests.SmokeTest"]);
+        let (hint, dym) = no_tests_found_guidance("Wk47.Tests", "APP", &cands, false);
+        assert_eq!(dym, v(&["Wk47.Tests.SmokeTest"]));
+        assert!(hint.contains("Did you mean"), "{hint}");
+    }
+
+    /// Cause (1) — nothing compiled — must read differently from cause (2), and must
+    /// name the namespace it looked in, since a wrong namespace produces this too.
+    #[test]
+    fn empty_candidates_separates_not_compiled_from_wrong_pattern() {
+        let (hint, dym) = no_tests_found_guidance("APP.Test", "USER", &[], false);
+        assert!(dym.is_empty());
+        assert!(hint.contains("No compiled test classes"), "{hint}");
+        assert!(
+            hint.contains("TestProduction"),
+            "this fork's tests extend %UnitTest.TestProduction — the guidance must say so: {hint}"
+        );
+        assert!(
+            hint.contains("USER") && hint.contains("different namespace"),
+            "a wrong namespace produces this exact result, so say which one was searched: {hint}"
+        );
+    }
+
+    /// Candidates exist but none resemble the pattern: list them, no false "did you mean".
+    #[test]
+    fn unrelated_candidates_are_listed_without_a_did_you_mean() {
+        let cands = v(&["Foo.Tests.A", "Bar.Tests.B"]);
+        let (hint, dym) = no_tests_found_guidance("Zzz.Nope", "APP", &cands, false);
+        assert!(dym.is_empty(), "nothing here is a near miss");
+        assert!(!hint.contains("Did you mean"), "{hint}");
+        assert!(
+            hint.contains("Foo.Tests.A") && hint.contains("Bar.Tests.B"),
+            "{hint}"
+        );
+    }
+
+    /// No silent caps: a truncated candidate list must say the count is a floor.
+    #[test]
+    fn truncated_candidate_list_is_reported_as_a_floor() {
+        let cands: Vec<String> = (0..25).map(|i| format!("Pkg.Tests.T{i}")).collect();
+        let (hint, _) = no_tests_found_guidance("Nope", "APP", &cands, true);
+        assert!(
+            hint.contains("25+"),
+            "a full page means more exist — say so rather than implying 25 is all: {hint}"
+        );
+    }
+
+    /// Case-insensitive: IRIS class names are case-sensitive but callers fumble case.
+    #[test]
+    fn near_miss_matching_ignores_case() {
+        let cands = v(&["Wk47.Tests.SmokeTest"]);
+        let (_, dym) = no_tests_found_guidance("wk47.tests", "APP", &cands, false);
+        assert_eq!(dym, v(&["Wk47.Tests.SmokeTest"]));
     }
 }
