@@ -363,9 +363,10 @@ fn e2e_symbols_plain_substring_no_regression() {
 // ── iris_doc ──────────────────────────────────────────────────────────────────
 
 #[test]
-fn e2e_doc_put_with_storage_block_strips_and_succeeds() {
+fn e2e_doc_put_with_storage_block_requires_opt_in() {
     require_iris!();
-    // I-3: Storage blocks must be stripped automatically
+    // I-3: the UDL write path strips Storage blocks, so a put that would silently
+    // discard one is refused unless the caller opts in (issue #18, upstream #88).
     let cls_with_storage = r#"Class Test022.StorageTest Extends %Persistent {
 Property Name As %String;
 Storage Default
@@ -382,14 +383,32 @@ Storage Default
 }
 }"#;
 
-    let result = call_tool(
+    let blocked = call_tool(
         "iris_doc",
         serde_json::json!({"mode":"put","name":"Test022.StorageTest.cls",
             "content": cls_with_storage, "namespace":"USER"}),
     );
     assert_eq!(
+        blocked["success"], false,
+        "put that would strip a Storage block must be refused: {}",
+        blocked
+    );
+    assert_eq!(
+        blocked["error_code"], "STORAGE_STRIP_BLOCKED",
+        "refusal must carry STORAGE_STRIP_BLOCKED: {}",
+        blocked
+    );
+
+    // Opting in strips the Storage block and writes the class.
+    let result = call_tool(
+        "iris_doc",
+        serde_json::json!({"mode":"put","name":"Test022.StorageTest.cls",
+            "content": cls_with_storage, "namespace":"USER",
+            "allow_storage_regeneration": true}),
+    );
+    assert_eq!(
         result["success"], true,
-        "put with Storage block should succeed: {}",
+        "put with allow_storage_regeneration should succeed: {}",
         result
     );
     assert_eq!(

@@ -4,6 +4,8 @@ on:
   push:
     branches: [master, main]
   pull_request:
+  # Lets the master-only e2e-tests job be validated on a branch before merging.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -81,7 +83,7 @@ jobs:
 
   e2e-tests:
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/master'
+    if: github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -89,14 +91,34 @@ jobs:
       - run: cargo build -p iris-agentic-dev
       - name: Start IRIS container
         run: |
+          # Image tag: intersystemsdc 2026.1 and latest-cd fail post-startup on GHA
+          # runners — the image's own `iris-after-start` hook dies with "Cannot call
+          # an iris.package wrapper ... dbapi.connect" and the entrypoint then shuts
+          # IRIS down (see #44). 2025.3 is the last known-good stable tag; upstream
+          # made the same switch. Community licenses expire ~150 days after image
+          # publish, so if this starts failing with "Community License expired",
+          # move to a newer known-good tag.
+          # --shm-size/--ulimit: the community image also needs these to start
+          # reliably on GitHub runners (upstream 0308344, afea706).
           docker run -d --name iris-e2e \
             -p 52773:52773 \
+            --shm-size 1g \
+            --ulimit nofile=65536:65536 \
             -e IRIS_PASSWORD=SYS \
             -e IRIS_USERNAME=_SYSTEM \
-            intersystemsdc/iris-community:2026.1
-          # Wait for container to be running
-          sleep 10
-          docker ps | grep iris-e2e
+            intersystemsdc/iris-community:2025.3
+          # Wait for container to be running, then show why if it is not
+          sleep 15
+          docker ps -a | grep iris-e2e
+          echo "=== Early container logs ==="
+          docker logs iris-e2e 2>&1 | head -40 || true
+          state=$(docker inspect -f '{{.State.Status}}' iris-e2e)
+          if [ "$state" != "running" ]; then
+            echo "::error::IRIS container is '$state' 15s after start (exit code $(docker inspect -f '{{.State.ExitCode}}' iris-e2e))"
+            echo "=== Full container logs ==="
+            docker logs iris-e2e 2>&1 | tail -80
+            exit 1
+          fi
       - name: Wait for IRIS Atelier API to be ready (up to 7 minutes)
         run: |
           IRIS_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' iris-e2e)
@@ -120,7 +142,8 @@ jobs:
             sleep 5
           done
           echo "IRIS did not become ready in 7 minutes"
-          docker logs iris-e2e 2>&1 | tail -20
+          echo "=== Full container logs ==="
+          docker logs iris-e2e 2>&1 | tail -80
           exit 1
       - name: Detect and set IRIS credentials
         run: |
