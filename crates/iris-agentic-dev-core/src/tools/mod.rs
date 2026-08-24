@@ -1099,6 +1099,36 @@ fn ok_json(v: serde_json::Value) -> Result<CallToolResult, McpError> {
 fn err_json(code: &str, msg: &str) -> Result<CallToolResult, McpError> {
     crate::tools::envelope::fail(code, msg)
 }
+/// Issue #46: a compile that IRIS rejected is a genuine tool failure, so it gets
+/// `isError` on the wire and the standard envelope — same contract iris_doc's
+/// compile path already follows (issue #2). Diagnostics ride along unchanged in
+/// `errors`/`warnings`/`console`; `payload` carries `success:false`, which the
+/// envelope owns and re-asserts.
+fn compile_failure(target: &str, payload: serde_json::Value) -> Result<CallToolResult, McpError> {
+    let first = payload["errors"][0]["text"]
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| payload["errors"][0].as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("compile of {target} failed — see console"));
+    crate::tools::envelope::fail_with(
+        "COMPILE_ERROR",
+        &first,
+        // The built-in COMPILE_ERROR hint names iris_doc's `compile_console`;
+        // this payload calls that field `console`.
+        merge_hint(
+            payload,
+            "Fix the first reported error and recompile — later errors are often cascades \
+             of the first. Full compiler output is in console.",
+        ),
+    )
+}
+fn merge_hint(mut payload: serde_json::Value, hint: &str) -> serde_json::Value {
+    if let Some(obj) = payload.as_object_mut() {
+        obj.entry("hint")
+            .or_insert_with(|| serde_json::Value::String(hint.to_string()));
+    }
+    payload
+}
 pub fn write_open_hint(namespace: &str, document: &str) {
     if let Some(home) = dirs::home_dir() {
         let dir = home.join(".iris-agentic-dev");
@@ -1976,7 +2006,7 @@ impl IrisTools {
                     .collect();
                 let success = cr.success();
                 self.record_call("iris_compile", success);
-                return ok_json(serde_json::json!({
+                let payload = serde_json::json!({
                     "success": success,
                     "target": doc_name,
                     "uploaded_from": local_src,
@@ -1985,7 +2015,11 @@ impl IrisTools {
                     "errors": errors,
                     "warnings": [],
                     "console": console,
-                }));
+                });
+                if !success {
+                    return compile_failure(&doc_name, payload);
+                }
+                return ok_json(payload);
             }
         }
 
@@ -2198,6 +2232,9 @@ impl IrisTools {
             resp["truncated"] = serde_json::Value::Bool(false);
         }
 
+        if !success {
+            return compile_failure(&p.target, resp);
+        }
         ok_json(resp)
     }
 
@@ -5567,6 +5604,68 @@ mod schema_normalization_tests {
         assert!(
             !DOCKER_REQUIRED_HINT.to_lowercase().contains("docker run"),
             "DOCKER_REQUIRED hint must not suggest 'docker run' (guides non-Docker users)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod compile_envelope_tests {
+    use super::compile_failure;
+    use rmcp::model::RawContent;
+
+    fn payload(r: &rmcp::model::CallToolResult) -> serde_json::Value {
+        let text = match &r.content[0].raw {
+            RawContent::Text(t) => &t.text,
+            _ => panic!("expected text content"),
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    /// Issue #46: a compile IRIS rejected came back as a success-shaped result —
+    /// `success:false` with no `isError` — so clients read it as a working call.
+    #[test]
+    fn failed_compile_is_flagged_and_keeps_diagnostics() {
+        let r = compile_failure(
+            "MyApp.Broken.cls",
+            serde_json::json!({
+                "success": false,
+                "target": "MyApp.Broken.cls",
+                "targets_compiled": 1,
+                "namespace": "USER",
+                "errors": [{"severity":"error","text":"ERROR #1026: Invalid command"}],
+                "warnings": [],
+                "console": ["Detected 1 errors during compilation"],
+            }),
+        )
+        .unwrap();
+        assert_eq!(r.is_error, Some(true), "failed compile must set isError");
+        let v = payload(&r);
+        assert_eq!(v["success"], false);
+        assert_eq!(v["error_code"], "COMPILE_ERROR");
+        assert_eq!(v["error"], "ERROR #1026: Invalid command");
+        assert!(
+            v["console"].is_array(),
+            "console must survive as detail: {v}"
+        );
+        assert_eq!(v["targets_compiled"], 1, "extras must survive: {v}");
+        assert!(
+            v["hint"].as_str().unwrap().contains("console"),
+            "hint must name this payload's console field, not iris_doc's: {v}"
+        );
+    }
+
+    #[test]
+    fn failed_compile_without_parsed_errors_still_carries_a_message() {
+        let r = compile_failure(
+            "MyApp.Silent.cls",
+            serde_json::json!({"success": false, "errors": [], "console": []}),
+        )
+        .unwrap();
+        let v = payload(&r);
+        assert_eq!(r.is_error, Some(true));
+        assert!(
+            v["error"].as_str().unwrap().contains("MyApp.Silent.cls"),
+            "fallback message must name the target: {v}"
         );
     }
 }
