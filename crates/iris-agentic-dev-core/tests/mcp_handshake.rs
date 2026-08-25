@@ -416,3 +416,118 @@ fn unreachable_iris_returns_the_error_envelope_not_a_protocol_error() {
         "an unreachable IRIS has a mechanical fix — say it: {v}"
     );
 }
+
+/// The two log-file tests spawn several servers each. Run them one at a time so the
+/// suite's peak process count stays where it was — `mcp_server_startup_latency_under_100ms`
+/// measures real startup and reads spawn contention as a regression.
+static LOG_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// #58: with IRIS_LOG_FILE set, the session's traces must survive the process, so a
+/// failed workshop run can be reconstructed afterwards. Off unless set, and never
+/// fatal when the path cannot be opened.
+#[test]
+fn log_file_is_written_when_requested_and_absent_otherwise() {
+    let _serialized = LOG_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let bin = iris_dev_bin();
+    if !bin.exists() {
+        eprintln!("Skipping: binary not found at {}", bin.display());
+        return;
+    }
+    let log = std::env::temp_dir().join(format!("iris-mcp-log-test-{}.log", std::process::id()));
+    let _ = std::fs::remove_file(&log);
+
+    let run = |log_env: Option<&std::path::Path>| {
+        let mut cmd = Command::new(&bin);
+        cmd.arg("mcp")
+            .env("IRIS_WEB_PORT", "9")
+            .env("IRIS_PASSWORD", "shouldnotappear")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        if let Some(p) = log_env {
+            cmd.env("IRIS_LOG_FILE", p);
+        }
+        let mut child = cmd.spawn().expect("spawn");
+        let mut stdin = child.stdin.take().unwrap();
+        let mut reader = BufReader::new(child.stdout.take().unwrap());
+        send_jsonrpc(
+            &mut stdin,
+            1,
+            "initialize",
+            r#"{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"1"}}"#,
+        );
+        let _ = read_jsonrpc(&mut reader);
+        let _ = child.kill();
+        let _ = child.wait();
+    };
+
+    // Not set → nothing is created.
+    run(None);
+    assert!(
+        !log.exists(),
+        "the log file must be opt-in — nothing should be written without IRIS_LOG_FILE"
+    );
+
+    // Set → the session is recorded, stamped with the build that produced it.
+    run(Some(&log));
+    let body = std::fs::read_to_string(&log).expect("log file should exist once requested");
+    assert!(
+        body.contains("session start"),
+        "each run must be delimited so consecutive sessions are separable: {body}"
+    );
+    assert!(
+        body.contains(env!("CARGO_PKG_VERSION")),
+        "the banner must record which build produced the log: {body}"
+    );
+    assert!(
+        !body.contains("shouldnotappear"),
+        "credentials must never reach the log file: {body}"
+    );
+
+    // A second run appends rather than truncating — a cohort's runs accumulate.
+    run(Some(&log));
+    let body = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        body.matches("session start").count(),
+        2,
+        "second session must append, not truncate: {body}"
+    );
+
+    let _ = std::fs::remove_file(&log);
+}
+
+/// #58: an unopenable path is a diagnostic problem, not a fatal one — the server
+/// must still serve.
+#[test]
+fn an_unwritable_log_path_does_not_stop_the_server() {
+    let _serialized = LOG_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let bin = iris_dev_bin();
+    if !bin.exists() {
+        return;
+    }
+    let mut child = Command::new(&bin)
+        .arg("mcp")
+        .env("IRIS_WEB_PORT", "9")
+        .env("IRIS_LOG_FILE", "/nonexistent-dir-for-test/x.log")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn");
+    let mut stdin = child.stdin.take().unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    send_jsonrpc(
+        &mut stdin,
+        1,
+        "initialize",
+        r#"{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"1"}}"#,
+    );
+    let frame = read_jsonrpc(&mut reader);
+    let _ = child.kill();
+    assert_eq!(
+        frame["result"]["serverInfo"]["name"], "iris-interop-dev",
+        "server must still handshake with an unusable log path: {frame}"
+    );
+}

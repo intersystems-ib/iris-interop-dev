@@ -59,6 +59,10 @@ pub fn fail_with(
 ///
 /// `context` names the operation for the message; `err` is the underlying error.
 pub fn transport_fail(context: &str, err: &str) -> Result<CallToolResult, McpError> {
+    // #58: record it server-side too. Before #57 this condition surfaced as an rmcp
+    // "response error" WARN; routing it through the envelope removed that line, so
+    // without this the server would go quiet about the failure it just reported.
+    tracing::warn!(context, error = err, "IRIS request failed");
     if crate::tools::interop::is_network_error(err) {
         fail(
             "IRIS_UNREACHABLE",
