@@ -1,6 +1,7 @@
 //! %Dictionary introspection tools for dynamic dispatch resolution.
 
 use crate::iris::connection::IrisConnection;
+use crate::objectscript::os_str_expr;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -79,8 +80,10 @@ pub async fn handle_resolve_dynamic_dispatch(
     }
 
     let has_prefix = !prefix.is_empty();
-    let method_esc = p.method_name.replace('"', "\\\"");
-    let prefix_esc = prefix.replace('"', "\\\"");
+    // #67: bound-style values still travel inside generated ObjectScript, so they are
+    // rendered as ObjectScript expressions, not wrapped in hand-written quotes.
+    let method_esc = os_str_expr(&p.method_name);
+    let prefix_esc = os_str_expr(prefix);
 
     // Build ObjectScript — use q=$CHAR(34) for embedded JSON quotes
     let mut lines: Vec<String> = vec!["Set q=$CHAR(34)".into()];
@@ -95,7 +98,7 @@ pub async fn handle_resolve_dynamic_dispatch(
     lines.push(format!(r#"Set sql="{}""#, sql));
     if has_prefix {
         lines.push(format!(
-            r#"Set rs=##class(%SQL.Statement).%ExecDirect(,sql,"{}","{}")"#,
+            r#"Set rs=##class(%SQL.Statement).%ExecDirect(,sql,{},{})"#,
             method_esc, prefix_esc
         ));
     } else {
@@ -254,7 +257,7 @@ pub struct FindSubclassImplementationsParams {
 fn build_expand_hierarchy_code(base_classes: &[String]) -> String {
     let bases_list = base_classes
         .iter()
-        .map(|c| format!(r#"$LISTBUILD("{}")"#, c.replace('"', "\\\"")))
+        .map(|c| format!(r#"$LISTBUILD({})"#, os_str_expr(c)))
         .collect::<Vec<_>>()
         .join("_");
     format!(
@@ -321,16 +324,16 @@ pub async fn handle_find_subclass_implementations(
         return ok_json(r);
     }
 
-    let method_esc = p.method_name.replace('"', "\\\"");
+    let method_esc = os_str_expr(&p.method_name);
     let desc_list = descendants
         .iter()
-        .map(|c| format!(r#"$LISTBUILD("{}")"#, c.replace('"', "\\\"")))
+        .map(|c| format!(r#"$LISTBUILD({})"#, os_str_expr(c)))
         .collect::<Vec<_>>()
         .join("_");
 
     let mut lines: Vec<String> = vec!["Set q=$CHAR(34)".into()];
     lines.push(format!("Set descList={}", desc_list));
-    lines.push(format!(r#"Set rs=##class(%SQL.Statement).%ExecDirect(,"SELECT m.parent, m.FormalSpec FROM %Dictionary.CompiledMethod m WHERE m.Name = ? AND m.Origin = m.parent ORDER BY m.parent FETCH FIRST {} ROWS ONLY","{}")"#, limit, method_esc));
+    lines.push(format!(r#"Set rs=##class(%SQL.Statement).%ExecDirect(,"SELECT m.parent, m.FormalSpec FROM %Dictionary.CompiledMethod m WHERE m.Name = ? AND m.Origin = m.parent ORDER BY m.parent FETCH FIRST {} ROWS ONLY",{})"#, limit, method_esc));
     lines.push(r#"If rs.%SQLCODE<0 { Write "ERROR:"_rs.%Message,! Quit }"#.into());
     lines.push(r#"Set out="[",sep="""#.into());
     lines.push("While rs.%Next() {".into());
@@ -373,6 +376,20 @@ pub async fn handle_find_subclass_implementations(
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod objectscript_escaping_tests {
+    use super::build_expand_hierarchy_code;
+
+    /// #67: class names reach $LISTBUILD as escaped expressions. A quote is doubled;
+    /// a backslash escape would end the literal and break the generated code.
+    #[test]
+    fn a_quote_in_a_class_name_is_doubled() {
+        let code = build_expand_hierarchy_code(&[r#"Pkg."Odd"Name"#.to_string()]);
+        assert!(code.contains(r#"$LISTBUILD("Pkg.""Odd""Name")"#), "{code}");
+        assert!(!code.contains("\\\""), "{code}");
+    }
+}
 
 #[cfg(test)]
 mod tests {

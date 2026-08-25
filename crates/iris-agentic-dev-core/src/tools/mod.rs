@@ -1,5 +1,6 @@
 use crate::elicitation::ElicitationStore;
 use crate::iris::connection::IrisConnection;
+use crate::objectscript::os_str_expr;
 
 /// Remediation hint appended to DOCKER_REQUIRED error strings.
 /// Guides native IRIS users (no Docker) toward the HTTP/Atelier REST path.
@@ -357,15 +358,18 @@ pub async fn probe_test_class_shape(
 /// terminal as well as the HTTP path. A stale or invalid root makes RunTest fail with
 /// "Directory ... is invalid" and report 0 tests. (A6.2)
 pub fn build_class_test_run_code(pattern: &str, flags: &str, token: &str) -> String {
+    // #67: one escaped expression, reused. ObjectScript doubles quotes; a backslash escapes
+    // nothing, so the old `"{pattern}"` broke the moment a pattern contained one.
+    let pattern = os_str_expr(pattern);
     format!(
         r#"set tIsWin=($zcvt($system.Version.GetOS(),"U")="WINDOWS")
 set ^UnitTestRoot=$select(tIsWin:##class(%File).NormalizeDirectory("httest",##class(%File).GetDirectory(##class(%File).TempFilename())),1:"/tmp/httest/")
 do ##class(%File).CreateDirectoryChain(^UnitTestRoot)
-set specDir=##class(%File).NormalizeDirectory($translate("{pattern}",".","/"),^UnitTestRoot)
+set specDir=##class(%File).NormalizeDirectory($translate({pattern},".","/"),^UnitTestRoot)
 do ##class(%File).CreateDirectoryChain(specDir)
-set tCls="{pattern}"
+set tCls={pattern}
 set tCC=##class(%Dictionary.CompiledClass).%OpenId(tCls)
-if $isobject(tCC)&&(tCC.PrimarySuper["%UnitTest.TestProduction") {{ do $classmethod(tCls,"Run") }} elseif $isobject(tCC)&&(tCC.PrimarySuper["%UnitTest.TestCase") {{ do ##class(%UnitTest.Manager).DebugRunTestCase("",tCls,"{flags}","","{token}") }} else {{ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}") }}"#,
+if $isobject(tCC)&&(tCC.PrimarySuper["%UnitTest.TestProduction") {{ do $classmethod(tCls,"Run") }} elseif $isobject(tCC)&&(tCC.PrimarySuper["%UnitTest.TestCase") {{ do ##class(%UnitTest.Manager).DebugRunTestCase("",tCls,"{flags}","","{token}") }} else {{ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}") }}"#,
         token = token,
         pattern = pattern,
         flags = flags,
@@ -2523,8 +2527,8 @@ impl IrisTools {
 
         // US3: namespace existence check before running tests.
         let ns_check_code = format!(
-            "write ##class(%SYS.Namespace).Exists(\"{}\")",
-            namespace.replace('"', "\\\"")
+            "write ##class(%SYS.Namespace).Exists({})",
+            os_str_expr(&namespace)
         );
         let ns_exists = tokio::time::timeout(
             std::time::Duration::from_secs(10),
@@ -2550,14 +2554,16 @@ impl IrisTools {
 
         // Generate a UUID correlation token; used as UserParam in RunTest.
         let correlation_token = log_store::new_log_id();
-        let safe_pattern = p.pattern.replace('"', "\\\"");
 
         // Detect whether the pattern is a compiled class name or a filesystem directory path.
         // Class names contain dots and no path separators: "ISC.sql.Tests", "MyApp.Tests.*"
         // Directory paths contain / or \ : "MyApp/Tests", "/tmp/tests/MyApp"
         // When the pattern is a class name, pass /noload so RunTest looks in the compiled
         // database rather than scanning the filesystem under ^UnitTestRoot.
-        let is_class_pattern = !safe_pattern.contains('/') && !safe_pattern.contains('\\');
+        // #67: classify the pattern the caller actually sent. It used to be classified after
+        // C-style quote escaping, so a pattern containing `"` grew a backslash and was taken
+        // for a directory path.
+        let is_class_pattern = !p.pattern.contains('/') && !p.pattern.contains('\\');
         let flags = if is_class_pattern {
             "/verbose=1/nodelete/noload"
         } else {
@@ -2568,7 +2574,7 @@ impl IrisTools {
         // After RunTest completes, ^UnitTest.Result global IS persisted (globals bypass
         // the objectgenerator transaction boundary; SQL %Save() does not).
         let run_code = if is_class_pattern {
-            build_class_test_run_code(&safe_pattern, flags, &correlation_token)
+            build_class_test_run_code(&p.pattern, flags, &correlation_token)
         } else {
             // Directory path: set ^UnitTestRoot and pre-create the pattern subdirectory.
             // ^UnitTestRoot is platform-aware: a portable temp dir on Windows (mgr/Temp via
@@ -2577,12 +2583,12 @@ impl IrisTools {
                 r#"set tIsWin=($zcvt($system.Version.GetOS(),"U")="WINDOWS")
 set utRoot=$select(tIsWin:##class(%File).NormalizeDirectory("httest",##class(%File).GetDirectory(##class(%File).TempFilename())),1:"/tmp/httest/")
 if '##class(%File).DirectoryExists(utRoot) {{ do ##class(%File).CreateDirectoryChain(utRoot) }}
-set pkgDir=##class(%File).NormalizeDirectory("{pattern}",utRoot)
+set pkgDir=##class(%File).NormalizeDirectory({pattern},utRoot)
 if '##class(%File).DirectoryExists(pkgDir) {{ do ##class(%File).CreateDirectoryChain(pkgDir) }}
 set ^UnitTestRoot=utRoot
-do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
+do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                 token = correlation_token,
-                pattern = safe_pattern,
+                pattern = os_str_expr(&p.pattern),
                 flags = flags,
             )
         };
@@ -3849,8 +3855,8 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
         let namespace = interop::resolve_namespace(p.namespace.as_deref(), Some(&iris));
         let _client = self.http_client();
         let code = format!(
-            "Write ##class(%Studio.Debugger).SourceLine(\"{}\",{})",
-            p.routine.replace('"', "\\\""),
+            "Write ##class(%Studio.Debugger).SourceLine({},{})",
+            os_str_expr(&p.routine),
             p.offset
         );
         match iris.execute(&code, &namespace).await {
@@ -3946,8 +3952,8 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
         let namespace = interop::resolve_namespace(p.namespace.as_deref(), Some(&iris));
         // Build source map by querying %Studio.Debugger for each .INT method
         let code = format!(
-            "set cls=\"{}\" set rtn=$translate(cls,\".\",\".\") set map=\"{{\" set first=1 set method=\"\" for {{ set method=$order(^rIndex(rtn,method)) quit:method=\"\"  set intline=$get(^rIndex(rtn,method)) if 'first {{ set map=map_\",\" }} set map=map_\"\\\"\"_method_\"\\\":\\\"\"_intline_\"\\\"\" set first=0 }} set map=map_\"}}\" write map",
-            cls_name.replace('"', "\\\"")
+            "set cls={} set rtn=$translate(cls,\".\",\".\") set map=\"{{\" set first=1 set method=\"\" for {{ set method=$order(^rIndex(rtn,method)) quit:method=\"\"  set intline=$get(^rIndex(rtn,method)) if 'first {{ set map=map_\",\" }} set map=map_\"\\\"\"_method_\"\\\":\\\"\"_intline_\"\\\"\" set first=0 }} set map=map_\"}}\" write map",
+            os_str_expr(cls_name)
         );
         // Bug 23: use namespace, not the hardcoded "USER".
         match iris.execute(&code, &namespace).await {
@@ -4151,7 +4157,7 @@ Methods:
         Parameters(p): Parameters<SkillNameParams>,
     ) -> Result<CallToolResult, McpError> {
         if let Some(iris) = self.iris_arc().as_deref() {
-            let code = format!("Write $Get(^SKILLS(\"{}\"))", p.name.replace('"', "\\\""));
+            let code = format!("Write $Get(^SKILLS({}))", os_str_expr(&p.name));
             if let Ok(output) = iris
                 .execute(&code, &crate::tools::skills_tools::skills_namespace())
                 .await
@@ -4207,10 +4213,7 @@ Methods:
         Parameters(p): Parameters<SkillNameParams>,
     ) -> Result<CallToolResult, McpError> {
         if let Some(iris) = self.iris_arc().as_deref() {
-            let code = format!(
-                "Kill ^SKILLS(\"{}\") Write \"OK\"",
-                p.name.replace('"', "\\\"")
-            );
+            let code = format!("Kill ^SKILLS({}) Write \"OK\"", os_str_expr(&p.name));
             if iris
                 .execute(&code, &crate::tools::skills_tools::skills_namespace())
                 .await
@@ -6123,6 +6126,19 @@ mod class_run_code_tests {
         let code = build_class_test_run_code("MyApp.Tests.Thing", FLAGS, "tok");
         assert!(code.contains("set ^UnitTestRoot="), "{code}");
         assert!(code.contains("CreateDirectoryChain(specDir)"), "{code}");
+    }
+
+    /// #67: the pattern is caller text. ObjectScript doubles a quote inside a literal, so
+    /// the old `"{pattern}"` with C-style escaping produced code that could not compile —
+    /// and the tool reported it as "no tests found", never as a broken call.
+    #[test]
+    fn a_quote_in_the_pattern_is_doubled_not_backslashed() {
+        let code = build_class_test_run_code(r#"Foo"Bar.Tests"#, FLAGS, "tok");
+        assert!(code.contains(r#"set tCls="Foo""Bar.Tests""#), "{code}");
+        assert!(
+            !code.contains("\\\""),
+            "no C-style escaping may survive: {code}"
+        );
     }
 
     /// The dispatch stays on ONE line: this code is piped through a docker-exec terminal as

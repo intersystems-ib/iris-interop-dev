@@ -1,6 +1,22 @@
 //! skill, skill_community, kb, agent_info tools via docker exec + ^SKILLS global.
 
 use crate::iris::connection::IrisConnection;
+use crate::objectscript::os_str_expr;
+
+/// Issue #67: write one `^SKILLS` entry. Each field is its own escaped ObjectScript
+/// expression, concatenated with the pipe separators the readers `$piece` back apart —
+/// the old form pasted all four into ONE literal after C-style `\"` escaping, so a
+/// description or a skill body containing a quote (or, for an installed skill, a newline,
+/// which a literal cannot hold at all) produced code that could not compile.
+fn skills_set_code(name: &str, description: &str, body: &str, now: &str) -> String {
+    format!(
+        "set ^SKILLS({})={}_\"|\"_{}_\"|0|\"_{} write \"ok\"",
+        os_str_expr(name),
+        os_str_expr(description),
+        os_str_expr(body),
+        os_str_expr(now),
+    )
+}
 use crate::tools::ToolCallEntry;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -63,7 +79,11 @@ pub async fn handle_skill(
     match p.action.as_str() {
         "list" => {
             // Bug 9: use separator variable so empty global yields "[]" not "]".
-            let code = "set key=\"\" set out=\"[\" set sep=\"\" for  { set key=$order(^SKILLS(key)) quit:key=\"\"  set data=$get(^SKILLS(key)) set out=out_sep_\"{\"_\"\\\"name\\\":\\\"\"_key_\"\\\",\\\"description\\\":\\\"\"_$piece(data,\"|\",1)_\"\\\",\\\"usage_count\\\":\"_$piece(data,\"|\",3)_\"}\" set sep=\",\" } set out=out_\"]\" write out";
+            // #67: a JSON quote inside an ObjectScript literal is $CHAR(34), never \" —
+            // backslash escapes nothing, so the old form was not valid ObjectScript and this
+            // tool could only ever answer []. Stored values are stripped of quotes/newlines
+            // so the assembled JSON stays parseable.
+            let code = "set q=$CHAR(34) set key=\"\" set out=\"[\" set sep=\"\" for  { set key=$order(^SKILLS(key)) quit:key=\"\"  set data=$get(^SKILLS(key)) set out=out_sep_\"{\"_q_\"name\"_q_\":\"_q_$translate(key,q_$CHAR(13,10),\"   \")_q_\",\"_q_\"description\"_q_\":\"_q_$translate($piece(data,\"|\",1),q_$CHAR(13,10),\"   \")_q_\",\"_q_\"usage_count\"_q_\":\"_+$piece(data,\"|\",3)_\"}\" set sep=\",\" } set out=out_\"]\" write out";
             let raw = xecute(iris, client, code, &ns).await.unwrap_or_default();
             let skills: serde_json::Value =
                 serde_json::from_str(&raw).unwrap_or(serde_json::json!([]));
@@ -71,10 +91,7 @@ pub async fn handle_skill(
         }
         "describe" => {
             let name = p.name.as_deref().unwrap_or("");
-            let code = format!(
-                "set data=$get(^SKILLS(\"{}\")) write data",
-                name.replace('"', "\\\"")
-            );
+            let code = format!("set data=$get(^SKILLS({})) write data", os_str_expr(name));
             let raw = xecute(iris, client, &code, &ns).await.unwrap_or_default();
             if raw.is_empty() {
                 return err_json("NOT_FOUND", &format!("Skill '{}' not found", name));
@@ -93,8 +110,8 @@ pub async fn handle_skill(
             let query = p.query.as_deref().unwrap_or("").to_lowercase();
             // Bug 9: use separator variable so empty results yield "[]" not "]".
             let code = format!(
-                "set key=\"\" set out=\"[\" set sep=\"\" for {{ set key=$order(^SKILLS(key)) quit:key=\"\"  set data=$get(^SKILLS(key)) if $find($zconvert(key_data,\"L\"),\"{}\")>0 {{ set out=out_sep_\"{{\\\"name\\\":\\\"\"_key_\"\\\",\\\"description\\\":\\\"\"_$piece(data,\"|\",1)_\"\\\"}}\" set sep=\",\" }} }} set out=out_\"]\" write out",
-                query.replace('"', "\\\"")
+                "set q=$CHAR(34) set key=\"\" set out=\"[\" set sep=\"\" for {{ set key=$order(^SKILLS(key)) quit:key=\"\"  set data=$get(^SKILLS(key)) if $find($zconvert(key_data,\"L\"),{})>0 {{ set out=out_sep_\"{{\"_q_\"name\"_q_\":\"_q_$translate(key,q_$CHAR(13,10),\"   \")_q_\",\"_q_\"description\"_q_\":\"_q_$translate($piece(data,\"|\",1),q_$CHAR(13,10),\"   \")_q_\"}}\" set sep=\",\" }} }} set out=out_\"]\" write out",
+                os_str_expr(&query)
             );
             let raw = xecute(iris, client, &code, &ns).await.unwrap_or_default();
             let results: serde_json::Value =
@@ -103,10 +120,7 @@ pub async fn handle_skill(
         }
         "forget" => {
             let name = p.name.as_deref().unwrap_or("");
-            let code = format!(
-                "kill ^SKILLS(\"{}\") write \"ok\"",
-                name.replace('"', "\\\"")
-            );
+            let code = format!("kill ^SKILLS({}) write \"ok\"", os_str_expr(name));
             xecute(iris, client, &code, &ns).await.unwrap_or_default();
             ok_json(serde_json::json!({"success": true, "name": name, "action": "forgotten"}))
         }
@@ -149,13 +163,7 @@ pub async fn handle_skill(
                     .join(" → ")
             );
             let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-            let code = format!(
-                "set ^SKILLS(\"{}\")=\"{}|{}|0|{}\" write \"ok\"",
-                skill_name.replace('"', "\\\""),
-                description.replace('"', "\\\""),
-                body.replace('"', "\\\""),
-                now,
-            );
+            let code = skills_set_code(&skill_name, &description, &body, &now);
             xecute(iris, client, &code, &ns).await.unwrap_or_default();
             ok_json(serde_json::json!({
                 "success": true,
@@ -217,13 +225,7 @@ pub async fn handle_skill_community(
                 Some((sname, sdesc, scontent)) => {
                     let ns = skills_namespace();
                     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-                    let code = format!(
-                        "set ^SKILLS(\"{}\")=\"{}|{}|0|{}\" write \"ok\"",
-                        sname.replace('"', "\\\""),
-                        sdesc.replace('"', "\\\""),
-                        scontent.replace('"', "\\\""),
-                        now,
-                    );
+                    let code = skills_set_code(&sname, &sdesc, &scontent, &now);
                     xecute(iris, client, &code, &ns).await.unwrap_or_default();
                     ok_json(serde_json::json!({"success": true, "installed": sname}))
                 }
@@ -290,15 +292,15 @@ pub async fn handle_kb(
                         .unwrap_or(false)
                     {
                         if let Ok(content) = std::fs::read_to_string(&fp) {
-                            let fname = fp
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("")
-                                .replace('"', "\\\"");
+                            let fname = fp.file_name().and_then(|n| n.to_str()).unwrap_or("");
                             let chunk: String = content.chars().take(2000).collect();
-                            let chunk_escaped = chunk.replace('"', "\\\"").replace('\n', "\\n");
+                            // #67: newlines cannot appear inside an ObjectScript literal at
+                            // all — the old `\\n` stored two literal characters. os_str_expr
+                            // splices them as $CHAR(10), so the chunk is stored verbatim.
                             let code = format!(
-                                "set ^KBCHUNKS(\"{fname}\")=\"{chunk_escaped}\" write \"ok\""
+                                "set ^KBCHUNKS({})={} write \"ok\"",
+                                os_str_expr(fname),
+                                os_str_expr(&chunk)
                             );
                             xecute(iris, client, &code, &ns).await.unwrap_or_default();
                             indexed += 1;
@@ -312,9 +314,13 @@ pub async fn handle_kb(
             let query = p.query.as_deref().unwrap_or("").to_lowercase();
             let top_k = p.top_k;
             // Bug 9: use separator variable so empty results yield "[]" not "]".
+            // #67: the loop's postconditional needs its own parentheses. ObjectScript has no
+            // operator precedence — `key="" || count>=N` groups as `((key="")||count)>=N`,
+            // which is false on the terminating pass, so the loop read ^KBCHUNKS("") and died
+            // with <SUBSCRIPT>. Every recall answered [] because the error was swallowed.
             let code = format!(
-                "set key=\"\" set out=\"[\" set sep=\"\" set count=0 for {{ set key=$order(^KBCHUNKS(key)) quit:(key=\"\" || count>={top_k})  set data=$get(^KBCHUNKS(key)) if $find($zconvert(data,\"L\"),\"{query}\")>0 {{ set out=out_sep_\"{{\\\"file\\\":\\\"\"_key_\"\\\",\\\"excerpt\\\":\\\"\"_$extract(data,1,200)_\"\\\"}}\" set sep=\",\" set count=count+1 }} }} set out=out_\"]\" write out",
-                query = query.replace('"', "\\\""),
+                "set q=$CHAR(34) set key=\"\" set out=\"[\" set sep=\"\" set count=0 for {{ set key=$order(^KBCHUNKS(key)) quit:((key=\"\")||(count>={top_k}))  set data=$get(^KBCHUNKS(key)) if $find($zconvert(data,\"L\"),{query})>0 {{ set out=out_sep_\"{{\"_q_\"file\"_q_\":\"_q_$translate(key,q_$CHAR(13,10),\"   \")_q_\",\"_q_\"excerpt\"_q_\":\"_q_$translate($extract(data,1,200),q_$CHAR(13,10),\"   \")_q_\"}}\" set sep=\",\" set count=count+1 }} }} set out=out_\"]\" write out",
+                query = os_str_expr(&query),
                 top_k = top_k,
             );
             let raw = xecute(iris, client, &code, &ns).await.unwrap_or_default();
@@ -391,5 +397,41 @@ pub async fn handle_agent_info(
             "INVALID_PARAM",
             &format!("Unknown what='{}'. Use: stats, history", other),
         ),
+    }
+}
+
+#[cfg(test)]
+mod objectscript_escaping_tests {
+    use super::*;
+
+    /// #67: ObjectScript doubles a quote inside a literal; `\\"` escapes nothing, so the
+    /// backslash survives and the quote ends the string. Nothing generated here may use it.
+    #[test]
+    fn a_quote_in_any_field_is_doubled_never_backslashed() {
+        let code = skills_set_code(
+            r#"say "hi""#,
+            r#"a "quoted" description"#,
+            "body",
+            "2026-08-25T00:00:00Z",
+        );
+        assert!(code.contains(r#""say ""hi""""#), "{code}");
+        assert!(
+            !code.contains(r#"\""#),
+            "no C-style escaping may survive: {code}"
+        );
+    }
+
+    /// A skill body is multi-line. A literal cannot span source lines at all — the old code
+    /// wrote a two-character `\\n` instead, which stored a backslash and an `n`.
+    #[test]
+    fn a_newline_in_a_body_is_spliced_as_char_not_written_into_a_literal() {
+        let code = skills_set_code("s", "d", "line one\nline two", "2026-08-25T00:00:00Z");
+        assert!(code.contains("$CHAR(10)"), "{code}");
+        assert!(!code.contains(r#"\n"#), "{code}");
+        assert_eq!(
+            code.lines().count(),
+            1,
+            "generated code stays on one line: {code}"
+        );
     }
 }

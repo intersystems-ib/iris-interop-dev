@@ -4,6 +4,7 @@
 //! iris_generate — LLM-based class/test generation.
 
 use crate::iris::connection::IrisConnection;
+use crate::objectscript::os_str_expr;
 use crate::tools::log_store;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -223,8 +224,8 @@ pub async fn handle_iris_debug(
         "map_int" => {
             let err = p.error_string.as_deref().unwrap_or("");
             let code = format!(
-                "set err=\"{}\" set routine=$piece($piece(err,\"^\",2),\".\",1) set offset=$piece(err,\"+\",2) set offset=$piece(offset,\"^\",1) write ##class(%Studio.Debugger).SourceLine(routine,+offset)",
-                err.replace('"', "\\\"")
+                "set err={} set routine=$piece($piece(err,\"^\",2),\".\",1) set offset=$piece(err,\"+\",2) set offset=$piece(offset,\"^\",1) write ##class(%Studio.Debugger).SourceLine(routine,+offset)",
+                os_str_expr(err)
             );
             // execute_via_generator works over plain Atelier HTTP — no docker exec
             // needed (issue #20; the DOCKER_REQUIRED bail-out made iris_debug fail on
@@ -456,7 +457,7 @@ pub async fn handle_iris_table_info(
     // Look up class projection: find a compiled class whose SQL mapping matches.
     let lookup_code = format!(
         r#"
-set sqlSchema = "{schema}", sqlTable = "{table}"
+set sqlSchema = {schema}, sqlTable = {table}
 // Check table exists at all via INFORMATION_SCHEMA
 set rsEx = ##class(%SQL.Statement).%ExecDirect(,"SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?", sqlSchema, sqlTable)
 if rsEx.%Next() && (rsEx.%GetData(1) = 0) {{ write "NOT_FOUND",! quit }}
@@ -472,8 +473,8 @@ if rs.%Next() {{
     write "DDL_TABLE",!
 }}
 "#,
-        schema = sql_schema.replace('"', "\\\""),
-        table = sql_table.replace('"', "\\\""),
+        schema = os_str_expr(&sql_schema),
+        table = os_str_expr(&sql_table),
     );
 
     let output = match iris
@@ -557,11 +558,14 @@ async fn get_row_count(
     schema: &str,
     table: &str,
 ) -> serde_json::Value {
+    // #67: build the SQL in Rust, then hand the whole statement to ObjectScript as ONE
+    // escaped expression. The delimited-identifier quotes around the schema are part of the
+    // SQL text, and os_str_expr doubles them for the ObjectScript literal.
+    let sql = format!(r#"SELECT COUNT(*) FROM "{schema}".{table}"#);
     let code = format!(
-        r#"set rs = ##class(%SQL.Statement).%ExecDirect(,"SELECT COUNT(*) FROM ""{schema}"".{table}")
+        r#"set rs = ##class(%SQL.Statement).%ExecDirect(,{sql})
 if rs.%Next() {{ write rs.%GetData(1),! }} else {{ write "error",! }}"#,
-        schema = schema.replace('"', "\\\""),
-        table = table.replace('"', "\\\""),
+        sql = os_str_expr(&sql),
     );
     match iris.execute_via_generator(&code, namespace, client).await {
         Ok(out) => out
