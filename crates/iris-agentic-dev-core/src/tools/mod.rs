@@ -58,7 +58,8 @@ pub use scm::ScmParams;
 /// Read from `IRIS_TOOLSET` env var or `--toolset` CLI flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Toolset {
-    /// All 34 tools — current behavior (default when IRIS_TOOLSET unset).
+    /// Every tool the binary carries (54 as of 0.8.3). NOT this fork's default — the
+    /// `--toolset` flag defaults to `interop`; baseline is opt-in via IRIS_TOOLSET/--toolset.
     Baseline,
     /// 29 tools — stub tools/actions removed; no merged tools.
     Nostub,

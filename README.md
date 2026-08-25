@@ -8,7 +8,7 @@ Works with IRIS installed natively on Windows or Linux, and with Docker. Require
 
 > **What this is.** `iris-interop-dev` is the **streamlined, interoperability-focused fork** of the
 > community [`intersystems-community/iris-agentic-dev`](https://github.com/intersystems-community/iris-agentic-dev)
-> MCP server. It exposes a locked **20-tool interop profile**, ships as a **single binary (no Python)**,
+> MCP server. It exposes a locked **23-tool interop profile**, ships as a **single binary (no Python)**,
 > and uses a **distinct MCP server name (`iris-interop-dev`)** so it can be installed alongside the
 > original. **Tool names are identical**, so the [`intersystems-ib/iris-interop-skills`](https://github.com/intersystems-ib/iris-interop-skills)
 > plugin works with either server. It is the binary baked into the *"De Prompt a Producción"* workshop VM.
@@ -67,7 +67,70 @@ Restart Claude and **verify with the `check_config` tool** that it connects and 
 
 > **VS Code + GitHub Copilot?** The VS Code extension path is provided by the upstream community tool —
 > see [`intersystems-community/iris-agentic-dev`](https://github.com/intersystems-community/iris-agentic-dev).
-> This fork is packaged for Claude Code as the `iris-interop-dev` binary.
+> This fork ships as the `iris-interop-dev` binary; the workshop VM registers it for Claude Code.
+
+---
+
+## Other MCP clients (Cursor, Codex, …)
+
+`iris-interop-dev mcp` is a plain stdio MCP server, so any client that can launch a command and
+pass environment variables can drive it. Only the registration file differs — the binary, the
+arguments and the environment are the same ones the Claude Code section uses above.
+
+**Cursor** — `~/.cursor/mcp.json` for every project, or `.cursor/mcp.json` for one:
+
+```json
+{
+  "mcpServers": {
+    "iris-interop-dev": {
+      "command": "/usr/local/bin/iris-interop-dev",
+      "args": ["mcp"],
+      "env": {
+        "IRIS_HOST": "localhost",
+        "IRIS_WEB_PORT": "52773",
+        "IRIS_USERNAME": "_SYSTEM",
+        "IRIS_PASSWORD": "SYS",
+        "IRIS_NAMESPACE": "USER"
+      }
+    }
+  }
+}
+```
+
+**Codex CLI** — `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.iris-interop-dev]
+command = "/usr/local/bin/iris-interop-dev"
+args = ["mcp"]
+default_tools_approval_mode = "approve"
+
+[mcp_servers.iris-interop-dev.env]
+IRIS_HOST = "localhost"
+IRIS_WEB_PORT = "52773"
+IRIS_USERNAME = "_SYSTEM"
+IRIS_PASSWORD = "SYS"
+IRIS_NAMESPACE = "USER"
+```
+
+> Two things that cost real time when we ran the skills eval corpus under Codex:
+> - **`default_tools_approval_mode = "approve"` is not optional** for non-interactive runs. Without
+>   it, `codex exec` cancels *every* MCP tool call (`user cancelled MCP tool call`) — reproduced 5/5
+>   on codex-cli 0.146.1. `auto`, `writes`, project trust settings and feature flags did not help.
+> - It must sit **inside `[mcp_servers.<name>]` and before the `.env` subtable header**. TOML puts any
+>   bare key written after that header into the env table instead, silently.
+
+Whatever the client:
+
+- **Verify with `check_config` first.** It reports `mcp_version`, `connected`, host/port/namespace and
+  the active toolset from a cached snapshot — no IRIS round-trip — so it answers even when IRIS is
+  down, which makes it the right first call to tell "MCP not registered" from "IRIS unreachable".
+- **`IRIS_TOOLSET` selects the tool surface** (`--toolset` also works). This fork defaults to
+  `interop` — the 23 tools below. `baseline` exposes everything the binary carries (54 on 0.8.3).
+- **`IRIS_LOG_FILE=<path>` is how a session's traces survive it.** An MCP client keeps the server's
+  stderr to itself, so without this there is nothing to read after a failed run.
+- **A running client keeps the binary it started with.** After installing a new release, restart the
+  client — `check_config`'s `mcp_version` tells you which build is actually answering.
 
 ---
 
@@ -149,6 +212,8 @@ server — run the ISC Web Gateway container alongside IRIS and point `web_port`
 | `IRIS_PASSWORD` | `SYS` | IRIS password |
 | `IRIS_NAMESPACE` | `USER` | Default namespace |
 | `IRIS_CONTAINER` | _(empty)_ | Docker container name — required for Docker-dependent tools |
+| `IRIS_TOOLSET` | `interop` | Tool surface: `interop` (23 tools) or `baseline` (full upstream surface). Same as `--toolset` |
+| `IRIS_LOG_FILE` | _(empty)_ | Mirror server traces to this file — the only trace that outlives an MCP session |
 | `OBJECTSCRIPT_WORKSPACE` | `$PWD` | Workspace root for `.iris-agentic-dev.toml` lookup |
 
 ---
@@ -177,10 +242,16 @@ numbers), `iris_execute` (run ObjectScript), `iris_query` (SQL → JSON rows), `
 `%UnitTest`, structured pass/fail), `iris_get_log` (fetch a truncated result by `log_id`).
 
 **Introspection** — `docs_introspect` (methods/properties/XData/superclasses), `iris_symbols` (search
-classes/methods), `iris_table_info` (real projected table + columns), `check_config` (active connection state).
+classes/methods), `iris_table_info` (real projected table + columns), `check_config` (active connection
+state), `find_subclass_implementations` (who overrides a method), `iris_debug` (map a .INT offset back
+to source, error logs).
 
-**Interoperability** — `iris_production` (start/stop/update/status/recover), `iris_production_item`
-(item get/set settings), `iris_interop_query` (logs, queues, message archive/trace),
+**Interoperability** — `iris_production` (start/stop/update/status/recover/autostart),
+`iris_production_item` (item get/set settings), `iris_interop_query` (logs, queues, message
+archive/trace), `iris_message_body` (read a message body — string/stream containers and any
+`EnsLib.EDI.Document`: HL7 v2, X12, ASTM, EDIFACT, EDI XML — with a PHI gate),
+`iris_business_rule_info` (list/describe routing rules), `iris_production_diff` (running config vs
+committed source), `extract_message_map_routing` (message-map targets of a business process),
 `iris_lookup_manage` / `iris_lookup_transfer` (lookup tables), `iris_credential_list` /
 `iris_credential_manage` (SSL/credentials).
 
