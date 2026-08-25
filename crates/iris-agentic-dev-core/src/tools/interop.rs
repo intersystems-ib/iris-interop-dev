@@ -2211,6 +2211,680 @@ If $$$ISERR(tSC) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC
     }
 }
 
+// ── 056 interop-depth ────────────────────────────────────────────────────────
+// Ported from upstream's 056-interop-depth (f92da6d), adapted to this fork:
+// every user string reaching ObjectScript goes through `os_str_expr` (issue #6),
+// SQL uses bound parameters instead of interpolation, and the namespace arrives
+// already resolved by the caller (issue #15).
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct MessageBodyParams {
+    pub message_id: String,
+    #[serde(default = "default_ns")]
+    pub namespace: String,
+    #[serde(default = "default_max_bytes")]
+    pub max_bytes: u32,
+    #[serde(default)]
+    pub acknowledge_phi: bool,
+}
+fn default_max_bytes() -> u32 {
+    65536
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BusinessRuleInfoParams {
+    pub action: String,
+    pub rule_name: Option<String>,
+    #[serde(default = "default_ns")]
+    pub namespace: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ProductionDiffParams {
+    pub production: Option<String>,
+    #[serde(default = "default_ns")]
+    pub namespace: String,
+}
+
+/// Detect a body's content type from its leading characters.
+/// `"HL7v2"` for MSH|-prefixed content, `"JSON"`/`"XML"` for {/[ and < prefixes,
+/// `"text"` for everything else.
+pub fn detect_content_type(body: &str) -> &'static str {
+    let trimmed = body.trim_start();
+    if trimmed.starts_with("MSH|") {
+        "HL7v2"
+    } else if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        "JSON"
+    } else if trimmed.starts_with('<') {
+        "XML"
+    } else {
+        "text"
+    }
+}
+
+/// Truncate `body` to at most `max_bytes`, breaking at a UTF-8 char boundary at or
+/// before the limit. Returns `(content, was_truncated, original_byte_len)` — the
+/// length is the whole body's, so callers can report what they did not return.
+pub fn truncate_body(body: &str, max_bytes: usize) -> (String, bool, usize) {
+    let original_len = body.len();
+    if original_len <= max_bytes {
+        return (body.to_string(), false, original_len);
+    }
+    let mut end = max_bytes;
+    while end > 0 && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    (body[..end].to_string(), true, original_len)
+}
+
+/// Replace the standard HL7 v2 PHI field positions (PID-3, PID-5, PID-7, PID-8,
+/// PID-11, PID-18, MSH-3) with `[REDACTED]`. Content without an `MSH|` segment is
+/// returned unchanged — only HL7 v2 has known PHI positions to blank.
+pub fn redact_hl7v2(body: &str) -> String {
+    if detect_content_type(body) != "HL7v2" {
+        return body.to_string();
+    }
+    let line_ending = if body.contains("\r\n") {
+        "\r\n"
+    } else if body.contains('\r') {
+        "\r"
+    } else {
+        "\n"
+    };
+    let redact_fields = |line: &str, segment: &str, field_indices: &[usize]| -> String {
+        let mut fields: Vec<&str> = line.split('|').collect();
+        if fields.first().copied() != Some(segment) {
+            return line.to_string();
+        }
+        for &idx in field_indices {
+            if idx < fields.len() {
+                fields[idx] = "[REDACTED]";
+            }
+        }
+        fields.join("|")
+    };
+    body.split(line_ending)
+        .map(|line| {
+            // MSH-1 is the implicit field-separator char (not a split element), so
+            // fields[1] = MSH-2 (encoding chars) and fields[2] = MSH-3 (sending app).
+            let redacted = redact_fields(line, "MSH", &[2]);
+            redact_fields(&redacted, "PID", &[3, 5, 7, 8, 11, 18])
+        })
+        .collect::<Vec<_>>()
+        .join(line_ending)
+}
+
+/// Parse `<Item Name="..." ClassName="..." Enabled="..."/>` entries out of a
+/// production class's UDL/XData source. Returns `(name, class_name, enabled)`.
+pub fn parse_production_items_from_source(source: &str) -> Vec<(String, String, bool)> {
+    let mut items = Vec::new();
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("<Item ") {
+            continue;
+        }
+        let name = extract_xml_attr(trimmed, "Name");
+        let class_name = extract_xml_attr(trimmed, "ClassName");
+        // IRIS treats a missing Enabled as enabled.
+        let enabled = extract_xml_attr(trimmed, "Enabled")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(true);
+        if let (Some(name), Some(class_name)) = (name, class_name) {
+            items.push((name, class_name, enabled));
+        }
+    }
+    items
+}
+
+fn extract_xml_attr(line: &str, attr: &str) -> Option<String> {
+    // Require whitespace before the attribute name so `Name="` does not match
+    // inside `ClassName="`. Attributes are always preceded by a space.
+    let needle = format!(" {attr}=\"");
+    let start = line.find(&needle)? + needle.len();
+    let rest = &line[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// Read an Ensemble message body (`Ens.StringContainer`, `Ens.StreamContainer`,
+/// `%Stream.Object`). `data_policy` gates PHI: `block` refuses outright, `allow`
+/// requires an explicit acknowledgement, `redact` blanks known HL7 v2 PHI fields.
+pub async fn handle_iris_message_body(
+    iris: Option<&IrisConnection>,
+    params: &MessageBodyParams,
+    data_policy: &str,
+) -> Result<CallToolResult, McpError> {
+    if data_policy == "block" {
+        return err_json(
+            "PHI_POLICY_BLOCKED",
+            "iris_message_body is blocked while dataPolicy=block — message bodies may contain PHI. \
+             Pass dataPolicy=redact to blank known HL7 v2 PHI fields, or dataPolicy=allow with \
+             acknowledgePhi=true to read the body as-is.",
+        );
+    }
+    if data_policy == "allow" && !params.acknowledge_phi {
+        return err_json(
+            "PHI_ACK_REQUIRED",
+            "dataPolicy=allow requires acknowledgePhi=true — the body is returned unredacted.",
+        );
+    }
+    let message_id: i64 = match params.message_id.trim().parse() {
+        Ok(n) => n,
+        Err(_) => {
+            return err_json(
+                "INVALID_MESSAGE_ID",
+                &format!(
+                    "message_id '{}' is not a valid integer — pass the Ens.MessageHeader ID",
+                    params.message_id
+                ),
+            )
+        }
+    };
+    let mut max_bytes = params.max_bytes.max(1);
+    let mut max_bytes_clamped = false;
+    if max_bytes > 1_048_576 {
+        max_bytes = 1_048_576;
+        max_bytes_clamped = true;
+    }
+
+    let iris = match iris {
+        Some(i) => i,
+        None => return err_json("IRIS_UNREACHABLE", "No IRIS connection"),
+    };
+    let client = IrisConnection::http_client().map_err(|_| iris_unreachable())?;
+
+    // message_id is an i64 and max_bytes a u32 — both are numeric, so nothing
+    // user-controlled reaches the generated source as a string here.
+    let code = format!(
+        r#"Set hdr=##class(Ens.MessageHeader).%OpenId({message_id})
+If '$IsObject(hdr) {{ Write "ERROR:MESSAGE_NOT_FOUND" Quit }}
+Set bodyClass=hdr.MessageBodyClassName
+Set bodyId=hdr.MessageBodyId
+If bodyClass="" {{ Write "ERROR:MESSAGE_NOT_FOUND" Quit }}
+Set body=$ClassMethod(bodyClass,"%OpenId",bodyId)
+If '$IsObject(body) {{ Write "ERROR:MESSAGE_NOT_FOUND" Quit }}
+If body.%IsA("Ens.StreamContainer") {{
+  Set stream=body.Stream
+  If '$IsObject(stream) {{ Write "ERROR:STREAM_READ_ERROR:no stream object" Quit }}
+  Set full=stream.Size
+  Set content=stream.Read({max_bytes})
+  Write "OK:"_full_":"
+  Write content
+}} ElseIf body.%IsA("%Stream.Object") {{
+  Set full=body.Size
+  Set content=body.Read({max_bytes})
+  Write "OK:"_full_":"
+  Write content
+}} ElseIf body.%IsA("Ens.StringContainer") {{
+  Set content=body.StringValue
+  Set full=$Length(content)
+  If full>{max_bytes} {{ Set content=$Extract(content,1,{max_bytes}) }}
+  Write "OK:"_full_":"
+  Write content
+}} Else {{
+  Write "ERROR:UNSUPPORTED_BODY_CLASS:"_bodyClass
+}}"#
+    );
+
+    match iris
+        .execute_via_generator(&code, &params.namespace, &client)
+        .await
+    {
+        Ok(out) => {
+            if out.starts_with("ERROR:MESSAGE_NOT_FOUND") {
+                return err_json(
+                    "MESSAGE_NOT_FOUND",
+                    &format!("No body found for message ID {message_id}"),
+                );
+            }
+            if let Some(rest) = out.strip_prefix("ERROR:STREAM_READ_ERROR:") {
+                return err_json("STREAM_READ_ERROR", rest.trim());
+            }
+            if let Some(rest) = out.strip_prefix("ERROR:UNSUPPORTED_BODY_CLASS:") {
+                return err_json(
+                    "UNSUPPORTED_BODY_CLASS",
+                    &format!(
+                        "Body class '{}' is not a recognized stream/text body type",
+                        rest.trim()
+                    ),
+                );
+            }
+            let Some(rest) = out.strip_prefix("OK:") else {
+                return err_json("IRIS_EXECUTE_ERROR", &out);
+            };
+            let mut parts = rest.splitn(2, ':');
+            // The prefix is the body's FULL size. IRIS caps what it hands back at
+            // max_bytes, so the returned content alone cannot say how much was left
+            // behind — reporting its length would understate a truncated body.
+            let full_size: usize = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let body_content = parts.next().unwrap_or("");
+
+            let (truncated_body, locally_truncated, _) =
+                truncate_body(body_content, max_bytes as usize);
+            let actual_size = full_size.max(body_content.len());
+            let was_truncated = locally_truncated || actual_size > body_content.len();
+            let content_type = detect_content_type(&truncated_body);
+
+            let final_body = if data_policy == "redact" {
+                redact_hl7v2(&truncated_body)
+            } else {
+                truncated_body
+            };
+
+            let mut resp = serde_json::json!({
+                "success": true,
+                "message_id": params.message_id,
+                "content_type": content_type,
+                "body": final_body,
+                "truncated": was_truncated,
+                "actual_size": actual_size,
+                "redacted": data_policy == "redact",
+            });
+            if max_bytes_clamped {
+                resp["max_bytes_clamped"] = serde_json::Value::Bool(true);
+            }
+            ok_json(resp)
+        }
+        Err(e) => err_json(
+            if is_network_error(&e.to_string()) {
+                "IRIS_UNREACHABLE"
+            } else {
+                "IRIS_EXECUTE_ERROR"
+            },
+            &e.to_string(),
+        ),
+    }
+}
+
+/// List the namespace's business rule sets, or describe one.
+/// `Ens.Rule.RuleSet` is the rule-set persistent class (upstream's research
+/// confirmed `EnsLib.Rules.Definition` does not exist).
+pub async fn handle_iris_business_rule_info(
+    iris: Option<&IrisConnection>,
+    params: &BusinessRuleInfoParams,
+) -> Result<CallToolResult, McpError> {
+    match params.action.as_str() {
+        "list" => {}
+        "get" => {
+            if params.rule_name.as_deref().unwrap_or("").trim().is_empty() {
+                return err_json("INVALID_PARAMS", "rule_name is required for action=get");
+            }
+        }
+        other => {
+            return err_json(
+                "INVALID_ACTION",
+                &format!("action must be 'list' or 'get', got '{other}'"),
+            )
+        }
+    }
+
+    let iris = match iris {
+        Some(i) => i,
+        None => return err_json("IRIS_UNREACHABLE", "No IRIS connection"),
+    };
+    let client = IrisConnection::http_client().map_err(|_| iris_unreachable())?;
+
+    let exists_code = r#"Write ##class(%Dictionary.ClassDefinition).%ExistsId("Ens.Rule.RuleSet")"#;
+    match iris
+        .execute_via_generator(exists_code, &params.namespace, &client)
+        .await
+    {
+        Ok(out) if out.trim() == "0" => {
+            return err_json(
+                "INTEROP_NOT_AVAILABLE",
+                &format!(
+                    "Ens.Rule.RuleSet is not available in namespace '{}' — Interoperability is not enabled there",
+                    params.namespace
+                ),
+            )
+        }
+        Ok(_) => {}
+        Err(e) => {
+            return err_json(
+                if is_network_error(&e.to_string()) {
+                    "IRIS_UNREACHABLE"
+                } else {
+                    "IRIS_EXECUTE_ERROR"
+                },
+                &e.to_string(),
+            )
+        }
+    }
+
+    if params.action == "list" {
+        let sql = "SELECT Name, FullName, ShortDescription, TimeModified \
+                   FROM Ens_Rule.RuleSet ORDER BY Name";
+        return match iris.query(sql, vec![], &params.namespace, &client).await {
+            Ok(resp) => {
+                let rows = resp["result"]["content"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                let rules: Vec<serde_json::Value> = rows
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "name": r["Name"],
+                            "class_name": r["FullName"],
+                            "description": r["ShortDescription"],
+                            "modified": r["TimeModified"],
+                        })
+                    })
+                    .collect();
+                if !rules.is_empty() {
+                    return ok_json(serde_json::json!({
+                        "success": true,
+                        "namespace": params.namespace,
+                        "count": rules.len(),
+                        "rules": rules,
+                        "source": "Ens_Rule.RuleSet",
+                    }));
+                }
+                // Ens_Rule.RuleSet is populated by the rule editor's projection, and
+                // is empty on instances where rules exist only as compiled
+                // Ens.Rule.Definition subclasses. Answering "no rules" there, while
+                // rule classes plainly exist, is the #47 failure again — so fall
+                // back to the class catalog and say which source answered.
+                let (rules, source) =
+                    match rule_classes_from_catalog(iris, &params.namespace, &client).await {
+                        Some(found) if !found.is_empty() => (found, "%Dictionary.CompiledClass"),
+                        _ => (rules, "Ens_Rule.RuleSet"),
+                    };
+                ok_json(serde_json::json!({
+                    "success": true,
+                    "namespace": params.namespace,
+                    "count": rules.len(),
+                    "rules": rules,
+                    "source": source,
+                }))
+            }
+            Err(e) => err_json("IRIS_UNREACHABLE", &e.to_string()),
+        };
+    }
+
+    // action == "get". Ens.Rule.RuleSet's ID is a composite key
+    // (HostClass||Name||Version), not the Name — look the ID up first, newest
+    // version (highest ID) wins. Bound parameter, not interpolation.
+    let rule_name = params.rule_name.as_deref().unwrap_or("").trim();
+    let sql = "SELECT ID, ShortDescription FROM Ens_Rule.RuleSet WHERE Name = ? ORDER BY ID DESC";
+    match iris
+        .query(
+            sql,
+            vec![serde_json::Value::String(rule_name.to_string())],
+            &params.namespace,
+            &client,
+        )
+        .await
+    {
+        Ok(resp) => {
+            let rows = resp["result"]["content"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            if rows.is_empty() {
+                // Distinguish "no such rule" from "the rule exists as a compiled class
+                // but the RuleSet projection has no row for it" — very different fixes.
+                let known: Vec<String> =
+                    rule_classes_from_catalog(iris, &params.namespace, &client)
+                        .await
+                        .unwrap_or_default()
+                        .iter()
+                        .filter_map(|r| r["name"].as_str().map(|s| s.to_string()))
+                        .collect();
+                if known.iter().any(|k| k == rule_name) {
+                    return err_json(
+                        "RULE_NOT_PROJECTED",
+                        &format!(
+                            "'{rule_name}' is a compiled Ens.Rule.Definition class in '{}', but it has no \
+                             Ens_Rule.RuleSet row — the rule-set projection is written when the rule is saved \
+                             from the Rule Editor. Read the class source with iris_doc to inspect its \
+                             RuleDefinition XData.",
+                            params.namespace
+                        ),
+                    );
+                }
+                return err_json(
+                    "RULE_NOT_FOUND",
+                    &format!(
+                        "No business rule named '{rule_name}' in namespace '{}' — call action=list to see what is there",
+                        params.namespace
+                    ),
+                );
+            }
+            let description = rows[0]["ShortDescription"].clone();
+            let rule_id = rows[0]["ID"].as_str().unwrap_or("").to_string();
+
+            let code = format!(
+                r#"Set rs=##class(Ens.Rule.RuleSet).%OpenId({rule_id_expr})
+If '$IsObject(rs) {{ Write "ERROR:RULE_NOT_FOUND" Quit }}
+Write "OK:"
+Set count=rs.Rules.Count()
+For i=1:1:count {{
+  Set rule=rs.Rules.GetAt(i)
+  Write "COND:"_$Select($IsObject(rule.Conditions):rule.Conditions.Count(),1:0)_"|"
+  Write "ACT:"_$Select($IsObject(rule.Actions):rule.Actions.Count(),1:0)_"|"
+}}"#,
+                rule_id_expr = os_str_expr(&rule_id)
+            );
+            match iris
+                .execute_via_generator(&code, &params.namespace, &client)
+                .await
+            {
+                Ok(out) => {
+                    if out.trim().starts_with("ERROR:RULE_NOT_FOUND") {
+                        return err_json(
+                            "RULE_NOT_FOUND",
+                            &format!("No business rule named '{rule_name}' found"),
+                        );
+                    }
+                    let mut conditions = 0usize;
+                    let mut actions = 0usize;
+                    let mut rule_count = 0usize;
+                    if let Some(rest) = out.trim().strip_prefix("OK:") {
+                        for part in rest.split('|') {
+                            if let Some(n) = part.strip_prefix("COND:") {
+                                conditions += n.parse::<usize>().unwrap_or(0);
+                                rule_count += 1;
+                            } else if let Some(n) = part.strip_prefix("ACT:") {
+                                actions += n.parse::<usize>().unwrap_or(0);
+                            }
+                        }
+                    }
+                    ok_json(serde_json::json!({
+                        "success": true,
+                        "name": rule_name,
+                        "namespace": params.namespace,
+                        "description": description,
+                        "rules": rule_count,
+                        "conditions": conditions,
+                        "actions": actions,
+                    }))
+                }
+                Err(e) => err_json("IRIS_UNREACHABLE", &e.to_string()),
+            }
+        }
+        Err(e) => err_json("IRIS_UNREACHABLE", &e.to_string()),
+    }
+}
+
+/// Compiled `Ens.Rule.Definition` subclasses in `namespace`, excluding the framework's
+/// own. Used when `Ens_Rule.RuleSet` has no rows so the caller still learns what exists.
+async fn rule_classes_from_catalog(
+    iris: &IrisConnection,
+    namespace: &str,
+    client: &reqwest::Client,
+) -> Option<Vec<serde_json::Value>> {
+    let sql = "SELECT Name FROM %Dictionary.CompiledClass \
+               WHERE PrimarySuper LIKE '%Ens.Rule.Definition%' \
+                 AND Name NOT LIKE 'Ens.%' AND Name NOT LIKE 'EnsLib.%' \
+                 AND Name NOT LIKE 'HS.%' AND Name NOT LIKE '\\%%' ESCAPE '\\' \
+               ORDER BY Name";
+    let resp = iris.query(sql, vec![], namespace, client).await.ok()?;
+    Some(
+        resp["result"]["content"]
+            .as_array()?
+            .iter()
+            .filter_map(|r| r["Name"].as_str())
+            .map(|n| {
+                serde_json::json!({
+                    "name": n,
+                    "class_name": n,
+                    "description": serde_json::Value::Null,
+                    "modified": serde_json::Value::Null,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Diff a running production's config items against the committed class source.
+pub async fn handle_iris_production_diff(
+    iris: Option<&IrisConnection>,
+    params: &ProductionDiffParams,
+) -> Result<CallToolResult, McpError> {
+    let iris = match iris {
+        Some(i) => i,
+        None => return err_json("IRIS_UNREACHABLE", "No IRIS connection"),
+    };
+    let client = IrisConnection::http_client().map_err(|_| iris_unreachable())?;
+    let ns = &params.namespace;
+
+    let prod_name = if let Some(p) = &params.production {
+        p.clone()
+    } else {
+        let status_code = r#"Set sc=##class(Ens.Director).GetProductionStatus(.n,.s) If $System.Status.IsError(sc)||(n="") { Write "ERROR:NO_PRODUCTION" } Else { Write n }"#;
+        match iris.execute_via_generator(status_code, ns, &client).await {
+            Ok(out) => {
+                let out = out.trim().to_string();
+                if out.starts_with("ERROR:NO_PRODUCTION") {
+                    return err_json(
+                        "NO_PRODUCTION",
+                        "No production is running in this namespace — pass `production` to diff a specific one",
+                    );
+                }
+                out
+            }
+            Err(e) => return err_json("IRIS_UNREACHABLE", &e.to_string()),
+        }
+    };
+
+    let doc_name = format!("{prod_name}.cls");
+    let scm_code = format!(
+        r#"Set sc=##class(%Studio.SourceControl.Interface).SourceControlCreate({user_expr},{pass_expr},.created,.flags,.outuser)
+Set isInSC=0
+Set sc=##class(%Studio.SourceControl.Interface).GetStatus({doc_expr},.isInSC,.editable,.isCheckedOut,.owner)
+If $System.Status.IsError(sc)||('isInSC) {{ Write "NO_SCM" }} Else {{ Write "IN_SCM" }}"#,
+        user_expr = os_str_expr(&iris.username),
+        pass_expr = os_str_expr(&iris.password),
+        doc_expr = os_str_expr(&doc_name),
+    );
+    match iris.execute_via_generator(&scm_code, ns, &client).await {
+        Ok(out) if out.trim() == "NO_SCM" => {
+            return err_json(
+                "NO_SCM",
+                &format!(
+                    "No source control is configured for '{doc_name}' in namespace '{ns}' — there is no committed source to diff against"
+                ),
+            )
+        }
+        Ok(_) => {}
+        Err(e) => return err_json("IRIS_UNREACHABLE", &e.to_string()),
+    }
+
+    let exists_code = format!(
+        r#"Write ##class(%Dictionary.ClassDefinition).%ExistsId({prod_expr})"#,
+        prod_expr = os_str_expr(&prod_name)
+    );
+    match iris.execute_via_generator(&exists_code, ns, &client).await {
+        Ok(out) if out.trim() == "0" => {
+            return err_json(
+                "PRODUCTION_NOT_FOUND",
+                &format!("Production '{prod_name}' does not exist in namespace '{ns}'"),
+            )
+        }
+        Ok(_) => {}
+        Err(e) => return err_json("IRIS_UNREACHABLE", &e.to_string()),
+    }
+
+    // Current in-memory item set. Bound parameter, not interpolation.
+    let sql = "SELECT Name, ClassName, Category, Enabled FROM Ens_Config.Item \
+               WHERE Production->Name = ?";
+    let current_items: Vec<(String, String, bool)> = match iris
+        .query(
+            sql,
+            vec![serde_json::Value::String(prod_name.clone())],
+            ns,
+            &client,
+        )
+        .await
+    {
+        Ok(resp) => resp["result"]["content"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|r| {
+                (
+                    r["Name"].as_str().unwrap_or("").to_string(),
+                    r["ClassName"].as_str().unwrap_or("").to_string(),
+                    // Enabled comes back as a SQL boolean on some builds and 0/1 on others.
+                    r["Enabled"]
+                        .as_bool()
+                        .unwrap_or_else(|| r["Enabled"].as_i64().unwrap_or(0) != 0),
+                )
+            })
+            .collect(),
+        Err(e) => return err_json("IRIS_UNREACHABLE", &e.to_string()),
+    };
+
+    // Committed source via Atelier REST GET /doc/<name>.
+    let doc_url = iris.versioned_ns_url(ns, &format!("/doc/{}", urlencoding::encode(&doc_name)));
+    let committed_items: Vec<(String, String, bool)> = match client
+        .get(&doc_url)
+        .basic_auth(&iris.username, Some(&iris.password))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            let source = crate::tools::doc::doc_content_to_string(&body);
+            parse_production_items_from_source(&source)
+        }
+        _ => Vec::new(),
+    };
+
+    let mut changes = Vec::new();
+    for (name, class_name, enabled) in &current_items {
+        match committed_items.iter().find(|(n, _, _)| n == name) {
+            None => changes.push(serde_json::json!({
+                "item_name": name, "item_type": class_name, "status": "added"
+            })),
+            Some((_, c_class, c_enabled)) => {
+                if c_class != class_name || c_enabled != enabled {
+                    changes.push(serde_json::json!({
+                        "item_name": name, "item_type": class_name, "status": "modified"
+                    }));
+                }
+            }
+        }
+    }
+    for (name, class_name, _) in &committed_items {
+        if !current_items.iter().any(|(n, _, _)| n == name) {
+            changes.push(serde_json::json!({
+                "item_name": name, "item_type": class_name, "status": "removed"
+            }));
+        }
+    }
+
+    ok_json(serde_json::json!({
+        "success": true,
+        "production": prod_name,
+        "namespace": ns,
+        "in_sync": changes.is_empty(),
+        "changes": changes,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
