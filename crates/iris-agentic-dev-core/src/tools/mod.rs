@@ -146,6 +146,10 @@ pub fn no_tests_found_guidance(
     let pat = pattern.to_lowercase();
     let did_you_mean: Vec<String> = candidates
         .iter()
+        // #62: a suggestion identical to the input is not a correction — following it
+        // re-sends the same call. When the pattern IS a compiled class, the class is
+        // what needs fixing, and `no_runnable_tests_cause` answers that instead.
+        .filter(|c| !c.eq_ignore_ascii_case(pattern))
         .filter(|c| {
             let c = c.to_lowercase();
             c.starts_with(&pat) || pat.starts_with(&c)
@@ -183,6 +187,152 @@ pub fn no_tests_found_guidance(
         )
     };
     (hint, did_you_mean)
+}
+
+/// Issue #62: `NO_TESTS_FOUND` covered two states that need OPPOSITE actions — fix
+/// the pattern, or fix the class — and always reported the first. A class that
+/// matched but exposes no runnable test got told its pattern was "one segment away"
+/// from a byte-identical name, with itself as the only `did_you_mean`.
+pub const ERR_NO_RUNNABLE_TESTS: &str = "NO_RUNNABLE_TESTS";
+
+/// What the class dictionary says about the class a pattern names. These four facts
+/// decide whether %UnitTest can run anything — all read from IRIS, none inferred.
+#[derive(Debug, Clone)]
+pub struct TestClassShape {
+    pub class: String,
+    /// `%Dictionary.CompiledClass.PrimarySuper` — the whole inheritance chain.
+    pub primary_super: String,
+    /// Effective `Parameter PRODUCTION` — empty when unset, absent, or inherited as "".
+    pub production: String,
+    /// `Test*` instance methods this class DECLARES. Inherited ones are excluded:
+    /// %UnitTest.TestProduction contributes its own, which say nothing about whether
+    /// the class under test has tests.
+    pub own_test_methods: u64,
+}
+
+impl TestClassShape {
+    pub fn extends_test_case(&self) -> bool {
+        self.primary_super.contains("%UnitTest.TestCase")
+    }
+    pub fn extends_test_production(&self) -> bool {
+        self.primary_super.contains("%UnitTest.TestProduction")
+    }
+}
+
+/// Issue #62: given a class that matched, name what about it stopped the run.
+/// Returns `(cause, hint)`. The cause is machine-readable; the hint is the fix.
+pub fn no_runnable_tests_cause(shape: &TestClassShape, namespace: &str) -> (&'static str, String) {
+    let class = &shape.class;
+    if !shape.extends_test_case() {
+        return (
+            "NOT_A_TEST_CLASS",
+            format!(
+                "'{class}' is compiled in '{namespace}' but extends neither %UnitTest.TestCase \
+                 nor %UnitTest.TestProduction, so %UnitTest has nothing to run. Make it \
+                 `Extends %UnitTest.TestProduction` with `Parameter PRODUCTION` naming the \
+                 production under test, and recompile."
+            ),
+        );
+    }
+    if shape.own_test_methods == 0 {
+        return (
+            "NO_TEST_METHODS",
+            format!(
+                "'{class}' is a compiled test class but declares no Test* instance methods of \
+                 its own — %UnitTest only runs instance methods whose name starts with `Test` \
+                 (a ClassMethod is skipped). Add e.g. `Method TestX()` and recompile."
+            ),
+        );
+    }
+    if shape.extends_test_production() && shape.production.is_empty() {
+        return (
+            "PRODUCTION_PARAMETER_EMPTY",
+            format!(
+                "'{class}' extends %UnitTest.TestProduction but its PRODUCTION parameter is \
+                 empty, so there is no production to start and the suite runs nothing. Set \
+                 `Parameter PRODUCTION = \"<Package.ProductionName>\";` and recompile — IRIS \
+                 itself refuses such a class (ERROR #5001: Parameter PRODUCTION must be \
+                 specified), which can leave a stale compiled class behind that still matches."
+            ),
+        );
+    }
+    if !shape.extends_test_production() {
+        return (
+            "NOT_A_TESTPRODUCTION_SUBCLASS",
+            format!(
+                "'{class}' extends %UnitTest.TestCase, not %UnitTest.TestProduction. iris_test \
+                 runs a class pattern by calling `{class}.Run()`, which %UnitTest.TestProduction \
+                 provides; a plain %UnitTest.TestCase has no Run(), so nothing is discovered. \
+                 Change it to `Extends %UnitTest.TestProduction` with `Parameter PRODUCTION` \
+                 naming the production under test, and recompile."
+            ),
+        );
+    }
+    (
+        "UNKNOWN",
+        format!(
+            "'{class}' is compiled in '{namespace}' and looks runnable ({} Test* method(s), \
+             PRODUCTION = '{}'), yet the run produced no method results. The pattern is not \
+             the problem — check OnBeforeAllTests/%OnNew for an early Quit, and read the run \
+             output with iris_get_log.",
+            shape.own_test_methods, shape.production
+        ),
+    )
+}
+
+/// Issue #62: read the class dictionary for the exact class a pattern names.
+///
+/// `None` means either nothing of that name is compiled — then the PATTERN is the
+/// problem and `no_tests_found_guidance` answers — or the catalog could not be read.
+/// An unreadable catalog must not become a confident claim about the class.
+pub async fn probe_test_class_shape(
+    iris: &IrisConnection,
+    namespace: &str,
+    client: &reqwest::Client,
+    class: &str,
+) -> Option<TestClassShape> {
+    // The class name is caller text: bound parameter, never interpolated.
+    // `_Default` is the SQL field name of %Dictionary.CompiledParameter.Default
+    // ("Default" is a reserved word). `Origin = c.Name` keeps inherited members out.
+    let sql = "SELECT TOP 1 c.Name AS ClassName, c.PrimarySuper AS Supers, \
+               (SELECT COUNT(*) FROM %Dictionary.CompiledMethod m WHERE m.parent = c.Name \
+                AND m.Name %STARTSWITH 'Test' AND m.ClassMethod = 0 AND m.Origin = c.Name) AS OwnTestMethods, \
+               (SELECT TOP 1 p._Default FROM %Dictionary.CompiledParameter p WHERE p.parent = c.Name \
+                AND p.Name = 'PRODUCTION') AS ProductionParam \
+               FROM %Dictionary.CompiledClass c WHERE c.Name = ?";
+    let body = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        iris.query(
+            sql,
+            vec![serde_json::Value::String(class.to_string())],
+            namespace,
+            client,
+        ),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let row = body["result"]["content"].as_array()?.first()?;
+    let name = row["ClassName"].as_str()?;
+    let methods = row["OwnTestMethods"]
+        .as_i64()
+        .or_else(|| {
+            row["OwnTestMethods"]
+                .as_str()
+                .and_then(|s| s.trim().parse().ok())
+        })
+        .unwrap_or(0);
+    Some(TestClassShape {
+        class: name.to_string(),
+        primary_super: row["Supers"].as_str().unwrap_or_default().to_string(),
+        production: row["ProductionParam"]
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .trim_matches('"')
+            .to_string(),
+        own_test_methods: methods.max(0) as u64,
+    })
 }
 
 pub const ERR_NAMESPACE_NOT_FOUND: &str = "NAMESPACE_NOT_FOUND";
@@ -2691,6 +2841,39 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
         // Treat any run with no parsed method results as NO_TESTS_FOUND.
         if total == 0 || test_cases.is_empty() {
             self.record_call("iris_test", false);
+            // #62: before proposing a correction to the pattern, check whether the pattern
+            // is already right. If it NAMES a compiled class, no pattern could have helped —
+            // the class is what exposed no runnable test, and saying otherwise sent callers
+            // round a loop whose only suggestion was the input they had just sent.
+            if is_class_pattern {
+                if let Some(shape) =
+                    probe_test_class_shape(&iris, &namespace, client, &p.pattern).await
+                {
+                    let (cause, hint) = no_runnable_tests_cause(&shape, &namespace);
+                    return envelope::fail_with(
+                        ERR_NO_RUNNABLE_TESTS,
+                        &format!(
+                            "Test class '{}' is compiled in namespace '{}' but exposed no runnable \
+                             test ({}) — the pattern is correct; the class is what needs fixing.",
+                            shape.class, namespace, cause
+                        ),
+                        serde_json::json!({
+                            "hint": hint,
+                            "cause": cause,
+                            "class": shape.class,
+                            "extends_test_production": shape.extends_test_production(),
+                            "production_parameter": shape.production,
+                            "test_methods": shape.own_test_methods,
+                            "pattern": p.pattern,
+                            "namespace": namespace,
+                            "total": 0,
+                            "passed": 0,
+                            "failed": 0,
+                            "path": path_label,
+                        }),
+                    );
+                }
+            }
             // A6.2 discovery probe: instead of a bare NO_TESTS_FOUND, list the compiled
             // %UnitTest.TestCase classes that DO exist so the model can correct the pattern
             // (the workshop's #1 iris_test failure was an unactionable "no test classes").
@@ -5870,6 +6053,108 @@ mod compile_envelope_tests {
         assert!(
             v["error"].as_str().unwrap().contains("MyApp.Silent.cls"),
             "fallback message must name the target: {v}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod no_runnable_tests_tests {
+    use super::{no_runnable_tests_cause, no_tests_found_guidance, TestClassShape};
+
+    fn shape(super_chain: &str, production: &str, methods: u64) -> TestClassShape {
+        TestClassShape {
+            class: "Admissions.Tests.MSG.AdmitNotice".into(),
+            primary_super: super_chain.into(),
+            production: production.into(),
+            own_test_methods: methods,
+        }
+    }
+
+    const TESTPROD: &str = "~Admissions.Tests.MSG.AdmitNotice~%UnitTest.TestProduction~%UnitTest.TestCase~%Library.RegisteredObject~";
+    const TESTCASE: &str =
+        "~Admissions.Tests.MSG.AdmitNotice~%UnitTest.TestCase~%Library.RegisteredObject~";
+
+    /// The verbatim #62 report: the only `did_you_mean` was the caller's own input, so
+    /// following it re-sent the same call. A suggestion equal to the input is not one.
+    #[test]
+    fn did_you_mean_never_proposes_the_input_back() {
+        let cands = vec!["Admissions.Tests.MSG.AdmitNotice".to_string()];
+        let (hint, dym) =
+            no_tests_found_guidance("Admissions.Tests.MSG.AdmitNotice", "EVALNS", &cands, false);
+        assert!(
+            dym.is_empty(),
+            "the input itself is not a correction: {dym:?}"
+        );
+        assert!(
+            !hint.contains("Did you mean") && !hint.contains("one segment away"),
+            "nothing is one segment away from a byte-identical name: {hint}"
+        );
+    }
+
+    /// Case differences are still a real correction — only an identical name is not.
+    #[test]
+    fn a_case_variant_is_still_offered() {
+        let cands = vec!["Wk47.Tests.SmokeTest".to_string()];
+        let (_, dym) = no_tests_found_guidance("wk47.tests.smoketest", "APP", &cands, false);
+        assert!(
+            dym.is_empty(),
+            "an exact case-insensitive match is the input"
+        );
+        let cands = vec!["Wk47.Tests.SmokeTest".to_string()];
+        let (_, dym) = no_tests_found_guidance("Wk47.Tests", "APP", &cands, false);
+        assert_eq!(dym, vec!["Wk47.Tests.SmokeTest".to_string()]);
+    }
+
+    /// 12 of 16 controlled runs: TestProduction + a real PRODUCTION ran its tests. The
+    /// 4 that ran nothing differed only in class shape — which is what must be named.
+    #[test]
+    fn a_plain_testcase_is_named_as_the_cause() {
+        let (cause, hint) = no_runnable_tests_cause(&shape(TESTCASE, "", 4), "EVALNS");
+        assert_eq!(cause, "NOT_A_TESTPRODUCTION_SUBCLASS");
+        assert!(hint.contains("%UnitTest.TestProduction"), "{hint}");
+        assert!(
+            hint.contains("Run()"),
+            "say WHY it runs nothing, not just what to change: {hint}"
+        );
+    }
+
+    #[test]
+    fn an_empty_production_parameter_is_named_as_the_cause() {
+        let (cause, hint) = no_runnable_tests_cause(&shape(TESTPROD, "", 5), "EVALNS");
+        assert_eq!(cause, "PRODUCTION_PARAMETER_EMPTY");
+        assert!(hint.contains("PRODUCTION"), "{hint}");
+    }
+
+    #[test]
+    fn a_class_with_no_test_methods_is_named_as_the_cause() {
+        let (cause, hint) = no_runnable_tests_cause(&shape(TESTPROD, "APP.Production", 0), "APP");
+        assert_eq!(cause, "NO_TEST_METHODS");
+        assert!(hint.contains("Test"), "{hint}");
+    }
+
+    #[test]
+    fn a_non_test_class_is_named_as_the_cause() {
+        let (cause, _) = no_runnable_tests_cause(
+            &shape(
+                "~Admissions.MSG.AdmitNotice~Ens.Request~%Library.Persistent~",
+                "",
+                3,
+            ),
+            "APP",
+        );
+        assert_eq!(cause, "NOT_A_TEST_CLASS");
+    }
+
+    /// A well-formed class that still ran nothing gets an honest answer: not a pattern
+    /// problem, and not a guess about the class either.
+    #[test]
+    fn a_well_formed_class_that_ran_nothing_is_not_blamed_on_the_pattern() {
+        let (cause, hint) =
+            no_runnable_tests_cause(&shape(TESTPROD, "Admissions.Production", 6), "EVALNS");
+        assert_eq!(cause, "UNKNOWN");
+        assert!(
+            hint.contains("pattern is not the problem"),
+            "the one thing we know for certain must still be said: {hint}"
         );
     }
 }
