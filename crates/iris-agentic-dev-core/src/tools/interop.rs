@@ -46,6 +46,28 @@ pub fn resolve_namespace(requested: Option<&str>, iris: Option<&IrisConnection>)
     }
 }
 
+/// Issue #63: `iris_production` read the production name from `production_name`
+/// in start/stop but from `production` in set_autostart, while the parameter
+/// struct and the tool description both say `production`. A name passed under the
+/// documented key was dropped, and the resulting empty name still went on to
+/// `Ens.Director`, which answers `<Ens>ErrInvalidProduction` — the SAME error
+/// IRIS gives when the production class was never compiled in the namespace. A
+/// parameter typo was therefore indistinguishable from a real deployment
+/// failure, and the correct next move looked like "compile it again".
+///
+/// One reader, every spelling; blank is treated as absent so it cannot reach a
+/// lifecycle call.
+pub const PRODUCTION_NAME_KEYS: [&str; 3] = ["production", "production_name", "name"];
+
+pub fn production_name_arg(p: &serde_json::Value) -> Option<String> {
+    PRODUCTION_NAME_KEYS
+        .iter()
+        .filter_map(|k| p.get(k).and_then(|v| v.as_str()))
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
 /// Positive probe results, keyed "base_url|namespace". Never invalidated: a
 /// namespace does not lose Interoperability within a server process lifetime.
 /// Negatives are NOT cached — a namespace can gain interop (or be created)
@@ -361,14 +383,33 @@ pub async fn interop_production_start_impl(
     iris: Option<&IrisConnection>,
     params: ProductionNameParams,
 ) -> Result<CallToolResult, McpError> {
+    // #63: a missing name is a PARAMETER error. Answer it here — an empty name
+    // reaching StartProduction comes back as ErrInvalidProduction, which is what
+    // IRIS says when the production was never compiled in this namespace.
+    let prod = match params.production.as_deref().map(str::trim) {
+        Some(p) if !p.is_empty() => p,
+        _ => {
+            return crate::tools::envelope::fail_with(
+                "MISSING_PARAMETER",
+                "iris_production action=start needs the production class name — nothing was sent to Ens.Director.",
+                serde_json::json!({
+                    "accepted_parameters": PRODUCTION_NAME_KEYS,
+                    "namespace": &params.namespace,
+                    "hint": "Pass production=<Package.ProductionName> (production_name and name are also accepted). \
+                             To see what is registered in this namespace: iris_query \
+                             \"SELECT ID FROM Ens_Config.Production\".",
+                }),
+            )
+        }
+    };
     let iris = match iris {
         Some(i) => i,
         None => return err_json("IRIS_UNREACHABLE", "No IRIS connection"),
     };
-    let prod = params.production.as_deref().unwrap_or("");
+    // #6: every user string reaching ObjectScript goes through os_str_expr.
     let code = format!(
-        r#"Set sc=##class(Ens.Director).StartProduction("{}") If $$$ISERR(sc) {{ Write "ERROR:"_$System.Status.GetErrorText(sc) }} Else {{ Write "OK" }}"#,
-        prod
+        r#"Set sc=##class(Ens.Director).StartProduction({}) If $$$ISERR(sc) {{ Write "ERROR:"_$System.Status.GetErrorText(sc) }} Else {{ Write "OK" }}"#,
+        os_str_expr(prod)
     );
     // Bug 7: use params.namespace, not iris.namespace.
     match exec_http(iris, &code, &params.namespace).await {
@@ -3292,5 +3333,44 @@ mod tests {
         ).unwrap();
         assert_eq!(p2.enabled, Some(true));
         assert_eq!(p2.production.as_deref(), Some("MyApp.Production"));
+    }
+
+    // ─── #63: one reader for the production-name argument ───
+
+    #[test]
+    fn production_name_arg_reads_every_documented_spelling() {
+        for key in PRODUCTION_NAME_KEYS {
+            let p = serde_json::json!({ key: "EvalOps.Production" });
+            assert_eq!(
+                production_name_arg(&p).as_deref(),
+                Some("EvalOps.Production"),
+                "key {key} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn production_name_arg_treats_blank_as_absent() {
+        assert_eq!(production_name_arg(&serde_json::json!({})), None);
+        assert_eq!(
+            production_name_arg(&serde_json::json!({"production": "   "})),
+            None
+        );
+        // A blank under one spelling must not mask a real name under another.
+        assert_eq!(
+            production_name_arg(
+                &serde_json::json!({"production": "", "production_name": "P.Prod"})
+            )
+            .as_deref(),
+            Some("P.Prod")
+        );
+    }
+
+    #[test]
+    fn production_name_arg_trims() {
+        assert_eq!(
+            production_name_arg(&serde_json::json!({"name": " P.Prod "})).as_deref(),
+            Some("P.Prod")
+        );
     }
 }
