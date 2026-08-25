@@ -118,6 +118,48 @@ mod interop_production_start {
     }
 }
 
+mod production_start_missing_name {
+    use super::*;
+
+    /// #63: an absent or blank name never reaches Ens.Director. It used to be
+    /// passed through as `StartProduction("")`, which answers
+    /// `<Ens>ErrInvalidProduction` — the same error IRIS gives when the production
+    /// class was never compiled in the namespace, so a parameter slip read as a
+    /// deployment failure and the "fix" looked like recompiling.
+    #[test]
+    fn is_a_parameter_error_not_a_lifecycle_error() {
+        for missing in [None, Some("   ".to_string())] {
+            let r = rt().block_on(interop_production_start_impl(
+                None,
+                ProductionNameParams {
+                    production: missing.clone(),
+                    namespace: "APP".into(),
+                },
+            ));
+            let result = r.unwrap();
+            assert_eq!(result.is_error, Some(true), "for {missing:?}");
+            let text = result.content[0].raw.as_text().unwrap().text.clone();
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(v["error_code"], "MISSING_PARAMETER", "for {missing:?}");
+            let err = v["error"].as_str().unwrap();
+            assert!(
+                !err.contains("ErrInvalidProduction"),
+                "must not look like a real IRIS lifecycle failure: {err}"
+            );
+            let accepted: Vec<&str> = v["accepted_parameters"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_str().unwrap())
+                .collect();
+            for key in ["production", "production_name", "name"] {
+                assert!(accepted.contains(&key), "{key} must be named in the error");
+            }
+            assert_eq!(v["namespace"], "APP");
+        }
+    }
+}
+
 mod interop_production_stop {
     use super::*;
 

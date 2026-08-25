@@ -4443,7 +4443,7 @@ Methods:
     // Note: iris_debug already exists above as a real tool — it IS the merged debug dispatcher.
 
     #[tool(
-        description = "Interoperability production lifecycle (merged). action: status=get current state, start=start named production, stop=stop production, restart=recycle ONE config item (pass item=<config item name>), update=hot-apply config, check=check if update needed, recover=recover troubled production. namespace: optional — defaults to the connection namespace (IRIS_NAMESPACE); must be an interop-enabled namespace."
+        description = "Interoperability production lifecycle (merged). action: status=get current state, start=start a production — pass production=<Package.ProductionName> (production_name and name are accepted too), stop=stop the running production, restart=recycle ONE config item (pass item=<config item name>), update=hot-apply config, check=check if update needed, recover=recover troubled production, get_autostart/set_autostart=read or set this namespace's autostart production. namespace: optional — defaults to the connection namespace (IRIS_NAMESPACE); must be an interop-enabled namespace."
     )]
     async fn iris_production(
         &self,
@@ -4475,10 +4475,8 @@ Methods:
                 interop::interop_production_start_impl(
                     iris_opt,
                     interop::ProductionNameParams {
-                        production: p
-                            .get("production_name")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string()),
+                        // #63: production / production_name / name all work.
+                        production: interop::production_name_arg(&p),
                         namespace: namespace.clone(),
                     },
                 )
@@ -4488,10 +4486,8 @@ Methods:
                 interop::interop_production_stop_impl(
                     iris_opt,
                     interop::ProductionStopParams {
-                        production: p
-                            .get("production_name")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string()),
+                        // #63: production / production_name / name all work.
+                        production: interop::production_name_arg(&p),
                         namespace: namespace.clone(),
                         timeout: p.get("timeout").and_then(|v| v.as_u64()).unwrap_or(30) as u32,
                         force: p.get("force").and_then(|v| v.as_bool()).unwrap_or(false),
@@ -4546,7 +4542,7 @@ Methods:
                         action: "set_autostart".into(),
                         namespace: namespace.clone(),
                         enabled: p.get("enabled").and_then(|v| v.as_bool()),
-                        production: p.get("production").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        production: interop::production_name_arg(&p),
                     },
                 ).await
             }
