@@ -113,10 +113,15 @@ pub async fn handle_resolve_dynamic_dispatch(
     lines.push(r#"Write out_"]",!"#.into());
     let code = lines.join("\n");
 
-    let output = iris
-        .execute_via_generator(&code, &namespace, client)
-        .await
-        .map_err(|e| rmcp::ErrorData::internal_error(format!("execute failed: {e}"), None))?;
+    let output = match iris.execute_via_generator(&code, &namespace, client).await {
+        Ok(v) => v,
+        Err(e) => {
+            return crate::tools::envelope::fail(
+                "IRIS_EXECUTE_ERROR",
+                &format!("dict::output: {e}"),
+            )
+        }
+    };
     let trimmed = output.trim();
 
     if trimmed.is_empty() {
@@ -201,10 +206,15 @@ pub async fn handle_extract_message_map_routing(
     }
 
     let code = build_message_map_code(&p.class_name);
-    let output = iris
-        .execute_via_generator(&code, &namespace, client)
-        .await
-        .map_err(|e| rmcp::ErrorData::internal_error(format!("execute failed: {e}"), None))?;
+    let output = match iris.execute_via_generator(&code, &namespace, client).await {
+        Ok(v) => v,
+        Err(e) => {
+            return crate::tools::envelope::fail(
+                "IRIS_EXECUTE_ERROR",
+                &format!("dict::output: {e}"),
+            )
+        }
+    };
     let trimmed = output.trim();
 
     if trimmed == "NOT_FOUND" {
@@ -332,10 +342,15 @@ pub async fn handle_find_subclass_implementations(
     lines.push(r#"Write out_"]",!"#.into());
     let code = lines.join("\n");
 
-    let output = iris
-        .execute_via_generator(&code, &namespace, client)
-        .await
-        .map_err(|e| rmcp::ErrorData::internal_error(format!("method query failed: {e}"), None))?;
+    let output = match iris.execute_via_generator(&code, &namespace, client).await {
+        Ok(v) => v,
+        Err(e) => {
+            return crate::tools::envelope::fail(
+                "IRIS_EXECUTE_ERROR",
+                &format!("dict::output: {e}"),
+            )
+        }
+    };
     let trimmed = output.trim();
 
     if let Some(msg) = trimmed.strip_prefix("ERROR:") {

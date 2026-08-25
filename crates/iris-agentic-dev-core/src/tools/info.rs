@@ -70,12 +70,17 @@ pub async fn handle_iris_info(
         other => return err_json("INVALID_PARAM", &format!("Unknown what='{}'. Use: documents, modified, namespace, metadata, jobs, csp_apps, csp_debug, sa_schema", other)),
     };
 
-    let resp = client
+    let resp = match client
         .get(&url)
         .basic_auth(&iris.username, Some(&iris.password))
         .send()
         .await
-        .map_err(|e| rmcp::ErrorData::internal_error(format!("HTTP error: {e}"), None))?;
+    {
+        Ok(v) => v,
+        Err(e) => {
+            return crate::tools::envelope::transport_fail("handle_iris_info", &e.to_string())
+        }
+    };
 
     if !resp.status().is_success() {
         return err_json(
@@ -132,12 +137,20 @@ pub async fn handle_iris_macro(
         "list" => {
             // Bug 14: use versioned_ns_url instead of hardcoded /v1/.
             let url = iris.versioned_ns_url(&namespace, "/docnames/INC");
-            let resp = client
+            let resp = match client
                 .get(&url)
                 .basic_auth(&iris.username, Some(&iris.password))
                 .send()
                 .await
-                .map_err(|e| rmcp::ErrorData::internal_error(format!("HTTP error: {e}"), None))?;
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    return crate::tools::envelope::transport_fail(
+                        "handle_iris_macro",
+                        &e.to_string(),
+                    )
+                }
+            };
             if !resp.status().is_success() {
                 return ok_json(serde_json::json!({
                     "success": true,
@@ -162,17 +175,10 @@ pub async fn handle_iris_macro(
             let name = p.name.as_deref().unwrap_or("");
             let url = iris.versioned_ns_url(&namespace, "/action/getmacro");
             let arg_count = p.args.len();
-            let resp = client
-                .post(&url)
-                .basic_auth(&iris.username, Some(&iris.password))
-                .json(&serde_json::json!({
-                    "macros": [{"name": name, "arguments": arg_count}],
-                    "action": action,
-                    "args": p.args,
-                }))
-                .send()
-                .await
-                .map_err(|e| rmcp::ErrorData::internal_error(format!("HTTP error: {e}"), None))?;
+            let resp= match client .post(&url) .basic_auth(&iris.username, Some(&iris.password)) .json(&serde_json::json!({ "macros": [{"name": name, "arguments": arg_count}], "action": action, "args": p.args, })) .send() .await {
+                Ok(v) => v,
+                Err(e) => return crate::tools::envelope::transport_fail("handle_iris_macro", &e.to_string()),
+            };
             let body: serde_json::Value = resp.json().await.unwrap_or_default();
             ok_json(
                 serde_json::json!({"success": true, "name": name, "action": action, "result": body["result"]}),
@@ -316,13 +322,21 @@ pub async fn handle_iris_generate(
                  FROM %Dictionary.CompiledMethod WHERE parent = '{}' ORDER BY Name",
                 cls.replace('\'', "''")
             );
-            let resp = client
+            let resp = match client
                 .post(&query_url)
                 .basic_auth(&iris.username, Some(&iris.password))
                 .json(&serde_json::json!({"query": sql}))
                 .send()
                 .await
-                .map_err(|e| rmcp::ErrorData::internal_error(format!("HTTP error: {e}"), None))?;
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    return crate::tools::envelope::transport_fail(
+                        "handle_iris_generate",
+                        &e.to_string(),
+                    )
+                }
+            };
             let body: serde_json::Value = resp.json().await.unwrap_or_default();
             let methods = body["result"]["content"].clone();
 
@@ -357,13 +371,21 @@ pub async fn handle_iris_generate(
             // Fetch existing classes in the namespace as naming/style context
             let sql = "SELECT TOP 10 Name FROM %Dictionary.ClassDefinition \
                        WHERE Name NOT LIKE '%\\%%' ESCAPE '\\' ORDER BY Name";
-            let resp = client
+            let resp = match client
                 .post(&query_url)
                 .basic_auth(&iris.username, Some(&iris.password))
                 .json(&serde_json::json!({"query": sql}))
                 .send()
                 .await
-                .map_err(|e| rmcp::ErrorData::internal_error(format!("HTTP error: {e}"), None))?;
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    return crate::tools::envelope::transport_fail(
+                        "handle_iris_generate",
+                        &e.to_string(),
+                    )
+                }
+            };
             let body: serde_json::Value = resp.json().await.unwrap_or_default();
             let existing: Vec<String> = body["result"]["content"]
                 .as_array()
@@ -454,10 +476,18 @@ if rs.%Next() {{
         table = sql_table.replace('"', "\\\""),
     );
 
-    let output = iris
+    let output = match iris
         .execute_via_generator(&lookup_code, &namespace, client)
         .await
-        .map_err(|e| rmcp::ErrorData::internal_error(format!("execute failed: {e}"), None))?;
+    {
+        Ok(v) => v,
+        Err(e) => {
+            return crate::tools::envelope::fail(
+                "IRIS_EXECUTE_ERROR",
+                &format!("info::output: {e}"),
+            )
+        }
+    };
 
     let lines: std::collections::HashMap<&str, &str> =
         output.lines().filter_map(|l| l.split_once(':')).collect();
