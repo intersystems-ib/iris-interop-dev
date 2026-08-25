@@ -2325,13 +2325,6 @@ pub fn redact_hl7v2(body: &str) -> String {
     if detect_content_type(body) != "HL7v2" {
         return body.to_string();
     }
-    let line_ending = if body.contains("\r\n") {
-        "\r\n"
-    } else if body.contains('\r') {
-        "\r"
-    } else {
-        "\n"
-    };
     let redact_fields = |line: &str, segment: &str, field_indices: &[usize]| -> String {
         let mut fields: Vec<&str> = line.split('|').collect();
         if fields.first().copied() != Some(segment) {
@@ -2344,15 +2337,37 @@ pub fn redact_hl7v2(body: &str) -> String {
         }
         fields.join("|")
     };
-    body.split(line_ending)
-        .map(|line| {
-            // MSH-1 is the implicit field-separator char (not a split element), so
-            // fields[1] = MSH-2 (encoding chars) and fields[2] = MSH-3 (sending app).
-            let redacted = redact_fields(line, "MSH", &[2]);
-            redact_fields(&redacted, "PID", &[3, 5, 7, 8, 11, 18])
-        })
-        .collect::<Vec<_>>()
-        .join(line_ending)
+    let redact_segment = |seg: &str| -> String {
+        // MSH-1 is the implicit field-separator char (not a split element), so
+        // fields[1] = MSH-2 (encoding chars) and fields[2] = MSH-3 (sending app).
+        let redacted = redact_fields(seg, "MSH", &[2]);
+        redact_fields(&redacted, "PID", &[3, 5, 7, 8, 11, 18])
+    };
+
+    // #72: a body can MIX separators — `EnsLib.HL7.Message.OutputToString()` separates
+    // segments with CR and ends the last one with CRLF. Picking ONE line ending (the old
+    // behaviour: "contains \r\n" wins) then made the whole message a single line, so only
+    // MSH was ever examined and every PID field was returned in the clear under
+    // dataPolicy=redact. Walk the boundaries instead, keeping each separator as it was so
+    // the body comes back byte-identical apart from the redactions.
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    loop {
+        match rest.find(['\r', '\n']) {
+            Some(pos) => {
+                let (seg, tail) = rest.split_at(pos);
+                out.push_str(&redact_segment(seg));
+                let sep_len = if tail.starts_with("\r\n") { 2 } else { 1 };
+                out.push_str(&tail[..sep_len]);
+                rest = &tail[sep_len..];
+            }
+            None => {
+                out.push_str(&redact_segment(rest));
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// Parse `<Item Name="..." ClassName="..." Enabled="..."/>` entries out of a
@@ -2390,6 +2405,68 @@ fn extract_xml_attr(line: &str, attr: &str) -> Option<String> {
 /// Read an Ensemble message body (`Ens.StringContainer`, `Ens.StreamContainer`,
 /// `%Stream.Object`). `data_policy` gates PHI: `block` refuses outright, `allow`
 /// requires an explicit acknowledgement, `redact` blanks known HL7 v2 PHI fields.
+/// Issue #72: read one message body, whatever shape it is in.
+///
+/// Two things this codegen gets wrong if written the obvious way:
+///
+/// 1. **`%IsA` is not the membership test.** It walks only the PRIMARY superclass chain.
+///    `EnsLib.HL7.Message` reaches `EnsLib.EDI.Document` through its SECOND superclass
+///    (`Super = %Persistent, EnsLib.EDI.BatchDocument, EnsLib.EDI.Segmented, …`), so
+///    `%IsA("EnsLib.EDI.Document")` is 0 on a live HL7 message while `%Extends(...)` is 1.
+///    Verified on IRIS 2026.1 — the issue's suggested `%IsA` branch would never fire. All
+///    four branches use `%Extends`; for the three that already worked it is equivalent
+///    (checked against StreamContainer, %Stream.GlobalCharacter and StringContainer) and it
+///    removes the same trap for any body class that inherits them secondarily.
+/// 2. **`EnsLib.EDI.Document` is the branch, not `EnsLib.HL7.Message`.** HL7, X12, ASTM,
+///    EDIFACT and `EnsLib.EDI.XML.Document` all extend it, and `OutputToString()` renders
+///    each one, so one branch covers every EDI/VDoc body instead of just HL7.
+///
+/// `OutputToString()` materialises the whole document as a string, which a very large batch
+/// can refuse to do (`<MAXSTRING>`); that is caught and reported rather than escaping as a
+/// raw execute error.
+pub fn build_message_body_code(message_id: i64, max_bytes: u32) -> String {
+    format!(
+        r#"Set hdr=##class(Ens.MessageHeader).%OpenId({message_id})
+If '$IsObject(hdr) {{ Write "ERROR:MESSAGE_NOT_FOUND" Quit }}
+Set bodyClass=hdr.MessageBodyClassName
+Set bodyId=hdr.MessageBodyId
+If bodyClass="" {{ Write "ERROR:MESSAGE_NOT_FOUND" Quit }}
+Set body=$ClassMethod(bodyClass,"%OpenId",bodyId)
+If '$IsObject(body) {{ Write "ERROR:MESSAGE_NOT_FOUND" Quit }}
+If body.%Extends("Ens.StreamContainer") {{
+  Set stream=body.Stream
+  If '$IsObject(stream) {{ Write "ERROR:STREAM_READ_ERROR:no stream object" Quit }}
+  Set full=stream.Size
+  Set content=stream.Read({max_bytes})
+  Write "OK:"_full_":"
+  Write content
+}} ElseIf body.%Extends("%Stream.Object") {{
+  Set full=body.Size
+  Set content=body.Read({max_bytes})
+  Write "OK:"_full_":"
+  Write content
+}} ElseIf body.%Extends("Ens.StringContainer") {{
+  Set content=body.StringValue
+  Set full=$Length(content)
+  If full>{max_bytes} {{ Set content=$Extract(content,1,{max_bytes}) }}
+  Write "OK:"_full_":"
+  Write content
+}} ElseIf body.%Extends("EnsLib.EDI.Document") {{
+  Try {{
+    Set content=body.OutputToString()
+    Set full=$Length(content)
+    If full>{max_bytes} {{ Set content=$Extract(content,1,{max_bytes}) }}
+    Write "OK:"_full_":"
+    Write content
+  }} Catch ex {{
+    Write "ERROR:BODY_READ_ERROR:"_ex.DisplayString()
+  }}
+}} Else {{
+  Write "ERROR:UNSUPPORTED_BODY_CLASS:"_bodyClass
+}}"#
+    )
+}
+
 pub async fn handle_iris_message_body(
     iris: Option<&IrisConnection>,
     params: &MessageBodyParams,
@@ -2436,36 +2513,7 @@ pub async fn handle_iris_message_body(
 
     // message_id is an i64 and max_bytes a u32 — both are numeric, so nothing
     // user-controlled reaches the generated source as a string here.
-    let code = format!(
-        r#"Set hdr=##class(Ens.MessageHeader).%OpenId({message_id})
-If '$IsObject(hdr) {{ Write "ERROR:MESSAGE_NOT_FOUND" Quit }}
-Set bodyClass=hdr.MessageBodyClassName
-Set bodyId=hdr.MessageBodyId
-If bodyClass="" {{ Write "ERROR:MESSAGE_NOT_FOUND" Quit }}
-Set body=$ClassMethod(bodyClass,"%OpenId",bodyId)
-If '$IsObject(body) {{ Write "ERROR:MESSAGE_NOT_FOUND" Quit }}
-If body.%IsA("Ens.StreamContainer") {{
-  Set stream=body.Stream
-  If '$IsObject(stream) {{ Write "ERROR:STREAM_READ_ERROR:no stream object" Quit }}
-  Set full=stream.Size
-  Set content=stream.Read({max_bytes})
-  Write "OK:"_full_":"
-  Write content
-}} ElseIf body.%IsA("%Stream.Object") {{
-  Set full=body.Size
-  Set content=body.Read({max_bytes})
-  Write "OK:"_full_":"
-  Write content
-}} ElseIf body.%IsA("Ens.StringContainer") {{
-  Set content=body.StringValue
-  Set full=$Length(content)
-  If full>{max_bytes} {{ Set content=$Extract(content,1,{max_bytes}) }}
-  Write "OK:"_full_":"
-  Write content
-}} Else {{
-  Write "ERROR:UNSUPPORTED_BODY_CLASS:"_bodyClass
-}}"#
-    );
+    let code = build_message_body_code(message_id, max_bytes);
 
     match iris
         .execute_via_generator(&code, &params.namespace, &client)
@@ -2481,11 +2529,19 @@ If body.%IsA("Ens.StreamContainer") {{
             if let Some(rest) = out.strip_prefix("ERROR:STREAM_READ_ERROR:") {
                 return err_json("STREAM_READ_ERROR", rest.trim());
             }
+            // #72: an EDI document renders through OutputToString, which a very large batch
+            // can refuse (<MAXSTRING>). Report it as a body-read failure naming the IRIS
+            // error, not as an unsupported class or a raw execute error.
+            if let Some(rest) = out.strip_prefix("ERROR:BODY_READ_ERROR:") {
+                return err_json("BODY_READ_ERROR", rest.trim());
+            }
             if let Some(rest) = out.strip_prefix("ERROR:UNSUPPORTED_BODY_CLASS:") {
                 return err_json(
                     "UNSUPPORTED_BODY_CLASS",
                     &format!(
-                        "Body class '{}' is not a recognized stream/text body type",
+                        "Body class '{}' is not a supported body type — this tool reads \
+                         Ens.StringContainer, Ens.StreamContainer, %Stream.Object and any \
+                         EnsLib.EDI.Document (HL7 v2, X12, ASTM, EDIFACT, EDI XML)",
                         rest.trim()
                     ),
                 );
@@ -3333,6 +3389,117 @@ mod tests {
         ).unwrap();
         assert_eq!(p2.enabled, Some(true));
         assert_eq!(p2.production.as_deref(), Some("MyApp.Production"));
+    }
+
+    // ─── #72: PHI redaction over real segment separators ───
+
+    /// The HL7 standard segment terminator is CR, and OutputToString() ends the LAST segment
+    /// with CRLF. Choosing one line ending made that whole message a single line: only MSH
+    /// was examined, and every PID field came back in the clear under dataPolicy=redact.
+    #[test]
+    fn mixed_cr_and_crlf_separators_still_redact_every_segment() {
+        let body = "MSH|^~\\&|SENDAPP|SENDFAC|RECVAPP|RECVFAC|20260825||ADT^A01|M1|P|2.5\r\
+                    PID|1||123456^^^MRN||DOE^JOHN||19700101|M\r\
+                    PV1|1|I|WARD^101^A\r\n";
+        let out = redact_hl7v2(body);
+        assert!(!out.contains("SENDAPP"), "MSH-3 must be redacted: {out}");
+        assert!(
+            !out.contains("123456^^^MRN"),
+            "PID-3 must be redacted: {out}"
+        );
+        assert!(!out.contains("DOE^JOHN"), "PID-5 must be redacted: {out}");
+        assert!(!out.contains("19700101"), "PID-7 must be redacted: {out}");
+        assert!(
+            out.contains("PV1|1|I|WARD^101^A"),
+            "PV1 is not PHI-listed: {out}"
+        );
+    }
+
+    /// Separators survive byte-for-byte — a redacted HL7 message must still parse as HL7.
+    #[test]
+    fn separators_are_preserved_exactly() {
+        for body in [
+            "MSH|^~\\&|A|B|C|D|20260825||ADT^A01|M1|P|2.5\rPID|1||X||Y\r",
+            "MSH|^~\\&|A|B|C|D|20260825||ADT^A01|M1|P|2.5\nPID|1||X||Y\n",
+            "MSH|^~\\&|A|B|C|D|20260825||ADT^A01|M1|P|2.5\r\nPID|1||X||Y\r\n",
+        ] {
+            let out = redact_hl7v2(body);
+            assert_eq!(
+                out.matches('\r').count(),
+                body.matches('\r').count(),
+                "CR count changed: {out:?}"
+            );
+            assert_eq!(
+                out.matches('\n').count(),
+                body.matches('\n').count(),
+                "LF count changed: {out:?}"
+            );
+        }
+    }
+
+    /// Non-HL7 bodies are returned untouched — redaction is HL7 v2 field knowledge, and
+    /// mangling JSON or XML would be worse than leaving it alone.
+    #[test]
+    fn a_non_hl7_body_is_left_alone() {
+        let json = "{\"patient\":\"DOE^JOHN\"}";
+        assert_eq!(redact_hl7v2(json), json);
+    }
+
+    // ─── #72: message bodies of every shape ───
+
+    /// `%IsA` walks only the primary superclass chain, and `EnsLib.HL7.Message` reaches
+    /// `EnsLib.EDI.Document` through its second superclass — verified live: `%IsA` is 0
+    /// there, `%Extends` is 1. A branch written with `%IsA` would never fire.
+    #[test]
+    fn every_body_branch_tests_membership_with_extends() {
+        let code = build_message_body_code(16, 65536);
+        assert!(
+            !code.contains("%IsA("),
+            "%IsA misses secondary superclasses — the bug this fixes: {code}"
+        );
+        for cls in [
+            "Ens.StreamContainer",
+            "%Stream.Object",
+            "Ens.StringContainer",
+            "EnsLib.EDI.Document",
+        ] {
+            assert!(
+                code.contains(&format!("%Extends(\"{cls}\")")),
+                "missing branch for {cls}: {code}"
+            );
+        }
+    }
+
+    /// The EDI branch is `EnsLib.EDI.Document`, not `EnsLib.HL7.Message`: HL7 v2, X12, ASTM,
+    /// EDIFACT and EDI XML all extend it and all render through OutputToString().
+    #[test]
+    fn the_edi_branch_covers_every_vdoc_not_just_hl7() {
+        let code = build_message_body_code(16, 65536);
+        assert!(code.contains("body.OutputToString()"), "{code}");
+        assert!(
+            !code.contains("EnsLib.HL7.Message"),
+            "branching on HL7 alone would leave X12/ASTM/EDIFACT/XML unreadable: {code}"
+        );
+    }
+
+    /// OutputToString materialises the whole document; a large batch can raise <MAXSTRING>.
+    /// That must come back as a named body-read failure, not a raw execute error.
+    #[test]
+    fn a_document_too_large_to_render_is_reported_not_thrown() {
+        let code = build_message_body_code(16, 4096);
+        assert!(code.contains("Catch ex"), "{code}");
+        assert!(code.contains("ERROR:BODY_READ_ERROR:"), "{code}");
+    }
+
+    /// max_bytes still caps what comes back, and the FULL length is reported before the cut
+    /// — the #55 defect (a truncated body understating its own size) must not return.
+    #[test]
+    fn the_edi_branch_reports_full_size_before_truncating() {
+        let code = build_message_body_code(16, 4096);
+        let edi = code.split("EnsLib.EDI.Document").nth(1).unwrap();
+        assert!(edi.contains("Set full=$Length(content)"), "{edi}");
+        assert!(edi.contains("If full>4096"), "{edi}");
+        assert!(edi.contains("$Extract(content,1,4096)"), "{edi}");
     }
 
     // ─── #63: one reader for the production-name argument ───
