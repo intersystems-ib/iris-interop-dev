@@ -20,6 +20,7 @@ serde_json.workspace = true
 urlencoding = "2"
 tracing.workspace = true
 tracing-subscriber.workspace = true
+chrono = { version = "0.4" }
 
 [dev-dependencies]
 tempfile = "3"

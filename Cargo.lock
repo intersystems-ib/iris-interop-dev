@@ -948,6 +948,7 @@ name = "iris-agentic-dev"
 version = "0.8.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "iris-agentic-dev-core",
  "rmcp",
