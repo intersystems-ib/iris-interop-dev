@@ -2027,13 +2027,21 @@ impl IrisTools {
                     &format!("/doc/{}?ignoreConflict=1", urlencoding::encode(&doc_name)),
                 );
                 let lines: Vec<&str> = content.lines().collect();
-                let put_resp = client
+                let put_resp = match client
                     .put(&put_url)
                     .basic_auth(&iris.username, Some(&iris.password))
                     .json(&serde_json::json!({"enc": false, "content": lines}))
                     .send()
                     .await
-                    .map_err(|e| McpError::internal_error(format!("Upload failed: {e}"), None))?;
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return crate::tools::envelope::transport_fail(
+                            "mod::put_resp",
+                            &e.to_string(),
+                        )
+                    }
+                };
                 if !put_resp.status().is_success() {
                     return err_json(
                         "UPLOAD_FAILED",
@@ -2161,7 +2169,7 @@ impl IrisTools {
         // Serialize compiles in-process and retry transient conflicts: Atelier 400s any overlapping
         // /action/compile (empty body), and a busy doc can 423/409. See tools::concurrency.
         let _compile_permit = crate::tools::concurrency::compile_gate().acquire().await;
-        let resp = crate::tools::concurrency::send_with_retry(
+        let resp = match crate::tools::concurrency::send_with_retry(
             || {
                 client
                     .post(&compile_url)
@@ -2171,7 +2179,12 @@ impl IrisTools {
             true,
         )
         .await
-        .map_err(|e| McpError::internal_error(format!("HTTP error: {e}"), None))?;
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return crate::tools::envelope::transport_fail("iris_compile", &e.to_string())
+            }
+        };
 
         // Bug 17: `&& != 200` was dead code since 200 is always is_success().
         if !resp.status().is_success() {
@@ -3051,13 +3064,16 @@ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}")"#,
         let namespace = interop::resolve_namespace(p.namespace.as_deref(), Some(&iris));
         let client = self.http_client();
         let query_url = iris.versioned_ns_url(&namespace, "/action/query");
-        let resp = client
+        let resp = match client
             .post(&query_url)
             .basic_auth(&iris.username, Some(&iris.password))
             .json(&serde_json::json!({"query": p.query, "parameters": p.parameters}))
             .send()
             .await
-            .map_err(|e| McpError::internal_error(format!("HTTP error: {e}"), None))?;
+        {
+            Ok(v) => v,
+            Err(e) => return crate::tools::envelope::transport_fail("iris_query", &e.to_string()),
+        };
 
         if !resp.status().is_success() {
             return err_json_with_url(

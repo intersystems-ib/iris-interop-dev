@@ -252,12 +252,15 @@ async fn handle_get(
     };
     let name = name.as_str();
     let url = iris.versioned_ns_url(&namespace, &format!("/doc/{}", urlencoding::encode(name)));
-    let resp = client
+    let resp = match client
         .get(&url)
         .basic_auth(&iris.username, Some(&iris.password))
         .send()
         .await
-        .map_err(|e| rmcp::ErrorData::internal_error(format!("HTTP error: {e}"), None))?;
+    {
+        Ok(v) => v,
+        Err(e) => return crate::tools::envelope::transport_fail("handle_get", &e.to_string()),
+    };
 
     if resp.status().as_u16() == 404 {
         return err_json("NOT_FOUND", &format!("Document not found: {name}"));
@@ -565,7 +568,7 @@ async fn do_write(
     // flight (reproduced under concurrency), so a bounded retry is still needed — also for the
     // cross-process case (multiple MCP processes) the in-process compile gate cannot coordinate.
     let put_body = serde_json::json!({"enc": false, "content": lines});
-    let resp = crate::tools::concurrency::send_with_retry(
+    let resp = match crate::tools::concurrency::send_with_retry(
         || {
             client
                 .put(&url)
@@ -575,7 +578,10 @@ async fn do_write(
         false,
     )
     .await
-    .map_err(|e| rmcp::ErrorData::internal_error(format!("HTTP error: {e}"), None))?;
+    {
+        Ok(v) => v,
+        Err(e) => return crate::tools::envelope::transport_fail("do_write", &e.to_string()),
+    };
 
     if !resp.status().is_success() {
         return http_err(resp).await;
@@ -758,12 +764,15 @@ async fn handle_delete(
     };
     let name = name.as_str();
     let url = iris.versioned_ns_url(&namespace, &format!("/doc/{}", urlencoding::encode(name)));
-    let resp = client
+    let resp = match client
         .delete(&url)
         .basic_auth(&iris.username, Some(&iris.password))
         .send()
         .await
-        .map_err(|e| rmcp::ErrorData::internal_error(format!("HTTP error: {e}"), None))?;
+    {
+        Ok(v) => v,
+        Err(e) => return crate::tools::envelope::transport_fail("handle_delete", &e.to_string()),
+    };
 
     if resp.status().as_u16() == 404 {
         return err_json("NOT_FOUND", &format!("Document not found: {name}"));
@@ -799,12 +808,15 @@ async fn handle_head(
     };
     let name = name.as_str();
     let url = iris.versioned_ns_url(&namespace, &format!("/doc/{}", urlencoding::encode(name)));
-    let resp = client
+    let resp = match client
         .head(&url)
         .basic_auth(&iris.username, Some(&iris.password))
         .send()
         .await
-        .map_err(|e| rmcp::ErrorData::internal_error(format!("HTTP error: {e}"), None))?;
+    {
+        Ok(v) => v,
+        Err(e) => return crate::tools::envelope::transport_fail("handle_head", &e.to_string()),
+    };
 
     let exists = resp.status().is_success();
     let ts = resp

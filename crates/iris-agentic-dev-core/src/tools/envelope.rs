@@ -51,6 +51,24 @@ pub fn fail_with(
     )]))
 }
 
+/// Issue #57: a failure to reach or read IRIS is a TOOL failure, not a protocol
+/// error. These paths used to `?` an `internal_error` out of the handler, which
+/// rmcp turns into a JSON-RPC `-32603` frame carrying no `error_code` and no
+/// `hint` — invisible to anything that classifies by the envelope, and the single
+/// most common workshop failure (wrong port, container not running).
+///
+/// `context` names the operation for the message; `err` is the underlying error.
+pub fn transport_fail(context: &str, err: &str) -> Result<CallToolResult, McpError> {
+    if crate::tools::interop::is_network_error(err) {
+        fail(
+            "IRIS_UNREACHABLE",
+            &format!("{context} could not reach IRIS: {err}"),
+        )
+    } else {
+        fail("IRIS_REQUEST_FAILED", &format!("{context} failed: {err}"))
+    }
+}
+
 /// Mechanical recoveries for failures the workshop data showed carry no hint
 /// (22/38 in issue #2). A hint earns its place only when the fix is known and
 /// mechanical — generic advice is noise.
@@ -60,6 +78,14 @@ fn builtin_hint(code: &str, msg: &str) -> Option<String> {
             "The production named in the error was not stopped cleanly — it may differ from \
              the one you asked for; it is the one still registered in this namespace. Run \
              iris_production action=recover, then retry."
+                .into(),
+        );
+    }
+    if code == "IRIS_UNREACHABLE" {
+        return Some(
+            "IRIS did not answer on the configured host/port. Check the instance is running \
+             (for Docker: `docker ps`), and check IRIS_HOST / IRIS_WEB_PORT — call check_config \
+             to see which host, port and namespace this server is actually using."
                 .into(),
         );
     }
