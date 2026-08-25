@@ -124,7 +124,70 @@ fn http_error_code(status: reqwest::StatusCode) -> &'static str {
 /// (previously discarded, which made these failures undiagnosable), and a retry `hint` for the transient
 /// concurrency conflicts Atelier raises under parallel writes/compiles — a document lock (423/409) or an
 /// empty-body 400 returned when a compile overlaps another. These are NOT unreachability.
-async fn http_err(resp: reqwest::Response) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+/// Issue #71: Atelier addresses documents by name AND type suffix. A bare class name is
+/// rejected with `ERROR #16006: Document 'X' name is invalid`, which blames the name — and
+/// the name is fine; the suffix is missing. Every other name-taking tool in this server
+/// (`iris_test`, `docs_introspect`, `iris_symbols`, `iris_production_item`) accepts a bare
+/// class name, so `iris_doc` is the one that surprises, and the error names no remedy.
+pub const ATELIER_DOC_SUFFIXES: [&str; 10] = [
+    "cls", "mac", "int", "inc", "bas", "mvb", "mvi", "dfi", "csp", "csr",
+];
+
+pub fn has_doc_suffix(name: &str) -> bool {
+    name.rsplit_once('.')
+        .map(|(_, ext)| ATELIER_DOC_SUFFIXES.contains(&ext.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+/// The corrected name, when the CONTENT says what the document is. `mode=put` with source
+/// starting `Class <name>` is a `.cls` by construction — nothing is being guessed. Returns
+/// `None` when the name already carries a suffix or the content does not settle it; a
+/// wrong suffix would be worse than the error.
+pub fn doc_name_with_suffix(name: &str, content: Option<&str>) -> Option<String> {
+    if has_doc_suffix(name) {
+        return None;
+    }
+    let body = content.unwrap_or("").trim_start();
+    let head: String = body
+        .chars()
+        .take(8)
+        .collect::<String>()
+        .to_ascii_uppercase();
+    if head.starts_with("CLASS ") {
+        return Some(format!("{name}.cls"));
+    }
+    if head.starts_with("ROUTINE ") {
+        let first_line = body.lines().next().unwrap_or("").to_ascii_uppercase();
+        // `ROUTINE X [Type=INC]` is an include file; anything else is a .mac.
+        return Some(if first_line.replace(' ', "").contains("TYPE=INC") {
+            format!("{name}.inc")
+        } else {
+            format!("{name}.mac")
+        });
+    }
+    None
+}
+
+/// What to tell a caller whose document name has no suffix. `(suggestion, hint)`.
+pub fn doc_suffix_hint(name: &str) -> Option<(String, String)> {
+    if has_doc_suffix(name) {
+        return None;
+    }
+    let suggestion = format!("{name}.cls");
+    Some((
+        suggestion.clone(),
+        format!(
+            "Atelier document names need a type suffix and '{name}' has none — pass \
+             '{suggestion}' for a class, or .mac/.inc/.int for a routine. iris_doc(put) adds \
+             the suffix itself when the content starts with `Class <name>` or `ROUTINE <name>`."
+        ),
+    ))
+}
+
+async fn http_err(
+    resp: reqwest::Response,
+    doc_name: Option<&str>,
+) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
     let status = resp.status();
     let code = http_error_code(status);
     let body: String = resp
@@ -143,6 +206,15 @@ async fn http_err(resp: reqwest::Response) -> Result<rmcp::model::CallToolResult
     let transient =
         matches!(status.as_u16(), 409 | 423) || (status.as_u16() == 400 && body.is_empty());
     let mut extra = serde_json::json!({});
+    // #71: IRIS says the NAME is invalid; what is missing is the type suffix. Name the
+    // remedy rather than sending the caller hunting for a naming-convention problem that
+    // does not exist — five consecutive #16006 calls in one measured run.
+    if body.contains("16006") {
+        if let Some((suggestion, hint)) = doc_name.and_then(doc_suffix_hint) {
+            extra["did_you_mean"] = serde_json::json!([suggestion]);
+            extra["hint"] = serde_json::Value::String(hint);
+        }
+    }
     if transient {
         extra["hint"] = serde_json::Value::String(
             "Transient concurrency conflict (document lock or overlapping compile) — IRIS is up. \
@@ -266,7 +338,7 @@ async fn handle_get(
         return err_json("NOT_FOUND", &format!("Document not found: {name}"));
     }
     if !resp.status().is_success() {
-        return http_err(resp).await;
+        return http_err(resp, Some(name)).await;
     }
 
     let body: serde_json::Value = resp.json().await.unwrap_or_default();
@@ -370,6 +442,15 @@ async fn handle_put(
     let name = match require_name(&p, "put") {
         Ok(n) => n,
         Err(r) => return r,
+    };
+    // #71: `Class <name>` in the content settles the type, so add the suffix instead of
+    // letting Atelier answer "#16006 name is invalid" about a perfectly good class name.
+    let name = match doc_name_with_suffix(&name, p.content.as_deref()) {
+        Some(fixed) => {
+            tracing::info!(from = %name, to = %fixed, "iris_doc: added the missing document suffix");
+            fixed
+        }
+        None => name,
     };
     let name = name.as_str();
 
@@ -584,7 +665,7 @@ async fn do_write(
     };
 
     if !resp.status().is_success() {
-        return http_err(resp).await;
+        return http_err(resp, Some(name)).await;
     }
     // Check body for Atelier-level errors (200 OK with status.errors, e.g. build 110
     // SetTextFromString NULL namespace bug via web gateway).
@@ -778,7 +859,7 @@ async fn handle_delete(
         return err_json("NOT_FOUND", &format!("Document not found: {name}"));
     }
     if !resp.status().is_success() {
-        return http_err(resp).await;
+        return http_err(resp, Some(name)).await;
     }
     // Atelier returns HTTP 200 even when the delete failed server-side (e.g. the doc is
     // locked / checked out -> ERROR #5845): the real failure is in the JSON body's
@@ -1038,5 +1119,60 @@ mod tests {
         assert!(flag);
         assert!(!stripped.contains("Storage Default"));
         assert!(!stripped.contains("nested"));
+    }
+}
+
+#[cfg(test)]
+mod doc_name_suffix_tests {
+    use super::{doc_name_with_suffix, doc_suffix_hint, has_doc_suffix};
+
+    /// #71: `Class <name>` settles the type — nothing is guessed, so put can add `.cls`
+    /// instead of letting Atelier answer "#16006 name is invalid" about a good class name.
+    #[test]
+    fn class_content_settles_a_bare_name() {
+        let content = "Class ZZVerify.BareName Extends %RegisteredObject\n{\n}\n";
+        assert_eq!(
+            doc_name_with_suffix("ZZVerify.BareName", Some(content)).as_deref(),
+            Some("ZZVerify.BareName.cls")
+        );
+    }
+
+    /// A name that already carries a suffix is left exactly as sent — including one this
+    /// server does not add itself.
+    #[test]
+    fn an_existing_suffix_is_never_touched() {
+        let content = "Class X Extends %RegisteredObject\n{\n}\n";
+        assert_eq!(doc_name_with_suffix("X.cls", Some(content)), None);
+        assert_eq!(doc_name_with_suffix("X.CLS", Some(content)), None);
+        assert_eq!(doc_name_with_suffix("X.dfi", None), None);
+        assert!(has_doc_suffix("Pkg.Sub.Thing.mac"));
+        assert!(!has_doc_suffix("Pkg.Sub.Thing"));
+    }
+
+    /// Routines split by their header: `[Type=INC]` is an include, anything else a .mac.
+    #[test]
+    fn a_routine_header_picks_mac_or_inc() {
+        assert_eq!(
+            doc_name_with_suffix("MyApp.Util", Some("ROUTINE MyApp.Util\n w 1")).as_deref(),
+            Some("MyApp.Util.mac")
+        );
+        assert_eq!(
+            doc_name_with_suffix("MyApp.Macros", Some("ROUTINE MyApp.Macros [Type=INC]\n"))
+                .as_deref(),
+            Some("MyApp.Macros.inc")
+        );
+    }
+
+    /// When the content does not settle it, nothing is invented — a wrong suffix would be
+    /// worse than the error, and the error now carries the remedy.
+    #[test]
+    fn ambiguous_content_is_left_for_the_error_to_explain() {
+        assert_eq!(doc_name_with_suffix("MyApp.Thing", Some(" quit 1")), None);
+        assert_eq!(doc_name_with_suffix("MyApp.Thing", None), None);
+        let (suggestion, hint) = doc_suffix_hint("MyApp.Thing").unwrap();
+        assert_eq!(suggestion, "MyApp.Thing.cls");
+        assert!(hint.contains("type suffix"), "{hint}");
+        assert!(hint.contains("MyApp.Thing.cls"), "{hint}");
+        assert!(doc_suffix_hint("MyApp.Thing.cls").is_none());
     }
 }
