@@ -228,9 +228,10 @@ pub fn no_runnable_tests_cause(shape: &TestClassShape, namespace: &str) -> (&'st
             "NOT_A_TEST_CLASS",
             format!(
                 "'{class}' is compiled in '{namespace}' but extends neither %UnitTest.TestCase \
-                 nor %UnitTest.TestProduction, so %UnitTest has nothing to run. Make it \
-                 `Extends %UnitTest.TestProduction` with `Parameter PRODUCTION` naming the \
-                 production under test, and recompile."
+                 nor %UnitTest.TestProduction, so %UnitTest has nothing to run. A test class \
+                 extends %UnitTest.TestCase — or %UnitTest.TestProduction with \
+                 `Parameter PRODUCTION` when the tests need a running production. Add the \
+                 superclass and recompile."
             ),
         );
     }
@@ -256,26 +257,22 @@ pub fn no_runnable_tests_cause(shape: &TestClassShape, namespace: &str) -> (&'st
             ),
         );
     }
-    if !shape.extends_test_production() {
-        return (
-            "NOT_A_TESTPRODUCTION_SUBCLASS",
-            format!(
-                "'{class}' extends %UnitTest.TestCase, not %UnitTest.TestProduction. iris_test \
-                 runs a class pattern by calling `{class}.Run()`, which %UnitTest.TestProduction \
-                 provides; a plain %UnitTest.TestCase has no Run(), so nothing is discovered. \
-                 Change it to `Extends %UnitTest.TestProduction` with `Parameter PRODUCTION` \
-                 naming the production under test, and recompile."
-            ),
-        );
-    }
+    // #66 retired the NOT_A_TESTPRODUCTION_SUBCLASS cause: a plain %UnitTest.TestCase
+    // class is now named after its suite in the RunTest spec and runs like any other, so
+    // its superclass is no longer a reason for an empty run.
     (
         "UNKNOWN",
         format!(
-            "'{class}' is compiled in '{namespace}' and looks runnable ({} Test* method(s), \
-             PRODUCTION = '{}'), yet the run produced no method results. The pattern is not \
-             the problem — check OnBeforeAllTests/%OnNew for an early Quit, and read the run \
-             output with iris_get_log.",
-            shape.own_test_methods, shape.production
+            "'{class}' is compiled in '{namespace}' and looks runnable ({} Test* method(s){}), \
+             yet the run produced no method results. The pattern is not the problem — check \
+             OnBeforeAllTests/%OnNew for an early Quit, confirm the Test* methods are instance \
+             methods, and read the run output with iris_get_log.",
+            shape.own_test_methods,
+            if shape.extends_test_production() {
+                format!(", PRODUCTION = '{}'", shape.production)
+            } else {
+                String::new()
+            }
         ),
     )
 }
@@ -333,6 +330,46 @@ pub async fn probe_test_class_shape(
             .to_string(),
         own_test_methods: methods.max(0) as u64,
     })
+}
+
+/// Issue #66: how a class pattern reaches %UnitTest.
+///
+/// `%UnitTest.Manager.RunTest` takes a SUITE spec — a directory under `^UnitTestRoot`,
+/// optionally `:class:method`. A bare class name therefore names a directory: the one this
+/// code pre-creates, which `/noload` deliberately leaves empty. RunTest walks it, finds no
+/// test class, and reports "All PASSED" having run nothing. A `%UnitTest.TestProduction`
+/// subclass escaped that because it runs through its own `Run()`; anything else — including
+/// a well-formed `%UnitTest.TestCase` with correctly-named `Test*` instance methods — ran
+/// nothing. That was issue #62's dominant cause (12.5% of BUILD runs).
+///
+/// `DebugRunTestCase(suite, class, qspec, method, userparam)` is the supported entry point
+/// for an ALREADY-COMPILED class: it runs the class directly, needs no suite directory, and
+/// still writes `^UnitTest.Result` — which is this tool's primary result source, so per-method
+/// results and failures come back the same way they do for a production suite.
+///
+/// A pattern that is not a compiled class — a package prefix like `MyApp.Tests`, which the
+/// tool description advertises — keeps the RunTest spec: there is no class to run, and
+/// `no_tests_found_guidance` answers with the near misses.
+///
+/// `^UnitTestRoot` is platform-aware (a temp dir under mgr on Windows, `/tmp/httest/`
+/// elsewhere) and the spec directory is created unconditionally — `CreateDirectoryChain`
+/// is idempotent, and keeping it branch-free lets the code pipe through the docker-exec
+/// terminal as well as the HTTP path. A stale or invalid root makes RunTest fail with
+/// "Directory ... is invalid" and report 0 tests. (A6.2)
+pub fn build_class_test_run_code(pattern: &str, flags: &str, token: &str) -> String {
+    format!(
+        r#"set tIsWin=($zcvt($system.Version.GetOS(),"U")="WINDOWS")
+set ^UnitTestRoot=$select(tIsWin:##class(%File).NormalizeDirectory("httest",##class(%File).GetDirectory(##class(%File).TempFilename())),1:"/tmp/httest/")
+do ##class(%File).CreateDirectoryChain(^UnitTestRoot)
+set specDir=##class(%File).NormalizeDirectory($translate("{pattern}",".","/"),^UnitTestRoot)
+do ##class(%File).CreateDirectoryChain(specDir)
+set tCls="{pattern}"
+set tCC=##class(%Dictionary.CompiledClass).%OpenId(tCls)
+if $isobject(tCC)&&(tCC.PrimarySuper["%UnitTest.TestProduction") {{ do $classmethod(tCls,"Run") }} elseif $isobject(tCC)&&(tCC.PrimarySuper["%UnitTest.TestCase") {{ do ##class(%UnitTest.Manager).DebugRunTestCase("",tCls,"{flags}","","{token}") }} else {{ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}") }}"#,
+        token = token,
+        pattern = pattern,
+        flags = flags,
+    )
 }
 
 pub const ERR_NAMESPACE_NOT_FOUND: &str = "NAMESPACE_NOT_FOUND";
@@ -2531,25 +2568,7 @@ impl IrisTools {
         // After RunTest completes, ^UnitTest.Result global IS persisted (globals bypass
         // the objectgenerator transaction boundary; SQL %Save() does not).
         let run_code = if is_class_pattern {
-            // Class pattern (/noload): RunTest still walks ^UnitTestRoot/<spec-as-path>/ even though
-            // it doesn't load from disk — a stale or invalid ^UnitTestRoot makes it fail with
-            // "Directory ... is invalid" and report 0 tests. Set a valid root and pre-create the spec
-            // directory (dots -> slashes) so the already-compiled class actually runs. (A6.2)
-            // CreateDirectoryChain is idempotent (no-op if the dir exists); kept unconditional
-            // so the multi-line code pipes cleanly through the docker-exec terminal too.
-            format!(
-                r#"set tIsWin=($zcvt($system.Version.GetOS(),"U")="WINDOWS")
-set ^UnitTestRoot=$select(tIsWin:##class(%File).NormalizeDirectory("httest",##class(%File).GetDirectory(##class(%File).TempFilename())),1:"/tmp/httest/")
-do ##class(%File).CreateDirectoryChain(^UnitTestRoot)
-set specDir=##class(%File).NormalizeDirectory($translate("{pattern}",".","/"),^UnitTestRoot)
-do ##class(%File).CreateDirectoryChain(specDir)
-set tCls="{pattern}"
-set tCC=##class(%Dictionary.CompiledClass).%OpenId(tCls)
-if $isobject(tCC)&&(tCC.PrimarySuper["%UnitTest.TestProduction") {{ do $classmethod(tCls,"Run") }} else {{ do ##class(%UnitTest.Manager).RunTest("{pattern}","{flags}","{token}") }}"#,
-                token = correlation_token,
-                pattern = safe_pattern,
-                flags = flags,
-            )
+            build_class_test_run_code(&safe_pattern, flags, &correlation_token)
         } else {
             // Directory path: set ^UnitTestRoot and pre-create the pattern subdirectory.
             // ^UnitTestRoot is platform-aware: a portable temp dir on Windows (mgr/Temp via
@@ -6058,6 +6077,71 @@ mod compile_envelope_tests {
 }
 
 #[cfg(test)]
+mod class_run_code_tests {
+    use super::build_class_test_run_code;
+
+    const FLAGS: &str = "/verbose=1/nodelete/noload";
+
+    /// #66: a compiled %UnitTest.TestCase class runs through DebugRunTestCase, which takes
+    /// the CLASS. Handing the same name to RunTest names an empty suite directory instead,
+    /// which reports "All PASSED" having run nothing.
+    #[test]
+    fn a_testcase_class_runs_through_debugruntestcase() {
+        let code = build_class_test_run_code("Admissions.Tests.MSG.AdmitNotice", FLAGS, "tok");
+        assert!(
+            code.contains(r#"DebugRunTestCase("",tCls,"/verbose=1/nodelete/noload","","tok")"#),
+            "the class itself must be passed, not a suite: {code}"
+        );
+    }
+
+    /// The TestProduction path is untouched: Run() starts the production, RunTest does not.
+    #[test]
+    fn a_testproduction_class_still_runs_through_run() {
+        let code = build_class_test_run_code("Wk47.Tests.SmokeTest", FLAGS, "tok");
+        assert!(
+            code.contains(r#"PrimarySuper["%UnitTest.TestProduction""#),
+            "{code}"
+        );
+        assert!(code.contains(r#"do $classmethod(tCls,"Run")"#), "{code}");
+    }
+
+    /// A pattern that is not a compiled class — the package prefix the tool description
+    /// advertises — keeps the bare spec: there is no class to name after the suite.
+    #[test]
+    fn a_non_class_pattern_keeps_the_bare_spec() {
+        let code = build_class_test_run_code("MyApp.Tests", FLAGS, "tok");
+        assert!(
+            code.contains(r#"RunTest("MyApp.Tests","/verbose=1/nodelete/noload","tok")"#),
+            "{code}"
+        );
+    }
+
+    /// A stale or invalid ^UnitTestRoot makes RunTest fail with "Directory ... is invalid"
+    /// and report 0 tests, so the root and the spec directory must survive the rework (A6.2).
+    #[test]
+    fn the_spec_directory_is_still_created_under_a_fresh_root() {
+        let code = build_class_test_run_code("MyApp.Tests.Thing", FLAGS, "tok");
+        assert!(code.contains("set ^UnitTestRoot="), "{code}");
+        assert!(code.contains("CreateDirectoryChain(specDir)"), "{code}");
+    }
+
+    /// The dispatch stays on ONE line: this code is piped through a docker-exec terminal as
+    /// well as the HTTP executor, and an ObjectScript literal cannot span source lines.
+    #[test]
+    fn the_dispatch_stays_on_one_line() {
+        let code = build_class_test_run_code("MyApp.Tests.Thing", FLAGS, "tok");
+        let dispatch = code.lines().last().unwrap();
+        assert!(dispatch.starts_with("if $isobject(tCC)"), "{dispatch}");
+        assert!(dispatch.contains("elseif"), "{dispatch}");
+        assert_eq!(
+            dispatch.matches("DebugRunTestCase").count(),
+            1,
+            "the compiled-class branch runs the class directly: {dispatch}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod no_runnable_tests_tests {
     use super::{no_runnable_tests_cause, no_tests_found_guidance, TestClassShape};
 
@@ -6105,17 +6189,17 @@ mod no_runnable_tests_tests {
         assert_eq!(dym, vec!["Wk47.Tests.SmokeTest".to_string()]);
     }
 
-    /// 12 of 16 controlled runs: TestProduction + a real PRODUCTION ran its tests. The
-    /// 4 that ran nothing differed only in class shape — which is what must be named.
+    /// #66 made a plain %UnitTest.TestCase class runnable, so its superclass is no longer
+    /// a cause. It must not be blamed — and neither must the pattern.
     #[test]
-    fn a_plain_testcase_is_named_as_the_cause() {
+    fn a_plain_testcase_is_no_longer_blamed_on_its_superclass() {
         let (cause, hint) = no_runnable_tests_cause(&shape(TESTCASE, "", 4), "EVALNS");
-        assert_eq!(cause, "NOT_A_TESTPRODUCTION_SUBCLASS");
-        assert!(hint.contains("%UnitTest.TestProduction"), "{hint}");
+        assert_eq!(cause, "UNKNOWN");
         assert!(
-            hint.contains("Run()"),
-            "say WHY it runs nothing, not just what to change: {hint}"
+            !hint.contains("PRODUCTION = "),
+            "PRODUCTION means nothing to a %UnitTest.TestCase class: {hint}"
         );
+        assert!(hint.contains("pattern is not the problem"), "{hint}");
     }
 
     #[test]
