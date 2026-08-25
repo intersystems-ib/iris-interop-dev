@@ -879,7 +879,7 @@ pub fn strip_storage_blocks(content: &str) -> (String, bool) {
     }
 }
 
-fn doc_content_to_string(body: &serde_json::Value) -> String {
+pub(crate) fn doc_content_to_string(body: &serde_json::Value) -> String {
     // Atelier GET /doc/<name> returns result.content as a flat array of line strings.
     body["result"]["content"]
         .as_array()

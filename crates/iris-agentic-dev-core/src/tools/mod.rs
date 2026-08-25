@@ -119,6 +119,10 @@ pub const INTEROP_TOOLS: &[&str] = &[
     "extract_message_map_routing",
     "find_subclass_implementations",
     "iris_table_info",
+    // 056 interop-depth
+    "iris_message_body",
+    "iris_business_rule_info",
+    "iris_production_diff",
 ];
 
 pub const ERR_NO_TESTS_FOUND: &str = "NO_TESTS_FOUND";
@@ -4817,6 +4821,124 @@ Methods:
         )
         .await;
         self.record_call("iris_production_item", Self::call_ok(&result));
+        result
+    }
+
+    // ─── 056-interop-depth: message bodies, business rules, production diff ───
+
+    #[tool(
+        description = "Read an Ensemble message body by message header ID (Ens.StringContainer, Ens.StreamContainer, %Stream.Object). Message bodies may contain PHI, so this tool refuses by default: pass dataPolicy=redact to blank known HL7 v2 PHI fields (PID-3/5/7/8/11/18, MSH-3), or dataPolicy=allow together with acknowledgePhi=true to read it unredacted. max_bytes caps the read (default 65536, hard cap 1048576) and the response reports actual_size and truncated. Use iris_interop_query first to find message IDs. namespace: optional — defaults to the connection namespace (IRIS_NAMESPACE); must be an interop-enabled namespace."
+    )]
+    async fn iris_message_body(
+        &self,
+        Parameters(p): Parameters<AnyParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let _iris_arc_hold = self.iris_arc();
+        let iris_opt = _iris_arc_hold.as_deref();
+        let namespace =
+            interop::resolve_namespace(p.get("namespace").and_then(|v| v.as_str()), iris_opt);
+        if let Some(iris) = iris_opt {
+            if let Some(blocked) = interop::ensure_interop_namespace(iris, &namespace).await {
+                self.record_call("iris_message_body", false);
+                return blocked;
+            }
+        }
+        // Default block: a body can carry patient data, so reading one is opt-in.
+        let data_policy = p
+            .get("dataPolicy")
+            .and_then(|v| v.as_str())
+            .unwrap_or("block")
+            .to_string();
+        let result = interop::handle_iris_message_body(
+            iris_opt,
+            &interop::MessageBodyParams {
+                message_id: p
+                    .get("message_id")
+                    .map(|v| match v {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    })
+                    .unwrap_or_default(),
+                namespace,
+                max_bytes: p.get("max_bytes").and_then(|v| v.as_u64()).unwrap_or(65536) as u32,
+                acknowledge_phi: p
+                    .get("acknowledgePhi")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            },
+            &data_policy,
+        )
+        .await;
+        self.record_call("iris_message_body", Self::call_ok(&result));
+        result
+    }
+
+    #[tool(
+        description = "Inspect business rule sets (Ens.Rule.RuleSet). action=list returns every rule set in the namespace with its class name, description and last-modified time; action=get with rule_name returns that rule set's description plus its rule/condition/action counts. Use this to find the real rule name before editing a routing rule. namespace: optional — defaults to the connection namespace (IRIS_NAMESPACE); must be an interop-enabled namespace."
+    )]
+    async fn iris_business_rule_info(
+        &self,
+        Parameters(p): Parameters<AnyParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let _iris_arc_hold = self.iris_arc();
+        let iris_opt = _iris_arc_hold.as_deref();
+        let namespace =
+            interop::resolve_namespace(p.get("namespace").and_then(|v| v.as_str()), iris_opt);
+        if let Some(iris) = iris_opt {
+            if let Some(blocked) = interop::ensure_interop_namespace(iris, &namespace).await {
+                self.record_call("iris_business_rule_info", false);
+                return blocked;
+            }
+        }
+        let result = interop::handle_iris_business_rule_info(
+            iris_opt,
+            &interop::BusinessRuleInfoParams {
+                action: p
+                    .get("action")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("list")
+                    .to_string(),
+                rule_name: p
+                    .get("rule_name")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                namespace,
+            },
+        )
+        .await;
+        self.record_call("iris_business_rule_info", Self::call_ok(&result));
+        result
+    }
+
+    #[tool(
+        description = "Diff a production's live config items against its committed class source, so you can see what was changed in the Management Portal but never saved to source control. Returns in_sync plus a changes array of added/modified/removed items. production: optional — defaults to the running production in the namespace. Requires source control to be configured for the namespace. namespace: optional — defaults to the connection namespace (IRIS_NAMESPACE); must be an interop-enabled namespace."
+    )]
+    async fn iris_production_diff(
+        &self,
+        Parameters(p): Parameters<AnyParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let _iris_arc_hold = self.iris_arc();
+        let iris_opt = _iris_arc_hold.as_deref();
+        let namespace =
+            interop::resolve_namespace(p.get("namespace").and_then(|v| v.as_str()), iris_opt);
+        if let Some(iris) = iris_opt {
+            if let Some(blocked) = interop::ensure_interop_namespace(iris, &namespace).await {
+                self.record_call("iris_production_diff", false);
+                return blocked;
+            }
+        }
+        let result = interop::handle_iris_production_diff(
+            iris_opt,
+            &interop::ProductionDiffParams {
+                production: p
+                    .get("production")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                namespace,
+            },
+        )
+        .await;
+        self.record_call("iris_production_diff", Self::call_ok(&result));
         result
     }
 

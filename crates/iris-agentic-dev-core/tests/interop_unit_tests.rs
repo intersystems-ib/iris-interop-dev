@@ -352,3 +352,305 @@ mod env_guard {
         assert!(names.contains("iris_production_item"));
     }
 }
+
+// ── 056 interop-depth: iris_message_body / iris_business_rule_info / iris_production_diff ──
+// Ported from upstream's 056-interop-depth (f92da6d), adapted to this fork's conventions.
+
+mod interop_depth_helpers {
+    use super::*;
+
+    #[test]
+    fn content_type_detects_hl7_json_xml_and_text() {
+        assert_eq!(detect_content_type("MSH|^~\\&|SENDER|..."), "HL7v2");
+        assert_eq!(
+            detect_content_type("  \n MSH|^~\\&|X"),
+            "HL7v2",
+            "leading whitespace is trimmed"
+        );
+        assert_eq!(detect_content_type("{\"a\":1}"), "JSON");
+        assert_eq!(detect_content_type("[1,2]"), "JSON");
+        assert_eq!(detect_content_type("<Root/>"), "XML");
+        assert_eq!(detect_content_type("just words"), "text");
+        assert_eq!(detect_content_type(""), "text");
+    }
+
+    #[test]
+    fn truncate_body_is_a_noop_under_the_limit() {
+        let (out, trunc, len) = truncate_body("hello", 100);
+        assert_eq!(out, "hello");
+        assert!(!trunc);
+        assert_eq!(len, 5);
+    }
+
+    #[test]
+    fn truncate_body_reports_the_original_length_not_the_kept_length() {
+        let (out, trunc, len) = truncate_body("abcdefghij", 4);
+        assert_eq!(out, "abcd");
+        assert!(trunc);
+        assert_eq!(
+            len, 10,
+            "actual_size must reflect the whole body, not the slice"
+        );
+    }
+
+    /// Cutting mid-character would panic on a str slice — the boundary walk is the point.
+    #[test]
+    fn truncate_body_breaks_on_a_utf8_boundary() {
+        let s = "aé€"; // 1 + 2 + 3 bytes
+        let (out, trunc, len) = truncate_body(s, 2);
+        assert_eq!(
+            out, "a",
+            "must back off to the boundary rather than split é"
+        );
+        assert!(trunc);
+        assert_eq!(len, 6);
+        let (out2, _, _) = truncate_body(s, 3);
+        assert_eq!(out2, "aé");
+    }
+
+    #[test]
+    fn redact_hl7v2_blanks_the_phi_fields_and_keeps_the_rest() {
+        let msg = "MSH|^~\\&|SENDAPP|SENDFAC|RECVAPP|RECVFAC|20260824||ADT^A01|MSG1|P|2.5\rPID|1||123456^^^MRN||DOE^JOHN||19700101|M|||742 Evergreen Tce^^Springfield^IL^62704";
+        let out = redact_hl7v2(msg);
+        assert!(
+            !out.contains("DOE^JOHN"),
+            "PID-5 patient name must go: {out}"
+        );
+        assert!(
+            !out.contains("123456^^^MRN"),
+            "PID-3 identifier must go: {out}"
+        );
+        assert!(!out.contains("19700101"), "PID-7 DOB must go: {out}");
+        assert!(!out.contains("Evergreen"), "PID-11 address must go: {out}");
+        assert!(!out.contains("SENDAPP"), "MSH-3 sending app must go: {out}");
+        assert!(
+            out.contains("ADT^A01"),
+            "message type is not PHI and must survive: {out}"
+        );
+        assert!(out.contains("RECVAPP"), "MSH-5 is not redacted: {out}");
+        assert!(
+            out.starts_with("MSH|"),
+            "segment structure must survive: {out}"
+        );
+    }
+
+    #[test]
+    fn redact_hl7v2_leaves_non_hl7_untouched() {
+        let json = "{\"patient\":\"DOE^JOHN\"}";
+        assert_eq!(
+            redact_hl7v2(json),
+            json,
+            "only HL7 v2 has known PHI positions"
+        );
+    }
+
+    #[test]
+    fn redact_hl7v2_handles_crlf_and_lf_segments() {
+        for sep in ["\r", "\n", "\r\n"] {
+            let msg =
+                format!("MSH|^~\\&|APP|F|R|F|20260824||ADT^A01|1|P|2.5{sep}PID|1||MRN1||DOE^JANE");
+            let out = redact_hl7v2(&msg);
+            assert!(!out.contains("DOE^JANE"), "sep {sep:?} not handled: {out}");
+            assert!(
+                out.contains(sep),
+                "the original separator must be preserved: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn production_items_parse_out_of_class_source() {
+        let src = r#"
+Class MyApp.Prod Extends Ens.Production
+{
+XData ProductionDefinition
+{
+<Production Name="MyApp.Prod">
+  <Item Name="FileIn" Category="" ClassName="MyApp.BS.FileService" PoolSize="1" Enabled="true"/>
+  <Item Name="SqlOut" Category="" ClassName="MyApp.BO.SqlOperation" PoolSize="1" Enabled="false"/>
+</Production>
+}
+}
+"#;
+        let items = parse_production_items_from_source(src);
+        assert_eq!(items.len(), 2, "got {items:?}");
+        assert_eq!(
+            items[0],
+            ("FileIn".into(), "MyApp.BS.FileService".into(), true)
+        );
+        assert_eq!(
+            items[1],
+            ("SqlOut".into(), "MyApp.BO.SqlOperation".into(), false)
+        );
+    }
+
+    /// `Name="` also appears inside `ClassName="` — the parser must not confuse them.
+    #[test]
+    fn item_name_is_not_matched_inside_class_name() {
+        let src = r#"<Item ClassName="Pkg.BS.Thing" Name="Real" Enabled="true"/>"#;
+        let items = parse_production_items_from_source(src);
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].0, "Real",
+            "Name must not bind to ClassName's suffix"
+        );
+        assert_eq!(items[0].1, "Pkg.BS.Thing");
+    }
+
+    #[test]
+    fn item_without_explicit_enabled_defaults_to_enabled() {
+        let items = parse_production_items_from_source(r#"<Item Name="A" ClassName="P.BS.A"/>"#);
+        assert_eq!(items.len(), 1);
+        assert!(items[0].2, "IRIS treats a missing Enabled as enabled");
+    }
+
+    #[test]
+    fn non_item_lines_are_ignored() {
+        let items = parse_production_items_from_source(
+            "Class X {\n<Production Name=\"P\">\n</Production>\n}",
+        );
+        assert!(items.is_empty(), "got {items:?}");
+    }
+}
+
+mod interop_depth_guards {
+    use super::*;
+
+    /// PHI gating is the reason this tool defaults to refusing: a message body can
+    /// carry patient data, so `block` must stop it before any IRIS call happens.
+    #[test]
+    fn message_body_is_blocked_under_the_default_policy() {
+        let r = rt().block_on(handle_iris_message_body(
+            None,
+            &MessageBodyParams {
+                message_id: "1".into(),
+                namespace: "USER".into(),
+                max_bytes: 65536,
+                acknowledge_phi: false,
+            },
+            "block",
+        ));
+        let v = tool_payload(&r);
+        assert_eq!(v["error_code"], "PHI_POLICY_BLOCKED", "{v}");
+    }
+
+    #[test]
+    fn allow_policy_still_requires_an_explicit_acknowledgement() {
+        let r = rt().block_on(handle_iris_message_body(
+            None,
+            &MessageBodyParams {
+                message_id: "1".into(),
+                namespace: "USER".into(),
+                max_bytes: 65536,
+                acknowledge_phi: false,
+            },
+            "allow",
+        ));
+        let v = tool_payload(&r);
+        assert_eq!(v["error_code"], "PHI_ACK_REQUIRED", "{v}");
+    }
+
+    #[test]
+    fn a_non_numeric_message_id_is_rejected_before_reaching_iris() {
+        let r = rt().block_on(handle_iris_message_body(
+            None,
+            &MessageBodyParams {
+                message_id: "not-a-number".into(),
+                namespace: "USER".into(),
+                max_bytes: 65536,
+                acknowledge_phi: true,
+            },
+            "allow",
+        ));
+        let v = tool_payload(&r);
+        assert_eq!(v["error_code"], "INVALID_MESSAGE_ID", "{v}");
+    }
+
+    #[test]
+    fn business_rule_info_rejects_an_unknown_action() {
+        let r = rt().block_on(handle_iris_business_rule_info(
+            None,
+            &BusinessRuleInfoParams {
+                action: "delete".into(),
+                rule_name: None,
+                namespace: "USER".into(),
+            },
+        ));
+        let v = tool_payload(&r);
+        assert_eq!(v["error_code"], "INVALID_ACTION", "{v}");
+    }
+
+    #[test]
+    fn business_rule_get_requires_a_rule_name() {
+        let r = rt().block_on(handle_iris_business_rule_info(
+            None,
+            &BusinessRuleInfoParams {
+                action: "get".into(),
+                rule_name: None,
+                namespace: "USER".into(),
+            },
+        ));
+        let v = tool_payload(&r);
+        assert_eq!(v["error_code"], "INVALID_PARAMS", "{v}");
+    }
+
+    #[test]
+    fn each_depth_tool_reports_no_connection_rather_than_panicking() {
+        let r = rt().block_on(handle_iris_business_rule_info(
+            None,
+            &BusinessRuleInfoParams {
+                action: "list".into(),
+                rule_name: None,
+                namespace: "USER".into(),
+            },
+        ));
+        assert_eq!(tool_payload(&r)["error_code"], "IRIS_UNREACHABLE");
+
+        let r = rt().block_on(handle_iris_production_diff(
+            None,
+            &ProductionDiffParams {
+                production: None,
+                namespace: "USER".into(),
+            },
+        ));
+        assert_eq!(tool_payload(&r)["error_code"], "IRIS_UNREACHABLE");
+    }
+}
+
+mod interop_depth_redaction_detail {
+    use super::*;
+
+    /// Truncation happens before redaction, so a redacted body can be longer than
+    /// max_bytes ([REDACTED] is wider than what it replaces). What must stay true is
+    /// that no PHI survives and the caller can still tell it got a partial body.
+    #[test]
+    fn redaction_after_truncation_still_removes_phi() {
+        let msg =
+            "MSH|^~\\&|SENDAPP|F|R|F|20260825||ADT^A01|1|P|2.5\rPID|1||MRN9||DOE^JOHN||19700101";
+        let (cut, truncated, full) = truncate_body(msg, 60);
+        assert!(truncated);
+        assert_eq!(full, msg.len(), "the reported size is the whole body");
+        let out = redact_hl7v2(&cut);
+        assert!(
+            !out.contains("SENDAPP"),
+            "MSH-3 must go even in a partial body: {out}"
+        );
+    }
+
+    /// A body cut mid-segment must not lose its HL7 identity — content_type drives
+    /// whether redaction runs at all.
+    #[test]
+    fn a_partial_hl7_body_is_still_detected_as_hl7() {
+        let (cut, _, _) = truncate_body("MSH|^~\\&|APP|FAC|R|F|20260825||ADT^A01", 12);
+        assert_eq!(detect_content_type(&cut), "HL7v2", "got {cut:?}");
+    }
+}
+
+/// Pull the JSON payload out of a tool result for assertions.
+fn tool_payload(r: &Result<rmcp::model::CallToolResult, rmcp::ErrorData>) -> serde_json::Value {
+    let r = r.as_ref().expect("tool returned a transport error");
+    match &r.content[0].raw {
+        rmcp::model::RawContent::Text(t) => serde_json::from_str(&t.text).expect("payload is JSON"),
+        _ => panic!("expected text content"),
+    }
+}
