@@ -226,6 +226,32 @@ pub(crate) fn skills_read_fail(
     e: SkillsReadError,
 ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
     match e {
+        // #101: `Unreachable` is a string from whatever failed, and this arm rendered EVERY
+        // such string as DOCKER_REQUIRED + "Set IRIS_CONTAINER=<container_name>" — advice
+        // about the one variable that is provably not the problem once IRIS has answered.
+        //
+        // Today every producer of this error is `IrisConnection::execute`, which is docker-exec
+        // only and fails with the literal "DOCKER_REQUIRED" before any HTTP, so a wrong
+        // password genuinely is not why a skills read failed and DOCKER_REQUIRED is the honest
+        // answer there — the live observation that correct and wrong credentials produce
+        // identical output has that benign cause. This guard is what keeps that true by
+        // construction rather than by coincidence: the moment a skills read learns to go over
+        // HTTP, an auth refusal must not be renamed into a container problem on its way out.
+        SkillsReadError::Unreachable(err)
+            if crate::tools::envelope::auth_error_code(&err.to_string()).is_some() =>
+        {
+            let code = crate::tools::envelope::auth_error_code(&err.to_string())
+                .expect("guarded by the match arm");
+            crate::tools::envelope::fail_with(
+                code,
+                &format!(
+                    "{tool} could not read ^SKILLS in namespace '{ns}': {err}. IRIS answered \
+                     and rejected the request, so it is reachable — this is a credentials \
+                     failure, not a missing container."
+                ),
+                serde_json::json!({"namespace": ns, "source": "^SKILLS"}),
+            )
+        }
         SkillsReadError::Unreachable(err) => crate::tools::envelope::fail_with(
             "DOCKER_REQUIRED",
             &format!(
@@ -613,6 +639,130 @@ fn default_limit() -> usize {
     20
 }
 
+/// #99: how many tool calls this session recorded, with the history mutex's poison
+/// RECOVERED rather than read as "no calls".
+///
+/// `agent_stats` computed this as `self.history.lock().map(|h| h.len()).unwrap_or(0)`, so a
+/// poisoned mutex — another tool panicked while holding it — reported `session_calls: 0`
+/// for a history that is still perfectly intact. That is the same false zero #89 removed
+/// from `agent_history` and from `agent_info(what=history)`, surviving one function over.
+/// `record_call` only pushes and pops a `VecDeque`, so a panic cannot leave the deque
+/// structurally invalid: the entries are there and must be counted.
+pub(crate) fn session_call_count(history: &std::sync::Mutex<VecDeque<ToolCallEntry>>) -> usize {
+    history.lock().unwrap_or_else(|e| e.into_inner()).len()
+}
+
+/// #99: the success payload of `agent_stats` / `agent_info(what=stats)`, as a pure function.
+///
+/// Split out so the field NAMES and the one rule that matters — a count appears only when a
+/// count was actually read — are unit-testable with no IRIS and no docker. Every failure
+/// path returns `skills_read_fail`'s envelope instead of reaching this function at all, so
+/// there is no branch here that could emit a zero nobody measured.
+///
+/// `subscribed` is `Some((skills, kb_items))` for `agent_stats`, which additionally reports
+/// the in-process `--subscribe` population, and `None` for `agent_info(what=stats)`, whose
+/// payload must stay field-for-field what it emits today.
+///
+/// `status: "ok"` rides with `subscribed` because it is `agent_stats`' own legacy field. It
+/// is kept rather than dropped: it is only ever emitted on success (the failure envelope
+/// carries `success: false` and no `status` at all), so it is not a lie, and removing it
+/// would break an existing consumer for nothing. `success: true` is added beside it as the
+/// field that actually carries the meaning.
+pub(crate) fn agent_stats_json(
+    skill_count: usize,
+    ns: &str,
+    session_calls: usize,
+    learning: bool,
+    subscribed: Option<(usize, usize)>,
+) -> serde_json::Value {
+    let mut v = serde_json::json!({
+        "success": true,
+        "skill_count": skill_count,
+        "session_calls": session_calls,
+        "learning_enabled": learning,
+        // #85: say WHICH registry the count came from. Every sibling reports these two.
+        "namespace": ns,
+        "source": SKILLS_GLOBAL,
+    });
+    if let Some((skills, kb_items)) = subscribed {
+        v["status"] = serde_json::json!("ok");
+        v["subscribed_skill_count"] = serde_json::json!(skills);
+        v["subscribed_kb_item_count"] = serde_json::json!(kb_items);
+        v["subscribed_source"] = serde_json::json!(
+            "--subscribe github packages (in-process, populated at startup only)"
+        );
+    }
+    v
+}
+
+/// #99: the ONE implementation of "learning agent status", shared by `agent_stats` and
+/// `agent_info(what=stats)` so the two can no longer drift apart.
+///
+/// `agent_stats` used to report `self.registry.list_skills().len()` — the in-process
+/// `SkillRegistry` — under the bare name `skill_count`, with no namespace and no source.
+/// That number is a STARTUP CONSTANT: `SkillRegistry::load_from_github` takes `&mut self`
+/// and is called only from `--subscribe <owner/repo>` before the server starts, and the
+/// registry is held behind an `Arc` with no interior mutability, so in every session
+/// started without `--subscribe` it is frozen at 0 for the whole process lifetime.
+///
+/// Reproduced live, twice, in one session against the dev instance: `agent_stats` answered
+/// `skill_count: 0` while `skill_list` and `agent_info(what=stats)` both answered 3 from
+/// `^SKILLS`; and with IRIS unreachable it answered `skill_count: 0, status: "ok"` while
+/// both siblings correctly answered DOCKER_REQUIRED. One field, three different meanings —
+/// "the registry is empty", "3 skills are present" and "IRIS was never reached" — and
+/// nothing in the payload to tell them apart. `agent_stats` is also the only agent_* skill
+/// count that survives into the `merged` profile, which prunes `agent_info`.
+///
+/// So `skill_count` MEANS `^SKILLS` in the connection's namespace here too — same builder,
+/// same namespace resolution (#85), same failure classification (#119) as `skill_list` —
+/// and the registry population is reported BESIDE it as `subscribed_*`, a name that says
+/// what it is. Nothing is dropped; the wrong number simply stops wearing the right name.
+///
+/// A failed read returns the shared envelope carrying NO count at all (#89/#119): "could
+/// not read it" must never arrive as "there are none".
+///
+/// COST: this makes `agent_stats` fallible and no longer free. Measured on the dev instance:
+/// 4.0 / 4.5 ms before (it touched no IRIS) against 51.7 / 54.7 ms for
+/// `agent_info(what=stats)` and 49.8 / 60.9 ms for `skill_list`, both of which do exactly
+/// this one `^SKILLS` read. `agent_history` still needs no connection.
+pub async fn agent_stats_result(
+    tool: &str,
+    iris: Option<&IrisConnection>,
+    history: &std::sync::Mutex<VecDeque<ToolCallEntry>>,
+    registry: Option<&crate::skills::SkillRegistry>,
+) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+    // #85: the namespace resolves from the CONNECTION. With no connection there is nothing
+    // to resolve and this falls to "USER" — honest, because the very next line reports that
+    // IRIS was never reached. Identical to `skill_list`, deliberately: going through
+    // `get_iris_reloaded().await?` instead would raise a protocol-level McpError rather than
+    // this envelope, and callers branch on `error_code`.
+    let ns = skills_namespace(iris);
+    let Some(iris) = iris else {
+        return skills_read_fail(
+            tool,
+            &ns,
+            SkillsReadError::Unreachable("no IRIS connection configured".into()),
+        );
+    };
+    let code = skills_list_json_code(None, false);
+    let skill_count = match read_skills_json(iris, &code, &ns)
+        .await
+        .and_then(|v| skills_count_from_payload(&v))
+    {
+        Ok(n) => n,
+        // Never `unwrap_or(0)`, never `map_or(0, …)`: that is the bug this function exists
+        // to remove, and it is one refactor away at all times.
+        Err(e) => return skills_read_fail(tool, &ns, e),
+    };
+    ok_json(agent_stats_json(
+        skill_count,
+        &ns,
+        session_call_count(history),
+        learning_enabled(),
+        registry.map(|r| (r.list_skills().len(), r.list_kb_items().len())),
+    ))
+}
+
 pub async fn handle_agent_info(
     iris: &IrisConnection,
     // #89: the ^SKILLS read goes through read_skills_json -> IrisConnection::execute
@@ -622,35 +772,13 @@ pub async fn handle_agent_info(
     history: &std::sync::Mutex<VecDeque<ToolCallEntry>>,
 ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
     match p.what.as_str() {
-        "stats" => {
-            let ns = skills_namespace(Some(iris));
-            // #89: count what `skill(action=list)` lists — SAME builder, SAME namespace
-            // (#85), SAME classification (#119) — so the two tools can no longer disagree
-            // about the registry. This arm was the last ^SKILLS *reader* in the crate that
-            // bypassed read_skills_json, hardcoded the global instead of SKILLS_GLOBAL, and
-            // pinned every failure to 0 with success:true.
-            let code = skills_list_json_code(None, false);
-            let skill_count = match read_skills_json(iris, &code, &ns)
-                .await
-                .and_then(|v| skills_count_from_payload(&v))
-            {
-                Ok(n) => n,
-                Err(e) => return skills_read_fail("agent_info(what=stats)", &ns, e),
-            };
-            // A poisoned mutex means another tool panicked holding the history; the deque
-            // itself is intact (record_call cannot leave it structurally invalid), so
-            // recover it rather than reporting "0 calls" — the same false zero again.
-            let session_calls = history.lock().unwrap_or_else(|e| e.into_inner()).len();
-            ok_json(serde_json::json!({
-                "success": true,
-                "skill_count": skill_count,
-                "session_calls": session_calls,
-                "learning_enabled": learning_enabled(),
-                // #85: which registry the count came from. Every sibling reports these.
-                "namespace": ns,
-                "source": "^SKILLS",
-            }))
-        }
+        // #89: count what `skill(action=list)` lists — SAME builder, SAME namespace (#85),
+        // SAME classification (#119) — so the two tools cannot disagree about the registry.
+        // #99: and SAME function as `agent_stats`, which had re-forked this arm from the
+        // in-process `SkillRegistry` and reintroduced #89's false zero one tool over.
+        // `registry: None` means no `subscribed_*` and no `status`, so this tool's payload
+        // is field-for-field what it emitted before the two implementations were merged.
+        "stats" => agent_stats_result("agent_info(what=stats)", Some(iris), history, None).await,
         "history" => {
             let limit = p.limit;
             // #89: same poison recovery — `.unwrap_or_default()` on the lock rendered an
@@ -996,6 +1124,51 @@ mod objectscript_escaping_tests {
             "the message must say IRIS WAS reached: {v}"
         );
     }
+    /// #101: the third state. `DOCKER_REQUIRED` + "Set IRIS_CONTAINER=<container_name>" came
+    /// back byte-for-byte identically with CORRECT and with WRONG credentials — verified live
+    /// across skill_list / agent_stats / agent_info / skill(action=list). IRIS had answered
+    /// 401; the container name is not what is wrong, and a caller following that hint edits
+    /// the one variable that was already right.
+    #[test]
+    fn a_rejected_password_is_not_reported_as_a_missing_container() {
+        fn payload(r: &rmcp::model::CallToolResult) -> serde_json::Value {
+            let text = match &r.content[0].raw {
+                rmcp::model::RawContent::Text(t) => &t.text,
+                _ => panic!("expected text content"),
+            };
+            serde_json::from_str(text).unwrap()
+        }
+
+        for (err, code) in [
+            ("PUT doc failed: HTTP 401 Unauthorized", "IRIS_AUTH_FAILED"),
+            ("PUT doc failed: HTTP 403 Forbidden", "IRIS_FORBIDDEN"),
+        ] {
+            let r = skills_read_fail(
+                "skill_list",
+                "APP",
+                SkillsReadError::Unreachable(err.into()),
+            )
+            .unwrap();
+            let v = payload(&r);
+            assert_eq!(r.is_error, Some(true), "{v}");
+            assert_eq!(v["error_code"], code, "{v}");
+            assert!(
+                !v.to_string().contains("IRIS_CONTAINER"),
+                "the container name is not the knob to turn here: {v}"
+            );
+        }
+        // The guard: a genuine "cannot reach IRIS at all" still says DOCKER_REQUIRED.
+        let v = payload(
+            &skills_read_fail(
+                "skill_list",
+                "APP",
+                SkillsReadError::Unreachable("DOCKER_REQUIRED".into()),
+            )
+            .unwrap(),
+        );
+        assert_eq!(v["error_code"], "DOCKER_REQUIRED", "{v}");
+    }
+
     /// #119 follow-up: an empty payload is an UNREACHABLE transport, not malformed JSON.
     /// `IrisConnection::execute` drops the exit status, so a failed `docker exec` arrives
     /// as `Ok("")`; classifying that as a parse failure made the tool state "IRIS WAS
@@ -1188,5 +1361,137 @@ mod skills_namespace_tests {
         assert_eq!(skills_namespace(None), "USER");
 
         std::env::remove_var("OBJECTSCRIPT_SKILLMCP_NAMESPACE");
+    }
+}
+
+// ── Issue #99: the two false zeros in agent_stats, as pure functions ──────────
+#[cfg(test)]
+mod agent_stats_shape_tests {
+    use super::*;
+
+    /// #99, the SECOND false zero — and the one that had no coverage anywhere in the tree.
+    /// `agent_stats` computed `session_calls` as `self.history.lock().map(|h| h.len())
+    /// .unwrap_or(0)`, so a mutex poisoned by an unrelated panic reported "0 calls" about a
+    /// deque that still holds every entry. `agent_history` got this fix in #89 and never got
+    /// a test; this is that test, on the path #89 missed.
+    #[test]
+    fn a_poisoned_history_is_not_zero_session_calls() {
+        let history = std::sync::Arc::new(std::sync::Mutex::new(VecDeque::new()));
+        for i in 0..3 {
+            history.lock().unwrap().push_back(ToolCallEntry {
+                tool: format!("tool{i}"),
+                success: true,
+                timestamp: std::time::Instant::now(),
+            });
+        }
+        assert_eq!(session_call_count(&history), 3, "control: not yet poisoned");
+
+        // Poison it exactly the way a panicking tool would: panic while holding the guard.
+        let h = std::sync::Arc::clone(&history);
+        let _ = std::thread::spawn(move || {
+            let _guard = h.lock().unwrap();
+            panic!("a tool panicked while holding the history");
+        })
+        .join();
+        assert!(history.lock().is_err(), "the mutex must really be poisoned");
+
+        assert_eq!(
+            session_call_count(&history),
+            3,
+            "a poisoned mutex means a tool panicked, not that the session made no calls"
+        );
+    }
+
+    /// #99: the registry population is REPORTED, not dropped — under a name that says what
+    /// it is. `skill_count` is the ^SKILLS number; the `--subscribe` number lives in
+    /// `subscribed_skill_count`, and the two are deliberately different here so a rename
+    /// that swapped them could not pass.
+    #[test]
+    fn agent_stats_names_the_registry_population_separately() {
+        let v = agent_stats_json(7, "APP", 4, true, Some((2, 9)));
+        assert_eq!(
+            v["skill_count"], 7,
+            "^SKILLS is what skill_count MEANS: {v}"
+        );
+        assert_eq!(v["namespace"], "APP", "{v}");
+        assert_eq!(v["source"], "^SKILLS", "{v}");
+        assert_eq!(v["subscribed_skill_count"], 2, "{v}");
+        assert_eq!(v["subscribed_kb_item_count"], 9, "{v}");
+        assert!(
+            v["subscribed_source"]
+                .as_str()
+                .unwrap()
+                .contains("--subscribe"),
+            "the second population must say where it came from: {v}"
+        );
+        assert!(
+            v["subscribed_source"].as_str().unwrap().contains("startup"),
+            "…and that it is frozen at startup, which is why it is not skill_count: {v}"
+        );
+    }
+
+    /// #99: pin the field names, so a rename cannot silently put one population back under
+    /// the other's name. `status` and the `subscribed_*` trio belong to `agent_stats` only —
+    /// `agent_info(what=stats)` must keep emitting exactly what it emits today.
+    #[test]
+    fn agent_stats_success_payload_shape() {
+        let stats = agent_stats_json(3, "APP", 1, true, Some((0, 0)));
+        for k in [
+            "success",
+            "status",
+            "skill_count",
+            "namespace",
+            "source",
+            "subscribed_skill_count",
+            "subscribed_kb_item_count",
+            "subscribed_source",
+            "session_calls",
+            "learning_enabled",
+        ] {
+            assert!(stats.get(k).is_some(), "agent_stats must emit {k}: {stats}");
+        }
+        assert_eq!(stats["success"], true, "{stats}");
+        assert_eq!(stats["status"], "ok", "{stats}");
+
+        let info = agent_stats_json(3, "APP", 1, true, None);
+        assert_eq!(
+            info,
+            serde_json::json!({
+                "success": true,
+                "skill_count": 3,
+                "session_calls": 1,
+                "learning_enabled": true,
+                "namespace": "APP",
+                "source": "^SKILLS",
+            }),
+            "agent_info(what=stats) must stay field-for-field what it emitted before #99"
+        );
+    }
+
+    /// #99/#89/#119: there is no path through the success payload that can carry a count
+    /// nobody measured, because the count is a `usize` parameter — a failed read returns
+    /// `skills_read_fail`'s envelope and never reaches this function. Pinned so a future
+    /// "partial success" refactor (`skill_count: null` + `skill_count_error`) has to argue
+    /// with a test: JSON null coerces to 0 in JS and is `or 0`-ed in Python, i.e. the same
+    /// false zero one hop downstream.
+    #[test]
+    fn a_failed_read_has_no_shape_here_at_all() {
+        let fail = skills_read_fail(
+            "agent_stats",
+            "APP",
+            SkillsReadError::Unreachable("no IRIS connection configured".into()),
+        )
+        .unwrap();
+        let text = match &fail.content[0].raw {
+            rmcp::model::RawContent::Text(t) => t.text.clone(),
+            _ => panic!("expected text content"),
+        };
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(fail.is_error, Some(true), "{v}");
+        assert_eq!(v["error_code"], "DOCKER_REQUIRED", "{v}");
+        assert!(v.get("skill_count").is_none(), "no count may survive: {v}");
+        assert!(v.get("status").is_none(), "no \"ok\" on a failure: {v}");
+        assert_eq!(v["namespace"], "APP", "{v}");
+        assert_eq!(v["source"], "^SKILLS", "{v}");
     }
 }

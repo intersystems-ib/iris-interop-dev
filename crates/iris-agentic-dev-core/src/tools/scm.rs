@@ -17,6 +17,16 @@ fn err_json(code: &str, msg: &str) -> Result<rmcp::model::CallToolResult, rmcp::
     crate::tools::envelope::fail(code, msg)
 }
 
+/// Issue #101: a wrong password made every SCM action answer `SCM_UNAVAILABLE` with no hint
+/// at all, which reads as "this instance has no source control" — a statement about the
+/// server's configuration, for a request IRIS rejected at the door. `SCM_UNAVAILABLE` is
+/// still right when the SCM session genuinely could not start; it is not right for a 401,
+/// a 403, or a closed port, and those three now say what they are and carry the hint that
+/// goes with them.
+fn scm_error_code(msg: &str) -> &'static str {
+    crate::tools::interop::classify_iris_error_or(msg, "SCM_UNAVAILABLE")
+}
+
 /// Menu prefix used for source control actions.
 pub const SCM_MENU: &str = "%SourceMenu";
 
@@ -171,7 +181,7 @@ pub async fn handle_iris_source_control(
                 Err(e) => {
                     // A transport/exec failure must NOT be reported as "editable" — that is the
                     // very inconsistency this path used to have. Surface it honestly.
-                    return err_json("SCM_UNAVAILABLE", &e.to_string());
+                    return err_json(scm_error_code(&e.to_string()), &e.to_string());
                 }
             };
             // The executor may append "ERROR($ZERROR): …" on later lines — find the SCMSTATUS
@@ -259,7 +269,7 @@ pub async fn handle_iris_source_control(
             let code = user_action_code("%CheckOut", doc, &iris.username, &iris.password);
             let raw = match xecute(iris, client, &code, ns).await {
                 Ok(o) => o,
-                Err(e) => return err_json("SCM_UNAVAILABLE", &e.to_string()),
+                Err(e) => return err_json(scm_error_code(&e.to_string()), &e.to_string()),
             };
             let out = raw.lines().next().unwrap_or("").trim();
             if out == "SCM_UNAVAILABLE" {
@@ -285,7 +295,7 @@ pub async fn handle_iris_source_control(
                             return err_json("SCM_CHECKOUT_FAILED", &aout);
                         }
                     }
-                    Err(e) => return err_json("SCM_UNAVAILABLE", &e.to_string()),
+                    Err(e) => return err_json(scm_error_code(&e.to_string()), &e.to_string()),
                 }
                 // Checkout committed — cache it so a following iris_doc write skips the probe.
                 checkout_cache.mark(ns, doc);
@@ -326,7 +336,7 @@ pub async fn handle_iris_source_control(
             let code = user_action_code(action_id, doc, &iris.username, &iris.password);
             let raw = match xecute(iris, client, &code, ns).await {
                 Ok(o) => o,
-                Err(e) => return err_json("SCM_UNAVAILABLE", &e.to_string()),
+                Err(e) => return err_json(scm_error_code(&e.to_string()), &e.to_string()),
             };
             let out = raw.lines().next().unwrap_or("").trim();
             if out == "SCM_UNAVAILABLE" {

@@ -392,6 +392,15 @@ if $isobject(tCC)&&(tCC.PrimarySuper["%UnitTest.TestProduction") {{ do $classmet
 
 pub const ERR_NAMESPACE_NOT_FOUND: &str = "NAMESPACE_NOT_FOUND";
 pub const ERR_TEST_EXECUTION_ERROR: &str = "TEST_EXECUTION_ERROR";
+/// #101/#102: IRIS answered, but `/api/atelier` is not published where this server looks —
+/// the request never reached a namespace or a document. Distinct from `NOT_FOUND` (which is
+/// a claim about a document) and from `IRIS_UNREACHABLE` (which is a claim about the host
+/// and port, both of which just answered).
+pub const ERR_ATELIER_NOT_FOUND: &str = "ATELIER_NOT_FOUND";
+/// #102: a 404 whose cause could not be established. The honest answer when the only
+/// alternative is a negative FACT the server cannot back — never a substitute for an error
+/// a caller already has.
+pub const ERR_INDETERMINATE: &str = "INDETERMINATE";
 
 // ── Live connection hot-reload types (034) ───────────────────────────────────
 
@@ -2186,6 +2195,39 @@ pub fn validate_read_only_sql(sql: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Issue #102: the failure envelope `docs_introspect` never had. Names the namespace when a
+/// 404 is its fault (#93), otherwise codes the failure from the status IRIS actually returned
+/// — never `null` fields on a `success:true` answer.
+async fn introspect_failure(
+    iris: &IrisConnection,
+    client: &reqwest::Client,
+    namespace: &str,
+    class_name: &str,
+    e: &anyhow::Error,
+) -> Result<CallToolResult, McpError> {
+    if let Some(missing) = interop::namespace_missing_error_for(
+        iris,
+        client,
+        namespace,
+        "Nothing was introspected.",
+        e,
+    )
+    .await
+    {
+        return missing;
+    }
+    let msg = e.to_string();
+    let code = match crate::iris::connection::atelier_status(e) {
+        Some(http) => envelope::http_status_code(http.status),
+        None => interop::classify_iris_error_or(&msg, "IRIS_REQUEST_FAILED"),
+    };
+    envelope::fail_with(
+        code,
+        &msg,
+        serde_json::json!({ "class_name": class_name, "namespace": namespace }),
+    )
+}
+
 fn err_json_with_url(
     code: &str,
     msg: &str,
@@ -2759,9 +2801,14 @@ impl IrisTools {
                     // it as UPLOAD_FAILED "PUT X returned HTTP 404 Not Found" and never
                     // named the namespace. Only on 404: 401/403 and 5xx keep their meaning.
                     if put_resp.status().as_u16() == 404 {
-                        if let Some(e) =
-                            interop::namespace_missing_error(&iris, client, &namespace, &put_url)
-                                .await
+                        if let Some(e) = interop::namespace_missing_error(
+                            &iris,
+                            client,
+                            &namespace,
+                            &put_url,
+                            "Nothing was compiled.",
+                        )
+                        .await
                         {
                             return e;
                         }
@@ -2903,7 +2950,11 @@ impl IrisTools {
                     if let Ok(resp) = &other {
                         if resp.status().as_u16() == 404 {
                             if let Some(e) = interop::namespace_missing_error(
-                                &iris, client, &namespace, &fetch_url,
+                                &iris,
+                                client,
+                                &namespace,
+                                &fetch_url,
+                                "Nothing was compiled.",
                             )
                             .await
                             {
@@ -2946,37 +2997,37 @@ impl IrisTools {
             // wildcard can never see a .mac/.int/.inc routine, and a bare NOT_FOUND there
             // reads as "that routine does not exist" when it does and compiles by name.
             // #94: `scanned` STOPS meaning "documents in the namespace" the moment the
-            // listing is narrowed server-side — left alone, this sentence would start
-            // saying "scanned 0 CLS document(s) in namespace APP" for a typo'd package,
-            // which reads as "the namespace is empty". A new silent wrong answer
-            // introduced by a performance fix is not an acceptable trade, so the two
-            // cases get two sentences.
-            let msg = match listing_filter_used {
-                Some(f) => format!(
-                    "No documents match pattern '{}' — the CLS listing for namespace {} was \
-                     narrowed server-side to names containing '{}', which returned {} \
-                     candidate document(s). Wildcards expand CLASS documents only: compile a \
-                     .mac/.int/.inc routine by its exact name.",
-                    p.target, namespace, f, scanned
-                ),
-                None => format!(
-                    "No documents match pattern '{}' — scanned {} CLS document(s) in \
-                     namespace {}. Wildcards expand CLASS documents only: compile a \
-                     .mac/.int/.inc routine by its exact name.",
-                    p.target, scanned, namespace
-                ),
+            // listing is narrowed server-side.
+            // #100: and neither wording could support the negative it asserted — the CLS
+            // listing omits `Hidden = 1 OR GeneratedBy <> ''`, so "No documents match
+            // pattern" was a claim about the world, made from a source that cannot see all
+            // of it. Reproduced live: `EnsPortal.I*` answered NOT_FOUND while
+            // EnsPortal.InterfaceMaps existed and compiled fine by its exact name.
+            //
+            // All three concerns now live in `compile_not_found_error`, which is pure and
+            // therefore pinned by unit tests rather than by reading the call site.
+            //
+            // The cross-check is called from HERE and nowhere else. This block is reachable
+            // only from `WildcardExpansion::Matched(vec![])` — after a listing that returned
+            // 200 and matched nothing — so it cannot fire on the happy path, and it sits
+            // downstream of every #88/#93 guard by construction rather than by a flag anyone
+            // can flip: SCOPE_REQUIRED, TOO_BROAD, LISTING_UNAVAILABLE and the
+            // missing-namespace attribution have all already returned above.
+            let cross = if p.target.contains('*') {
+                not_listable_crosscheck(&iris, client, &p.target, &namespace).await
+            } else {
+                // An exact target never consulted a listing, so there is no listing blindness
+                // to second-guess and no query to pay for. (Unreachable today — an exact
+                // target yields exactly one element — but the outcome is stated, not assumed.)
+                CrossCheck::Unavailable("an exact target is not expanded from a listing".into())
             };
-            return crate::tools::envelope::fail_with(
-                "NOT_FOUND",
-                &msg,
-                serde_json::json!({
-                    "pattern": p.target,
-                    "namespace": namespace,
-                    // Machine-readable, so the distinction is not only in the prose.
-                    "listing_narrowed": listing_narrowed,
-                    "listing_filter": listing_filter_used,
-                    "candidates_scanned": scanned,
-                }),
+            return compile_not_found_error(
+                &p.target,
+                &namespace,
+                listing_filter_used,
+                listing_narrowed,
+                scanned,
+                cross,
             );
         }
 
@@ -3045,11 +3096,26 @@ impl IrisTools {
             // missing document; ask the root descriptor. Only on 404 — a 401/403 is
             // credentials and a 5xx is a sick instance, and both keep their current error.
             if status == 404 {
-                if let Some(e) =
-                    interop::namespace_missing_error(&iris, client, &namespace, &url_str).await
+                if let Some(e) = interop::namespace_missing_error(
+                    &iris,
+                    client,
+                    &namespace,
+                    &url_str,
+                    "Nothing was compiled.",
+                )
+                .await
                 {
                     return e;
                 }
+            }
+            // #101: 401/403 are credentials and privileges, not connectivity — IRIS
+            // answered, so it is reachable by definition. Only these two statuses move:
+            // every other status keeps its current code verbatim, which is what keeps
+            // `a_namespace_that_differs_only_in_case_is_not_reported_as_missing` (the #93
+            // scope tripwire, asserting IRIS_UNREACHABLE for a 404 whose namespace DOES
+            // exist) green. A failure there is a scope violation, not a test to update.
+            if envelope::auth_status_code(status).is_some() {
+                return envelope::http_status_fail("iris_compile", resp.status(), &url_str);
             }
             return err_json_with_url("IRIS_UNREACHABLE", &format!("HTTP {}", status), &url_str);
         }
@@ -3128,6 +3194,21 @@ impl IrisTools {
         if let Some(uri) = open_uri {
             resp["open_uri"] = serde_json::Value::String(uri);
         }
+        // #100 on the SUCCESS path. The listing blindness does not only produce false
+        // NOT_FOUNDs; it under-compiles and reports that as success. Reproduced live:
+        // `iris_compile {"target":"EnsPortal.*Maps"}` returned success:true /
+        // targets_compiled:1 while EnsPortal.InterfaceMaps also matches the pattern and was
+        // silently never compiled. A genuine fix needs the cross-check on the happy path,
+        // which costs a query on every successful wildcard compile; this discloses the
+        // limitation instead, as a string literal — zero round trips, so the "the
+        // cross-check never runs on the happy path" cost rule holds absolutely.
+        if p.target.contains('*') {
+            resp["expansion_source"] = serde_json::Value::String(
+                "atelier /docnames/CLS — Hidden and generated classes are not listed and were \
+                 not expanded; compile those by exact name"
+                    .into(),
+            );
+        }
 
         // Progressive disclosure (027): truncate errors array when count exceeds threshold.
         // Threshold counts distinct error+warning entries (not raw console lines).
@@ -3175,31 +3256,28 @@ impl IrisTools {
         let namespace = interop::resolve_namespace(p.namespace.as_deref(), Some(&iris));
         let client = self.http_client();
 
-        // US3: namespace existence check before running tests.
-        let ns_check_code = format!(
-            "write ##class(%SYS.Namespace).Exists({})",
-            os_str_expr(&namespace)
-        );
-        let ns_exists = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            iris.execute_via_generator(&ns_check_code, "USER", client),
+        // US3 / #102: namespace pre-flight before running tests.
+        //
+        // This used to spend a whole `execute_via_generator` cycle — PUT + compile + SQL query
+        // + DELETE, four HTTP round trips — hardcoded into namespace USER, inside a 10s
+        // timeout, to ask `%SYS.Namespace.Exists`, and then `.unwrap_or(true)`: assume it
+        // exists. The #93 helper answers the same question with ONE GET of `/api/atelier/`,
+        // and answers it better — it lists the namespaces that DO exist, and it says "or is
+        // not accessible to user X", a distinction `%SYS.Namespace.Exists` cannot make (it
+        // reports raw existence, so a namespace the credentials cannot reach passed this
+        // pre-flight and failed later with a confusing error). `None` still means CANNOT TELL,
+        // which is the old optimistic default stated honestly. Same ERR_NAMESPACE_NOT_FOUND.
+        if let Some(missing) = interop::namespace_missing_error(
+            &iris,
+            client,
+            &namespace,
+            &iris.versioned_ns_url(&namespace, "/action/query"),
+            "No tests were run.",
         )
         .await
-        .ok()
-        .and_then(|r| r.ok())
-        .map(|s| s.trim().starts_with('1'))
-        .unwrap_or(true); // If we can't check, assume it exists and let RunTest fail naturally.
-
-        if !ns_exists {
+        {
             self.record_call("iris_test", false);
-            return envelope::fail_with(
-                ERR_NAMESPACE_NOT_FOUND,
-                &format!(
-                    "Namespace '{}' does not exist on this IRIS instance",
-                    namespace
-                ),
-                serde_json::json!({"namespace": namespace}),
-            );
+            return missing;
         }
 
         // Generate a UUID correlation token; used as UserParam in RunTest.
@@ -3297,12 +3375,37 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                     .await
                     {
                         Ok(Ok(out)) => out,
-                        _ => {
+                        Err(_) => {
                             self.record_call("iris_test", false);
                             return envelope::fail(
-                                "DOCKER_REQUIRED",
-                                &format!("iris_test: IRIS_CONTAINER set but docker exec failed and HTTP fallback also failed.{DOCKER_REQUIRED_HINT}"),
+                                "TIMEOUT",
+                                &format!("Test run timed out after {}s", p.timeout),
                             );
+                        }
+                        Ok(Err(e)) => {
+                            // #101/#102: the HTTP leg's error was discarded here, so a wrong
+                            // password and a mistyped namespace both answered DOCKER_REQUIRED
+                            // — naming an env var with no bearing on either problem.
+                            self.record_call("iris_test", false);
+                            if let Some(missing) = interop::namespace_missing_error_for(
+                                &iris,
+                                client,
+                                &namespace,
+                                "No tests were run.",
+                                &e,
+                            )
+                            .await
+                            {
+                                return missing;
+                            }
+                            let msg = e.to_string();
+                            let code = interop::classify_iris_error_or(&msg, "DOCKER_REQUIRED");
+                            let text = if code == "DOCKER_REQUIRED" {
+                                format!("iris_test: IRIS_CONTAINER set but docker exec failed and HTTP fallback also failed: {msg}.{DOCKER_REQUIRED_HINT}")
+                            } else {
+                                format!("iris_test: docker exec failed and the HTTP fallback was rejected: {msg}")
+                            };
+                            return envelope::fail(code, &text);
                         }
                     }
                 }
@@ -3328,7 +3431,25 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                 }
                 Ok(Err(e)) => {
                     self.record_call("iris_test", false);
-                    return envelope::fail(ERR_TEST_EXECUTION_ERROR, &e.to_string());
+                    // #101: "PUT doc failed: HTTP 401 Unauthorized" is a credentials failure,
+                    // not a test-execution failure — three tools used to give one cause three
+                    // different codes. #102: and a 404 here is a mistyped namespace.
+                    if let Some(missing) = interop::namespace_missing_error_for(
+                        &iris,
+                        client,
+                        &namespace,
+                        "No tests were run.",
+                        &e,
+                    )
+                    .await
+                    {
+                        return missing;
+                    }
+                    let msg = e.to_string();
+                    return envelope::fail(
+                        interop::classify_iris_error_or(&msg, ERR_TEST_EXECUTION_ERROR),
+                        &msg,
+                    );
                 }
                 Ok(Ok(out)) => out,
             }
@@ -3714,7 +3835,13 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
         )
         .await;
 
-        match gen_result {
+        // #101: what the HTTP leg said, kept for the docker fallback's error message. The
+        // `Ok(Err(_))` arm below used to DISCARD it, so a wrong password was reported as
+        // DOCKER_REQUIRED — "set IRIS_CONTAINER", an env var with no bearing on the problem.
+        // Bound as a match EXPRESSION: the other two arms diverge (both `return`), so only
+        // the fall-through arm yields a value. A deferred `let` + assignment trips
+        // clippy::needless_late_init on the CI toolchain (1.98) though not on 1.96.
+        let http_leg_error: String = match gen_result {
             Err(_) => {
                 self.record_call("iris_execute", false);
                 return envelope::fail(
@@ -3777,10 +3904,29 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                 }
                 return ok_json(resp);
             }
-            Ok(Err(_)) => {
-                // HTTP path failed — fall through to docker exec.
+            Ok(Err(e)) => {
+                // #102: a 404 here is very often a mistyped NAMESPACE. Docker was never the
+                // problem and cannot be the remedy, so answer it now rather than falling
+                // through and reporting the fallback's failure as the cause.
+                if let Some(missing) = interop::namespace_missing_error_for(
+                    &iris,
+                    client,
+                    &namespace,
+                    "Nothing was executed.",
+                    &e,
+                )
+                .await
+                {
+                    self.record_call("iris_execute", false);
+                    return missing;
+                }
+                // #101: the fall-through STAYS. `IrisConnection::execute` shells out via
+                // `docker exec ... iris session` and does not use IRIS_USERNAME/IRIS_PASSWORD
+                // at all, so with a valid IRIS_CONTAINER a wrong Atelier password genuinely IS
+                // recoverable. Only what gets REPORTED when the docker leg also fails changes.
+                e.to_string()
             }
-        }
+        };
 
         // Fallback: docker exec (requires IRIS_CONTAINER env var).
         let docker_result =
@@ -3797,6 +3943,19 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                 let msg = e.to_string();
                 self.record_call("iris_execute", false);
                 if msg == "DOCKER_REQUIRED" {
+                    // #101: both legs have now failed. If the HTTP leg was an auth refusal,
+                    // that is the cause and IRIS_CONTAINER is not the remedy — name both legs.
+                    // DOCKER_REQUIRED survives verbatim for every non-auth HTTP failure.
+                    if let Some(code) = envelope::auth_error_code(&http_leg_error) {
+                        return envelope::fail(
+                            code,
+                            &format!(
+                                "iris_execute: the HTTP path was rejected ({http_leg_error}); \
+                                 the docker exec fallback is unavailable because IRIS_CONTAINER \
+                                 is not set."
+                            ),
+                        );
+                    }
                     envelope::fail(
                         "DOCKER_REQUIRED",
                         &format!("iris_execute: HTTP execution failed and IRIS_CONTAINER is not set for docker exec fallback.{DOCKER_REQUIRED_HINT}"),
@@ -3934,11 +4093,30 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
         };
 
         if !resp.status().is_success() {
-            return err_json_with_url(
-                "IRIS_UNREACHABLE",
-                &format!("HTTP {}", resp.status()),
-                &query_url,
-            );
+            let status = resp.status();
+            // #93 first: the 404 body is ZERO bytes, so the transport alone cannot tell a
+            // missing namespace from a missing endpoint — ask the root descriptor. `None`
+            // means cannot tell, and the status-coded error below survives.
+            if status.as_u16() == 404 {
+                if let Some(missing) = interop::namespace_missing_error(
+                    &iris,
+                    client,
+                    &namespace,
+                    &query_url,
+                    "No rows were read.",
+                )
+                .await
+                {
+                    return missing;
+                }
+            }
+            // #101, the filed repro: this answered IRIS_UNREACHABLE + "Check IRIS_HOST and
+            // IRIS_WEB_PORT" for a 401 while IRIS was answering perfectly on that very host
+            // and port. An HTTP *response* is proof of reachability. The hint goes with the
+            // code: `http_status_fail` attaches `attempted_url` (useful) and lets
+            // `builtin_hint` supply the credentials advice (correct), instead of hard-coding
+            // networking advice that was wrong for every status.
+            return envelope::http_status_fail("iris_query", status, &query_url);
         }
 
         let body: serde_json::Value = resp.json().await.unwrap_or_default();
@@ -4189,7 +4367,7 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
     }
 
     #[tool(
-        description = "Return the active IRIS connection state + this MCP server's own version. It only reports the cached connection snapshot (no IRIS network call), so it ALWAYS succeeds — when IRIS is down it returns connected:false / connection_source:disconnected instead of erroring with IRIS_UNREACHABLE. That is the point: it's the one tool you can call to DIAGNOSE an unreachable IRIS (read the `connected` field) without the call itself failing — unlike iris_query/iris_execute/etc., which do return IRIS_UNREACHABLE. Also use to: verify hot-reload completed; confirm which container/host is active; validate the loaded MCP build (mcp_version). To switch connection mid-session without restart: call check_config first to get config_watch_path, then write a .iris-agentic-dev.toml to that exact path, then call any tool — the reload fires automatically. Fields: mcp_version, toolset, connected, connection_source (http|docker|disconnected), host, port, namespace, container, config_file, config_watch_path, config_loaded_at, iris_version, write_tools_enabled."
+        description = "Return the active IRIS connection state + this MCP server's own version. It only reports the cached connection snapshot (no IRIS network call), so it ALWAYS succeeds — when IRIS is down it returns connected:false / connection_source:disconnected instead of erroring with IRIS_UNREACHABLE. That is the point: it's the one tool you can call to DIAGNOSE an unreachable IRIS (read the `connected` field) without the call itself failing — unlike iris_query/iris_execute/etc., which do return IRIS_UNREACHABLE. If those tools instead return IRIS_AUTH_FAILED (HTTP 401) or IRIS_FORBIDDEN (HTTP 403), IRIS is REACHABLE and the credentials are the problem: read `auth_ok` and `probe_status` here — auth_ok:false means IRIS rejected IRIS_USERNAME/IRIS_PASSWORD (401) or refused this user the %Development privilege (403), and `connected` is false for that reason, not a network one. Also use to: verify hot-reload completed; confirm which container/host is active; validate the loaded MCP build (mcp_version). To switch connection mid-session without restart: call check_config first to get config_watch_path, then write a .iris-agentic-dev.toml to that exact path, then call any tool — the reload fires automatically. Fields: mcp_version, toolset, connected, auth_ok, probe_status, connection_source (http|docker|disconnected), host, port, namespace, container, config_file, config_watch_path, config_loaded_at, iris_version, write_tools_enabled."
     )]
     async fn check_config(
         &self,
@@ -4265,8 +4443,41 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                 .unwrap_or(serde_json::Value::Null)
         };
 
+        // #101: `connected` was `conn.iris.is_some()` — a claim about whether an object
+        // exists, not about IRIS. Under a wrong password it answered `true`, and this tool's
+        // own description is what sends a model here to diagnose that. The root probe already
+        // knows: a 401/403 means these credentials cannot use this instance, so `connected` is
+        // false and `auth_ok` says why. Anything else (no probe yet, a transport failure, an
+        // odd status) leaves the old answer alone — cannot-tell must not become a claim.
+        let probe_status = conn.iris.as_ref().and_then(|i| i.probe_status);
+        let auth_ok = match probe_status {
+            Some(401) | Some(403) => Some(false),
+            Some(s) if (200..300).contains(&s) => Some(true),
+            _ => None,
+        };
+        // #101/#102, the rest of the same sentence. Keying `connected` on the 401/403 arm
+        // alone still left it `true` for a CLOSED PORT, an unroutable host, a wrong
+        // IRIS_WEB_PREFIX (probe_status 404) and a sick instance (500) — the exact states
+        // this tool's own description promises to report as `connected: false`, and the ones
+        // a model is sent here to diagnose. `connected` is a claim about IRIS, so it is
+        // answered from what the root probe saw:
+        //   2xx                       -> usable
+        //   any other status          -> IRIS answered, but this server cannot use it here
+        //   probe ran, no response    -> IRIS did not answer
+        //   probe never ran           -> cannot tell, and cannot-tell must not become a claim
+        let usable = match (
+            probe_status,
+            conn.iris.as_ref().and_then(|i| i.probe_reached),
+        ) {
+            (Some(s), _) if (200..300).contains(&s) => Some(true),
+            (Some(_), _) => Some(false),
+            (None, Some(false)) => Some(false),
+            (None, _) => None,
+        };
         let mut response = serde_json::json!({
-            "connected": conn.iris.is_some(),
+            "connected": conn.iris.is_some() && usable != Some(false),
+            "auth_ok": auth_ok,
+            "probe_status": probe_status,
             "connection_source": connection_source,
             "host": host,
             "port": port,
@@ -4402,7 +4613,37 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                 "count": resp["result"]["content"].as_array().map(|a| a.len()).unwrap_or(0),
                 "query_hint": "Supports: plain text (substring), 'Pkg.*' (package prefix), 'Pkg.*.Name' (glob)",
             })),
-            Err(e) => err_json("IRIS_UNREACHABLE", &e.to_string()),
+            Err(e) => {
+                // #102: this said IRIS_UNREACHABLE for BOTH a missing namespace and a wrong
+                // password — and, because `query_once` never looked at the status, the message
+                // was "error decoding response body" (the 404 body is zero bytes, so serde
+                // reported EOF and the status was thrown away). Name the namespace when that
+                // is the cause, otherwise code the failure from the status IRIS actually sent.
+                // Only a genuine transport failure — no response at all — keeps
+                // IRIS_UNREACHABLE.
+                if let Some(missing) = interop::namespace_missing_error_for(
+                    &iris,
+                    client,
+                    &namespace,
+                    "No symbols were read.",
+                    &e,
+                )
+                .await
+                {
+                    return missing;
+                }
+                match crate::iris::connection::atelier_status(&e) {
+                    Some(http) => envelope::fail_with(
+                        envelope::http_status_code(http.status),
+                        &e.to_string(),
+                        serde_json::json!({ "attempted_url": http.url }),
+                    ),
+                    None => err_json(
+                        interop::classify_iris_error_or(&e.to_string(), "IRIS_REQUEST_FAILED"),
+                        &e.to_string(),
+                    ),
+                }
+            }
         }
     }
 
@@ -4468,13 +4709,24 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
         let client = self.http_client();
         // Bug 15: use parameterized queries instead of manual string escaping.
         let namespace = interop::resolve_namespace(p.namespace.as_deref(), Some(&iris));
-        let methods = iris.query(
+        // #102 P0: both queries used to end in `.unwrap_or_default()`, so ANY failure —
+        // a namespace that does not exist, a wrong password, a 500 — became
+        // `{"success":true,"methods":null,"properties":null}`. A class that genuinely has no
+        // methods answers `methods:[]`, so `null` vs `[]` was the ONLY thing separating
+        // "unreachable" from "no methods" and no caller makes that distinction. A failed call
+        // must never be answered with a negative FACT.
+        let methods = match iris.query(
             "SELECT Name,FormalSpec,ReturnType FROM %Dictionary.CompiledMethod WHERE parent=? ORDER BY Name",
             vec![serde_json::Value::String(p.class_name.clone())],
             &namespace,
             client,
-        ).await.unwrap_or_default();
-        let props = iris
+        ).await {
+            Ok(v) => v,
+            Err(e) => {
+                return introspect_failure(&iris, client, &namespace, &p.class_name, &e).await
+            }
+        };
+        let props = match iris
             .query(
                 "SELECT Name,Type FROM %Dictionary.CompiledProperty WHERE parent=? ORDER BY Name",
                 vec![serde_json::Value::String(p.class_name.clone())],
@@ -4482,7 +4734,12 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                 client,
             )
             .await
-            .unwrap_or_default();
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return introspect_failure(&iris, client, &namespace, &p.class_name, &e).await
+            }
+        };
         ok_json(
             serde_json::json!({"success": true, "class_name": p.class_name, "methods": methods["result"]["content"], "properties": props["result"]["content"]}),
         )
@@ -4520,7 +4777,7 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                 "DOCKER_REQUIRED",
                 &format!("debug_map_int requires docker exec. Set IRIS_CONTAINER=<container_name>.{DOCKER_REQUIRED_HINT}"),
             ),
-            Err(e) => err_json("IRIS_UNREACHABLE", &e.to_string()),
+            Err(e) => err_json(interop::classify_iris_error_or(&e.to_string(), "IRIS_REQUEST_FAILED"), &e.to_string()),
         }
     }
 
@@ -4540,7 +4797,7 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                 if msg.contains("SQLCODE: -30") || msg.contains("Table") && msg.contains("not found") {
                     ok_json(serde_json::json!({"success": true, "errors": [], "note": "%SYSTEM.Error not available on this IRIS edition"}))
                 } else {
-                    err_json("IRIS_UNREACHABLE", &msg)
+                    err_json(interop::classify_iris_error_or(&msg, "IRIS_REQUEST_FAILED"), &msg)
                 }
             }
         }
@@ -4583,7 +4840,10 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                         serde_json::json!({"success": true, "logs": [], "note": "%SYSTEM.Error not available on this IRIS edition"}),
                     )
                 } else {
-                    err_json("IRIS_UNREACHABLE", &msg)
+                    err_json(
+                        interop::classify_iris_error_or(&msg, "IRIS_REQUEST_FAILED"),
+                        &msg,
+                    )
                 }
             }
         }
@@ -4618,7 +4878,7 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                 "DOCKER_REQUIRED",
                 &format!("debug_source_map requires docker exec. Set IRIS_CONTAINER=<container_name>.{DOCKER_REQUIRED_HINT}"),
             ),
-            Err(e) => err_json("IRIS_UNREACHABLE", &e.to_string()),
+            Err(e) => err_json(interop::classify_iris_error_or(&e.to_string(), "IRIS_REQUEST_FAILED"), &e.to_string()),
         }
     }
 
@@ -5128,19 +5388,31 @@ Methods:
         ok_json(serde_json::json!({"calls": calls, "limit": p.limit}))
     }
 
-    #[tool(description = "Return learning agent status: skill count, pattern count, KB size.")]
+    // #99: the old description promised "skill count, pattern count, KB size" and delivered
+    // none of the three honestly — no pattern count and no KB size at all, and a
+    // `skill_count` that was the in-process `--subscribe` registry, not `^SKILLS`. It now
+    // says what it returns and, more importantly, what it does NOT do: report a zero it
+    // could not measure.
+    #[tool(
+        description = "Learning agent status. Returns the ^SKILLS skill count for the connection's namespace (skill_count, with namespace + source), the count of skills/KB items loaded from --subscribe GitHub packages (subscribed_skill_count / subscribed_kb_item_count / subscribed_source), the session call count and the learning flag. Reads ^SKILLS, so it FAILS with DOCKER_REQUIRED / SKILLS_PARSE_FAILED if that registry cannot be read — it never reports 0 for a registry it could not read. For session history alone, which needs no IRIS, use agent_history."
+    )]
     async fn agent_stats(&self, _: Parameters<NoParams>) -> Result<CallToolResult, McpError> {
-        let skill_count = self.registry.list_skills().len();
-        let session_calls = self.history.lock().map(|h| h.len()).unwrap_or(0);
-        let learning_enabled = std::env::var("OBJECTSCRIPT_LEARNING")
-            .map(|v| v != "false")
-            .unwrap_or(true);
-        ok_json(serde_json::json!({
-            "status": "ok",
-            "skill_count": skill_count,
-            "session_calls": session_calls,
-            "learning_enabled": learning_enabled,
-        }))
+        // #99: ONE implementation, shared with `agent_info(what=stats)` — the two used to be
+        // separate and reported different numbers for the same field in the same session.
+        //
+        // Deliberately NO `record_call` here, so `agent_stats` and `agent_info(what=stats)`
+        // report session_calls that differ by one (agent_info does record itself, at its own
+        // call site). Adding it would make this tool inflate the very number it is reporting;
+        // the documented off-by-one is the lesser evil, and it is stated in the PR rather
+        // than left to be discovered.
+        let iris = self.iris_arc();
+        skills_tools::agent_stats_result(
+            "agent_stats",
+            iris.as_deref(),
+            &self.history,
+            Some(self.registry.as_ref()),
+        )
+        .await
     }
 
     #[tool(
@@ -5505,6 +5777,21 @@ Methods:
         };
         let _iris_arc_hold = self.iris_arc();
         let iris_opt = _iris_arc_hold.as_deref();
+        // #102: the one interop tool with no `ensure_interop_namespace` pre-flight. Its five
+        // impls call `iris.query` directly, so a mistyped namespace surfaced as a raw decode
+        // failure and a non-interop namespace as a raw SQL error. One guard here aligns it
+        // with iris_production, iris_production_item, iris_message_body,
+        // iris_business_rule_info, iris_production_diff, iris_credential_list,
+        // iris_credential_manage, iris_lookup_manage and iris_lookup_transfer — and the
+        // #93 404 attribution rides along through that helper's Err arm.
+        if let Some(iris) = iris_opt {
+            let ns =
+                interop::resolve_namespace(p.get("namespace").and_then(|v| v.as_str()), Some(iris));
+            if let Some(blocked) = interop::ensure_interop_namespace(iris, &ns).await {
+                self.record_call("iris_interop_query", false);
+                return blocked;
+            }
+        }
         #[allow(unused_variables)]
         let result = match what {
             "logs" => {
@@ -6496,11 +6783,13 @@ fn expand_wildcard_target(names: &[&str], pattern: &str) -> WildcardExpansion {
     if wildcard_target_is_unqualified(pattern) {
         return WildcardExpansion::Unqualified;
     }
-    let re = match docname_pattern_regex(wildcard_pattern_stem(pattern)) {
-        Some(re) => re,
+    // #100: the selector is shared with `not_listable_crosscheck` so the two can never
+    // disagree about what a pattern names. `docname_stem` is applied HERE and only here:
+    // /docnames names carry their extension, %Dictionary.ClassDefinition names do not.
+    let (re, want_system) = match wildcard_matcher(pattern) {
+        Some(m) => m,
         None => return WildcardExpansion::Matched(Vec::new()),
     };
-    let want_system = pattern.starts_with('%');
     let matched: Vec<&str> = names
         .iter()
         .copied()
@@ -6557,6 +6846,380 @@ fn too_broad_wildcard_error(
                      a namespace-wide recompile, which is what this guard exists to stop.",
         }),
     )
+}
+
+// ── Issue #100: the classes an Atelier listing cannot see ─────────────────────
+
+/// Issue #100: the ONE selector a wildcard compile target uses, so the `/docnames` expansion
+/// and the `%Dictionary.ClassDefinition` cross-check below can never select differently.
+///
+/// Returns the anchored, case-insensitive regex for the pattern's stem plus whether the
+/// caller asked for `%`-prefixed system documents (only a pattern that itself starts with
+/// `%` reaches those — otherwise a package wildcard would drag library classes in behind
+/// it). `None` means the pattern cannot be compiled to a regex at all, which selects
+/// NOTHING; never `.*`.
+///
+/// TRAP — the two call sites legitimately differ on STEMMING, and getting it wrong is
+/// silent. `/docnames` names carry their extension (`Pkg.Foo.cls`), so
+/// `expand_wildcard_target` must run each name through `docname_stem` before matching.
+/// Names out of `%Dictionary.ClassDefinition` do NOT carry one, so they are matched
+/// DIRECTLY: `docname_stem` strips a trailing `.cls`/`.mac`/`.int`/`.inc`, and a real class
+/// named `Pkg.Int` would be mangled to `Pkg` and then fail to match its own pattern
+/// `Pkg.*`. Asserted, not merely commented — see
+/// `the_shared_matcher_selects_identically_for_docnames_and_sql_names`.
+fn wildcard_matcher(pattern: &str) -> Option<(regex::Regex, bool)> {
+    let re = docname_pattern_regex(wildcard_pattern_stem(pattern))?;
+    Some((re, pattern.starts_with('%')))
+}
+
+/// Issue #100: a `*` wildcard pattern as a SQL `LIKE` pattern, under `ESCAPE '\'`.
+///
+/// The pattern's own `\`, `%` and `_` are escaped FIRST and only then is `*` translated to
+/// `%`, so the SQL selection stays a superset of what `wildcard_matcher`'s regex selects and
+/// never a WIDER one. That ordering is the whole point: `%Library.*` left unescaped becomes
+/// `LIKE '%Library.%'`, a leading-wildcard *contains* match over the entire dictionary, and
+/// with a `TOP` cap in front of it the real match can be truncated away before the client
+/// regex ever sees it — inventing a brand-new false "no such class" inside the very fix that
+/// exists to remove one. Verified live: `\%Library.%` returns %Library classes only, while
+/// `%Library.%` returns the whole alphabet.
+///
+/// The `ESCAPE '\'` idiom is already used in this crate (mod.rs `probe_sql`, info.rs,
+/// interop.rs), so this is not a new technique here.
+fn like_pattern(pattern: &str) -> String {
+    let mut out = String::with_capacity(pattern.len() + 8);
+    for c in pattern.chars() {
+        match c {
+            '\\' => out.push_str(r"\\"),
+            '%' => out.push_str(r"\%"),
+            '_' => out.push_str(r"\_"),
+            '*' => out.push('%'),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Issue #100: one class that exists in `%Dictionary.ClassDefinition` but that Atelier's
+/// `/docnames/CLS` listing does not offer.
+#[derive(Debug, PartialEq)]
+pub(crate) struct NotListable {
+    pub(crate) name: String,
+    pub(crate) hidden: bool,
+    /// The generator's document name (`Ens.Alerting.AlertManager.CLS`), or `None` when the
+    /// class was authored. This is why `GeneratedBy` is selected at all: the advice SPLITS
+    /// on it — see `not_listable_advice`.
+    pub(crate) generated_by: Option<String>,
+}
+
+/// Issue #100: what the `%Dictionary.ClassDefinition` cross-check concluded.
+///
+/// Three states, never two. `Unavailable` exists because #89/#119 keep being reintroduced by
+/// folding "we could not check" into "there is nothing": a cross-check that failed must not
+/// be reported as an empty result, or the new code carries the old bug.
+#[derive(Debug, PartialEq)]
+pub(crate) enum CrossCheck {
+    /// Classes matching the pattern that the listing did not offer. `truncated` means the
+    /// row cap was hit, so the count is a floor.
+    Found {
+        rows: Vec<NotListable>,
+        truncated: bool,
+    },
+    /// The query ran, and nothing anywhere matches. The ONLY state that may say "no such
+    /// class".
+    NoSuchClass,
+    /// The query could not be run or could not be read. NOT a verdict.
+    Unavailable(String),
+}
+
+/// Issue #100: the most rows the cross-check will name. One more than this is fetched so a
+/// full page can be reported as a floor rather than as the truth.
+const NOT_LISTABLE_ROW_CAP: usize = 100;
+
+/// Issue #100: the most class names the cross-check prints into its message.
+const NOT_LISTABLE_NAMES_SHOWN: usize = 20;
+
+/// Issue #100: does a class matching `pattern` exist even though the CLS listing did not
+/// offer one?
+///
+/// `%Api.Atelier.v1:GetDocNames` runs `%Library.RoutineMgr:StudioOpenDialog`, which omits
+/// precisely `Hidden = 1 OR GeneratedBy <> ''`. Measured on the dev instance, per package,
+/// as (ClassDefinition rows / listed / delta / rows with `Hidden=1 OR GeneratedBy<>''`):
+/// `EnsPortal*` 251/224/27/27, `EnsLib.HL7*` 67/58/9/9, `Ens.Alerting*` 23/16/7/7,
+/// `EnsPortal.I*` 2/0/2/2. Passing `ShowGenerated=1` does NOT recover them (`Ens.Alerting*`
+/// stays 16 either way), so no Atelier flag can fix this — a second source is the only route.
+///
+/// SOURCE TABLE: `%Dictionary.ClassDefinition` alone. `%Dictionary.CompiledClass` returned
+/// identical counts for all three affected packages on this instance (67 / 251 / 2), so
+/// unioning it would exactly double the cost of a path chosen for being cheap. That is a
+/// measurement, not a preference — do not "improve" it back without re-measuring.
+///
+/// COST, measured end-to-end through the tool against the dev instance, not server-side:
+/// the empty wildcard path went from 39–43 ms to 53–64 ms, i.e. +20 ms / roughly +50%, on a
+/// call that has already failed and compiled nothing. The query itself is ~22 ms warm
+/// through the full MCP + HTTP round trip. That is MORE than the +5–11 ms a server-side-only
+/// measurement predicts — the number here is the one a caller actually feels, and the
+/// difference is the round trip plus the index trade-off below. It is worth paying: it turns
+/// a confident wrong answer into a correct one that names the classes. The happy path pays
+/// ZERO — it never reaches this function — pinned by
+/// `the_cross_check_never_runs_on_the_happy_path`.
+///
+/// `LIKE` on the WHOLE stem, not `%STARTSWITH` on the literal prefix: a mid-pattern `*`
+/// (`EnsPortal.*Maps`) under a prefix query returns `EnsPortal.…` in alphabetical order and
+/// the row cap could truncate the real match away — a new false negative. Pushing the whole
+/// pattern into `LIKE` makes the cap a genuine "too many to name".
+///
+/// `UPPER(Name) LIKE UPPER(?)` AND NOT the cheaper `Name LIKE ?`, which is the one place
+/// this function knowingly gives up an index. Measured on this instance: plain `LIKE` 5.8–6.8
+/// ms, `UPPER(...)` 15.9–23.5 ms. The plain form is CASE-SENSITIVE — verified live,
+/// `Name LIKE 'ensportal.i%'` returns 0 rows where `'EnsPortal.I%'` returns 2, and
+/// `%STARTSWITH 'ensportal.i'` returns 0 as well — while `wildcard_matcher`'s regex is
+/// `(?i)` and the /docnames expansion it is checking is case-insensitive too. A cross-check
+/// NARROWER than the selection it checks can only manufacture false negatives, which is the
+/// exact bug class this whole change exists to remove. So the ~16 ms is bought deliberately.
+/// Do not "optimise" the UPPER away without re-reading this paragraph.
+async fn not_listable_crosscheck(
+    iris: &IrisConnection,
+    client: &reqwest::Client,
+    pattern: &str,
+    namespace: &str,
+) -> CrossCheck {
+    let Some((re, want_system)) = wildcard_matcher(pattern) else {
+        // A pattern that compiles to no regex selects nothing anywhere — the expansion
+        // already reached the same conclusion by the same route.
+        return CrossCheck::NoSuchClass;
+    };
+    let like = like_pattern(wildcard_pattern_stem(pattern));
+    // Parameterised, via the existing `/action/query` path — no interpolation, no embedded
+    // ObjectScript, so neither the #67 escaping rule nor the postconditional rule gains any
+    // new surface here.
+    let sql = format!(
+        "SELECT TOP {} Name, Hidden, GeneratedBy FROM %Dictionary.ClassDefinition \
+         WHERE UPPER(Name) LIKE UPPER(?) ESCAPE '\\' ORDER BY Name",
+        NOT_LISTABLE_ROW_CAP + 1
+    );
+    let body = match iris
+        .query(
+            &sql,
+            vec![serde_json::Value::String(like)],
+            namespace,
+            client,
+        )
+        .await
+    {
+        Ok(b) => b,
+        Err(e) => return CrossCheck::Unavailable(e.to_string()),
+    };
+    let Some(content) = body["result"]["content"].as_array() else {
+        return CrossCheck::Unavailable(
+            "the /action/query response carried no result.content array".into(),
+        );
+    };
+    let truncated = content.len() > NOT_LISTABLE_ROW_CAP;
+    let rows: Vec<NotListable> = content
+        .iter()
+        .filter_map(|r| {
+            let name = r["Name"].as_str()?;
+            // NOT `docname_stem`: these names carry no extension. See `wildcard_matcher`.
+            if (!want_system && name.starts_with('%')) || !re.is_match(name) {
+                return None;
+            }
+            Some(NotListable {
+                name: name.to_string(),
+                // Atelier's JSON renders the boolean column as `true`/`false`; older shapes
+                // send 1/0. Accept both rather than silently reading "not hidden".
+                hidden: r["Hidden"].as_bool().unwrap_or(false)
+                    || matches!(r["Hidden"].as_i64(), Some(n) if n != 0),
+                generated_by: r["GeneratedBy"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string),
+            })
+        })
+        .collect();
+    match (rows.is_empty(), truncated) {
+        // The cap was hit AND the client re-filter kept nothing: the rows that would match
+        // may have been truncated away before we ever saw them. That is "cannot tell", not
+        // "does not exist" — the whole reason `Unavailable` exists.
+        (true, true) => CrossCheck::Unavailable(format!(
+            "the cross-check hit its {NOT_LISTABLE_ROW_CAP}-row cap and none of the rows it \
+             saw matched, so a matching class may have been truncated away"
+        )),
+        (true, false) => CrossCheck::NoSuchClass,
+        (false, _) => CrossCheck::Found { rows, truncated },
+    }
+}
+
+/// Issue #100: what to tell the caller about classes the listing cannot reach.
+///
+/// The advice SPLITS, and the issue's own suggested wording gets one half wrong. Verified
+/// live on the dev instance:
+///   `iris_compile {"target":"EnsPortal.InterfaceMaps.cls"}` -> success, targets_compiled 1
+///   `iris_compile {"target":"Ens.Alerting.AlertManagerMessagesReceived.cls"}`
+///        -> COMPILE_ERROR "ERROR #5202: Nothing to compile"
+/// "Compile it by exact name" is right for a Hidden-but-authored class and WRONG for a
+/// generated one (`GeneratedBy = "Ens.Alerting.AlertManager.CLS"`), which has no source of
+/// its own — its generator must be compiled instead. The cross-check already has to read
+/// `GeneratedBy` to say this, and it arrives in the same row for free.
+fn not_listable_advice(rows: &[NotListable]) -> String {
+    let mut out = String::new();
+    let authored: Vec<&str> = rows
+        .iter()
+        .filter(|r| r.generated_by.is_none())
+        .map(|r| r.name.as_str())
+        .take(NOT_LISTABLE_NAMES_SHOWN)
+        .collect();
+    if !authored.is_empty() {
+        out.push_str(&format!(
+            " Compile these by exact name: {}.",
+            authored.join(", ")
+        ));
+    }
+    for r in rows
+        .iter()
+        .filter(|r| r.generated_by.is_some())
+        .take(NOT_LISTABLE_NAMES_SHOWN)
+    {
+        let gen = r.generated_by.as_deref().unwrap_or_default();
+        out.push_str(&format!(
+            " {} is generated by {} — compiling {} by name fails with ERROR #5202: Nothing \
+             to compile; compile {} instead.",
+            r.name,
+            docname_stem(gen),
+            r.name,
+            docname_stem(gen)
+        ));
+    }
+    out
+}
+
+/// Issue #100 (and #88/#94 before it): the NOT_FOUND a wildcard compile returns when the
+/// listing matched nothing.
+///
+/// Pure, so the wording and — far more importantly — the payload RULES are testable with no
+/// IRIS. The rules, in the order they matter:
+///
+/// 1. The sentence is about the LISTING, never about the world. `/docnames/CLS` omits Hidden
+///    and generated classes, so "no documents match" was asserting a negative the listing
+///    cannot support. Reproduced live: `iris_compile {"target":"EnsPortal.I*"}` answered
+///    NOT_FOUND while `EnsPortal.InterfaceMaps` existed and compiled fine by exact name.
+/// 2. `error_code` stays NOT_FOUND in every branch. Nothing was compiled, so it must remain
+///    an error, and callers branch on the code. The new information rides on `reason` /
+///    `crosscheck` / `not_listable`, the way #94 added `listing_narrowed` beside prose
+///    instead of minting a code.
+/// 3. `reason` exists ONLY when `crosscheck == "ok"`, and `not_listable` ONLY when the
+///    cross-check actually ran. A failed cross-check emitting `not_listable: []` would be
+///    #89 rewritten in a new function.
+fn compile_not_found_error(
+    target: &str,
+    namespace: &str,
+    listing_filter: Option<&str>,
+    listing_narrowed: bool,
+    scanned: usize,
+    cross: CrossCheck,
+) -> Result<CallToolResult, McpError> {
+    // #94: `scanned` STOPS meaning "documents in the namespace" the moment the listing is
+    // narrowed server-side, so the two cases get two sentences. Left alone, this would say
+    // "scanned 0 CLS document(s) in namespace APP" for a typo'd package — which reads as
+    // "the namespace is empty".
+    let mut msg = match listing_filter {
+        Some(f) => format!(
+            "iris_compile: the Atelier CLS listing for namespace {namespace} — narrowed \
+             server-side to names containing '{f}' — returned {scanned} candidate \
+             document(s), none matching '{target}'."
+        ),
+        None => format!(
+            "iris_compile: scanned {scanned} CLS document(s) in namespace {namespace}; none \
+             matches '{target}'."
+        ),
+    };
+    // The floor, present in every branch and costing nothing: what the listing cannot see.
+    msg.push_str(
+        " That listing (/docnames/CLS) does not include Hidden or generated classes, so a \
+         wildcard can never reach those — a class can still be compiled by its exact name, \
+         which needs no listing.",
+    );
+
+    let mut extra = serde_json::json!({
+        "pattern": target,
+        "namespace": namespace,
+        // Machine-readable, so the distinction is not only in the prose.
+        "listing_narrowed": listing_narrowed,
+        "listing_filter": listing_filter,
+        "candidates_scanned": scanned,
+        // Static, zero-cost, and the reason this NOT_FOUND is not proof of absence.
+        "listing_source": "atelier /docnames/CLS",
+        "listing_omits": ["Hidden", "generated"],
+    });
+
+    match cross {
+        CrossCheck::Found { rows, truncated } => {
+            let shown: Vec<&str> = rows
+                .iter()
+                .map(|r| r.name.as_str())
+                .take(NOT_LISTABLE_NAMES_SHOWN)
+                .collect();
+            let count = if truncated {
+                format!("at least {}", rows.len())
+            } else {
+                rows.len().to_string()
+            };
+            msg = format!(
+                "iris_compile: no LISTABLE class matches '{target}' in namespace \
+                 {namespace}, but %Dictionary.ClassDefinition holds {count} class(es) that \
+                 do: {}{}. Atelier's /docnames/CLS omits Hidden and generated classes, \
+                 which is why the wildcard cannot reach them.{}",
+                shown.join(", "),
+                if rows.len() > shown.len() {
+                    format!(" (showing {} of {count})", shown.len())
+                } else {
+                    String::new()
+                },
+                not_listable_advice(&rows),
+            );
+            extra["reason"] = serde_json::json!("not_listable");
+            extra["crosscheck"] = serde_json::json!("ok");
+            extra["not_listable_total"] = serde_json::json!(rows.len());
+            extra["not_listable_truncated"] = serde_json::json!(truncated);
+            extra["not_listable"] = serde_json::Value::Array(
+                rows.iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "name": r.name,
+                            "hidden": r.hidden,
+                            "generated_by": r.generated_by,
+                        })
+                    })
+                    .collect(),
+            );
+        }
+        CrossCheck::NoSuchClass => {
+            msg.push_str(
+                " %Dictionary.ClassDefinition — which DOES include Hidden and generated \
+                 classes — holds no match either, so this is a genuine miss.",
+            );
+            extra["reason"] = serde_json::json!("no_such_class");
+            extra["crosscheck"] = serde_json::json!("ok");
+            extra["not_listable"] = serde_json::json!([]);
+        }
+        CrossCheck::Unavailable(why) => {
+            // #89/#119 on the NEW path. "We could not check" must never be rendered as
+            // "it does not exist": no `reason`, and no empty `not_listable` array to be
+            // misread as one.
+            msg.push_str(&format!(
+                " The %Dictionary.ClassDefinition cross-check that would settle whether a \
+                 Hidden or generated class matches could not be run ({why}), so this is not \
+                 proof that no such class exists."
+            ));
+            extra["crosscheck"] = serde_json::json!("unavailable");
+            extra["crosscheck_error"] = serde_json::json!(why);
+        }
+    }
+
+    msg.push_str(
+        " Wildcards expand CLASS documents only: compile a .mac/.int/.inc routine by its \
+         exact name. Nothing was compiled.",
+    );
+    crate::tools::envelope::fail_with("NOT_FOUND", &msg, extra)
 }
 
 // ── Compile-console diagnostics (issue #80) ───────────────────────────────────
@@ -7937,6 +8600,469 @@ mod wildcard_listing_failure_tests {
                     .unwrap()
                     .contains("Nothing was compiled"),
                 "{v}"
+            );
+        });
+    }
+
+    // ── Issue #100: the classes /docnames/CLS cannot see ─────────────────────
+
+    /// An Atelier `/action/query` body for the cross-check: (Name, Hidden, GeneratedBy).
+    fn class_rows(rows: &[(&str, bool, &str)]) -> serde_json::Value {
+        serde_json::json!({"result": {"content": rows.iter()
+            .map(|(n, h, g)| serde_json::json!({"Name": n, "Hidden": h, "GeneratedBy": g}))
+            .collect::<Vec<_>>()}})
+    }
+
+    /// Mount `/action/query` with a fixed body, expecting exactly `times` calls.
+    async fn mount_query(server: &MockServer, body: serde_json::Value, times: u64) {
+        Mock::given(method("POST"))
+            .and(path_regex(r".*/action/query$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(times)
+            .mount(server)
+            .await;
+    }
+
+    /// Mount `/docnames/CLS?filter=<f>` returning `names`.
+    async fn mount_listing(server: &MockServer, filter: &str, names: &[&str]) {
+        Mock::given(method("GET"))
+            .and(path_regex(r".*/docnames/CLS$"))
+            .and(query_param("filter", filter))
+            .respond_with(ResponseTemplate::new(200).set_body_json(listing(names)))
+            .mount(server)
+            .await;
+    }
+
+    /// `/action/compile` must NEVER be called. `expect(0)` is asserted on drop.
+    async fn forbid_compile(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path_regex(r".*/action/compile$"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(server)
+            .await;
+    }
+
+    /// #100, the filed repro. `iris_compile {"target":"EnsPortal.I*"}` answered NOT_FOUND
+    /// "No documents match pattern" while `EnsPortal.InterfaceMaps` existed — `iris_doc`
+    /// said `exists:true` in the same session and the class compiled fine by exact name.
+    /// `%Api.Atelier.v1:GetDocNames` omits precisely `Hidden = 1 OR GeneratedBy <> ''`
+    /// (measured: EnsPortal.I* is 2 rows in %Dictionary.ClassDefinition and 0 in the
+    /// listing), and `ShowGenerated=1` does not recover them — so the listing alone can
+    /// never support the negative the old message asserted.
+    #[test]
+    fn a_wildcard_that_matches_no_listable_class_names_the_classes_that_exist() {
+        rt().block_on(async {
+            let server = MockServer::start().await;
+            mount_listing(&server, "EnsPortal.I", &[]).await;
+            mount_query(
+                &server,
+                class_rows(&[
+                    ("EnsPortal.InterfaceMaps", true, ""),
+                    ("EnsPortal.InterfaceReferences", true, ""),
+                ]),
+                1,
+            )
+            .await;
+            forbid_compile(&server).await;
+
+            let (is_err, v) = compile_against(&server, "APP", None, "EnsPortal.I*").await;
+            assert_eq!(is_err, Some(true), "nothing was compiled: {v}");
+            assert_eq!(v["error_code"], "NOT_FOUND", "the contract is stable: {v}");
+            assert_eq!(v["reason"], "not_listable", "{v}");
+            assert_eq!(v["crosscheck"], "ok", "{v}");
+            assert_eq!(v["not_listable_total"], 2, "{v}");
+            assert_eq!(v["not_listable_truncated"], false, "{v}");
+            assert_eq!(
+                v["not_listable"][0]["name"], "EnsPortal.InterfaceMaps",
+                "{v}"
+            );
+            assert_eq!(v["not_listable"][0]["hidden"], true, "{v}");
+            assert!(v["not_listable"][0]["generated_by"].is_null(), "{v}");
+
+            let msg = v["error"].as_str().unwrap();
+            assert!(msg.contains("EnsPortal.InterfaceMaps"), "{v}");
+            assert!(msg.contains("EnsPortal.InterfaceReferences"), "{v}");
+            assert!(msg.contains("no LISTABLE class matches"), "{v}");
+            assert!(
+                msg.contains("Compile these by exact name"),
+                "a Hidden but AUTHORED class compiles by name — verified live: {v}"
+            );
+            assert!(
+                !msg.contains("No documents match pattern"),
+                "the old sentence asserted a negative the listing cannot support: {v}"
+            );
+            assert!(msg.contains("Nothing was compiled"), "{v}");
+            assert_eq!(v["listing_source"], "atelier /docnames/CLS", "{v}");
+            assert_eq!(
+                v["listing_omits"],
+                serde_json::json!(["Hidden", "generated"]),
+                "{v}"
+            );
+        });
+    }
+
+    /// #100: the advice SPLITS, and the issue's own suggested wording gets one half wrong.
+    /// Verified live: `iris_compile {"target":"EnsPortal.InterfaceMaps.cls"}` succeeds, but
+    /// `iris_compile {"target":"Ens.Alerting.AlertManagerMessagesReceived.cls"}` fails with
+    /// COMPILE_ERROR "ERROR #5202: Nothing to compile" — a generated class has no source of
+    /// its own. Telling a caller to "compile it by exact name" would send them straight into
+    /// that error, which is why `GeneratedBy` is selected at all.
+    #[test]
+    fn a_generated_class_is_told_to_compile_its_generator_not_itself() {
+        rt().block_on(async {
+            let server = MockServer::start().await;
+            mount_listing(&server, "Ens.Alerting.AlertManagerM", &[]).await;
+            mount_query(
+                &server,
+                class_rows(&[(
+                    "Ens.Alerting.AlertManagerMessagesReceived",
+                    true,
+                    "Ens.Alerting.AlertManager.CLS",
+                )]),
+                1,
+            )
+            .await;
+            forbid_compile(&server).await;
+
+            let (_, v) = compile_against(&server, "APP", None, "Ens.Alerting.AlertManagerM*").await;
+            assert_eq!(v["error_code"], "NOT_FOUND", "{v}");
+            assert_eq!(v["reason"], "not_listable", "{v}");
+            assert_eq!(
+                v["not_listable"][0]["generated_by"], "Ens.Alerting.AlertManager.CLS",
+                "{v}"
+            );
+            let msg = v["error"].as_str().unwrap();
+            assert!(
+                msg.contains("is generated by Ens.Alerting.AlertManager "),
+                "name the GENERATOR, stemmed of its .CLS: {v}"
+            );
+            assert!(
+                msg.contains("ERROR #5202"),
+                "say what compiling it by name would actually do: {v}"
+            );
+            assert!(
+                !msg.contains("Compile these by exact name"),
+                "that advice is WRONG for a generated class and must not appear: {v}"
+            );
+        });
+    }
+
+    /// #100 B4, the explicit false-positive criterion. A genuine typo must still be a clean
+    /// NOT_FOUND — the cross-check exists to sharpen the verdict, not to soften it. Verified
+    /// live that `Zzz.Nope.*` and `%ZzzNope.*` really do return zero rows.
+    #[test]
+    fn a_pattern_that_matches_nothing_anywhere_is_still_not_found() {
+        rt().block_on(async {
+            let server = MockServer::start().await;
+            mount_listing(&server, "Zzz.Nope.", &[]).await;
+            mount_query(&server, class_rows(&[]), 1).await;
+            forbid_compile(&server).await;
+
+            let (is_err, v) = compile_against(&server, "APP", None, "Zzz.Nope.*").await;
+            assert_eq!(is_err, Some(true), "{v}");
+            assert_eq!(v["error_code"], "NOT_FOUND", "{v}");
+            assert_eq!(v["reason"], "no_such_class", "{v}");
+            assert_eq!(v["crosscheck"], "ok", "{v}");
+            assert_eq!(v["not_listable"], serde_json::json!([]), "{v}");
+            assert!(
+                v["error"].as_str().unwrap().contains("genuine miss"),
+                "the cross-check RAN and settled it — say so: {v}"
+            );
+        });
+    }
+
+    /// #100, THE COST GUARD. The cross-check is inside `if targets.is_empty()`, reachable
+    /// only after a listing that returned 200 and matched nothing, so a successful compile
+    /// pays exactly zero extra round trips. `expect(0)` on `/action/query` is asserted when
+    /// the server drops: this is the test that fails the day someone "helpfully" hoists the
+    /// cross-check above the emptiness check.
+    #[test]
+    fn the_cross_check_never_runs_on_the_happy_path() {
+        rt().block_on(async {
+            let server = MockServer::start().await;
+            mount_listing(
+                &server,
+                "APPPKG.",
+                &["APPPKG.FoundationProduction.cls", "APPPKG.Sub.Helper.cls"],
+            )
+            .await;
+            mount_query(&server, class_rows(&[]), 0).await;
+            Mock::given(method("POST"))
+                .and(path_regex(r".*/action/compile$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(clean_compile()))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let (is_err, v) = compile_against(&server, "APP", None, "APPPKG.*").await;
+            assert_eq!(is_err, Some(false), "{v}");
+            assert_eq!(v["targets_compiled"], 2, "{v}");
+        });
+    }
+
+    /// #100 C: the success payload over-claims too. Reproduced live:
+    /// `iris_compile {"target":"EnsPortal.*Maps"}` returns success:true /
+    /// targets_compiled:1 while EnsPortal.InterfaceMaps also matches and was silently never
+    /// compiled. A genuine fix needs the cross-check on the happy path, which the cost rule
+    /// above forbids — so the limitation is DISCLOSED, as a string literal costing nothing.
+    #[test]
+    fn the_happy_path_payload_discloses_what_the_listing_omits() {
+        rt().block_on(async {
+            let server = MockServer::start().await;
+            mount_listing(&server, "APPPKG.", &["APPPKG.FoundationProduction.cls"]).await;
+            mount_query(&server, class_rows(&[]), 0).await;
+            Mock::given(method("POST"))
+                .and(path_regex(r".*/action/compile$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(clean_compile()))
+                .mount(&server)
+                .await;
+
+            let (is_err, v) = compile_against(&server, "APP", None, "APPPKG.*").await;
+            assert_eq!(is_err, Some(false), "{v}");
+            let src = v["expansion_source"].as_str().unwrap_or_default();
+            assert!(src.contains("Hidden"), "{v}");
+            assert!(src.contains("generated"), "{v}");
+            assert!(src.contains("exact name"), "{v}");
+        });
+    }
+
+    /// #100: every #88/#93 guard returns BEFORE the emptiness check, so the cross-check is
+    /// downstream of them by construction rather than by a flag anyone can flip. Pinned with
+    /// `expect(0)` mocks instead of by reading the call site, and each message asserted
+    /// unchanged.
+    #[test]
+    fn the_cross_check_never_runs_for_the_88_guards() {
+        rt().block_on(async {
+            // (a) SCOPE_REQUIRED — refused before the listing is even fetched.
+            {
+                let server = MockServer::start().await;
+                Mock::given(method("GET"))
+                    .and(path_regex(r".*/docnames/CLS$"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(listing(&[])))
+                    .expect(0)
+                    .mount(&server)
+                    .await;
+                mount_query(&server, class_rows(&[]), 0).await;
+                forbid_compile(&server).await;
+                let (is_err, v) = compile_against(&server, "APP", None, "*").await;
+                assert_eq!(is_err, Some(true), "{v}");
+                assert_eq!(v["error_code"], "SCOPE_REQUIRED", "{v}");
+                assert!(
+                    v["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("has nothing before its first '*'"),
+                    "{v}"
+                );
+            }
+            // (b) TOO_BROAD — the expansion matched more than the cap.
+            {
+                let server = MockServer::start().await;
+                let names: Vec<String> = (0..WILDCARD_EXPANSION_CAP + 1)
+                    .map(|i| format!("APPPKG.C{i}.cls"))
+                    .collect();
+                let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+                mount_listing(&server, "APPPKG.", &refs).await;
+                mount_query(&server, class_rows(&[]), 0).await;
+                forbid_compile(&server).await;
+                let (is_err, v) = compile_against(&server, "APP", None, "APPPKG.*").await;
+                assert_eq!(is_err, Some(true), "{v}");
+                assert_eq!(v["error_code"], "TOO_BROAD", "{v}");
+                assert_eq!(v["matched"], WILDCARD_EXPANSION_CAP + 1, "{v}");
+                assert!(
+                    v["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Nothing was compiled"),
+                    "{v}"
+                );
+            }
+            // (c) LISTING_UNAVAILABLE — nothing to expand against, so nothing to cross-check.
+            {
+                let server = MockServer::start().await;
+                Mock::given(method("GET"))
+                    .and(path_regex(r".*/docnames/CLS$"))
+                    .respond_with(ResponseTemplate::new(500))
+                    .mount(&server)
+                    .await;
+                mount_query(&server, class_rows(&[]), 0).await;
+                forbid_compile(&server).await;
+                let (is_err, v) = compile_against(&server, "APP", None, "APPPKG.*").await;
+                assert_eq!(is_err, Some(true), "{v}");
+                assert_eq!(v["error_code"], "LISTING_UNAVAILABLE", "{v}");
+                assert!(
+                    v["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Nothing was compiled"),
+                    "{v}"
+                );
+            }
+        });
+    }
+
+    /// #100 B5 — the #89/#119 rule applied to the NEW path, and the one that is easiest to
+    /// get wrong. A cross-check that could not run (SQL error, HTTP error, transport drop,
+    /// no privilege on %Dictionary) must NOT emit `not_listable: []` and must NOT set
+    /// `reason` to "no_such_class": an empty array here would read as "it does not exist"
+    /// and would be #89 rewritten one function over. The verdict stays NOT_FOUND — a caller
+    /// who could compile before must still be told the same thing — and only the extra
+    /// sentence changes.
+    #[test]
+    fn a_failed_cross_check_does_not_read_as_no_such_class() {
+        rt().block_on(async {
+            let server = MockServer::start().await;
+            mount_listing(&server, "EnsPortal.I", &[]).await;
+            Mock::given(method("POST"))
+                .and(path_regex(r".*/action/query$"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&server)
+                .await;
+            forbid_compile(&server).await;
+
+            let (is_err, v) = compile_against(&server, "APP", None, "EnsPortal.I*").await;
+            assert_eq!(is_err, Some(true), "{v}");
+            assert_eq!(
+                v["error_code"], "NOT_FOUND",
+                "the verdict must not move: {v}"
+            );
+            assert_eq!(v["crosscheck"], "unavailable", "{v}");
+            assert!(
+                v.get("reason").is_none(),
+                "no verdict may be recorded when the check did not run: {v}"
+            );
+            assert!(
+                v.get("not_listable").is_none(),
+                "an empty array here IS the bug: {v}"
+            );
+            let msg = v["error"].as_str().unwrap();
+            assert!(msg.contains("could not be run"), "{v}");
+            assert!(
+                msg.contains("not proof that no such class exists"),
+                "cannot-tell must never be stated as a fact: {v}"
+            );
+        });
+    }
+
+    /// #100, pure: the escape must happen BEFORE `*` is translated, or a pattern's own
+    /// literal `%` widens the LIKE into a leading-wildcard scan and the row cap can truncate
+    /// the real match away — a brand-new false "no such class" inside the fix for one.
+    #[test]
+    fn like_pattern_escapes_literal_wildcards_before_translating_star() {
+        assert_eq!(like_pattern("EnsPortal.I*"), "EnsPortal.I%");
+        assert_eq!(like_pattern("%Library.*"), r"\%Library.%");
+        assert_eq!(like_pattern("A_B.*"), r"A\_B.%");
+        assert_eq!(like_pattern("EnsPortal.*Maps"), "EnsPortal.%Maps");
+        // A literal backslash is escaped too, so `ESCAPE '\'` cannot swallow the next char.
+        assert_eq!(like_pattern(r"Odd\Name*"), r"Odd\\Name%");
+    }
+
+    /// #100, pure: the shared matcher, and the stemming TRAP it makes easy to get wrong.
+    /// `/docnames` names carry `.cls` and must be stemmed; `%Dictionary.ClassDefinition`
+    /// names do not and must NOT be — `docname_stem` would mangle a real class named
+    /// `Pkg.Int` into `Pkg` and it would then fail to match its own pattern. Asserted rather
+    /// than merely commented.
+    #[test]
+    fn the_shared_matcher_selects_identically_for_docnames_and_sql_names() {
+        let (re, want_system) = wildcard_matcher("EnsPortal.I*").unwrap();
+        assert!(!want_system);
+        assert!(re.is_match("EnsPortal.InterfaceMaps"), "raw SQL name");
+        assert!(
+            re.is_match(docname_stem("EnsPortal.InterfaceMaps.cls")),
+            "stemmed docname"
+        );
+
+        // The trap: a SQL name whose last segment happens to be a document extension.
+        let (re, _) = wildcard_matcher("Pkg.*").unwrap();
+        assert!(
+            re.is_match("Pkg.Int"),
+            "a SQL name must be matched DIRECTLY — stemming it would leave 'Pkg'"
+        );
+        assert!(
+            !re.is_match(docname_stem("Pkg.Int")),
+            "…and this is what stemming it would do, which is why it must not happen"
+        );
+
+        // `%` system documents need an explicit `%` pattern, on both sides.
+        let (re, want_system) = wildcard_matcher("Foo.*").unwrap();
+        assert!(!want_system, "a non-% pattern must not drag % classes in");
+        assert!(!re.is_match("%Foo.Bar"));
+        let (_, want_system) = wildcard_matcher("%Api.*").unwrap();
+        assert!(want_system);
+
+        // Regex metacharacters in the pattern are LITERAL — `docname_pattern_regex` runs
+        // `regex::escape` before translating `*`, so `A|*` cannot become an unanchored
+        // alternation that selects the whole namespace.
+        let (re, _) = wildcard_matcher("A[*").unwrap();
+        assert!(re.is_match("A[Anything"), "'[' is literal");
+        assert!(!re.is_match("AAnything"), "'[' is not a character class");
+        let (re, _) = wildcard_matcher("A|*").unwrap();
+        assert!(
+            !re.is_match("Zzz.Whatever"),
+            "the right branch must not float free"
+        );
+    }
+
+    /// #100: the row cap is a "too many to name" cap, so a full page must be reported as a
+    /// FLOOR. Printing 20 names and a bare count of 101 would understate a package the
+    /// caller is about to go looking through by hand.
+    #[test]
+    fn a_capped_cross_check_reports_a_floor_not_a_count() {
+        rt().block_on(async {
+            let server = MockServer::start().await;
+            mount_listing(&server, "Big.Pkg.", &[]).await;
+            let names: Vec<String> = (0..NOT_LISTABLE_ROW_CAP + 1)
+                .map(|i| format!("Big.Pkg.C{i:03}"))
+                .collect();
+            let rows: Vec<(&str, bool, &str)> =
+                names.iter().map(|n| (n.as_str(), true, "")).collect();
+            mount_query(&server, class_rows(&rows), 1).await;
+            forbid_compile(&server).await;
+
+            let (_, v) = compile_against(&server, "APP", None, "Big.Pkg.*").await;
+            assert_eq!(v["error_code"], "NOT_FOUND", "{v}");
+            assert_eq!(v["reason"], "not_listable", "{v}");
+            assert_eq!(v["not_listable_truncated"], true, "{v}");
+            let msg = v["error"].as_str().unwrap();
+            assert!(
+                msg.contains(&format!("at least {}", NOT_LISTABLE_ROW_CAP + 1)),
+                "a full page is a floor, not a total: {v}"
+            );
+            assert!(
+                msg.contains(&format!("showing {NOT_LISTABLE_NAMES_SHOWN} of at least")),
+                "say how many of them are actually printed: {v}"
+            );
+        });
+    }
+
+    /// #100: the truncation failure mode `like_pattern`'s escaping exists to prevent, caught
+    /// on the other side as well. If the cap was hit AND the client re-filter kept nothing,
+    /// the rows that would have matched may have been cut off before we ever saw them — that
+    /// is "cannot tell", and folding it into `no_such_class` would manufacture exactly the
+    /// false negative this whole issue is about.
+    #[test]
+    fn a_truncated_cross_check_that_matched_nothing_is_unavailable_not_absent() {
+        rt().block_on(async {
+            let server = MockServer::start().await;
+            mount_listing(&server, "Big.Pkg.", &[]).await;
+            // A full page, none of which survives the client-side regex.
+            let names: Vec<String> = (0..NOT_LISTABLE_ROW_CAP + 1)
+                .map(|i| format!("Unrelated.C{i:03}"))
+                .collect();
+            let rows: Vec<(&str, bool, &str)> =
+                names.iter().map(|n| (n.as_str(), true, "")).collect();
+            mount_query(&server, class_rows(&rows), 1).await;
+            forbid_compile(&server).await;
+
+            let (_, v) = compile_against(&server, "APP", None, "Big.Pkg.*").await;
+            assert_eq!(v["error_code"], "NOT_FOUND", "{v}");
+            assert_eq!(v["crosscheck"], "unavailable", "{v}");
+            assert!(v.get("reason").is_none(), "{v}");
+            assert!(v.get("not_listable").is_none(), "{v}");
+            assert!(
+                v["error"].as_str().unwrap().contains("truncated away"),
+                "say WHY it could not tell: {v}"
             );
         });
     }
@@ -9434,5 +10560,787 @@ mod get_log_params_tests {
         assert_ne!(r.is_error, Some(true));
         assert_eq!(with_noise, bare, "the exemptions must be invisible");
         assert!(with_noise.get("warnings").is_none(), "{with_noise}");
+    }
+}
+
+// ── Issues #101 / #102: what a tool says when IRIS answers something other than 200 ──
+//
+// Drives the REAL tool handlers against a mock Atelier, so every assertion here is the wire
+// answer a caller gets. The matrix is deliberately the same at every site: a 2xx keeps
+// today's answer, a 404 whose namespace IS listed keeps the tool's own not-found answer, a
+// 404 whose namespace is NOT listed names the namespace, and a 401 is an ERROR — never a
+// confident negative fact. The 401 cases were written first: the issue text described the
+// defect as 404-blindness, and reproducing it with a wrong password against a namespace that
+// EXISTS showed the sites were blind to every non-2xx.
+#[cfg(test)]
+mod http_status_answer_tests {
+    use super::*;
+    use crate::iris::connection::{DiscoverySource, IrisConnection};
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    fn root_descriptor(namespaces: &[&str]) -> serde_json::Value {
+        serde_json::json!({"result": {"content": {
+            "version": "IRIS for UNIX 2026.1", "api": 8, "namespaces": namespaces
+        }}})
+    }
+
+    fn tools_for(server: &MockServer) -> IrisTools {
+        let conn = IrisConnection::new(
+            server.uri(),
+            "APP",
+            "_SYSTEM",
+            "SYS",
+            DiscoverySource::EnvVar,
+        );
+        IrisTools::new_with_toolset(Some(conn), Toolset::Interop).unwrap()
+    }
+
+    fn payload(r: &CallToolResult) -> serde_json::Value {
+        match &r.content[0].raw {
+            rmcp::model::RawContent::Text(t) => serde_json::from_str(&t.text).unwrap(),
+            _ => panic!("expected text content"),
+        }
+    }
+
+    /// A mock Atelier: `verb`+`path` answers `tpl`, and the root descriptor lists `["APP"]`.
+    async fn server_with(verb: &str, path: &str, tpl: ResponseTemplate) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method(verb))
+            .and(path_regex(path))
+            .respond_with(tpl)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/api/atelier/$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(root_descriptor(&["APP"])))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn introspect(server: &MockServer, ns: &str) -> (Option<bool>, serde_json::Value) {
+        let r = tools_for(server)
+            .docs_introspect(Parameters(
+                serde_json::from_value(
+                    serde_json::json!({"class_name": "Ens.Director", "namespace": ns}),
+                )
+                .unwrap(),
+            ))
+            .await
+            .expect("the tool must answer, not error out of the transport");
+        (r.is_error, payload(&r))
+    }
+
+    /// (a)+(b) The two answers that must NOT change. `methods:[]` for a class that genuinely
+    /// has none is the control captured live — turning THAT into an error would be a new bug.
+    #[test]
+    fn introspect_still_answers_an_empty_method_list_for_an_unknown_class() {
+        rt().block_on(async {
+            let server = server_with(
+                "POST",
+                r".*/action/query$",
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"result": {"content": []}})),
+            )
+            .await;
+            let (is_err, v) = introspect(&server, "APP").await;
+            assert_ne!(is_err, Some(true), "{v}");
+            assert_eq!(v["success"], true, "{v}");
+            assert_eq!(v["methods"], serde_json::json!([]), "{v}");
+            assert_eq!(v["properties"], serde_json::json!([]), "{v}");
+        });
+    }
+
+    /// #102 P0. `null` vs `[]` was the ONLY thing separating "I could not reach it" from "it
+    /// has no methods", and no caller makes that distinction.
+    #[test]
+    fn introspect_never_reports_null_methods_on_a_successful_envelope() {
+        rt().block_on(async {
+            for (status, expected) in [
+                (401u16, "IRIS_AUTH_FAILED"),
+                (403, "IRIS_FORBIDDEN"),
+                (500, "IRIS_SERVER_ERROR"),
+            ] {
+                let server =
+                    server_with("POST", r".*/action/query$", ResponseTemplate::new(status)).await;
+                let (is_err, v) = introspect(&server, "APP").await;
+                assert_eq!(is_err, Some(true), "{v}");
+                assert_eq!(v["error_code"], expected, "{v}");
+                assert_eq!(v["success"], false, "{v}");
+                assert!(v.get("methods").is_none(), "no negative FACT: {v}");
+                assert_eq!(v["namespace"], "APP", "{v}");
+            }
+        });
+    }
+
+    #[test]
+    fn introspect_names_the_namespace_on_a_404() {
+        rt().block_on(async {
+            let server = server_with("POST", r".*/action/query$", ResponseTemplate::new(404)).await;
+            let (is_err, v) = introspect(&server, "ZZNOSUCHNS").await;
+            assert_eq!(is_err, Some(true), "{v}");
+            assert_eq!(v["error_code"], ERR_NAMESPACE_NOT_FOUND, "{v}");
+            assert!(
+                v["hint"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Nothing was introspected"),
+                "the hint must not claim a compile that never happened: {v}"
+            );
+        });
+    }
+
+    async fn query(server: &MockServer, ns: &str) -> (Option<bool>, serde_json::Value) {
+        let r = tools_for(server)
+            .iris_query(Parameters(
+                serde_json::from_value(
+                    serde_json::json!({"query": "SELECT 1 AS n", "namespace": ns}),
+                )
+                .unwrap(),
+            ))
+            .await
+            .expect("the tool must answer");
+        (r.is_error, payload(&r))
+    }
+
+    /// The verbatim #101 repro. A 401 sent the caller to debug networking — "Check IRIS_HOST
+    /// and IRIS_WEB_PORT" — while IRIS was answering perfectly on that very host and port.
+    #[test]
+    fn a_wrong_password_is_named_instead_of_blaming_the_host_and_port() {
+        rt().block_on(async {
+            let server = server_with(
+                "POST",
+                r".*/action/query$",
+                ResponseTemplate::new(401).set_body_string("Unauthorized"),
+            )
+            .await;
+            let (is_err, v) = query(&server, "APP").await;
+            assert_eq!(is_err, Some(true), "{v}");
+            assert_eq!(v["error_code"], "IRIS_AUTH_FAILED", "{v}");
+            assert!(
+                !v.to_string().contains("Check IRIS_HOST"),
+                "the host and port are fine — IRIS answered: {v}"
+            );
+            assert!(v["hint"].as_str().unwrap().contains("IRIS_PASSWORD"), "{v}");
+            assert!(
+                v["attempted_url"]
+                    .as_str()
+                    .unwrap()
+                    .contains("/action/query"),
+                "{v}"
+            );
+        });
+    }
+
+    /// 401's sibling. If someone later collapses the two codes into one, this fails.
+    #[test]
+    fn a_forbidden_response_does_not_tell_the_caller_to_check_their_password() {
+        rt().block_on(async {
+            let server = server_with("POST", r".*/action/query$", ResponseTemplate::new(403)).await;
+            let (_, v) = query(&server, "APP").await;
+            assert_eq!(v["error_code"], "IRIS_FORBIDDEN", "{v}");
+            let hint = v["hint"].as_str().unwrap();
+            assert!(!v.to_string().contains("Check IRIS_HOST"), "{v}");
+            // The password is mentioned exactly once, to rule it OUT. IRIS validated it
+            // before it could evaluate %Development, so on a 403 it is provably correct and
+            // sending the caller back to it burns the session on the wrong variable.
+            assert!(hint.contains("password is not the problem"), "{v}");
+            assert!(
+                hint.contains("Do not change IRIS_USERNAME / IRIS_PASSWORD"),
+                "{v}"
+            );
+            assert!(hint.contains("%Development"), "{v}");
+        });
+    }
+
+    /// #102 P2: `iris_query` builds its own POST and checked the status itself, so fixing
+    /// `query_once` alone would never have reached it. No HTTP status may leave this tool as
+    /// IRIS_UNREACHABLE — an HTTP response is proof of reachability.
+    #[test]
+    fn iris_query_never_answers_unreachable_for_a_response_that_arrived() {
+        rt().block_on(async {
+            for status in [400u16, 401, 403, 404, 409, 423, 500, 503] {
+                let server =
+                    server_with("POST", r".*/action/query$", ResponseTemplate::new(status)).await;
+                let (is_err, v) = query(&server, "APP").await;
+                assert_eq!(is_err, Some(true), "{v}");
+                assert_ne!(v["error_code"], "IRIS_UNREACHABLE", "HTTP {status}: {v}");
+            }
+            // ...and a 404 whose namespace is absent from the root descriptor is attributed.
+            let server = server_with("POST", r".*/action/query$", ResponseTemplate::new(404)).await;
+            let (_, v) = query(&server, "ZZNOSUCHNS").await;
+            assert_eq!(v["error_code"], ERR_NAMESPACE_NOT_FOUND, "{v}");
+            assert_eq!(v["available_namespaces"], serde_json::json!(["APP"]), "{v}");
+        });
+    }
+
+    /// A SQL error still arrives byte-for-byte: Atelier reports it as 200 + `status.errors`,
+    /// and the body-first ordering in `query_once` keeps `status.errors` winning.
+    #[test]
+    fn a_sql_error_is_still_a_sql_error() {
+        rt().block_on(async {
+            let server = server_with(
+                "POST",
+                r".*/action/query$",
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "status": {"errors": [{"error": "ERROR #5540: SQLCODE: -30 Table not found"}]}
+                })),
+            )
+            .await;
+            let (_, v) = query(&server, "APP").await;
+            assert_eq!(v["error_code"], "SQL_ERROR", "{v}");
+            assert!(v["error"].as_str().unwrap().contains("SQLCODE: -30"), "{v}");
+        });
+    }
+
+    /// #102 P2 for the two tools that DO go through `query_once`. Both used to answer
+    /// IRIS_UNREACHABLE + "error decoding response body".
+    #[test]
+    fn iris_symbols_names_the_namespace_and_the_credentials() {
+        rt().block_on(async {
+            let symbols = |server: &MockServer, ns: &str| {
+                let tools = tools_for(server);
+                let ns = ns.to_string();
+                async move {
+                    let r = tools
+                        .iris_symbols(Parameters(
+                            serde_json::from_value(
+                                serde_json::json!({"query": "Ens.*", "namespace": ns}),
+                            )
+                            .unwrap(),
+                        ))
+                        .await
+                        .expect("the tool must answer");
+                    payload(&r)
+                }
+            };
+            let server = server_with("POST", r".*/action/query$", ResponseTemplate::new(404)).await;
+            let v = symbols(&server, "ZZNOSUCHNS").await;
+            assert_eq!(v["error_code"], ERR_NAMESPACE_NOT_FOUND, "{v}");
+            assert!(
+                !v.to_string().contains("error decoding response body"),
+                "{v}"
+            );
+
+            let server = server_with("POST", r".*/action/query$", ResponseTemplate::new(401)).await;
+            let v = symbols(&server, "APP").await;
+            assert_eq!(v["error_code"], "IRIS_AUTH_FAILED", "{v}");
+        });
+    }
+
+    async fn macros(server: &MockServer, ns: &str) -> (Option<bool>, serde_json::Value) {
+        let r = tools_for(server)
+            .iris_macro(Parameters(
+                serde_json::from_value(serde_json::json!({"action": "list", "namespace": ns}))
+                    .unwrap(),
+            ))
+            .await
+            .expect("the tool must answer");
+        (r.is_error, payload(&r))
+    }
+
+    /// #102 P0, the third lying-with-success site. A 2xx with nothing in it keeps today's
+    /// answer; a 401 must not be dressed up as "this namespace has no include files".
+    #[test]
+    fn iris_macro_list_separates_no_macros_from_no_answer() {
+        rt().block_on(async {
+            // The RTN listing carries .mac / .int / .inc together as OBJECTS. Unmasking the
+            // status (below) is what exposed that this tool asked for `/docnames/INC` — not an
+            // Atelier category at all, HTTP 400 on every instance — so the listing had never
+            // once worked and the swallowed non-2xx made it look like an empty namespace.
+            let server = server_with(
+                "GET",
+                r".*/docnames/RTN$",
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"result": {"content": [
+                        {"cat": "RTN", "name": "%assert.inc", "gen": false},
+                        {"cat": "RTN", "name": "MyApp.Util.mac", "gen": false},
+                        {"cat": "RTN", "name": "MyApp.Macros.INC", "gen": false},
+                    ]}}),
+                ),
+            )
+            .await;
+            let (is_err, v) = macros(&server, "APP").await;
+            assert_ne!(is_err, Some(true), "{v}");
+            assert_eq!(v["success"], true, "{v}");
+            assert_eq!(
+                v["macros"],
+                serde_json::json!(["%assert.inc", "MyApp.Macros.INC"]),
+                "only include files, case-insensitively, and .mac must not leak in: {v}"
+            );
+
+            let server = server_with(
+                "GET",
+                r".*/docnames/RTN$",
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"result": {"content": []}})),
+            )
+            .await;
+            let (is_err, v) = macros(&server, "APP").await;
+            assert_ne!(is_err, Some(true), "{v}");
+            assert_eq!(
+                v["macros"],
+                serde_json::json!([]),
+                "the legitimate empty answer: {v}"
+            );
+
+            let server = server_with("GET", r".*/docnames/RTN$", ResponseTemplate::new(401)).await;
+            let (is_err, v) = macros(&server, "APP").await;
+            assert_eq!(is_err, Some(true), "{v}");
+            assert_eq!(v["error_code"], "IRIS_AUTH_FAILED", "{v}");
+            assert!(
+                !v.to_string().contains("No include files found"),
+                "a failed call must not answer with a negative fact: {v}"
+            );
+
+            let server = server_with("GET", r".*/docnames/RTN$", ResponseTemplate::new(404)).await;
+            let (_, v) = macros(&server, "ZZNOSUCHNS").await;
+            assert_eq!(v["error_code"], ERR_NAMESPACE_NOT_FOUND, "{v}");
+        });
+    }
+
+    /// #102 P3: `iris_execute` threw the HTTP error away and then reported the DOCKER
+    /// fallback's failure, so a mistyped namespace answered "set IRIS_CONTAINER".
+    #[test]
+    fn iris_execute_names_the_namespace_instead_of_demanding_docker() {
+        rt().block_on(async {
+            let server = server_with("PUT", r".*/doc/.*", ResponseTemplate::new(404)).await;
+            let r = tools_for(&server)
+                .iris_execute(Parameters(
+                    serde_json::from_value(
+                        serde_json::json!({"code": "write 1", "namespace": "ZZNOSUCHNS"}),
+                    )
+                    .unwrap(),
+                ))
+                .await
+                .expect("the tool must answer");
+            let v = payload(&r);
+            assert_eq!(v["error_code"], ERR_NAMESPACE_NOT_FOUND, "{v}");
+            assert_ne!(
+                v["error_code"], "DOCKER_REQUIRED",
+                "Docker was never the problem: {v}"
+            );
+            assert!(
+                v["hint"].as_str().unwrap().contains("Nothing was executed"),
+                "{v}"
+            );
+        });
+    }
+
+    /// #101 for the same tool: with the HTTP leg rejected and no container, the answer must
+    /// name the 401 rather than an env var with no bearing on the problem. The docker attempt
+    /// itself still happens — `IrisConnection::execute` does not use IRIS_USERNAME/IRIS_PASSWORD,
+    /// so a wrong Atelier password IS genuinely recoverable when a container is configured.
+    #[test]
+    fn iris_execute_reports_a_401_rather_than_docker_when_both_legs_fail() {
+        rt().block_on(async {
+            if std::env::var("IRIS_CONTAINER")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .is_some()
+            {
+                eprintln!("IRIS_CONTAINER is set — the docker leg would really run; skipping");
+                return;
+            }
+            let server = server_with("PUT", r".*/doc/.*", ResponseTemplate::new(401)).await;
+            let r = tools_for(&server)
+                .iris_execute(Parameters(
+                    serde_json::from_value(
+                        serde_json::json!({"code": "write 1", "namespace": "APP"}),
+                    )
+                    .unwrap(),
+                ))
+                .await
+                .expect("the tool must answer");
+            let v = payload(&r);
+            assert_eq!(v["error_code"], "IRIS_AUTH_FAILED", "{v}");
+            assert!(v["error"].as_str().unwrap().contains("HTTP 401"), "{v}");
+            assert!(v["hint"].as_str().unwrap().contains("IRIS_PASSWORD"), "{v}");
+        });
+    }
+
+    /// The nine-tool lever, end to end: `iris_production` never touches
+    /// `namespace_missing_error` itself — it inherits the answer from the one Err arm in
+    /// `ensure_interop_namespace`.
+    #[test]
+    fn iris_production_inherits_the_namespace_answer_from_the_interop_preflight() {
+        rt().block_on(async {
+            let server = server_with("POST", r".*/action/query$", ResponseTemplate::new(404)).await;
+            let r = tools_for(&server)
+                .iris_production(Parameters(AnyParams(
+                    serde_json::json!({"action": "status", "namespace": "ZZNOSUCHNS"}),
+                )))
+                .await
+                .expect("the tool must answer");
+            let v = payload(&r);
+            assert_eq!(v["error_code"], ERR_NAMESPACE_NOT_FOUND, "{v}");
+            assert!(
+                !v.to_string().contains("PUT doc failed"),
+                "the generator's scaffolding is not the caller's mistake: {v}"
+            );
+        });
+    }
+
+    /// #102 step 5: the pre-flight used to spend a whole `execute_via_generator` cycle — PUT +
+    /// compile + SQL + DELETE — in namespace USER to ask %SYS.Namespace.Exists. This is
+    /// simultaneously the correctness test and the four-round-trips-to-one proof.
+    #[test]
+    fn iris_test_answers_a_missing_namespace_in_exactly_one_request() {
+        rt().block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/api/atelier/$"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(root_descriptor(&["APP", "USER"])),
+                )
+                .mount(&server)
+                .await;
+            let r = tools_for(&server)
+                .iris_test(Parameters(
+                    serde_json::from_value(
+                        serde_json::json!({"pattern": "Nope.Test", "namespace": "ZZNOSUCHNS"}),
+                    )
+                    .unwrap(),
+                ))
+                .await
+                .expect("the tool must answer");
+            let v = payload(&r);
+            assert_eq!(v["error_code"], ERR_NAMESPACE_NOT_FOUND, "{v}");
+            assert!(
+                v["hint"].as_str().unwrap().contains("No tests were run"),
+                "{v}"
+            );
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                1,
+                "one GET of the root descriptor — not a PUT/compile/query/DELETE cycle"
+            );
+        });
+    }
+
+    /// #101 Phase 5, closing the diagnostic loop. `check_config`'s own description is what
+    /// tells a model to call it to diagnose exactly this — and under a wrong password it
+    /// answered `connected: true`, actively confirming the misdiagnosis. The server already
+    /// knew: `probe()` saw the 401 and logged it to a level nobody reads.
+    #[test]
+    fn check_config_stops_claiming_connected_under_a_rejected_password() {
+        rt().block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/api/atelier/$"))
+                .respond_with(ResponseTemplate::new(401))
+                .mount(&server)
+                .await;
+            let mut conn = IrisConnection::new(
+                server.uri(),
+                "APP",
+                "_SYSTEM",
+                "WRONGPW",
+                DiscoverySource::EnvVar,
+            );
+            conn.probe().await;
+            assert_eq!(conn.probe_status, Some(401), "the probe must remember");
+
+            let tools = IrisTools::new_with_toolset(Some(conn), Toolset::Interop).unwrap();
+            let v = payload(
+                &tools
+                    .check_config(Parameters(NoParams {}))
+                    .await
+                    .expect("check_config always answers"),
+            );
+            assert_eq!(v["connected"], false, "{v}");
+            assert_eq!(v["auth_ok"], false, "{v}");
+            assert_eq!(v["probe_status"], 401, "{v}");
+        });
+    }
+
+    /// The converse, and the guard against over-firing: a probe that succeeded, or one that
+    /// never ran, must not start reporting a credentials problem.
+    #[test]
+    fn check_config_still_reports_connected_when_the_probe_was_accepted() {
+        rt().block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/api/atelier/$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(root_descriptor(&["APP"])))
+                .mount(&server)
+                .await;
+            let mut conn = IrisConnection::new(
+                server.uri(),
+                "APP",
+                "_SYSTEM",
+                "SYS",
+                DiscoverySource::EnvVar,
+            );
+            conn.probe().await;
+            let tools = IrisTools::new_with_toolset(Some(conn), Toolset::Interop).unwrap();
+            let v = payload(&tools.check_config(Parameters(NoParams {})).await.unwrap());
+            assert_eq!(v["connected"], true, "{v}");
+            assert_eq!(v["auth_ok"], true, "{v}");
+
+            // Never probed: cannot tell, so the old answer stands.
+            let unprobed = IrisConnection::new(
+                "http://127.0.0.1:9",
+                "APP",
+                "_SYSTEM",
+                "SYS",
+                DiscoverySource::EnvVar,
+            );
+            let tools = IrisTools::new_with_toolset(Some(unprobed), Toolset::Interop).unwrap();
+            let v = payload(&tools.check_config(Parameters(NoParams {})).await.unwrap());
+            assert_eq!(v["connected"], true, "{v}");
+            assert_eq!(v["auth_ok"], serde_json::Value::Null, "{v}");
+        });
+    }
+
+    /// #101 at the second `err_json_with_url` call site. `iris_compile`'s 404 behaviour is
+    /// deliberately untouched (see `a_namespace_that_differs_only_in_case_is_not_reported_as_missing`,
+    /// the #93 scope tripwire); only 401/403 move here.
+    #[test]
+    fn iris_compile_names_the_credentials_on_a_401() {
+        rt().block_on(async {
+            let server =
+                server_with("POST", r".*/action/compile$", ResponseTemplate::new(401)).await;
+            let r = tools_for(&server)
+                .iris_compile(Parameters(CompileParams {
+                    target: "Ens.Director.cls".into(),
+                    flags: "cuk".into(),
+                    namespace: Some("APP".into()),
+                    force_writable: false,
+                    inline: false,
+                }))
+                .await
+                .expect("the tool must answer");
+            let v = payload(&r);
+            assert_eq!(v["error_code"], "IRIS_AUTH_FAILED", "{v}");
+            assert!(!v.to_string().contains("Check IRIS_HOST"), "{v}");
+        });
+    }
+
+    /// A mock Atelier where EVERY route answers `tpl` — no root descriptor either. The state
+    /// a wrong password, a wrong prefix or a dead app actually produces.
+    async fn all_routes(tpl_status: u16) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(path_regex(r".*"))
+            .respond_with(ResponseTemplate::new(tpl_status))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// #101 THE FILED REPRO, still standing on an interop-profile tool after the fix shipped:
+    /// `iris_production_diff` answered `{"error":"PUT doc failed: HTTP 401 Unauthorized",
+    /// "error_code":"IRIS_UNREACHABLE","hint":"IRIS did not answer on the configured
+    /// host/port …"}`. Four arms in `handle_iris_production_diff` still hard-coded
+    /// IRIS_UNREACHABLE while `interop.rs`'s header claimed the shared classifier had
+    /// replaced 34 of them.
+    #[test]
+    fn iris_production_diff_names_the_credentials_on_a_401() {
+        rt().block_on(async {
+            let server = all_routes(401).await;
+            let r = tools_for(&server)
+                .iris_production_diff(Parameters(
+                    serde_json::from_value(serde_json::json!({"namespace": "APP"})).unwrap(),
+                ))
+                .await
+                .expect("the tool must answer");
+            let v = payload(&r);
+            assert_eq!(v["error_code"], "IRIS_AUTH_FAILED", "{v}");
+            assert!(v["hint"].as_str().unwrap().contains("IRIS_PASSWORD"), "{v}");
+            assert!(
+                !v.to_string().contains("IRIS_WEB_PORT"),
+                "IRIS answered on that port — the host/port hint is the wrong advice: {v}"
+            );
+        });
+    }
+
+    /// #101 on `dict.rs`, the file the "one shared helper so every tool inherits it" claim
+    /// never reached (zero lines of diff). `extract_message_map_routing` reported a wrong
+    /// password as `IRIS_EXECUTE_ERROR` with no hint and no mention of a credential.
+    #[test]
+    fn extract_message_map_routing_names_the_credentials_on_a_401() {
+        rt().block_on(async {
+            let server = all_routes(401).await;
+            let r = tools_for(&server)
+                .extract_message_map_routing(Parameters(
+                    serde_json::from_value(
+                        serde_json::json!({"class_name": "Ens.Director", "namespace": "APP"}),
+                    )
+                    .unwrap(),
+                ))
+                .await
+                .expect("the tool must answer");
+            let v = payload(&r);
+            assert_eq!(v["error_code"], "IRIS_AUTH_FAILED", "{v}");
+            assert!(v["hint"].as_str().unwrap().contains("IRIS_PASSWORD"), "{v}");
+        });
+    }
+
+    /// #101 + #57: `find_subclass_implementations` escaped the envelope entirely on a 401 —
+    /// raw JSON-RPC `-32603 "hierarchy expansion failed: PUT doc failed: HTTP 401
+    /// Unauthorized"`, with no `error_code`, no `hint` and no `isError` for anything
+    /// downstream to branch on. A failure to read IRIS is a TOOL failure.
+    #[test]
+    fn find_subclass_implementations_stays_inside_the_envelope_on_a_401() {
+        rt().block_on(async {
+            let server = all_routes(401).await;
+            let r = tools_for(&server)
+                .find_subclass_implementations(Parameters(
+                    serde_json::from_value(serde_json::json!({
+                        "base_classes": ["Ens.BusinessOperation"],
+                        "method_name": "OnMessage",
+                        "namespace": "APP"
+                    }))
+                    .unwrap(),
+                ))
+                .await
+                .expect("a 401 must not become a JSON-RPC -32603");
+            let v = payload(&r);
+            assert_eq!(r.is_error, Some(true), "{v}");
+            assert_eq!(v["error_code"], "IRIS_AUTH_FAILED", "{v}");
+            assert!(v["hint"].as_str().unwrap().contains("IRIS_PASSWORD"), "{v}");
+        });
+    }
+
+    /// #101 REGRESSION, on the tool the issue's own repro used. A wrong `IRIS_WEB_PREFIX`
+    /// used to answer `IRIS_UNREACHABLE` + "Check IRIS_HOST and IRIS_WEB_PORT (and
+    /// IRIS_WEB_PREFIX if using a non-root gateway)". The fix replaced that with a bare
+    /// `{"error_code":"NOT_FOUND","error":"HTTP 404 Not Found"}` — no hint, and
+    /// `IRIS_WEB_PREFIX` named nowhere. Both are wrong in different directions: the first
+    /// blames a host and port that are answering, the second states a negative about a
+    /// document the request never went looking for.
+    #[test]
+    fn a_wrong_web_prefix_names_the_prefix_on_iris_query() {
+        rt().block_on(async {
+            let server = all_routes(404).await;
+            let r = tools_for(&server)
+                .iris_query(Parameters(
+                    serde_json::from_value(
+                        serde_json::json!({"query": "SELECT 1 AS n", "namespace": "APP"}),
+                    )
+                    .unwrap(),
+                ))
+                .await
+                .expect("the tool must answer");
+            let v = payload(&r);
+            assert_eq!(v["error_code"], "ATELIER_NOT_FOUND", "{v}");
+            let hint = v["hint"].as_str().unwrap_or_default();
+            assert!(hint.contains("IRIS_WEB_PREFIX"), "{v}");
+            assert!(
+                !hint.contains("Check IRIS_HOST and IRIS_WEB_PORT"),
+                "IRIS answered twice — the host and port are the two things this proves: {v}"
+            );
+            assert_ne!(v["error_code"], "IRIS_UNREACHABLE", "{v}");
+            assert_ne!(
+                v["error_code"], "NOT_FOUND",
+                "nothing here is a statement about a document: {v}"
+            );
+        });
+    }
+
+    /// #101/#102 caveat: `check_config` is the tool whose own description sends a model here
+    /// to diagnose a dead IRIS, and it reported `connected: true` for a closed port, an
+    /// unroutable host, a wrong prefix (probe_status 404) and a 500. Keying only on 401/403
+    /// fixed the credential case and left the rest.
+    #[test]
+    fn check_config_reports_connected_false_when_iris_did_not_answer_usefully() {
+        rt().block_on(async {
+            // (a) IRIS answered, but not with a usable root descriptor.
+            for status in [404u16, 500] {
+                let server = all_routes(status).await;
+                let mut conn = IrisConnection::new(
+                    server.uri(),
+                    "APP",
+                    "_SYSTEM",
+                    "SYS",
+                    DiscoverySource::EnvVar,
+                );
+                conn.probe().await;
+                let tools = IrisTools::new_with_toolset(Some(conn), Toolset::Interop).unwrap();
+                let v = payload(&tools.check_config(Parameters(NoParams {})).await.unwrap());
+                assert_eq!(v["connected"], false, "HTTP {status}: {v}");
+                assert_eq!(v["probe_status"], status, "{v}");
+            }
+
+            // (b) The probe ran and nothing came back at all — port 1 is reserved and closed.
+            let mut conn = IrisConnection::new(
+                "http://127.0.0.1:1",
+                "APP",
+                "_SYSTEM",
+                "SYS",
+                DiscoverySource::EnvVar,
+            );
+            conn.probe().await;
+            assert_eq!(conn.probe_reached, Some(false), "the probe must remember");
+            let tools = IrisTools::new_with_toolset(Some(conn), Toolset::Interop).unwrap();
+            let v = payload(&tools.check_config(Parameters(NoParams {})).await.unwrap());
+            assert_eq!(v["connected"], false, "{v}");
+            assert_eq!(
+                v["auth_ok"],
+                serde_json::Value::Null,
+                "nothing was learned about the credentials: {v}"
+            );
+        });
+    }
+}
+
+// ── Issue #99: the agent_stats tool's own wiring ──────────────────────────────
+//
+// The shared implementation is exercised in `skills_tools::agent_stats_shape_tests` (pure)
+// and in `tests/skills_tests.rs` (both tools, same unreachable registry). What is left to
+// pin HERE is the three lines of wiring the `#[tool]` handler contributes — that it reaches
+// the shared builder at all, rather than reading `self.registry.list_skills().len()` again.
+//
+// Deliberately no assertion on `namespace`: `OBJECTSCRIPT_SKILLMCP_NAMESPACE` is
+// process-global and `skills_tools`' own `skills_namespace_fallback_chain` sets it, and
+// cargo runs lib tests in parallel threads. This test is written so no environment variable
+// can change its outcome — with no connection at all, `agent_stats_result` returns before
+// anything is dialled, spawned or read.
+#[cfg(test)]
+mod agent_stats_wiring_tests {
+    use super::*;
+
+    /// #99: `agent_stats` used to answer `{"status":"ok","skill_count":0,…}` for a registry
+    /// it had never read — the same 0 it printed for "empty" and for "3 skills present". It
+    /// must now fail, and carry no count at all.
+    #[test]
+    fn agent_stats_never_answers_ok_about_a_registry_it_did_not_read() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let tools = IrisTools::new_with_toolset(None, Toolset::Merged).unwrap();
+            let r = tools
+                .agent_stats(rmcp::handler::server::wrapper::Parameters(NoParams {}))
+                .await
+                .expect("the tool must answer, not error out of the transport");
+            let v: serde_json::Value = match &r.content[0].raw {
+                rmcp::model::RawContent::Text(t) => serde_json::from_str(&t.text).unwrap(),
+                _ => panic!("expected text content"),
+            };
+            assert_eq!(r.is_error, Some(true), "a false zero is not success: {v}");
+            assert_eq!(v["error_code"], "DOCKER_REQUIRED", "{v}");
+            assert!(
+                v.get("skill_count").is_none(),
+                "the in-process registry must not stand in for ^SKILLS: {v}"
+            );
+            assert!(
+                v.get("status").is_none(),
+                "\"ok\" was an unconditional literal — it must not outlive a failure: {v}"
+            );
+            assert_eq!(
+                v["source"], "^SKILLS",
+                "say WHICH registry was unreadable: {v}"
+            );
+        });
     }
 }

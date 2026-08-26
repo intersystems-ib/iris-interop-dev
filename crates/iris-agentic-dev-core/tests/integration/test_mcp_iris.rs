@@ -123,7 +123,12 @@ fn e2e_iris_compile_success() {
         result
     );
 
-    if result["error_code"].as_str() != Some("IRIS_UNREACHABLE") {
+    // #101: a mis-credentialed runner receives IRIS_AUTH_FAILED / IRIS_FORBIDDEN where it
+    // used to receive IRIS_UNREACHABLE — the same "environment not usable" skip condition.
+    if !matches!(
+        result["error_code"].as_str(),
+        Some("IRIS_UNREACHABLE" | "IRIS_AUTH_FAILED" | "IRIS_FORBIDDEN")
+    ) {
         assert_eq!(
             result["success"], true,
             "iris_compile should succeed with live IRIS: {}",

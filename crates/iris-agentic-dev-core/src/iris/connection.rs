@@ -2,6 +2,65 @@
 
 use std::fmt;
 
+/// Issues #101 / #102: an Atelier call that came back with a non-2xx status, carried as a
+/// TYPED error instead of an opaque `anyhow` string.
+///
+/// Before this, every consumer re-guessed what "PUT doc failed: HTTP 401 Unauthorized" meant
+/// and they disagreed — `iris_production` said INTEROP_ERROR, `iris_table_info` said
+/// IRIS_EXECUTE_ERROR, `iris_test` said TEST_EXECUTION_ERROR. Three tools, three codes, one
+/// cause. `query_once` was worse: it never looked at the status at all, so a 401 (whose body
+/// is not JSON) and a 404 (whose body is ZERO bytes) both surfaced as "error decoding
+/// response body" with the status destroyed.
+///
+/// `message` is the human text — deliberately byte-identical to the string each site used to
+/// `bail!`, so nothing that reads these messages moves. `status` and `url` are the new part:
+/// the tool layer downcasts (see [`atelier_status`]) and can finally ask "is the NAMESPACE
+/// why this 404 happened" without re-parsing prose.
+#[derive(Debug, Clone)]
+pub struct AtelierHttpError {
+    pub status: u16,
+    pub url: String,
+    /// Response body, trimmed and truncated — Atelier puts real diagnostics here on a 400.
+    pub body: String,
+    message: String,
+}
+
+impl AtelierHttpError {
+    pub fn new(
+        status: reqwest::StatusCode,
+        url: impl Into<String>,
+        body: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            status: status.as_u16(),
+            url: url.into(),
+            body: body.into(),
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for AtelierHttpError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AtelierHttpError {}
+
+/// `Some` when this `anyhow::Error` is an Atelier non-2xx response, `None` for a transport
+/// failure, a SQL error, or anything else. The tool layer's one entry point to the status.
+pub fn atelier_status(err: &anyhow::Error) -> Option<&AtelierHttpError> {
+    err.downcast_ref::<AtelierHttpError>()
+}
+
+/// Trim and cut a response body to `max` CHARACTERS (not bytes — a cut inside a UTF-8
+/// sequence would panic).
+pub(crate) fn truncate_body(body: &str, max: usize) -> String {
+    body.trim().chars().take(max).collect()
+}
+
 /// Whether the connected IRIS instance is a production (Live) system.
 /// Detected at probe time via `^%SYS("SystemMode")` SQL query.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -46,6 +105,19 @@ pub struct IrisConnection {
     pub port_superserver: Option<u16>,
     /// Detected at probe time — controls write-tool availability (issue #26).
     pub system_mode: SystemMode,
+    /// Issue #101: the HTTP status the Atelier root probe got, or `None` if the probe never
+    /// ran or never got a response. The server already KNEW a wrong password had been
+    /// rejected — `probe()` logged it to `tracing::debug!` and threw it away, while
+    /// `check_config`, the tool whose own description says to call it to diagnose exactly
+    /// this, went on reporting `connected: true`.
+    pub probe_status: Option<u16>,
+    /// Issue #101: `Some(true)` when the root probe got an HTTP *response* of any status,
+    /// `Some(false)` when it ran and the request never completed (closed port, unroutable
+    /// host), `None` when the probe never ran. `probe_status` alone cannot express the
+    /// middle case — it is `None` for "never ran" AND for "ran, got nothing", and
+    /// `check_config` needs those apart to answer `connected` honestly without turning
+    /// "never asked" into a claim.
+    pub probe_reached: Option<bool>,
 }
 
 /// T011: Manual Debug implementation — never prints the password.
@@ -61,8 +133,30 @@ impl fmt::Debug for IrisConnection {
             .field("source", &self.source)
             .field("port_superserver", &self.port_superserver)
             .field("system_mode", &self.system_mode)
+            .field("probe_status", &self.probe_status)
+            .field("probe_reached", &self.probe_reached)
             .finish()
     }
+}
+
+/// Issue #101/#102: what a GET of the Atelier ROOT descriptor actually established.
+///
+/// See [`IrisConnection::root_probe`]. The `Option<Vec<String>>` this replaces answered
+/// "cannot tell" to a question it could in fact answer, and every caller read "cannot tell"
+/// as licence to keep its own guess.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootProbe {
+    /// The root descriptor was read: these namespaces are visible to these credentials.
+    Namespaces(Vec<String>),
+    /// IRIS answered `/api/atelier/` with **404**. Every IRIS with the Atelier REST
+    /// application enabled serves that URL, so this is a positive finding, not an absence
+    /// of one: the application is not published where this server is looking. The usual
+    /// cause is a wrong (or missing) `IRIS_WEB_PREFIX`; the other is the web application
+    /// being disabled.
+    NoAtelierHere { url: String },
+    /// Nothing was established: the request never completed, or IRIS answered with a status
+    /// or a body this probe cannot read anything into. Never a claim.
+    Unknown,
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +199,8 @@ impl IrisConnection {
             source,
             port_superserver: None,
             system_mode: SystemMode::Unknown,
+            probe_status: None,
+            probe_reached: None,
         }
     }
 
@@ -154,13 +250,19 @@ impl IrisConnection {
         };
 
         let url = self.atelier_url("/");
-        if let Ok(resp) = client
+        let probe = client
             .get(&url)
             .basic_auth(&self.username, Some(&self.password))
             .send()
-            .await
-        {
+            .await;
+        // #101: record REACHED separately from the status. A closed port and a probe that
+        // never ran both leave `probe_status` at None, and `check_config` must not report
+        // them the same way — one is a definite "IRIS did not answer", the other is
+        // "nobody asked", and only the first may become `connected: false`.
+        self.probe_reached = Some(probe.is_ok());
+        if let Ok(resp) = probe {
             let status = resp.status();
+            self.probe_status = Some(status.as_u16());
             if status.is_success() {
                 if let Ok(body) = resp.json::<serde_json::Value>().await {
                     tracing::debug!("Atelier root response: {}", body);
@@ -203,34 +305,70 @@ impl IrisConnection {
     /// created while this server runs, and a stale "does not exist" is precisely the wrong
     /// answer #93 is about. It only ever runs on a path that has ALREADY failed.
     ///
-    /// `None` always means *cannot tell* — transport error, non-2xx (a wrong
-    /// `IRIS_WEB_PREFIX` 404s here too), or a body without the array (an old or foreign
-    /// server). Callers must keep their own error in that case and never turn `None` into
-    /// a positive claim about a namespace.
+    /// `None` always means *cannot tell*. Callers must keep their own error in that case and
+    /// never turn `None` into a positive claim about a namespace. Callers that need to tell
+    /// the two *reasons* for `None` apart — "the Atelier app is not at this URL at all" vs
+    /// "the probe established nothing" — use [`IrisConnection::root_probe`] instead.
     ///
     /// The list reflects ACCESSIBILITY, not raw existence: `%Atelier.v1.Utils.General`
     /// filters to what the authenticated user can reach, so a namespace that exists but is
     /// invisible to these credentials is absent from it. Messages built from this must say
     /// so.
     pub async fn accessible_namespaces(&self, client: &reqwest::Client) -> Option<Vec<String>> {
-        let resp = client
-            .get(self.atelier_url("/"))
+        match self.root_probe(client).await {
+            RootProbe::Namespaces(list) => Some(list),
+            _ => None,
+        }
+    }
+
+    /// Issue #101/#102: the same GET as [`IrisConnection::accessible_namespaces`], keeping the
+    /// finding it used to throw away.
+    ///
+    /// `Option<Vec<String>>` collapsed three different outcomes into one `None`, and the
+    /// difference between them is the whole answer. A **404 on `/api/atelier/`** is not
+    /// "cannot tell": a working Atelier always serves its own root descriptor, so a 404 there
+    /// says positively that the REST application is not published at this URL — the signature
+    /// of a wrong `IRIS_WEB_PREFIX`. Treating that as "cannot tell" is what let `iris_doc`
+    /// mode=head answer `{"success":true,"exists":false}` for a class that provably exists,
+    /// and what stripped the `IRIS_WEB_PREFIX` diagnosis off `iris_query`'s bare 404.
+    ///
+    /// Everything else — transport failure, 5xx, 401/403, or a 2xx body with no `namespaces`
+    /// array (an older or foreign server) — stays [`RootProbe::Unknown`]. Those are genuinely
+    /// unknowable and must never become a claim.
+    pub async fn root_probe(&self, client: &reqwest::Client) -> RootProbe {
+        let url = self.atelier_url("/");
+        let resp = match client
+            .get(&url)
             .basic_auth(&self.username, Some(&self.password))
             .send()
             .await
-            .ok()?;
-        if !resp.status().is_success() {
-            tracing::debug!("Atelier root namespace probe got HTTP {}", resp.status());
-            return None;
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!("Atelier root probe did not complete: {e}");
+                return RootProbe::Unknown;
+            }
+        };
+        let status = resp.status();
+        if status.as_u16() == 404 {
+            tracing::debug!("Atelier root descriptor 404 at {url} — no Atelier application here");
+            return RootProbe::NoAtelierHere { url };
         }
-        let body: serde_json::Value = resp.json().await.ok()?;
-        Some(
-            body["result"]["content"]["namespaces"]
-                .as_array()?
-                .iter()
-                .filter_map(|n| n.as_str().map(str::to_string))
-                .collect(),
-        )
+        if !status.is_success() {
+            tracing::debug!("Atelier root namespace probe got HTTP {status}");
+            return RootProbe::Unknown;
+        }
+        let Ok(body) = resp.json::<serde_json::Value>().await else {
+            return RootProbe::Unknown;
+        };
+        match body["result"]["content"]["namespaces"].as_array() {
+            Some(arr) => RootProbe::Namespaces(
+                arr.iter()
+                    .filter_map(|n| n.as_str().map(str::to_string))
+                    .collect(),
+            ),
+            None => RootProbe::Unknown,
+        }
     }
 
     /// Query `^%SYS("SystemMode")` to detect whether this is a Live instance.
@@ -358,7 +496,15 @@ impl IrisConnection {
             .send()
             .await?;
         if !put_resp.status().is_success() {
-            anyhow::bail!("PUT doc failed: HTTP {}", put_resp.status());
+            // #101/#102: typed, with the SAME text it has always emitted — the caller can now
+            // ask whether the 404 is a missing NAMESPACE rather than reporting Docker.
+            let status = put_resp.status();
+            return Err(anyhow::Error::new(AtelierHttpError::new(
+                status,
+                put_url,
+                "",
+                format!("PUT doc failed: HTTP {}", status),
+            )));
         }
 
         // 2. Compile
@@ -370,8 +516,14 @@ impl IrisConnection {
             .send()
             .await?;
         if !compile_resp.status().is_success() {
+            let status = compile_resp.status();
             let _ = self.delete_doc(&doc_name, namespace, client).await;
-            anyhow::bail!("compile HTTP {}", compile_resp.status());
+            return Err(anyhow::Error::new(AtelierHttpError::new(
+                status,
+                compile_url,
+                "",
+                format!("compile HTTP {}", status),
+            )));
         }
         let compile_body: serde_json::Value = compile_resp.json().await.unwrap_or_default();
         let has_errors = compile_body["result"]["log"]
@@ -578,11 +730,22 @@ impl IrisConnection {
                 Err(e) => {
                     let msg = e.to_string();
                     // Only transport-level failures are retryable; a SQL error is deterministic.
-                    let is_retryable = msg.contains("error sending request")
-                        || msg.contains("connection refused")
-                        || msg.contains("connection reset")
-                        || msg.contains("timed out")
-                        || msg.contains("HTTP 5");
+                    // #102: the 5xx arm is STRUCTURAL now. Before the typed error below, a 500
+                    // made `resp.json()` fail with "error decoding response body", which matches
+                    // none of these substrings — so a 5xx was never actually retried, despite the
+                    // doc comment above promising it. Relying on the Display text happening to
+                    // contain "HTTP 5" would keep that accidental; asking the status makes it
+                    // deliberate.
+                    let is_retryable = match atelier_status(&e) {
+                        Some(http) => http.status >= 500,
+                        None => {
+                            msg.contains("error sending request")
+                                || msg.contains("connection refused")
+                                || msg.contains("connection reset")
+                                || msg.contains("timed out")
+                                || msg.contains("HTTP 5")
+                        }
+                    };
                     if !is_retryable || attempt == delays.len() - 1 {
                         return Err(e);
                     }
@@ -615,15 +778,47 @@ impl IrisConnection {
             .json(&serde_json::json!({"query": sql, "parameters": params}))
             .send()
             .await?;
-        let body: serde_json::Value = resp.json().await?;
-        // Surface Atelier-level errors returned as 200 OK with status.errors in body.
-        if let Some(errs) = body["status"]["errors"].as_array() {
-            if !errs.is_empty() {
-                let msg = errs[0]["error"].as_str().unwrap_or("Atelier query error");
-                anyhow::bail!("{}", msg);
+        // #101/#102: BODY FIRST, then the status. `resp.json()` alone destroyed the status —
+        // a 401 body is not JSON and a missing-namespace 404 body is ZERO bytes, so every
+        // caller saw "error decoding response body" and IRIS's actual answer was gone.
+        //
+        // The ordering is mandatory, not stylistic. Atelier puts REAL diagnostics in the body
+        // of some non-2xx responses: a malformed query POST returns HTTP 400 carrying
+        // `{"status":{"errors":[{"error":"ERROR #16002: Invalid JSON Content",...}]}}`. A
+        // status-first `if !status.is_success() { bail!("HTTP {}") }` would swap one
+        // uninformative error for another. `status.errors` therefore wins over the HTTP status
+        // whatever that status is, so SQL_ERROR and the #16002 text keep coming through
+        // byte-for-byte. (A bad SELECT is not even this case — it returns 200 with
+        // status.errors.)
+        let status = resp.status();
+        let text = resp.text().await?;
+        let parsed = serde_json::from_str::<serde_json::Value>(&text).ok();
+        if let Some(body) = &parsed {
+            if let Some(errs) = body["status"]["errors"].as_array() {
+                if !errs.is_empty() {
+                    let msg = errs[0]["error"].as_str().unwrap_or("Atelier query error");
+                    anyhow::bail!("{}", msg);
+                }
             }
         }
-        Ok(body)
+        if !status.is_success() {
+            let snippet = truncate_body(&text, 500);
+            let message = if snippet.is_empty() {
+                format!("HTTP {status} from {url}")
+            } else {
+                format!("HTTP {status} from {url}: {snippet}")
+            };
+            return Err(anyhow::Error::new(AtelierHttpError::new(
+                status, &url, snippet, message,
+            )));
+        }
+        match parsed {
+            Some(body) => Ok(body),
+            None => anyhow::bail!(
+                "non-JSON response from {url}: {}",
+                truncate_body(&text, 200)
+            ),
+        }
     }
 
     /// Compile a document via POST /action/compile. Returns structured errors and console output.
@@ -646,7 +841,13 @@ impl IrisConnection {
             .send()
             .await?;
         if !resp.status().is_success() {
-            anyhow::bail!("compile HTTP {}", resp.status());
+            let status = resp.status();
+            return Err(anyhow::Error::new(AtelierHttpError::new(
+                status,
+                compile_url,
+                "",
+                format!("compile HTTP {}", status),
+            )));
         }
         let body: serde_json::Value = resp.json().await.unwrap_or_default();
         let console: Vec<String> = body["console"]
@@ -985,5 +1186,178 @@ mod system_mode_tests {
         assert!(!is_production_namespace("USER"));
         assert!(!is_production_namespace("DEV"));
         assert!(!is_production_namespace("MYAPP"));
+    }
+}
+
+// ── Issues #101 / #102: `query_once` must not destroy what IRIS said ──────────
+#[cfg(test)]
+mod atelier_http_error_tests {
+    use super::*;
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    async fn mount(server: &MockServer, tpl: ResponseTemplate) -> IrisConnection {
+        Mock::given(method("POST"))
+            .and(path_regex(r".*/action/query$"))
+            .respond_with(tpl)
+            .mount(server)
+            .await;
+        IrisConnection::new(
+            server.uri(),
+            "APP",
+            "_SYSTEM",
+            "SYS",
+            DiscoverySource::EnvVar,
+        )
+    }
+
+    async fn ask(tpl: ResponseTemplate) -> anyhow::Result<serde_json::Value> {
+        let server = MockServer::start().await;
+        let iris = mount(&server, tpl).await;
+        iris.query_once("SELECT 1", vec![], "APP", &reqwest::Client::new())
+            .await
+    }
+
+    /// The happy path is untouched.
+    #[test]
+    fn a_200_with_json_is_returned_verbatim() {
+        rt().block_on(async {
+            let body = serde_json::json!({"result": {"content": [{"n": 1}]}});
+            let out = ask(ResponseTemplate::new(200).set_body_json(body.clone()))
+                .await
+                .expect("a 200 with a JSON body is a success");
+            assert_eq!(out, body);
+        });
+    }
+
+    /// Atelier reports SQL errors as 200 + `status.errors`. That message is the useful one
+    /// and it still wins.
+    #[test]
+    fn a_200_carrying_status_errors_still_bails_with_the_atelier_message() {
+        rt().block_on(async {
+            let e = ask(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": {"errors": [{"error": "ERROR #5540: SQLCODE: -51"}]}
+            })))
+            .await
+            .expect_err("status.errors is a failure");
+            assert_eq!(e.to_string(), "ERROR #5540: SQLCODE: -51");
+            assert!(
+                atelier_status(&e).is_none(),
+                "a SQL error is not an HTTP-status error"
+            );
+        });
+    }
+
+    /// THE TRAP this rewrite exists to avoid. A malformed query POST returns HTTP 400 with a
+    /// REAL diagnostic in the body (verified live: `ERROR #16002: Invalid JSON Content`). A
+    /// status-first `if !status.is_success() { bail!("HTTP {}") }` would swap one
+    /// uninformative error for another — so the body is parsed FIRST and `status.errors` wins
+    /// whatever the status is.
+    #[test]
+    fn a_400_carrying_a_diagnostic_reports_the_diagnostic_not_the_status() {
+        rt().block_on(async {
+            let e = ask(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "status": {"errors": [{"error": "ERROR #16002: Invalid JSON Content", "code": 16002}]}
+            })))
+            .await
+            .expect_err("a 400 is a failure");
+            assert_eq!(e.to_string(), "ERROR #16002: Invalid JSON Content");
+            assert!(!e.to_string().contains("HTTP 400"), "{e}");
+        });
+    }
+
+    /// The #102 P2 root cause: a missing-namespace 404 has a ZERO-BYTE body, so `resp.json()`
+    /// reported EOF ("error decoding response body") and the status was destroyed. Every
+    /// caller then said IRIS_UNREACHABLE about an instance that had just answered.
+    #[test]
+    fn a_404_with_an_empty_body_keeps_its_status_and_url() {
+        rt().block_on(async {
+            let server = MockServer::start().await;
+            let iris = mount(&server, ResponseTemplate::new(404)).await;
+            let e = iris
+                .query_once("SELECT 1", vec![], "ZZNOSUCHNS", &reqwest::Client::new())
+                .await
+                .expect_err("a 404 is a failure");
+            let http = atelier_status(&e).expect("the status must survive as a typed error");
+            assert_eq!(http.status, 404);
+            assert!(http.url.contains("ZZNOSUCHNS"), "{}", http.url);
+            assert!(e.to_string().contains("HTTP 404"), "{e}");
+            assert!(
+                !e.to_string().contains("error decoding response body"),
+                "{e}"
+            );
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                1,
+                "a 404 is deterministic — it must not be retried"
+            );
+        });
+    }
+
+    /// The #101 repro one layer down: a 401 body is not JSON, so this was the other way the
+    /// status got destroyed.
+    #[test]
+    fn a_401_keeps_its_status_instead_of_becoming_a_decode_failure() {
+        rt().block_on(async {
+            let e = ask(ResponseTemplate::new(401).set_body_string("Unauthorized"))
+                .await
+                .expect_err("a 401 is a failure");
+            let http = atelier_status(&e).expect("typed");
+            assert_eq!(http.status, 401);
+            assert_eq!(http.body, "Unauthorized");
+            assert_eq!(
+                crate::tools::envelope::auth_error_code(&e.to_string()),
+                Some("IRIS_AUTH_FAILED"),
+                "the message must stay classifiable: {e}"
+            );
+        });
+    }
+
+    /// The deliberate retry change. Before the typed error a 5xx surfaced as "error decoding
+    /// response body", which matches none of `query()`'s retry substrings — so a 5xx was
+    /// never retried despite the doc comment promising it. The predicate is structural now.
+    #[test]
+    fn a_5xx_is_retried_and_a_404_is_not() {
+        rt().block_on(async {
+            let server = MockServer::start().await;
+            let iris = mount(&server, ResponseTemplate::new(503)).await;
+            let e = iris
+                .query("SELECT 1", vec![], "APP", &reqwest::Client::new())
+                .await
+                .expect_err("a 503 is a failure");
+            assert_eq!(atelier_status(&e).map(|h| h.status), Some(503));
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                3,
+                "three attempts: the delay table has three entries"
+            );
+        });
+    }
+
+    /// A 2xx whose body is not JSON at all names the URL and shows what came back, instead of
+    /// reqwest's opaque "error decoding response body".
+    #[test]
+    fn a_200_that_is_not_json_says_so() {
+        rt().block_on(async {
+            let e = ask(ResponseTemplate::new(200).set_body_string("<html>login</html>"))
+                .await
+                .expect_err("a non-JSON 200 cannot be a query result");
+            assert!(e.to_string().contains("non-JSON response"), "{e}");
+            assert!(e.to_string().contains("<html>login</html>"), "{e}");
+        });
+    }
+
+    #[test]
+    fn truncate_body_cuts_on_char_boundaries() {
+        // A byte-wise cut inside a multi-byte sequence would panic.
+        assert_eq!(truncate_body("  héllo  ", 3), "hél");
+        assert_eq!(truncate_body("", 500), "");
     }
 }

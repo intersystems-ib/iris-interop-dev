@@ -272,7 +272,10 @@ fn e2e_execute_docker_required_has_instructions() {
             ec == "DOCKER_REQUIRED"
                 || text.contains("iris_container")
                 || text.contains("docker")
-                || ec == "IRIS_UNREACHABLE",
+                || ec == "IRIS_UNREACHABLE"
+                // #101: a mis-credentialed runner now gets the auth codes, not IRIS_UNREACHABLE.
+                || ec == "IRIS_AUTH_FAILED"
+                || ec == "IRIS_FORBIDDEN",
             "error without IRIS should mention Docker or container: {}",
             result
         );
@@ -3507,9 +3510,15 @@ fn e2e_resolve_dynamic_dispatch_returns_candidates() {
         serde_json::json!({"method_name": "Connect", "package_prefix": "EnsLib", "namespace": "USER"}),
     );
     // Accept NO_RESULTS if namespace has no EnsLib classes compiled
-    if result["error_code"].as_str() == Some("IRIS_UNREACHABLE")
-        || result["error_code"].as_str() == Some("TIMEOUT")
-    {
+    // #101: a mis-credentialed runner used to receive IRIS_UNREACHABLE here and skip.
+    // It now receives IRIS_AUTH_FAILED / IRIS_FORBIDDEN — same "environment not usable"
+    // condition, two new codes — so the sentinel has to recognise them or this test
+    // stops skipping and fails on an unrelated cause. Local gates never see it: our
+    // credentials are correct.
+    if matches!(
+        result["error_code"].as_str(),
+        Some("IRIS_UNREACHABLE" | "IRIS_AUTH_FAILED" | "IRIS_FORBIDDEN" | "TIMEOUT")
+    ) {
         eprintln!("resolve_dynamic_dispatch: IRIS unavailable — skipping");
         return;
     }
@@ -3549,9 +3558,10 @@ fn e2e_extract_message_map_no_message_map_class() {
         "extract_message_map_routing",
         serde_json::json!({"class_name": "%ASQ.AST", "namespace": "USER"}),
     );
-    if result["error_code"].as_str() == Some("IRIS_UNREACHABLE")
-        || result["error_code"].as_str() == Some("TIMEOUT")
-    {
+    if matches!(
+        result["error_code"].as_str(),
+        Some("IRIS_UNREACHABLE" | "IRIS_AUTH_FAILED" | "IRIS_FORBIDDEN" | "TIMEOUT")
+    ) {
         eprintln!("extract_message_map_routing: IRIS unavailable — skipping");
         return;
     }
@@ -3590,7 +3600,10 @@ fn e2e_extract_message_map_not_found() {
         "extract_message_map_routing",
         serde_json::json!({"class_name": "DoesNot.Exist.Class", "namespace": "USER"}),
     );
-    if result["error_code"].as_str() == Some("IRIS_UNREACHABLE") {
+    if matches!(
+        result["error_code"].as_str(),
+        Some("IRIS_UNREACHABLE" | "IRIS_AUTH_FAILED" | "IRIS_FORBIDDEN")
+    ) {
         return;
     }
     assert_eq!(
@@ -3613,9 +3626,10 @@ fn e2e_find_subclass_implementations_returns_results() {
             "namespace": "USER"
         }),
     );
-    if result["error_code"].as_str() == Some("IRIS_UNREACHABLE")
-        || result["error_code"].as_str() == Some("TIMEOUT")
-    {
+    if matches!(
+        result["error_code"].as_str(),
+        Some("IRIS_UNREACHABLE" | "IRIS_AUTH_FAILED" | "IRIS_FORBIDDEN" | "TIMEOUT")
+    ) {
         eprintln!("find_subclass_implementations: IRIS unavailable — skipping");
         return;
     }
@@ -3652,7 +3666,10 @@ fn e2e_find_subclass_implementations_empty_base_classes() {
             "namespace": "USER"
         }),
     );
-    if result["error_code"].as_str() == Some("IRIS_UNREACHABLE") {
+    if matches!(
+        result["error_code"].as_str(),
+        Some("IRIS_UNREACHABLE" | "IRIS_AUTH_FAILED" | "IRIS_FORBIDDEN")
+    ) {
         return;
     }
     assert_eq!(

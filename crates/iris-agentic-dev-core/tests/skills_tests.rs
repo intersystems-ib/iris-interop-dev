@@ -330,3 +330,124 @@ fn agent_info_stats_reports_unreachable_not_a_count_of_zero() {
 
     std::env::remove_var("IRIS_CONTAINER");
 }
+
+// ── Issue #99: agent_stats must report the SAME registry agent_info does ──────
+
+/// #99, reproduced live twice on the dev instance and reproduced here offline.
+///
+/// `agent_stats` reported `self.registry.list_skills().len()` — the in-process
+/// `--subscribe` registry, a startup constant that is 0 in every session started without
+/// `--subscribe` — under the bare name `skill_count`, with no namespace and no source. In
+/// ONE live session it answered `{"skill_count":0,"status":"ok"}` while `skill_list` and
+/// `agent_info(what=stats)` both answered 3 from `^SKILLS`; with IRIS unreachable it
+/// answered `{"skill_count":0,"status":"ok"}` again while both siblings correctly answered
+/// DOCKER_REQUIRED. Character for character the #89 symptom, in the tool that survives into
+/// the `merged` profile (which prunes `agent_info`).
+///
+/// `IrisConnection::execute` is docker-exec ONLY, so with no `IRIS_CONTAINER` the read fails
+/// before anything is dialled or spawned: this test touches neither the network nor docker.
+///
+/// ONE `#[test]` on purpose — `IRIS_CONTAINER` and `OBJECTSCRIPT_SKILLMCP_NAMESPACE` are
+/// process-global and cargo runs tests in parallel threads, so splitting the sub-cases would
+/// race (same rule as `skills_namespace_fallback_chain` and the #89 test above).
+#[test]
+fn agent_stats_reports_unreachable_not_a_count_of_zero() {
+    use iris_agentic_dev_core::iris::connection::{DiscoverySource, IrisConnection};
+    use iris_agentic_dev_core::skills::SkillRegistry;
+    use iris_agentic_dev_core::tools::skills_tools::{
+        agent_stats_result, handle_agent_info, AgentInfoParams,
+    };
+
+    fn payload(r: &rmcp::model::CallToolResult) -> serde_json::Value {
+        let text = match &r.content[0].raw {
+            rmcp::model::RawContent::Text(t) => &t.text,
+            _ => panic!("expected text content"),
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    std::env::remove_var("IRIS_CONTAINER");
+    std::env::remove_var("OBJECTSCRIPT_SKILLMCP_NAMESPACE");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    // RFC 2606 `.invalid` host so a future edit cannot accidentally point this at the
+    // maintainer's live dev IRIS.
+    let iris = IrisConnection::new(
+        "http://never-dialled.invalid",
+        "APP",
+        "_SYSTEM",
+        "SYS",
+        DiscoverySource::EnvVar,
+    );
+    let client = reqwest::Client::new();
+    let history = std::sync::Mutex::new(std::collections::VecDeque::new());
+    let registry = SkillRegistry::new();
+
+    rt.block_on(async {
+        // 1. The issue itself: an unreadable ^SKILLS is an ERROR, not a count of zero — and
+        //    emphatically not `status: "ok"`.
+        let r = agent_stats_result("agent_stats", Some(&iris), &history, Some(&registry))
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true), "a false zero is not success");
+        let stats = payload(&r);
+        assert_eq!(stats["error_code"], "DOCKER_REQUIRED", "{stats}");
+        assert!(
+            stats.get("skill_count").is_none(),
+            "no count may survive a failed read: {stats}"
+        );
+        assert!(
+            stats.get("status").is_none(),
+            "the unconditional \"ok\" literal must not outlive the failure: {stats}"
+        );
+        // #85: say WHICH registry — the count resolves from the connection (APP, not USER).
+        assert_eq!(stats["namespace"], "APP", "{stats}");
+        assert_eq!(stats["source"], "^SKILLS", "{stats}");
+
+        // 2. THE REGRESSION TEST THAT MATTERS: `agent_stats` and `agent_info(what=stats)`
+        //    are one implementation now, so they cannot report different things about the
+        //    same registry in the same session. This is the test that fails the day someone
+        //    re-forks them — which is exactly how #99 came to exist after #89 fixed #89.
+        let info = payload(
+            &handle_agent_info(
+                &iris,
+                &client,
+                AgentInfoParams {
+                    what: "stats".into(),
+                    limit: 20,
+                },
+                &history,
+            )
+            .await
+            .unwrap(),
+        );
+        for field in ["error_code", "namespace", "source", "success"] {
+            assert_eq!(
+                stats[field], info[field],
+                "agent_stats and agent_info(what=stats) disagree on {field}: \
+                 {stats} vs {info}"
+            );
+        }
+        assert_eq!(
+            stats.get("skill_count").is_none(),
+            info.get("skill_count").is_none(),
+            "one of them invented a count: {stats} vs {info}"
+        );
+
+        // 3. With no connection at all the answer is the same shape, not a cheap zero. This
+        //    is the `merged`-profile session an operator actually hits.
+        let r = agent_stats_result("agent_stats", None, &history, Some(&registry))
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true), "still not a success");
+        let v = payload(&r);
+        assert_eq!(v["error_code"], "DOCKER_REQUIRED", "{v}");
+        assert!(v.get("skill_count").is_none(), "{v}");
+        assert_eq!(v["source"], "^SKILLS", "{v}");
+    });
+
+    std::env::remove_var("IRIS_CONTAINER");
+}
