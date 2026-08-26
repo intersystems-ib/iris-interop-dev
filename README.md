@@ -215,6 +215,7 @@ server — run the ISC Web Gateway container alongside IRIS and point `web_port`
 | `IRIS_TOOLSET` | `interop` | Tool surface: `interop` (23 tools) or `baseline` (full upstream surface). Same as `--toolset` |
 | `IRIS_LOG_FILE` | _(empty)_ | Mirror server traces to this file — the only trace that outlives an MCP session |
 | `IRIS_DISCOVERY_TIMEOUT_MS` | `2000` | How long startup waits for IRIS discovery before serving. Missing this window is not fatal — the connection is adopted whenever the probe finishes — so raise it only if you would rather `initialize` block than serve unconnected |
+| `IRIS_ALLOW_PROD` | _(unset)_ | Allow MUTATING calls on a connection that is not write-allowed (Live system mode, or a production-looking namespace). Reads are never blocked, so this is only needed to write. Set to `1` deliberately |
 | `IRIS_DISCOVERY_RETRY_SECS` | `15` | Minimum gap between lazy re-probes when a session has no connection. A session started before IRIS was ready heals on a later tool call instead of answering `IRIS_UNREACHABLE` for its lifetime |
 | `OBJECTSCRIPT_WORKSPACE` | `$PWD` | Workspace root for `.iris-agentic-dev.toml` lookup |
 | `OBJECTSCRIPT_SKILLMCP_NAMESPACE` | _(connection namespace)_ | Namespace holding the `^SKILLS` / `^KBCHUNKS` registry (baseline toolset). Defaults to the connection namespace (`IRIS_NAMESPACE` / `--namespace`); set it only to centralise the registry in one namespace |

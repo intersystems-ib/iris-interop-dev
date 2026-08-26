@@ -2878,11 +2878,130 @@ pub struct IrisTools {
     tool_router: ToolRouter<IrisTools>,
 }
 
-/// Write-capable tools the gate removes when the connection is not write-allowed
-/// (Live system mode, or a production-looking namespace without IRIS_ALLOW_PROD).
-/// Named so the dispatch rejection in `call_tool` can tell "gated" from "not in this
-/// toolset" — the two have completely different fixes.
-pub(crate) const WRITE_GATED_TOOLS: &[&str] = &["iris_production_item", "iris_credential_manage"];
+/// Whether a specific CALL would mutate the instance, and under which name.
+///
+/// #114. The gate used to be a list of two tool NAMES removed from the router when the
+/// connection was not write-allowed, which was wrong in both directions:
+///
+/// - It let five write-capable tools straight through. `iris_doc {mode:put}`,
+///   `iris_execute`, `iris_compile`, `iris_lookup_manage {action:set}` and `iris_test` all
+///   dispatched and reached IRIS on a write-disallowed connection — proven at the wire.
+///   Two refusals and a tool list that shrank to 21 made a Live server *look* guarded.
+/// - It also blocked reads. Removing `iris_production_item` wholesale took `get_settings`
+///   with it, so you could not even look at a config item. This server is aimed at
+///   DEVELOPMENT instances; friction there is the expensive failure, not the safe one.
+///
+/// So the gate is per-CALL and mutation-only: reading is never blocked anywhere, and a
+/// mutation is refused only on a connection that is not write-allowed. Every tool stays
+/// listed and reachable on every connection.
+///
+/// Returns `Some(action)` naming what would have been mutated, or `None` for a read.
+/// The classification is per-tool-and-arguments and comes from each tool's verified reach
+/// — a name-based guess got this wrong twice (it read `iris_get_log`, an in-memory store
+/// lookup, as a writer and missed `iris_doc` entirely).
+pub(crate) fn mutating_call(tool: &str, args: &serde_json::Value) -> Option<&'static str> {
+    // The discriminator, whatever this tool calls it.
+    let action = args
+        .get("action")
+        .or_else(|| args.get("mode"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    match tool {
+        // Unconditionally mutating: these have no read-only mode at all.
+        // iris_execute runs arbitrary ObjectScript, and its generator path writes, compiles
+        // and deletes a scratch class even for a read-shaped `write` statement.
+        "iris_execute" => Some("run ObjectScript"),
+        // Compiling regenerates storage and replaces the compiled class.
+        "iris_compile" => Some("compile"),
+        // %UnitTest runs arbitrary test code, and TestProduction starts productions.
+        "iris_test" => Some("run tests"),
+        // Every action of this tool writes a credential.
+        "iris_credential_manage" => Some("change credentials"),
+
+        // Mode/action-aware: the read half must keep working.
+        "iris_doc" => matches!(action, "put" | "delete").then_some("write a document"),
+        "iris_lookup_manage" => {
+            matches!(action, "set" | "delete").then_some("change a lookup table")
+        }
+        "iris_lookup_transfer" => (action == "import").then_some("import a lookup table"),
+        "iris_production" => matches!(
+            action,
+            "start" | "stop" | "restart" | "update" | "recover" | "set_autostart"
+        )
+        .then_some("change production state"),
+        "iris_production_item" => matches!(
+            action,
+            "add" | "remove" | "enable" | "disable" | "set_settings"
+        )
+        .then_some("change a production item"),
+        // source_map is the one iris_debug action that writes — it goes through
+        // execute_via_generator, which PUTs and compiles a scratch class.
+        "iris_debug" => (action == "source_map").then_some("build a source map"),
+        // iris_query keeps its own gate (`force` + write_tools_enabled) because it has to
+        // parse the SQL to know; this is the same verdict expressed for the dispatcher, so
+        // a forced destructive statement is refused here first and identically.
+        "iris_query" => args
+            .get("force")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+            .then_some("run forced SQL"),
+
+        // Everything else reads. Named exhaustively rather than defaulted, so a NEW tool
+        // does not inherit "safe" by omission — `write_capable_tools_are_all_classified`
+        // fails on any interop tool missing from this match.
+        "check_config"
+        | "docs_introspect"
+        | "extract_message_map_routing"
+        | "find_subclass_implementations"
+        | "iris_business_rule_info"
+        | "iris_credential_list"
+        | "iris_get_log"
+        | "iris_interop_query"
+        | "iris_message_body"
+        | "iris_production_diff"
+        | "iris_symbols"
+        | "iris_table_info" => None,
+        _ => None,
+    }
+}
+
+/// The call's arguments as a JSON object — `{}` when the client sent none.
+fn args_of(request: &rmcp::model::CallToolRequestParams) -> serde_json::Value {
+    request
+        .arguments
+        .clone()
+        .map(serde_json::Value::Object)
+        .unwrap_or_else(|| serde_json::json!({}))
+}
+
+/// The interop tools this file has deliberately classified in [`mutating_call`].
+/// Guarded by a test so a tool added to `INTEROP_TOOLS` cannot skip the decision.
+#[cfg(test)]
+pub(crate) const CLASSIFIED_TOOLS: &[&str] = &[
+    "check_config",
+    "docs_introspect",
+    "extract_message_map_routing",
+    "find_subclass_implementations",
+    "iris_business_rule_info",
+    "iris_compile",
+    "iris_credential_list",
+    "iris_credential_manage",
+    "iris_debug",
+    "iris_doc",
+    "iris_execute",
+    "iris_get_log",
+    "iris_interop_query",
+    "iris_lookup_manage",
+    "iris_lookup_transfer",
+    "iris_message_body",
+    "iris_production",
+    "iris_production_diff",
+    "iris_production_item",
+    "iris_query",
+    "iris_symbols",
+    "iris_table_info",
+    "iris_test",
+];
 
 #[tool_router]
 impl IrisTools {
@@ -3040,13 +3159,12 @@ impl IrisTools {
                     namespace = %c.namespace,
                     "iris-agentic-dev: write tool gate evaluated"
                 );
-                // Remove write-capable tools if not allowed (issue #26 env guard).
-                // iris_production_item is write-capable; available in all tiers but gated on prod.
-                if !write_tools_enabled {
-                    for name in WRITE_GATED_TOOLS {
-                        router.remove_route(name);
-                    }
-                }
+                // #114: NOTHING is pruned for the write gate any more. Removing a tool took
+                // its read actions with it — `iris_production_item` gone meant `get_settings`
+                // gone — and this server is aimed at development instances, where that
+                // friction costs far more than it protects. The gate now runs per CALL in
+                // `call_tool`, refusing only the mutating ones, so every tool stays listed
+                // and every read works on every connection.
                 {
                     // Record ConfigFile source (and the path) when the connection came from
                     // a .iris-agentic-dev.toml — so check_config shows config_file at
@@ -3175,7 +3293,9 @@ impl IrisTools {
     }
 
     /// Returns the active write_tools_enabled flag from connection state.
-    fn write_tools_enabled(&self) -> bool {
+    /// Public so a test can assert the CONNECTION is read-only without inferring it from
+    /// which tools are listed — #114 stopped the gate expressing itself in the listing.
+    pub fn write_tools_enabled(&self) -> bool {
         self.connection.lock().unwrap().write_tools_enabled
     }
 
@@ -7172,15 +7292,19 @@ impl ServerHandler for IrisTools {
         if !self.tool_router.has_route(&request.name) {
             return Err(self.unreachable_tool_error(&request.name));
         }
-        // The router prunes write tools ONCE, at construction. The connection can change
-        // afterwards and the router is never rebuilt: `check_reload` (034) re-probes from a
-        // changed .iris-agentic-dev.toml and can land on a Live instance, and #110's lazy
-        // re-probe adopts a connection into a router that was built while disconnected —
-        // when there was no connection to gate on. Both would hand a Live instance the
-        // write tools. Re-checking here costs a slice scan of two names and makes the gate
-        // follow the CURRENT connection rather than the one that existed at startup.
-        if WRITE_GATED_TOOLS.contains(&request.name.as_ref()) && self.connected_but_read_only() {
-            return Err(self.unreachable_tool_error(&request.name));
+        // #114: the write gate, per CALL rather than per tool. Reading is never blocked —
+        // this server is for development instances, and the friction of a hidden tool costs
+        // more than it protects. A MUTATION on a connection that is not write-allowed is
+        // refused here, and only here: the router no longer prunes anything for the gate, so
+        // the decision follows the CURRENT connection rather than the one that existed at
+        // startup. That matters because the connection can change under a long-lived router
+        // — `check_reload` re-probes a changed .iris-agentic-dev.toml and can land on a Live
+        // instance, and #110's lazy re-probe adopts a connection into a router that was built
+        // while disconnected.
+        if let Some(action) = mutating_call(&request.name, &args_of(&request)) {
+            if self.connected_but_read_only() {
+                return Err(self.write_gated_error(&request.name, action));
+            }
         }
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         self.tool_router.call(tcc).await
@@ -7210,6 +7334,36 @@ impl ServerHandler for IrisTools {
 }
 
 impl IrisTools {
+    /// #114: a mutation refused because the connection is not write-allowed. Says what it
+    /// would have changed and how to allow it — the escape hatch is deliberately named,
+    /// because a false positive on a development instance must be a five-second fix and not
+    /// a mystery. Reads are never refused, so reaching this means a write was attempted.
+    fn write_gated_error(&self, tool: &str, action: &str) -> McpError {
+        let (mode, namespace) = {
+            let c = self.connection.lock().unwrap();
+            match c.iris.as_ref() {
+                Some(i) => (format!("{:?}", i.system_mode), i.namespace.clone()),
+                None => ("Unknown".to_string(), String::new()),
+            }
+        };
+        McpError::invalid_params(
+            format!(
+                "'{tool}' would {action} on a connection that is not write-allowed \
+                 (system mode {mode}, namespace '{namespace}'), so it was not called. \
+                 Reads are never blocked — the read actions of this tool still work. \
+                 Set IRIS_ALLOW_PROD=1 if writing to this instance is intended."
+            ),
+            Some(serde_json::json!({
+                "error_code": "WRITE_GATED",
+                "tool": tool,
+                "would": action,
+                "system_mode": mode,
+                "namespace": namespace,
+                "allow_with": "IRIS_ALLOW_PROD=1",
+            })),
+        )
+    }
+
     /// There IS a connection and it is not write-allowed — a Live system mode, or a
     /// production-looking namespace without IRIS_ALLOW_PROD. Disconnected is deliberately
     /// NOT this: those calls fail with IRIS_UNREACHABLE anyway, and reporting them as
@@ -7236,20 +7390,8 @@ impl IrisTools {
                 })),
             );
         }
-        if WRITE_GATED_TOOLS.contains(&name) && self.connected_but_read_only() {
-            return McpError::invalid_params(
-                format!(
-                    "Tool '{name}' is write-capable and this connection is not write-allowed \
-                     (Live system mode, or a production-looking namespace). It was not called. \
-                     Set IRIS_ALLOW_PROD=1 only if writing to this instance is intended."
-                ),
-                Some(serde_json::json!({
-                    "error_code": "WRITE_GATED",
-                    "tool": name,
-                    "toolset": self.toolset.as_str(),
-                })),
-            );
-        }
+        // A pruned-tool rejection never mentions the write gate: #114 stopped the gate
+        // pruning anything, so an unreachable name can only be a toolset decision.
         McpError::invalid_params(
             format!(
                 "Tool '{name}' exists but is not part of the '{ts}' toolset, so it was not \
@@ -8969,6 +9111,201 @@ mod no_tests_found_guidance_tests {
         let cands = v(&["Wk47.Tests.SmokeTest"]);
         let (_, dym) = no_tests_found_guidance("wk47.tests", "APP", &cands, false);
         assert_eq!(dym, v(&["Wk47.Tests.SmokeTest"]));
+    }
+}
+
+/// #114: the write gate, as a pure decision. Reading is never blocked; a mutation is
+/// refused only on a connection that is not write-allowed.
+#[cfg(test)]
+mod write_gate_tests {
+    use super::*;
+
+    fn call(tool: &str, args: serde_json::Value) -> Option<&'static str> {
+        mutating_call(tool, &args)
+    }
+
+    /// The half the user cares about most: on a development instance nothing is blocked,
+    /// and on ANY instance a read is never blocked. These are the calls that must pass
+    /// through untouched no matter what the connection is.
+    #[test]
+    fn reads_are_never_mutations() {
+        let reads = [
+            (
+                "iris_doc",
+                serde_json::json!({"mode": "get", "name": "A.B.cls"}),
+            ),
+            (
+                "iris_doc",
+                serde_json::json!({"mode": "head", "name": "A.B.cls"}),
+            ),
+            ("iris_query", serde_json::json!({"query": "SELECT 1"})),
+            ("iris_interop_query", serde_json::json!({"what": "logs"})),
+            ("iris_production", serde_json::json!({"action": "status"})),
+            ("iris_production", serde_json::json!({"action": "check"})),
+            (
+                "iris_production",
+                serde_json::json!({"action": "get_autostart"}),
+            ),
+            // The read that the OLD gate made unreachable: removing the whole tool took
+            // get_settings with it, so you could not look at a config item at all.
+            (
+                "iris_production_item",
+                serde_json::json!({"action": "get_settings"}),
+            ),
+            ("iris_lookup_manage", serde_json::json!({"action": "get"})),
+            (
+                "iris_lookup_manage",
+                serde_json::json!({"action": "list_tables"}),
+            ),
+            (
+                "iris_lookup_manage",
+                serde_json::json!({"action": "list_keys"}),
+            ),
+            (
+                "iris_lookup_transfer",
+                serde_json::json!({"action": "export"}),
+            ),
+            (
+                "iris_business_rule_info",
+                serde_json::json!({"action": "list"}),
+            ),
+            ("iris_debug", serde_json::json!({"action": "error_logs"})),
+            ("iris_debug", serde_json::json!({"action": "map_int"})),
+            ("check_config", serde_json::json!({})),
+            ("docs_introspect", serde_json::json!({"class_name": "A.B"})),
+            ("iris_symbols", serde_json::json!({"query": "A"})),
+            ("iris_table_info", serde_json::json!({"table": "A.B"})),
+            ("iris_credential_list", serde_json::json!({})),
+            ("iris_message_body", serde_json::json!({"message_id": "1"})),
+            ("iris_production_diff", serde_json::json!({})),
+            ("iris_get_log", serde_json::json!({})),
+            (
+                "extract_message_map_routing",
+                serde_json::json!({"class_name": "A.B"}),
+            ),
+            (
+                "find_subclass_implementations",
+                serde_json::json!({"method_name": "m"}),
+            ),
+        ];
+        for (tool, args) in reads {
+            assert_eq!(
+                call(tool, args.clone()),
+                None,
+                "{tool} {args} is a READ and must never be gated — this server is aimed at \
+                 development instances, where a blocked read costs more than it protects"
+            );
+        }
+    }
+
+    /// The five that reached a Live instance ungated before #114, plus the two that were
+    /// already gated. Each must be recognised as a mutation.
+    #[test]
+    fn every_write_path_is_recognised() {
+        let writes = [
+            (
+                "iris_doc",
+                serde_json::json!({"mode": "put", "name": "A.B.cls"}),
+            ),
+            (
+                "iris_doc",
+                serde_json::json!({"mode": "delete", "name": "A.B.cls"}),
+            ),
+            ("iris_execute", serde_json::json!({"code": "write 1"})),
+            ("iris_compile", serde_json::json!({"target": "A.B.cls"})),
+            ("iris_test", serde_json::json!({"pattern": "A"})),
+            ("iris_lookup_manage", serde_json::json!({"action": "set"})),
+            (
+                "iris_lookup_manage",
+                serde_json::json!({"action": "delete"}),
+            ),
+            (
+                "iris_lookup_transfer",
+                serde_json::json!({"action": "import"}),
+            ),
+            ("iris_production", serde_json::json!({"action": "start"})),
+            ("iris_production", serde_json::json!({"action": "stop"})),
+            ("iris_production", serde_json::json!({"action": "restart"})),
+            ("iris_production", serde_json::json!({"action": "update"})),
+            ("iris_production", serde_json::json!({"action": "recover"})),
+            (
+                "iris_production",
+                serde_json::json!({"action": "set_autostart"}),
+            ),
+            ("iris_production_item", serde_json::json!({"action": "add"})),
+            (
+                "iris_production_item",
+                serde_json::json!({"action": "remove"}),
+            ),
+            (
+                "iris_production_item",
+                serde_json::json!({"action": "enable"}),
+            ),
+            (
+                "iris_production_item",
+                serde_json::json!({"action": "disable"}),
+            ),
+            (
+                "iris_production_item",
+                serde_json::json!({"action": "set_settings"}),
+            ),
+            (
+                "iris_credential_manage",
+                serde_json::json!({"action": "create"}),
+            ),
+            (
+                "iris_credential_manage",
+                serde_json::json!({"action": "update"}),
+            ),
+            (
+                "iris_credential_manage",
+                serde_json::json!({"action": "delete"}),
+            ),
+            (
+                "iris_query",
+                serde_json::json!({"query": "DELETE FROM T", "force": true}),
+            ),
+            // source_map is the one iris_debug action that writes — execute_via_generator
+            // PUTs and compiles a scratch class.
+            ("iris_debug", serde_json::json!({"action": "source_map"})),
+        ];
+        for (tool, args) in writes {
+            assert!(
+                call(tool, args.clone()).is_some(),
+                "{tool} {args} MUTATES and must be gated on a Live connection"
+            );
+        }
+    }
+
+    /// A tool added to the interop profile must be classified deliberately, not inherit
+    /// "safe" from the fall-through arm. This is what stops the next `iris_execute` from
+    /// quietly becoming ungated.
+    #[test]
+    fn every_interop_tool_is_classified() {
+        for tool in INTEROP_TOOLS {
+            assert!(
+                CLASSIFIED_TOOLS.contains(tool),
+                "'{tool}' is in INTEROP_TOOLS but not in `mutating_call`'s explicit arms. \
+                 Decide whether it writes and add it — the fall-through returns None, so \
+                 forgetting means it is treated as read-only on a Live instance"
+            );
+        }
+    }
+
+    /// An unknown discriminator is not a write. A typo'd action fails in the handler with a
+    /// message naming the valid set (#112); it must not be reported as a blocked write,
+    /// which would send the caller to IRIS_ALLOW_PROD for a parameter mistake.
+    #[test]
+    fn an_unknown_action_is_not_treated_as_a_write() {
+        assert_eq!(
+            call("iris_production", serde_json::json!({"action": "wibble"})),
+            None
+        );
+        assert_eq!(
+            call("iris_doc", serde_json::json!({"mode": "wibble"})),
+            None
+        );
+        assert_eq!(call("iris_production_item", serde_json::json!({})), None);
     }
 }
 
