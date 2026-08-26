@@ -1406,6 +1406,11 @@ pub async fn interop_partners_impl(
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ProductionItemParams {
+    // #112: the enum belongs in the SCHEMA, not only in the INVALID_ACTION message.
+    // Nine of the campaign's 31 parameter errors were a guessed action on one of these
+    // tools; the runtime message names the valid set correctly, it just arrives a round
+    // trip late. `extend` puts the same set where the model reads it first.
+    #[schemars(extend("enum" = ["add", "remove", "enable", "disable", "get_settings", "set_settings"]))]
     pub action: String,
     pub item: String,
     #[serde(default = "default_ns")]
@@ -1777,6 +1782,11 @@ pub struct CredentialListParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CredentialManageParams {
+    // #112: the enum belongs in the SCHEMA, not only in the INVALID_ACTION message.
+    // Nine of the campaign's 31 parameter errors were a guessed action on one of these
+    // tools; the runtime message names the valid set correctly, it just arrives a round
+    // trip late. `extend` puts the same set where the model reads it first.
+    #[schemars(extend("enum" = ["create", "update", "delete"]))]
     pub action: String,
     pub id: String,
     pub username: Option<String>,
@@ -1942,6 +1952,11 @@ If $$$ISERR(tSC) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct LookupManageParams {
+    // #112: the enum belongs in the SCHEMA, not only in the INVALID_ACTION message.
+    // Nine of the campaign's 31 parameter errors were a guessed action on one of these
+    // tools; the runtime message names the valid set correctly, it just arrives a round
+    // trip late. `extend` puts the same set where the model reads it first.
+    #[schemars(extend("enum" = ["get", "set", "delete", "list_keys", "list_tables"]))]
     pub action: String,
     pub table: Option<String>,
     pub key: Option<String>,
@@ -1952,6 +1967,11 @@ pub struct LookupManageParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct LookupTransferParams {
+    // #112: the enum belongs in the SCHEMA, not only in the INVALID_ACTION message.
+    // Nine of the campaign's 31 parameter errors were a guessed action on one of these
+    // tools; the runtime message names the valid set correctly, it just arrives a round
+    // trip late. `extend` puts the same set where the model reads it first.
+    #[schemars(extend("enum" = ["export", "import"]))]
     pub action: String,
     pub table: String,
     pub xml: Option<String>,
@@ -2338,6 +2358,11 @@ fn default_max_bytes() -> u32 {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct BusinessRuleInfoParams {
+    // #112: the enum belongs in the SCHEMA, not only in the INVALID_ACTION message.
+    // Nine of the campaign's 31 parameter errors were a guessed action on one of these
+    // tools; the runtime message names the valid set correctly, it just arrives a round
+    // trip late. `extend` puts the same set where the model reads it first.
+    #[schemars(extend("enum" = ["list", "get"]))]
     pub action: String,
     pub rule_name: Option<String>,
     #[serde(default = "default_ns")]

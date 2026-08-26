@@ -251,6 +251,11 @@ pub async fn handle_iris_macro(
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DebugParams {
     /// Action: map_int, error_logs, capture, source_map
+    // #112: the valid set was in the description prose only, so the schema said "any
+    // string". Caught by `every_tool_advertises_the_parameters_it_reads` — iris_debug was
+    // the tool held up as the example of a well-described dispatcher, and it had the same
+    // gap one level down.
+    #[schemars(extend("enum" = ["map_int", "error_logs", "capture", "source_map"]))]
     pub action: String,
     /// Error string for map_int e.g. "<UNDEFINED>x+3^MyApp.Foo.1"
     pub error_string: Option<String>,

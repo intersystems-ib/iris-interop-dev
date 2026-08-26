@@ -9,6 +9,42 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// `#` followed by one or more digits — an issue reference. Hand-rolled so this test
+/// pulls in no new dependency.
+struct IssueRef;
+impl IssueRef {
+    fn find_iter<'a>(&self, hay: &'a str) -> impl Iterator<Item = IssueMatch<'a>> {
+        let bytes: Vec<(usize, char)> = hay.char_indices().collect();
+        let mut out = vec![];
+        for (i, (pos, c)) in bytes.iter().enumerate() {
+            if *c != '#' {
+                continue;
+            }
+            let mut end = *pos + 1;
+            let mut n = 0;
+            for (p2, c2) in bytes.iter().skip(i + 1) {
+                if c2.is_ascii_digit() {
+                    end = p2 + c2.len_utf8();
+                    n += 1;
+                } else {
+                    break;
+                }
+            }
+            if n > 0 {
+                out.push(IssueMatch(&hay[*pos..end]));
+            }
+        }
+        out.into_iter()
+    }
+}
+struct IssueMatch<'a>(&'a str);
+impl<'a> IssueMatch<'a> {
+    fn as_str(&self) -> &'a str {
+        self.0
+    }
+}
+const ISSUE_REF: IssueRef = IssueRef;
+
 fn iris_dev_bin() -> std::path::PathBuf {
     // Find the binary in the cargo target directory
     let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -92,6 +128,107 @@ fn mcp_server_starts_and_responds_to_initialize() {
         "initialize response missing 'result': {}",
         response
     );
+
+    child.kill().ok();
+}
+
+/// #112: every tool that takes parameters must SAY SO in its advertised schema.
+///
+/// Ten of the 23 interop tools shipped `{"type":"object"}` — no properties, no `required` —
+/// because their handler signature was `Parameters<AnyParams>`. A model had nothing to work
+/// from but the tool description, and `{}` was a schema-valid call. Measured over a
+/// 1121-call OpenCode campaign: 31 parameter errors in 223 calls to those tools (13.9%),
+/// and ZERO in 898 calls to the twelve that had real schemas. All 22 `MISSING_WHAT` errors
+/// were calls of exactly `{}`.
+///
+/// This asserts at the wire, over the whole profile, so a new tool cannot quietly join the
+/// schema-less group.
+#[test]
+fn every_tool_advertises_the_parameters_it_reads() {
+    let bin = iris_dev_bin();
+    if !bin.exists() {
+        eprintln!("Skipping: iris-agentic-dev binary not found");
+        return;
+    }
+
+    let mut child = Command::new(&bin)
+        .arg("mcp")
+        .env("IRIS_WEB_PORT", "9")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn iris-agentic-dev mcp");
+
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    send_jsonrpc(
+        &mut stdin,
+        1,
+        "initialize",
+        r#"{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}"#,
+    );
+    let _ = read_jsonrpc(&mut reader);
+    stdin
+        .write_all(
+            b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\",\"params\":{}}\n",
+        )
+        .unwrap();
+    stdin.flush().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    send_jsonrpc(&mut stdin, 2, "tools/list", "{}");
+    let response = read_jsonrpc(&mut reader);
+    let tools = response["result"]["tools"].as_array().unwrap();
+
+    // The ONLY tool that legitimately advertises no properties is the one that reads none.
+    // Adding a name here is a claim that the tool takes no parameters at all — check the
+    // handler before you do.
+    const TAKES_NO_PARAMETERS: &[&str] = &["check_config"];
+
+    for tool in tools {
+        let name = tool["name"].as_str().unwrap_or("?");
+        let schema = &tool["inputSchema"];
+        let props = schema.get("properties").and_then(|p| p.as_object());
+        if TAKES_NO_PARAMETERS.contains(&name) {
+            continue;
+        }
+        let props = props.unwrap_or_else(|| {
+            panic!(
+                "tool '{name}' advertises no properties. A caller — human or model — has \
+                 only the prose description to guess parameter names from, and `{{}}` is a \
+                 schema-valid call. Give the handler a typed params struct (or wrap the \
+                 existing one in `Described<…>`): {schema}"
+            )
+        });
+        assert!(
+            !props.is_empty(),
+            "tool '{name}' advertises an EMPTY properties map: {schema}"
+        );
+
+        // A dispatcher's discriminator must be required AND enumerated. Naming the field
+        // without its values only moves the guess one level down — which is what the nine
+        // INVALID_ACTION errors in the campaign were.
+        for key in ["action", "what"] {
+            let Some(prop) = props.get(key) else { continue };
+            let required: Vec<&str> = schema["required"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            assert!(
+                required.contains(&key),
+                "tool '{name}' has a '{key}' discriminator that is not in `required` — a \
+                 model may legitimately omit it and will: {schema}"
+            );
+            assert!(
+                prop.get("enum")
+                    .and_then(|e| e.as_array())
+                    .is_some_and(|e| !e.is_empty()),
+                "tool '{name}' declares '{key}' without its valid values. The runtime error \
+                 names them correctly; it just arrives a round trip late: {prop}"
+            );
+        }
+    }
 
     child.kill().ok();
 }
@@ -333,6 +470,21 @@ fn mcp_server_tools_list_returns_interop_profile() {
                  Keep the rationale in the source as a `//` comment: {schema}"
             );
         }
+        // #112, a third route for the same leak, and the one the jargon list above could
+        // not see: an ISSUE NUMBER. `#82` shipped its own rationale — `iris_get_log`
+        // advertised "(issue #82)", "(issue #81)", "(issue #78)" and "(issue #83)" in its
+        // property descriptions for as long as that fix has existed, because none of those
+        // strings is Rust syntax. No caller-facing sentence needs a tracker reference:
+        // the reader of a tools/list cannot open the issue and does not want to. This is a
+        // precise marker — `#` followed by digits — not a substring match on prose.
+        let issue_refs: Vec<&str> = ISSUE_REF.find_iter(&schema).map(|m| m.as_str()).collect();
+        assert!(
+            issue_refs.is_empty(),
+            "tool '{name}' ships issue references {issue_refs:?} in its advertised \
+             inputSchema — maintainer bookkeeping, sent to every client on every \
+             tools/list. Keep it in the source as a `//` comment: {schema}"
+        );
+
         // The same leak by another route: schemars puts the params STRUCT NAME in the
         // schema's top-level `title` (`GetLogParams`, `CompileParams`, …). It names
         // nothing the caller can act on — the tool already has a `name` — and it went out

@@ -37,6 +37,227 @@ impl std::ops::Deref for AnyParams {
         &self.0
     }
 }
+
+// #112: the advertised shape of `iris_production`. Schema only — the handler still reads
+// the raw object, because the nine actions take overlapping subsets and a strict struct
+// would reject valid calls. Every field below is one the handler actually reads; the
+// per-action applicability is in each field's description, which is where a model looks.
+//
+// `//`, not `///`, deliberately: schemars promotes a struct doc comment to the schema's
+// top-level `description`, which then ships on every tools/list. That is #82's rule.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[allow(dead_code)] // read via the raw Value; this type exists to be the schema
+pub struct ProductionDispatchSchema {
+    /// REQUIRED. status=current state, start=start a production, stop=stop the running one,
+    /// restart=recycle ONE config item (pass item), update=hot-apply config changes,
+    /// check=report whether an update is needed, recover=recover a troubled production,
+    /// get_autostart / set_autostart=read or set this namespace's autostart production.
+    pub action: ProductionAction,
+    /// Interop-enabled namespace. Omit to use the connection namespace (IRIS_NAMESPACE).
+    #[serde(default)]
+    pub namespace: Option<String>,
+    /// start / stop / set_autostart: the production class, e.g. "MyPkg.MyProduction".
+    /// `production_name` and `name` are accepted as spellings of this same field.
+    #[serde(default)]
+    pub production: Option<String>,
+    /// restart: the config item to recycle. `component` is accepted for this field too.
+    #[serde(default)]
+    pub item: Option<String>,
+    /// status: include per-item detail rather than the production summary alone.
+    #[serde(default)]
+    pub full: Option<bool>,
+    /// start / stop / update: seconds to wait for the operation (default 30).
+    #[serde(default)]
+    pub timeout: Option<u32>,
+    /// start / stop / update: force the operation past a busy or troubled state.
+    #[serde(default)]
+    pub force: Option<bool>,
+    /// set_autostart: whether this namespace should autostart the production.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
+/// The `action` discriminator, as a schema `enum` so a model picks rather than guesses.
+///
+/// The `JsonSchema` impl is hand-written for one reason: a derived enum is emitted as
+/// `{"$ref": "#/$defs/ProductionAction"}`, and an MCP client that does not resolve `$ref`
+/// sees a property with no enum at all — which is #112 again, one level down.
+/// `inline_schema()` is what keeps the advertised inputSchema self-contained.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
+pub enum ProductionAction {
+    Status,
+    Start,
+    Stop,
+    Restart,
+    Update,
+    Check,
+    Recover,
+    GetAutostart,
+    SetAutostart,
+}
+
+impl JsonSchema for ProductionAction {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "ProductionAction".into()
+    }
+    fn json_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({"type": "string", "enum": [
+            "status", "start", "stop", "restart", "update",
+            "check", "recover", "get_autostart", "set_autostart"
+        ]})
+    }
+    fn inline_schema() -> bool {
+        true
+    }
+}
+
+// #112: the advertised shape of `iris_interop_query`. All 22 MISSING_WHAT errors in the
+// campaign were calls of exactly `{}` — with `what` declared and required there is nothing
+// left to omit. Schema only, for the same reason as ProductionDispatchSchema: the five
+// `what` values take different subsets. `//` not `///` — see the note there.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+pub struct InteropQueryDispatchSchema {
+    /// REQUIRED. logs=Ens_Util.Log entries, queues=message queue depths,
+    /// messages=the Ens.MessageHeader archive (optionally searching message CONTENT),
+    /// trace=one whole session by session_id, partners=Ens.Config.BusinessPartner rows.
+    pub what: InteropQueryWhat,
+    /// Interop-enabled namespace. Omit to use the connection namespace (IRIS_NAMESPACE).
+    #[serde(default)]
+    pub namespace: Option<String>,
+    /// logs: narrow to one config item. (`component` is this field's name on the wire.)
+    #[serde(default)]
+    pub component: Option<String>,
+    /// logs: comma-separated severities to include. Default "error,warning".
+    #[serde(default)]
+    pub log_type: Option<String>,
+    /// logs / messages / trace: narrow to one session. REQUIRED for what=trace.
+    #[serde(default)]
+    pub session_id: Option<i64>,
+    /// logs / messages: return only rows after this id — tails without a MAX(ID) round trip.
+    #[serde(default)]
+    pub since_id: Option<i64>,
+    /// logs / messages: row cap (default 50).
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// messages: narrow to messages sent by this config item.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// messages: narrow to messages sent to this config item.
+    #[serde(default)]
+    pub target: Option<String>,
+    /// messages: narrow to one message class.
+    #[serde(default)]
+    pub message_class: Option<String>,
+    /// messages: join the body table of this message class server-side, so a WHERE can run
+    /// against message CONTENT. The SQL table name is resolved for you.
+    #[serde(default)]
+    pub body_class: Option<String>,
+    /// messages: SQL fragment applied to the body table named by body_class.
+    #[serde(default)]
+    pub body_where: Option<String>,
+    /// messages: body columns to return alongside the header.
+    #[serde(default)]
+    pub body_select: Option<Vec<String>>,
+    /// messages: search an indexed Search Table field instead of the body table —
+    /// {prop, value | value_like, class?, extent?}. extent defaults to
+    /// EnsLib.HL7.SearchTable; an error lists the searchable props.
+    #[serde(default)]
+    pub search_table: Option<serde_json::Value>,
+}
+
+/// The `what` discriminator, as a schema `enum`. Hand-written for the same reason as
+/// [`ProductionAction`] — it must inline rather than `$ref`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
+pub enum InteropQueryWhat {
+    Logs,
+    Queues,
+    Messages,
+    Trace,
+    Partners,
+}
+
+impl JsonSchema for InteropQueryWhat {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "InteropQueryWhat".into()
+    }
+    fn json_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({"type": "string", "enum": [
+            "logs", "queues", "messages", "trace", "partners"
+        ]})
+    }
+    fn inline_schema() -> bool {
+        true
+    }
+}
+
+/// Free-form JSON to the handler, `S`'s real schema on the wire.
+///
+/// #112: ten interop tools took [`AnyParams`], so `tools/list` advertised
+/// `{"type":"object"}` for each — no properties, no `required`. A model had nothing to
+/// work from but the prose description, and `{}` was a schema-valid call. Measured over a
+/// 1121-call OpenCode campaign: the 11 schema-less tools took 31 parameter errors in 223
+/// calls (13.9%), the 12 tools with real schemas took **zero** in 898. All 22
+/// `MISSING_WHAT` calls sent exactly `{}`, across 8 runs.
+///
+/// The handlers already had the answer: each one builds a typed `…Params` struct that
+/// derives `JsonSchema` and carries doc comments. The schema existed; the tool signature
+/// simply did not point at it. This wrapper publishes `S`'s schema while still handing the
+/// handler the raw `Value` it destructures today — so nothing about dispatch, defaults or
+/// the permissive per-action shapes changes. A field the schema does not name is still
+/// accepted, which is what keeps the dispatchers' unions working.
+pub struct Described<S>(pub serde_json::Value, std::marker::PhantomData<S>);
+
+impl<S> Described<S> {
+    /// Wrap a raw object — for tests and any caller driving a handler directly.
+    pub fn new(value: serde_json::Value) -> Self {
+        Described(value, std::marker::PhantomData)
+    }
+}
+
+impl<S> std::fmt::Debug for Described<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+impl<S> std::ops::Deref for Described<S> {
+    type Target = serde_json::Value;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<'de, S> Deserialize<'de> for Described<S> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // Deliberately infallible over any JSON object: the schema advertises the shape,
+        // the handler validates it and answers with a message that names the valid values.
+        // Deserialising strictly here would replace MISSING_WHAT ("one of logs, queues,
+        // messages, trace, partners") with rmcp's generic "missing field `what`".
+        serde_json::Value::deserialize(d).map(|v| Described(v, std::marker::PhantomData))
+    }
+}
+
+impl<S: JsonSchema> JsonSchema for Described<S> {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        S::schema_name()
+    }
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        S::schema_id()
+    }
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        S::json_schema(generator)
+    }
+    fn inline_schema() -> bool {
+        // The advertised inputSchema must be self-contained — a `$ref` into `$defs` is not
+        // something every MCP client resolves.
+        true
+    }
+}
 pub mod admin;
 pub mod concurrency;
 pub mod dict;
@@ -1144,20 +1365,20 @@ pub struct NoParams {}
 pub struct GetLogParams {
     /// The log_id a previous truncated:true result returned. If omitted (and `log_id` is
     /// omitted too), lists the stored entries. `log_id` is the SAME parameter, declared
-    /// separately so strict clients can emit it (issue #82); pass either one, or the same
-    /// value in both. A number is read as its decimal string (issue #81).
+    /// separately so strict clients can emit it; pass either one, or the same
+    /// value in both. A number is read as its decimal string.
     pub id: Option<String>,
     /// Identical to `id` — the name every truncating tool emits in its `log_id` field
-    /// (issue #78). Pass either; passing both with DIFFERENT values is an error.
+    /// Pass either; passing both with DIFFERENT values is an error.
     pub log_id: Option<String>,
     /// Max entries to return. Must be > 0 if provided. Paginates BOTH forms: the stored
-    /// result when an id is given, and the index listing when it is not (issue #83).
+    /// result when an id is given, and the index listing when it is not.
     // The runtime rejects 0 with INVALID_PARAMS, so the schema has to reject it too:
     // `usize` alone advertises `minimum: 0`, and a client that validates against the
     // published schema then believes 0 is legal and only learns otherwise from an error.
     #[schemars(range(min = 1))]
     pub limit: Option<usize>,
-    /// Start index. Default 0. Paginates both forms (issue #83).
+    /// Start index. Default 0. Paginates both forms.
     // Advertised as nullable even though it is read as a plain `usize`, because that is
     // the whole point of #82: a strict function-calling client puts EVERY declared
     // property in `required` and sends `null` for the ones it is not using. `offset` was
@@ -1169,16 +1390,16 @@ pub struct GetLogParams {
     #[serde(default)]
     #[schemars(with = "Option<usize>")]
     pub offset: usize,
-    /// Issue #78: every key serde did not recognise. Captured rather than dropped so a
-    /// mistyped addressing key (`logid`) can be NAMED instead of silently falling through
-    /// to the index listing, which is a different response shape. Not a caller-facing
-    /// parameter: schemars emits no property for a flattened map, only
-    /// `additionalProperties: true` (which `drop_default_additional_properties` removes
-    /// again on the wire).
+    // Issue #78: every key serde did not recognise. Captured rather than dropped so a
+    // mistyped addressing key (`logid`) can be NAMED instead of silently falling through
+    // to the index listing, which is a different response shape. Not a caller-facing
+    // parameter: schemars emits no property for a flattened map, only
+    // `additionalProperties: true` (which `drop_default_additional_properties` removes
+    // again on the wire).
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
-    /// Issue #81: what the deserializer coerced or could not use. Never a wire parameter —
-    /// `Deserialize` fills it, `get_log_impl` decides error vs warning.
+    // Issue #81: what the deserializer coerced or could not use. Never a wire parameter —
+    // `Deserialize` fills it, `get_log_impl` decides error vs warning.
     #[serde(skip)]
     #[schemars(skip)]
     pub issues: Vec<GetLogIssue>,
@@ -6093,7 +6314,7 @@ Methods:
     )]
     async fn iris_production(
         &self,
-        Parameters(p): Parameters<AnyParams>,
+        Parameters(p): Parameters<Described<ProductionDispatchSchema>>,
     ) -> Result<CallToolResult, McpError> {
         let action = p.get("action").and_then(|v| v.as_str()).unwrap_or("status");
         let _iris_arc_hold = self.iris_arc();
@@ -6216,7 +6437,7 @@ Methods:
     )]
     async fn iris_interop_query(
         &self,
-        Parameters(p): Parameters<AnyParams>,
+        Parameters(p): Parameters<Described<InteropQueryDispatchSchema>>,
     ) -> Result<CallToolResult, McpError> {
         // B9: `what` is required-with-enum — fail fast with the valid set instead of silently
         // defaulting (the workshop's missing-discriminator calls otherwise misfired).
@@ -6428,7 +6649,7 @@ Methods:
     )]
     async fn iris_production_item(
         &self,
-        Parameters(p): Parameters<AnyParams>,
+        Parameters(p): Parameters<Described<interop::ProductionItemParams>>,
     ) -> Result<CallToolResult, McpError> {
         let action = p
             .get("action")
@@ -6504,7 +6725,7 @@ Methods:
     )]
     async fn iris_message_body(
         &self,
-        Parameters(p): Parameters<AnyParams>,
+        Parameters(p): Parameters<Described<interop::MessageBodyParams>>,
     ) -> Result<CallToolResult, McpError> {
         let _iris_arc_hold = self.iris_arc();
         let iris_opt = _iris_arc_hold.as_deref();
@@ -6551,7 +6772,7 @@ Methods:
     )]
     async fn iris_business_rule_info(
         &self,
-        Parameters(p): Parameters<AnyParams>,
+        Parameters(p): Parameters<Described<interop::BusinessRuleInfoParams>>,
     ) -> Result<CallToolResult, McpError> {
         let _iris_arc_hold = self.iris_arc();
         let iris_opt = _iris_arc_hold.as_deref();
@@ -6588,7 +6809,7 @@ Methods:
     )]
     async fn iris_production_diff(
         &self,
-        Parameters(p): Parameters<AnyParams>,
+        Parameters(p): Parameters<Described<interop::ProductionDiffParams>>,
     ) -> Result<CallToolResult, McpError> {
         let _iris_arc_hold = self.iris_arc();
         let iris_opt = _iris_arc_hold.as_deref();
@@ -6622,7 +6843,7 @@ Methods:
     )]
     async fn iris_credential_list(
         &self,
-        Parameters(p): Parameters<AnyParams>,
+        Parameters(p): Parameters<Described<interop::CredentialListParams>>,
     ) -> Result<CallToolResult, McpError> {
         let _iris_arc_hold = self.iris_arc();
         let namespace = interop::resolve_namespace(
@@ -6649,7 +6870,7 @@ Methods:
     )]
     async fn iris_credential_manage(
         &self,
-        Parameters(p): Parameters<AnyParams>,
+        Parameters(p): Parameters<Described<interop::CredentialManageParams>>,
     ) -> Result<CallToolResult, McpError> {
         let _iris_arc_hold = self.iris_arc();
         let namespace = interop::resolve_namespace(
@@ -6698,7 +6919,7 @@ Methods:
     )]
     async fn iris_lookup_manage(
         &self,
-        Parameters(p): Parameters<AnyParams>,
+        Parameters(p): Parameters<Described<interop::LookupManageParams>>,
     ) -> Result<CallToolResult, McpError> {
         let _iris_arc_hold = self.iris_arc();
         let namespace = interop::resolve_namespace(
@@ -6741,7 +6962,7 @@ Methods:
     )]
     async fn iris_lookup_transfer(
         &self,
-        Parameters(p): Parameters<AnyParams>,
+        Parameters(p): Parameters<Described<interop::LookupTransferParams>>,
     ) -> Result<CallToolResult, McpError> {
         let _iris_arc_hold = self.iris_arc();
         let namespace = interop::resolve_namespace(
@@ -12028,7 +12249,7 @@ mod http_status_answer_tests {
         rt().block_on(async {
             let server = server_with("POST", r".*/action/query$", ResponseTemplate::new(404)).await;
             let r = tools_for(&server)
-                .iris_production(Parameters(AnyParams(
+                .iris_production(Parameters(Described::new(
                     serde_json::json!({"action": "status", "namespace": "ZZNOSUCHNS"}),
                 )))
                 .await
