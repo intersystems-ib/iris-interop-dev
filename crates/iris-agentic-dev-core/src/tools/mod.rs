@@ -4471,28 +4471,26 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
         let namespace = interop::resolve_namespace(p.namespace.as_deref(), Some(&iris));
         let client = self.http_client();
         let query_url = iris.versioned_ns_url(&namespace, "/action/query");
-        let resp = match client
-            .post(&query_url)
-            .basic_auth(&iris.username, Some(&iris.password))
-            .json(&serde_json::json!({"query": p.query, "parameters": p.parameters}))
-            .send()
+
+        // #105: `iris_query` used to carry its own copy of this request — which meant its own
+        // (drifted) response reading AND no retry at all, while every `query`-backed tool rode
+        // out transient drops. One OpenCode campaign run took four consecutive
+        // IRIS_UNREACHABLEs here over ~190s of a sandbox blip that the shared retry absorbs.
+        // Now the request, the retry policy and the reading are all shared; what stays local
+        // is the PRESENTATION — SQL_ERROR with the table hints, and the #93 404 probe.
+        let params: Vec<serde_json::Value> = p
+            .parameters
+            .iter()
+            .map(|v| serde_json::Value::String(v.clone()))
+            .collect();
+        let outcome = match iris
+            .query_outcome(&p.query, params, &namespace, client)
             .await
         {
-            Ok(v) => v,
+            Ok(o) => o,
             Err(e) => return crate::tools::envelope::transport_fail("iris_query", &e.to_string()),
         };
-
-        // #105: read the response through the SAME interpreter `IrisConnection::query_once`
-        // uses, so `iris_query` and every query_once-backed tool (iris_symbols,
-        // iris_interop_query, …) can no longer answer a malformed response two different
-        // ways. What stays local is the PRESENTATION — SQL_ERROR with the table hints, and
-        // the 404 namespace probe — not the reading of the response.
-        let status = resp.status();
-        let text = match resp.text().await {
-            Ok(t) => t,
-            Err(e) => return crate::tools::envelope::transport_fail("iris_query", &e.to_string()),
-        };
-        let body = match crate::iris::connection::interpret_query_response(status, &text) {
+        let body = match outcome {
             crate::iris::connection::QueryOutcome::Rows(body) => body,
             crate::iris::connection::QueryOutcome::HttpError { status, .. } => {
                 // #93 first: the 404 body is ZERO bytes, so the transport alone cannot tell a
@@ -4524,7 +4522,7 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
             // NOT an empty result set. `unwrap_or_default()` used to make it the latter:
             // `{"success":true,"rows":[],"count":0}` — a confident wrong answer, and the
             // exact shape #102 was filed about, surviving in the one tool that copy missed.
-            crate::iris::connection::QueryOutcome::NonJson { snippet } => {
+            crate::iris::connection::QueryOutcome::NonJson { status, snippet } => {
                 self.record_call("iris_query", false);
                 return envelope::fail_with(
                     "IRIS_REQUEST_FAILED",
@@ -9031,6 +9029,62 @@ mod query_parity_tests {
                 conn_err.contains("ERROR #16002"),
                 "both paths must surface the same Atelier text, got: {conn_err}"
             );
+        });
+    }
+
+    /// #105, the half the first pass missed. Sharing the response READER left `iris_query`
+    /// still issuing its own request — and therefore still with no retry, while every
+    /// `query`-backed tool rode out transient drops. The OpenCode campaign logs show the
+    /// cost: one run took four consecutive IRIS_UNREACHABLEs from `iris_query` across ~190s
+    /// of a sandbox blip, with `check_config` answering fine in between.
+    #[test]
+    fn a_transient_5xx_is_retried_rather_than_reported() {
+        rt().block_on(async {
+            let server = MockServer::start().await;
+            // Two failures, then the real answer — exactly what a restarting instance does.
+            Mock::given(method("POST"))
+                .and(path_regex(r".*/action/query$"))
+                .respond_with(ResponseTemplate::new(503))
+                .up_to_n_times(2)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(r".*/action/query$"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_string(
+                        r#"{"status":{"errors":[]},"result":{"content":[{"N":1}]}}"#,
+                    ),
+                )
+                .mount(&server)
+                .await;
+
+            let tool = tool_answer(&server).await;
+            assert_eq!(
+                tool["success"],
+                serde_json::json!(true),
+                "the third attempt succeeded — the caller must never see the first two: {tool}"
+            );
+            assert_eq!(tool["count"], 1, "{tool}");
+        });
+    }
+
+    /// The retry must not paper over a DETERMINISTIC failure. A SQL error is the same on
+    /// every attempt, so retrying it only delays the answer.
+    #[test]
+    fn a_sql_error_is_answered_immediately_not_retried() {
+        rt().block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path_regex(r".*/action/query$"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(
+                    r#"{"status":{"errors":[{"error":"SQLCODE: -30 Table not found"}]}}"#,
+                ))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let tool = tool_answer(&server).await;
+            assert_eq!(tool["error_code"], "SQL_ERROR", "{tool}");
         });
     }
 

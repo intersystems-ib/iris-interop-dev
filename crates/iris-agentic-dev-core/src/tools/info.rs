@@ -395,17 +395,19 @@ async fn read_query_context(tool: &str, resp: reqwest::Response, url: &str) -> Q
         QueryOutcome::HttpError { status, .. } => {
             QueryRead::Failed(crate::tools::envelope::http_status_fail(tool, status, url))
         }
-        QueryOutcome::NonJson { snippet } => QueryRead::Failed(crate::tools::envelope::fail_with(
-            "IRIS_REQUEST_FAILED",
-            &format!("non-JSON response from {url}: {snippet}"),
-            serde_json::json!({
-                "attempted_url": url,
-                "http_status": status.as_u16(),
-                "hint": "IRIS answered, but not with JSON — typically a proxy error page or \
-                         an HTML login redirect in front of the Atelier API. No context was \
-                         gathered; this is not an empty namespace.",
-            }),
-        )),
+        QueryOutcome::NonJson { snippet, .. } => {
+            QueryRead::Failed(crate::tools::envelope::fail_with(
+                "IRIS_REQUEST_FAILED",
+                &format!("non-JSON response from {url}: {snippet}"),
+                serde_json::json!({
+                    "attempted_url": url,
+                    "http_status": status.as_u16(),
+                    "hint": "IRIS answered, but not with JSON — typically a proxy error page or \
+                             an HTML login redirect in front of the Atelier API. No context was \
+                             gathered; this is not an empty namespace.",
+                }),
+            ))
+        }
     }
 }
 
