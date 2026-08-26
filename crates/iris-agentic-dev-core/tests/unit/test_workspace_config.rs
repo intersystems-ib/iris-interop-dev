@@ -11,10 +11,54 @@ fn write_toml(dir: &tempfile::TempDir, contents: &str) {
     f.write_all(contents.as_bytes()).unwrap();
 }
 
+// ── Env serialisation (#95) ───────────────────────────────────────────────────
+//
+// This file was red on 7 of 15 `cargo test` runs before this guard, the same defect as
+// #91: process-global env vars read and written by tests that cargo runs on parallel
+// threads in one binary. The observed failure was a CROSS-VARIABLE leak —
+// `test_https_scheme_in_base_url` saw `https://iris.example.com:443/myprefix`, i.e. an
+// `IRIS_WEB_PREFIX` set by a web-prefix test bled into a scheme test.
+//
+// The treatment differs from #91's merge-into-one-function on purpose: #91 had three
+// tests on one variable, which merge cleanly. Here there are five variables across 23
+// tests and the leaks cross variable boundaries, so merging would mean one unreadable
+// mega-test. A serialising guard that also resets every key keeps the test names.
+//
+// The guard clears SEVEN keys, not the five the tests mention directly:
+// `workspace_config_to_connection` (src/iris/workspace_config.rs:247-253) SETS
+// `IRIS_NAMESPACE`, `IRIS_USERNAME` and `IRIS_PASSWORD` as a side effect of merely being
+// called, so a test that never names them still leaves them behind for the next one.
+//
+// Every test that calls `workspace_config_to_connection`, `load_workspace_config` or
+// `workspace_root` takes the guard — including the `load_*` tests that pass an explicit
+// directory, because `workspace_root` (:39-44) consults `OBJECTSCRIPT_WORKSPACE` BEFORE
+// the path argument: a racing `set_var` makes them read the wrong directory entirely.
+// The `generate_toml_*` and `score_*` tests touch no env and are deliberately unguarded.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+    // `into_inner`: a panicking test must not poison the mutex and turn one real failure
+    // into twenty-two misleading ones.
+    let g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    for k in [
+        "OBJECTSCRIPT_WORKSPACE",
+        "IRIS_NAMESPACE",
+        "IRIS_CONTAINER",
+        "IRIS_WEB_PREFIX",
+        "IRIS_SCHEME",
+        "IRIS_USERNAME",
+        "IRIS_PASSWORD",
+    ] {
+        std::env::remove_var(k);
+    }
+    g
+}
+
 // ── T004: Core loading tests ──────────────────────────────────────────────────
 
 #[test]
 fn test_load_returns_none_when_no_file() {
+    let _g = env_guard();
     let result = load_workspace_config(Some("/nonexistent/path/that/cannot/exist"));
     assert!(
         result.is_none(),
@@ -24,6 +68,7 @@ fn test_load_returns_none_when_no_file() {
 
 #[test]
 fn test_load_parses_container_field() {
+    let _g = env_guard();
     let dir = tempfile::TempDir::new().unwrap();
     write_toml(&dir, r#"container = "test-iris""#);
     let cfg = load_workspace_config(Some(dir.path().to_str().unwrap())).unwrap();
@@ -32,6 +77,7 @@ fn test_load_parses_container_field() {
 
 #[test]
 fn test_load_parses_all_fields() {
+    let _g = env_guard();
     let dir = tempfile::TempDir::new().unwrap();
     write_toml(
         &dir,
@@ -55,6 +101,7 @@ password = "mypass"
 
 #[test]
 fn test_load_returns_none_on_syntax_error() {
+    let _g = env_guard();
     let dir = tempfile::TempDir::new().unwrap();
     write_toml(&dir, "this is not valid toml = = = !!!");
     let result = load_workspace_config(Some(dir.path().to_str().unwrap()));
@@ -66,6 +113,7 @@ fn test_load_returns_none_on_syntax_error() {
 
 #[test]
 fn test_load_uses_cwd_when_workspace_none() {
+    let _g = env_guard();
     // Call with None from a temp dir that has no .iris-dev.toml
     let dir = tempfile::TempDir::new().unwrap();
     let result = load_workspace_config(Some(dir.path().to_str().unwrap()));
@@ -74,6 +122,7 @@ fn test_load_uses_cwd_when_workspace_none() {
 
 #[test]
 fn test_workspace_root_uses_env_var() {
+    let _g = env_guard();
     // Note: env var tests can be flaky if run in parallel; use a unique key.
     // We only test the logic — the env var takes precedence over the path arg.
     let tmp = tempfile::TempDir::new().unwrap();
@@ -90,6 +139,7 @@ fn test_workspace_root_uses_env_var() {
 
 #[test]
 fn test_workspace_root_uses_path_when_no_env_var() {
+    let _g = env_guard();
     std::env::remove_var("OBJECTSCRIPT_WORKSPACE");
     let root = workspace_root(Some("/explicit/path"));
     assert_eq!(root.to_str().unwrap(), "/explicit/path");
@@ -99,6 +149,7 @@ fn test_workspace_root_uses_path_when_no_env_var() {
 
 #[test]
 fn test_workspace_config_host_returns_connection() {
+    let _g = env_guard();
     let dir = tempfile::TempDir::new().unwrap();
     write_toml(&dir, r#"host = "remotehost"\nweb_port = 9999"#);
     // Parse manually since \n in raw string literal doesn't give newline
@@ -127,6 +178,7 @@ fn test_workspace_config_host_returns_connection() {
 
 #[test]
 fn test_workspace_config_namespace_applied() {
+    let _g = env_guard();
     // Container config sets IRIS_NAMESPACE env var
     std::env::remove_var("IRIS_NAMESPACE");
     let cfg = iris_agentic_dev_core::iris::workspace_config::WorkspaceConfig {
@@ -146,6 +198,7 @@ fn test_workspace_config_namespace_applied() {
 
 #[test]
 fn test_workspace_config_sets_iris_container_env() {
+    let _g = env_guard();
     std::env::remove_var("IRIS_CONTAINER");
     let cfg = iris_agentic_dev_core::iris::workspace_config::WorkspaceConfig {
         container: Some("mytest-iris".to_string()),
@@ -164,6 +217,7 @@ fn test_workspace_config_sets_iris_container_env() {
 
 #[test]
 fn test_compile_workspace_config_overrides_env() {
+    let _g = env_guard();
     // Set IRIS_CONTAINER to an "old" value via env
     std::env::set_var("IRIS_CONTAINER", "old-container");
 
@@ -258,6 +312,7 @@ fn test_workspace_config_field_shape() {
 
 #[test]
 fn test_load_parses_web_prefix_field() {
+    let _g = env_guard();
     let dir = tempfile::TempDir::new().unwrap();
     write_toml(
         &dir,
@@ -273,6 +328,7 @@ web_prefix = "irisaicore"
 
 #[test]
 fn test_web_prefix_included_in_base_url() {
+    let _g = env_guard();
     let cfg = iris_agentic_dev_core::iris::workspace_config::WorkspaceConfig {
         host: Some("localhost".to_string()),
         web_port: Some(80),
@@ -289,6 +345,7 @@ fn test_web_prefix_included_in_base_url() {
 
 #[test]
 fn test_web_prefix_strips_leading_trailing_slashes() {
+    let _g = env_guard();
     let cfg = iris_agentic_dev_core::iris::workspace_config::WorkspaceConfig {
         host: Some("localhost".to_string()),
         web_port: Some(52773),
@@ -305,6 +362,7 @@ fn test_web_prefix_strips_leading_trailing_slashes() {
 
 #[test]
 fn test_no_web_prefix_gives_clean_base_url() {
+    let _g = env_guard();
     std::env::remove_var("IRIS_WEB_PREFIX");
     let cfg = iris_agentic_dev_core::iris::workspace_config::WorkspaceConfig {
         host: Some("localhost".to_string()),
@@ -322,6 +380,7 @@ fn test_no_web_prefix_gives_clean_base_url() {
 
 #[test]
 fn test_iris_web_prefix_env_var_used_when_no_toml_prefix() {
+    let _g = env_guard();
     std::env::set_var("IRIS_WEB_PREFIX", "myprefix");
     let cfg = iris_agentic_dev_core::iris::workspace_config::WorkspaceConfig {
         host: Some("localhost".to_string()),
@@ -340,6 +399,7 @@ fn test_iris_web_prefix_env_var_used_when_no_toml_prefix() {
 
 #[test]
 fn test_toml_web_prefix_overrides_env_var() {
+    let _g = env_guard();
     std::env::set_var("IRIS_WEB_PREFIX", "envprefix");
     let cfg = iris_agentic_dev_core::iris::workspace_config::WorkspaceConfig {
         host: Some("localhost".to_string()),
@@ -370,6 +430,7 @@ fn test_generate_toml_contains_web_prefix_comment() {
 
 #[test]
 fn test_load_parses_scheme_field() {
+    let _g = env_guard();
     let dir = tempfile::TempDir::new().unwrap();
     write_toml(
         &dir,
@@ -385,6 +446,7 @@ scheme = "https"
 
 #[test]
 fn test_https_scheme_in_base_url() {
+    let _g = env_guard();
     std::env::remove_var("IRIS_SCHEME");
     let cfg = iris_agentic_dev_core::iris::workspace_config::WorkspaceConfig {
         host: Some("iris.example.com".to_string()),
@@ -403,6 +465,7 @@ fn test_https_scheme_in_base_url() {
 
 #[test]
 fn test_https_scheme_with_prefix() {
+    let _g = env_guard();
     std::env::remove_var("IRIS_SCHEME");
     let cfg = iris_agentic_dev_core::iris::workspace_config::WorkspaceConfig {
         host: Some("dem".to_string()),
@@ -421,6 +484,7 @@ fn test_https_scheme_with_prefix() {
 
 #[test]
 fn test_default_scheme_is_http() {
+    let _g = env_guard();
     std::env::remove_var("IRIS_SCHEME");
     let cfg = iris_agentic_dev_core::iris::workspace_config::WorkspaceConfig {
         host: Some("localhost".to_string()),
@@ -438,6 +502,7 @@ fn test_default_scheme_is_http() {
 
 #[test]
 fn test_iris_scheme_env_var() {
+    let _g = env_guard();
     std::env::set_var("IRIS_SCHEME", "https");
     let cfg = iris_agentic_dev_core::iris::workspace_config::WorkspaceConfig {
         host: Some("localhost".to_string()),
@@ -456,6 +521,7 @@ fn test_iris_scheme_env_var() {
 
 #[test]
 fn test_toml_scheme_overrides_env_var() {
+    let _g = env_guard();
     std::env::set_var("IRIS_SCHEME", "http");
     let cfg = iris_agentic_dev_core::iris::workspace_config::WorkspaceConfig {
         host: Some("localhost".to_string()),

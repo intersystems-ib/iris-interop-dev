@@ -21,47 +21,108 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
-      # Build binary first (required for mcp_handshake test which spawns it)
+      # Build the binary first — mcp_handshake, plugin_dispatch_tests and test_compile_cmd
+      # all spawn it, and cargo test does not build another package's bin for them.
       - run: cargo build -p iris-agentic-dev
-      # Unit + handshake tests — no live IRIS needed.
-      # Integration tests (test_mcp_iris, test_e2e_all_tools, test_scm, discovery_tests,
-      # interop_e2e_tests) require IRIS_HOST/IRIS_WEB_PORT; run them locally.
-      # KNOWN FLAKES — if this gate goes red, check these before calling it a regression:
-      #   * mcp_server_startup_latency_under_100ms — load sensitive; re-run it alone.
-      #   * manifest_tests::test_resolve_github_* — live GitHub API. Unauthenticated GitHub
-      #     allows 60 requests/hour PER IP, shared by every job on the runner, and reports
-      #     exhaustion as HTTP 403 — which reads like a permissions bug, not a flake (#87).
-      #     Those four tests no longer run here: they are opt-in behind IRIS_DEV_LIVE_GITHUB
-      #     and covered offline by the *_offline wiremock tests in the same target. The live
-      #     canary runs in the advisory step below.
-      # --no-fail-fast: without it a failure in an earlier --test target means the later ones
-      # never execute and print nothing, which reads as "passed" (#87). Cargo still exits
-      # non-zero if any target failed.
-      - name: Unit + handshake gate (offline, required)
+      # THE RULE (#95): this gate runs EVERY test target the workspace declares or
+      # auto-discovers, minus an explicit opt-out list. New test targets are covered
+      # automatically — there is no list here to forget to update.
+      #
+      # The opt-out list lives in scripts/ci-test-targets.sh, one entry with one reason.
+      # Today it holds exactly one target (docker_discovery_e2e). That script derives the
+      # target list from `cargo metadata`, so auto-discovered targets like transport_e2e
+      # — which appears in no [[test]] block — are included too.
+      #
+      # ADDING A TEST TARGET THAT NEEDS A LIVE IRIS? It is CI-blocking by default now.
+      # Mark the individual tests `#[ignore = "requires live IRIS"]`, or, if the whole
+      # target is unrunnable here, add it to EXCLUDED in that script with a reason.
+      #
+      # PREFER #[ignore] TO A SELF-SKIP. Two styles are in the tree and they are NOT
+      # equivalent in what this gate reports:
+      #   - `#[ignore]` (admin_e2e_tests, interop_e2e_tests, progressive_disclosure_integration,
+      #     test_iris_test_e2e, test_live_reload_e2e, test_sql_safety_e2e, test_sql_translate_e2e)
+      #     reports 46 results as `ignored` — visibly not run.
+      #   - a `require_iris!`/IRIS_HOST check that prints a note and returns (test_e2e,
+      #     test_scm, test_mcp_iris, test_e2e_all_tools, test_compile_cmd) reports as
+      #     PASSED. About 137 of this gate's passes are green-but-vacuous for that reason.
+      # The pass count therefore overstates what ran, which is the same dishonesty #87(b)
+      # fixed for fail-fast. New live-IRIS tests should use #[ignore] so the count stays
+      # truthful; the master-only e2e-tests job is what actually exercises them.
+      #
+      # Before this change the gate ran 11 hand-listed targets. Three targets that were in
+      # no gate at all were found red or intermittently red (#90 test_search_unit,
+      # #91 admin_unit_tests, test_workspace_config) — nobody saw them because nobody ran
+      # them. The marginal cost of the other 32 targets is ~10s: clippy --all-targets
+      # already pays the compile.
+      #
+      # --lib --bins: --bins is not redundant. crates/iris-agentic-dev-bin/src/cmd/plugin.rs
+      # holds unit tests that no job had ever run.
+      #
+      # --no-fail-fast: without it a failure in an earlier --test target means the later
+      # ones never execute and print nothing, which reads as "passed" (#87). Cargo still
+      # exits non-zero if any target failed.
+      #
+      # KNOWN LOAD-SENSITIVE ASSERTIONS — wall-clock budgets, not logic. If one of these
+      # is the only red, RE-RUN IT ALONE before calling it a regression:
+      #   * mcp_handshake::mcp_server_startup_latency_under_100ms  (p50 < 100ms)
+      #   * symbols_local_tests::sc003_parse_500_lines_under_100ms (tree-sitter budget)
+      #   * discovery_tests::probe_atelier_respects_timeout        (< 500ms vs 10.255.255.1)
+      #
+      # NOT a flake source any more: manifest_tests and skills_tests used to reach GitHub
+      # unauthenticated (60 req/hr per IP, shared by every job on a runner, reported as a
+      # 403 that reads like a permissions bug). Both are now covered offline by wiremock
+      # (#87, #92); their live canaries are opt-in behind IRIS_DEV_LIVE_GITHUB and run in
+      # the advisory step below. This gate makes no outbound request.
+      #
+      # Running it locally: use `env -u IRIS_HOST -u IRIS_CONTAINER cargo test ...`. Do NOT
+      # use `IRIS_HOST= ` — src/iris/discovery.rs:149 treats a set-but-empty host as real
+      # and spends 5s probing it. With IRIS_HOST exported, test_e2e and test_scm will talk
+      # to your live instance and write to it.
+      #
+      # WHY THE TARGET LIST IS BUILT ON ITS OWN LINE, AND MUST STAY THERE:
+      # `cargo test ... $(scripts/ci-test-targets.sh) ...` looks equivalent and is not.
+      # Bash `set -e` — the shell Actions runs `run:` with — does NOT propagate a failed
+      # command substitution sitting in argument position (`-eo pipefail` does not either;
+      # both measured). The step would carry on with EMPTY args and EXIT 0. Measured in
+      # this repo, that degraded command runs 2 targets (lib + bin, 408 tests) instead of
+      # 45 and is fully GREEN: every test target — mcp_handshake, test_toolset,
+      # plugin_dispatch_tests included — drops out of the required gate with no signal.
+      # That is #95's own pathology reproduced one level up, so: keep the assignment
+      # standalone. As a standalone assignment the same failure exits 1 (measured).
+      # Triggers that make this matter: the script's anti-drift guard firing (its whole
+      # job is to exit 1), `cargo metadata` failing, python3 missing, or the file landing
+      # without its exec bit.
+      #
+      # `bash scripts/...` rather than `scripts/...`: the file's mode bit is then not
+      # load-bearing. A checkout that loses +x gets a working gate instead of one that
+      # depends on the guard above to notice `Permission denied`.
+      - name: Full offline test gate (required)
         run: |
-          cargo test --no-fail-fast -p iris-agentic-dev-core --lib \
-            --test test_compile_params \
-            --test test_doc_params \
-            --test test_elicitation \
-            --test interop_unit_tests \
-            --test manifest_tests \
-            --test skills_tests \
-            --test vscode_config_tests \
-            --test mcp_handshake \
-            --test test_toolset
+          TARGETS=$(bash scripts/ci-test-targets.sh)
+          # The script refuses to exit 0 with an empty list; this refuses to trust it.
+          # A $TARGETS carrying no --test flag is precisely the silent degradation above,
+          # and the glob catches empty, whitespace-only and malformed alike.
+          if [[ "$TARGETS" != *--test* ]]; then
+            echo "::error::scripts/ci-test-targets.sh emitted no test targets - refusing to run a degraded gate"
+            exit 1
+          fi
+          # Unquoted on purpose: $TARGETS must word-split into the --test flags.
+          cargo test --workspace --lib --bins $TARGETS --no-fail-fast
         env:
           RUST_LOG: warn
-      # #86: these two tests were red at master and were in no gate, so nobody saw it.
-      - name: Plugin dispatch gate (#86)
-        run: cargo test --no-fail-fast -p iris-agentic-dev --test plugin_dispatch_tests
-        env:
-          RUST_LOG: warn
-      # Advisory: exercises the real api.github.com path with the token Actions injects
-      # (1000 req/hr per repo, not 60 per IP). continue-on-error so a GitHub-side outage
-      # or limit can never redden the required gate above.
-      - name: Live GitHub resolver canary (advisory)
+      # Advisory: exercises the real api.github.com and raw.githubusercontent.com paths
+      # with the token Actions injects (1000 req/hr per repo, not 60 per IP).
+      # continue-on-error so a GitHub-side outage or limit can never redden the gate above.
+      #   * manifest_tests — the version resolver against api.github.com (#87).
+      #   * skills_tests   — the subscription path against raw.githubusercontent.com (#92).
+      #     Retargeted: it pointed at intersystems-community/iris-vector-rag, which
+      #     publishes no manifest (HTTP 404), so it had been failing-when-enabled and
+      #     hidden behind a flag since v0.5.0.
+      - name: Live GitHub canaries — resolver + subscription (advisory)
         continue-on-error: true
-        run: cargo test --no-fail-fast -p iris-agentic-dev-core --test manifest_tests -- --nocapture
+        run: |
+          cargo test --no-fail-fast -p iris-agentic-dev-core \
+            --test manifest_tests --test skills_tests -- --nocapture
         env:
           RUST_LOG: warn
           IRIS_DEV_LIVE_GITHUB: "1"

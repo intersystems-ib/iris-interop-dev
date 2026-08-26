@@ -2754,6 +2754,18 @@ impl IrisTools {
                     }
                 };
                 if !put_resp.status().is_success() {
+                    // #93: an Atelier 404 for a missing NAMESPACE has a zero-byte body, so
+                    // it is indistinguishable from a missing document — this path reported
+                    // it as UPLOAD_FAILED "PUT X returned HTTP 404 Not Found" and never
+                    // named the namespace. Only on 404: 401/403 and 5xx keep their meaning.
+                    if put_resp.status().as_u16() == 404 {
+                        if let Some(e) =
+                            interop::namespace_missing_error(&iris, client, &namespace, &put_url)
+                                .await
+                        {
+                            return e;
+                        }
+                    }
                     return err_json(
                         "UPLOAD_FAILED",
                         &format!("PUT {} returned HTTP {}", doc_name, put_resp.status()),
@@ -2811,6 +2823,11 @@ impl IrisTools {
         // see `docnames_in_body`. `scanned` is carried so a NOT_FOUND can distinguish "the
         // pattern matched nothing" from "the listing itself came back empty".
         let mut scanned = 0usize;
+        // #94: whether the listing was narrowed server-side, and with what. Hoisted out of
+        // the wildcard arm because the NOT_FOUND message below MUST branch on it: once the
+        // listing is filtered, `scanned` counts CANDIDATES, not the namespace.
+        let mut listing_narrowed = false;
+        let mut listing_filter_used: Option<&str> = None;
         let targets: Vec<String> = if p.target.contains('*') {
             // #88: an unqualified pattern is refused BEFORE the listing is fetched — there
             // is no expansion to inspect, and no reason to pull 10k names to say so.
@@ -2818,12 +2835,44 @@ impl IrisTools {
                 return unqualified_wildcard_error(&p.target, &namespace);
             }
             let list_url = iris.versioned_ns_url(&namespace, "/docnames/CLS");
-            match client
-                .get(&list_url)
+            // #94: narrow the listing SERVER-SIDE. `?filter=X` becomes `Name Like '%X%'`
+            // inside the query GetDocNames already runs, so the response is a SUPERSET of
+            // what the client regex selects — see `wildcard_listing_filter`. 1,696,950
+            // bytes -> ~2,066; a wildcard compile 331 ms -> ~45 ms.
+            //
+            // DELIBERATELY NO CACHE, and do not add one. What is left after narrowing is
+            // ~38 ms of server-side index walk that no filter can avoid; a perfect cache
+            // would buy back ~33 ms. In-process invalidation cannot see another MCP process,
+            // a human saving a class in VS Code / Studio / the Portal, an ImportDir or IPM
+            // install, a mapping change, or generated dependents — and any of those inside
+            // the TTL makes `Pkg.*` skip a class while still reporting success:true. That is
+            // the exact failure mode this issue series exists to eliminate; 33 ms does not
+            // buy it. `e2e_compile_wildcard_package` is the regression test.
+            let listing_filter = wildcard_listing_filter(&p.target);
+            let mut fetch_url = match listing_filter {
+                Some(f) => format!("{list_url}?filter={}", urlencoding::encode(f)),
+                None => list_url.clone(),
+            };
+            listing_filter_used = listing_filter;
+            listing_narrowed = listing_filter.is_some();
+            let mut listing = client
+                .get(&fetch_url)
                 .basic_auth(&iris.username, Some(&iris.password))
                 .send()
-                .await
-            {
+                .await;
+            // An Atelier build that rejects the parameter must degrade to exactly today's
+            // behaviour, not to a new failure: retry once, unfiltered.
+            if listing_narrowed && !matches!(&listing, Ok(r) if r.status().is_success()) {
+                fetch_url = list_url.clone();
+                listing_narrowed = false;
+                listing_filter_used = None;
+                listing = client
+                    .get(&fetch_url)
+                    .basic_auth(&iris.username, Some(&iris.password))
+                    .send()
+                    .await;
+            }
+            match listing {
                 Ok(resp) if resp.status().is_success() => {
                     let body: serde_json::Value = resp.json().await.unwrap_or_default();
                     // One pass over the listing, not two: `scanned` and the expansion read
@@ -2848,6 +2897,20 @@ impl IrisTools {
                 // expansion, no count and no cap — the guard silently off exactly when the
                 // instance is unhealthy. A wildcard therefore fails here instead of guessing.
                 other => {
+                    // #93: a 404 here used to become LISTING_UNAVAILABLE, which never said
+                    // the namespace does not exist and never named the ones that do — the
+                    // 404 body is zero bytes, so only a second question can tell them apart.
+                    if let Ok(resp) = &other {
+                        if resp.status().as_u16() == 404 {
+                            if let Some(e) = interop::namespace_missing_error(
+                                &iris, client, &namespace, &fetch_url,
+                            )
+                            .await
+                            {
+                                return e;
+                            }
+                        }
+                    }
                     let detail = match other {
                         Ok(resp) => format!("HTTP {}", resp.status().as_u16()),
                         Err(e) => e.to_string(),
@@ -2863,7 +2926,9 @@ impl IrisTools {
                         serde_json::json!({
                             "pattern": p.target,
                             "namespace": namespace,
-                            "listing_url": list_url,
+                            // #94: the URL actually requested, so the caller can reproduce it.
+                            "listing_url": fetch_url,
+                            "listing_filter": listing_filter_used,
                             "hint": "Compile a single document by its exact name, which needs \
                                      no listing. If the namespace is wrong, iris_query can \
                                      confirm it exists.",
@@ -2880,14 +2945,38 @@ impl IrisTools {
             // It also has to say what was NOT searched: the listing is /docnames/CLS, so a
             // wildcard can never see a .mac/.int/.inc routine, and a bare NOT_FOUND there
             // reads as "that routine does not exist" when it does and compiles by name.
-            return err_json(
-                "NOT_FOUND",
-                &format!(
+            // #94: `scanned` STOPS meaning "documents in the namespace" the moment the
+            // listing is narrowed server-side — left alone, this sentence would start
+            // saying "scanned 0 CLS document(s) in namespace APP" for a typo'd package,
+            // which reads as "the namespace is empty". A new silent wrong answer
+            // introduced by a performance fix is not an acceptable trade, so the two
+            // cases get two sentences.
+            let msg = match listing_filter_used {
+                Some(f) => format!(
+                    "No documents match pattern '{}' — the CLS listing for namespace {} was \
+                     narrowed server-side to names containing '{}', which returned {} \
+                     candidate document(s). Wildcards expand CLASS documents only: compile a \
+                     .mac/.int/.inc routine by its exact name.",
+                    p.target, namespace, f, scanned
+                ),
+                None => format!(
                     "No documents match pattern '{}' — scanned {} CLS document(s) in \
                      namespace {}. Wildcards expand CLASS documents only: compile a \
                      .mac/.int/.inc routine by its exact name.",
                     p.target, scanned, namespace
                 ),
+            };
+            return crate::tools::envelope::fail_with(
+                "NOT_FOUND",
+                &msg,
+                serde_json::json!({
+                    "pattern": p.target,
+                    "namespace": namespace,
+                    // Machine-readable, so the distinction is not only in the prose.
+                    "listing_narrowed": listing_narrowed,
+                    "listing_filter": listing_filter_used,
+                    "candidates_scanned": scanned,
+                }),
             );
         }
 
@@ -2949,6 +3038,19 @@ impl IrisTools {
         if !resp.status().is_success() {
             let url_str = compile_url.clone();
             let status = resp.status().as_u16();
+            // #93, the verbatim repro: compiling an EXACT target in a namespace that does
+            // not exist answered IRIS_UNREACHABLE + "Check IRIS_HOST and IRIS_WEB_PORT"
+            // while IRIS was answering perfectly on that host and port. The 404 body is
+            // zero bytes, so the transport alone cannot tell a missing namespace from a
+            // missing document; ask the root descriptor. Only on 404 — a 401/403 is
+            // credentials and a 5xx is a sick instance, and both keep their current error.
+            if status == 404 {
+                if let Some(e) =
+                    interop::namespace_missing_error(&iris, client, &namespace, &url_str).await
+                {
+                    return e;
+                }
+            }
             return err_json_with_url("IRIS_UNREACHABLE", &format!("HTTP {}", status), &url_str);
         }
 
@@ -4708,13 +4810,17 @@ Methods:
         };
         let code = skills_tools::skills_list_json_code(None, false);
         match skills_tools::read_skills_json(&iris, &code, &ns).await {
-            Ok(skills) => {
-                let count = skills.as_array().map(|a| a.len()).unwrap_or(0);
-                ok_json(serde_json::json!({
+            // #89 follow-up: count via the shared helper, not `unwrap_or(0)`. This is the
+            // tool agent_info is meant to agree with, and the old shape would have made the
+            // two disagree in the opposite direction — count:0 success:true here against
+            // SKILLS_PARSE_FAILED there — for any payload that parsed to a non-array.
+            Ok(skills) => match skills_tools::skills_count_from_payload(&skills) {
+                Err(e) => skills_tools::skills_read_fail("skill_list", &ns, e),
+                Ok(count) => ok_json(serde_json::json!({
                     "success": true, "skills": skills, "count": count,
                     "namespace": ns, "source": "^SKILLS"
-                }))
-            }
+                })),
+            },
             Err(e) => skills_tools::skills_read_fail("skill_list", &ns, e),
         }
     }
@@ -5003,7 +5109,22 @@ Methods:
                     })
                     .collect()
             })
-            .unwrap_or_default();
+            // #89 follow-up: recover the guard rather than reporting an unreadable
+            // history as an empty one, matching handle_agent_info(what=history).
+            .unwrap_or_else(|e| {
+                let h = e.into_inner();
+                h.iter()
+                    .rev()
+                    .take(p.limit)
+                    .map(|c| {
+                        serde_json::json!({
+                            "tool": c.tool,
+                            "success": c.success,
+                            "ago_secs": c.timestamp.elapsed().as_secs(),
+                        })
+                    })
+                    .collect()
+            });
         ok_json(serde_json::json!({"calls": calls, "limit": p.limit}))
     }
 
@@ -5202,7 +5323,7 @@ Methods:
     }
 
     #[tool(
-        description = "Session and learning agent information. what=stats returns skill count and session call count, what=history returns recent tool call history."
+        description = "Session and learning agent information. what=stats returns the ^SKILLS skill count for the connection's namespace plus the session call count — it FAILS with DOCKER_REQUIRED / SKILLS_PARSE_FAILED if the registry cannot be read, and never reports 0 for a registry it could not read. what=history returns recent tool call history and needs no IRIS connection."
     )]
     async fn agent_info(
         &self,
@@ -6300,6 +6421,41 @@ fn wildcard_target_is_unqualified(pattern: &str) -> bool {
     matches!(pattern.find('*'), Some(0))
 }
 
+/// Issue #94: the literal text before a wildcard's first `*`, when it is safe to hand to
+/// the Atelier `?filter=` query parameter.
+///
+/// Every wildcard compile used to GET the WHOLE `/docnames/CLS` listing: measured on the
+/// dev instance at 1,696,950 bytes / 0.294 s server-side / 12,750 documents, ~98% of the
+/// cost of the call. `%Api.Atelier.v1:GetDocNames` accepts `filter=X` and turns it into
+/// `Name Like '%X%'` inside the same `%Library.RoutineMgr:StudioOpenDialog` query it
+/// already runs — 2,066 bytes / 0.040 s for `filter=Ens.Alerting.`.
+///
+/// The safety argument is the SUPERSET INVARIANT: `LIKE '%X%'` is a *contains* match and
+/// `docname_pattern_regex` is anchored on the same literal prefix, so every name the client
+/// regex would have matched necessarily contains that prefix and survives the server
+/// filter. The server can only over-deliver; the client-side regex still does the real
+/// selection, so `Matched` / `TooBroad` / `NOT_FOUND` are bit-for-bit unchanged. (Measured:
+/// the filter is case-insensitive, matching the regex's `(?i)`.)
+///
+/// `%` and `_` are PERMITTED. In `LIKE` they are wildcards, so they can only broaden the
+/// match, never narrow it — and `%Pkg.*` needs its leading `%` to reach a system package.
+/// A quote must never get through: `GetDocNames` builds that `Name Like` clause by STRING
+/// CONCATENATION, and a probe with `filter=%27` returned 200 with an empty content array —
+/// i.e. an unguarded quote would narrow WRONGLY rather than fail loudly. Hence an allowlist
+/// rather than an escape, and a rejected prefix means "fetch the whole listing" (today's
+/// behaviour), never "narrow it wrongly".
+fn wildcard_listing_filter(pattern: &str) -> Option<&str> {
+    let prefix = &pattern[..pattern.find('*')?];
+    if prefix.is_empty() {
+        // Unqualified — already refused before any fetch by `wildcard_target_is_unqualified`.
+        return None;
+    }
+    prefix
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '%' | '-'))
+        .then_some(prefix)
+}
+
 /// Issue #88: the most documents ONE wildcard compile may queue.
 ///
 /// Picked from the shape of a real namespace, not as a round number. The dev instance's APP
@@ -7383,8 +7539,80 @@ mod no_tests_found_guidance_tests {
 mod wildcard_listing_failure_tests {
     use super::*;
     use crate::iris::connection::{DiscoverySource, IrisConnection};
-    use wiremock::matchers::{method, path_regex};
+    use wiremock::matchers::{method, path_regex, query_param, query_param_is_missing};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Drive the real `iris_compile` handler against a mock Atelier and read its envelope.
+    /// `namespace: None` targets the connection namespace, exactly as an omitted parameter
+    /// does in production.
+    async fn compile_against(
+        server: &MockServer,
+        conn_ns: &str,
+        namespace: Option<&str>,
+        target: &str,
+    ) -> (Option<bool>, serde_json::Value) {
+        let conn = IrisConnection::new(
+            server.uri(),
+            conn_ns,
+            "_SYSTEM",
+            "SYS",
+            DiscoverySource::EnvVar,
+        );
+        let tools = IrisTools::new_with_toolset(Some(conn), Toolset::Interop).unwrap();
+        let r = tools
+            .iris_compile(rmcp::handler::server::wrapper::Parameters(CompileParams {
+                target: target.into(),
+                flags: "cuk".into(),
+                namespace: namespace.map(str::to_string),
+                force_writable: false,
+                inline: false,
+            }))
+            .await
+            .expect("the tool must answer, not error out of the transport");
+        let text = match &r.content[0].raw {
+            rmcp::model::RawContent::Text(t) => t.text.clone(),
+            _ => panic!("expected text content"),
+        };
+        (r.is_error, serde_json::from_str(&text).unwrap())
+    }
+
+    /// An Atelier `/docnames/CLS` body over the given document names.
+    fn listing(names: &[&str]) -> serde_json::Value {
+        serde_json::json!({"result": {"content": names.iter()
+            .map(|n| serde_json::json!({"cat":"CLS","db":"APP-CODE","gen":false,"name":n}))
+            .collect::<Vec<_>>()}})
+    }
+
+    /// A compile response with no errors.
+    fn clean_compile() -> serde_json::Value {
+        serde_json::json!({"status":{"errors":[],"summary":""},"console":[],"result":{"content":[]}})
+    }
+
+    /// The Atelier root descriptor — `result.content.namespaces` is what #93 reads.
+    fn root_descriptor(namespaces: &[&str]) -> serde_json::Value {
+        serde_json::json!({"result": {"content": {
+            "version": "IRIS for UNIX 2026.1", "api": 8, "namespaces": namespaces
+        }}})
+    }
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// The POST bodies `/action/compile` actually received.
+    async fn compile_payloads(server: &MockServer) -> Vec<serde_json::Value> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path().ends_with("/action/compile"))
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect()
+    }
 
     /// #88 follow-up: the guard lives on the expansion, so when the LISTING cannot be read
     /// there is nothing to apply it to. The old `_ => vec![p.target.clone()]` fallback handed
@@ -7451,6 +7679,323 @@ mod wildcard_listing_failure_tests {
             assert_eq!(v["pattern"], "APPPKG.*");
         });
     }
+
+    /// #94: the listing GET must actually carry `?filter=<prefix>` — the whole point is
+    /// that the 1,696,950-byte namespace listing never crosses the wire. The mock only
+    /// answers a request that HAS the parameter, so an unfiltered fetch would fall through
+    /// to LISTING_UNAVAILABLE and fail this test loudly.
+    #[test]
+    fn a_wildcard_narrows_the_listing_server_side_and_compiles_what_it_matched() {
+        rt().block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path_regex(r".*/docnames/CLS$"))
+                .and(query_param("filter", "APPPKG."))
+                .respond_with(ResponseTemplate::new(200).set_body_json(listing(&[
+                    "APPPKG.FoundationProduction.cls",
+                    "APPPKG.Sub.Helper.cls",
+                ])))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(r".*/action/compile$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(clean_compile()))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let (is_err, v) = compile_against(&server, "APP", None, "APPPKG.*").await;
+            assert_eq!(is_err, Some(false), "{v}");
+            assert_eq!(v["targets_compiled"], 2, "{v}");
+            assert_eq!(
+                compile_payloads(&server).await,
+                vec![serde_json::json!([
+                    "APPPKG.FoundationProduction.cls",
+                    "APPPKG.Sub.Helper.cls"
+                ])],
+                "the narrowed listing must drive the compile set unchanged"
+            );
+        });
+    }
+
+    /// #94: an Atelier build that rejects `?filter=` must degrade to EXACTLY today's
+    /// behaviour — one unfiltered retry — not to a new failure mode. Without this the
+    /// performance fix would break wildcards on every server that does not know the
+    /// parameter.
+    #[test]
+    fn a_rejected_filter_falls_back_to_the_unfiltered_listing() {
+        rt().block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path_regex(r".*/docnames/CLS$"))
+                .and(query_param("filter", "APPPKG."))
+                .respond_with(ResponseTemplate::new(400))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path_regex(r".*/docnames/CLS$"))
+                .and(query_param_is_missing("filter"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(listing(&[
+                    "APPPKG.FoundationProduction.cls",
+                    "WebTerminal.Common.cls",
+                ])))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(r".*/action/compile$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(clean_compile()))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let (is_err, v) = compile_against(&server, "APP", None, "APPPKG.*").await;
+            assert_eq!(is_err, Some(false), "{v}");
+            assert_eq!(v["targets_compiled"], 1, "{v}");
+        });
+    }
+
+    /// #94 B3: once the listing is narrowed, `scanned` counts CANDIDATES, not the
+    /// namespace — so the old sentence would start reporting "scanned 0 CLS document(s) in
+    /// namespace APP" for a typo'd package, which reads as "the namespace is empty". A
+    /// performance fix must not ship a new silent wrong answer.
+    #[test]
+    fn a_narrowed_listing_never_says_it_scanned_zero_documents_in_the_namespace() {
+        rt().block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path_regex(r".*/docnames/CLS$"))
+                .and(query_param("filter", "ZZNOPKG."))
+                .respond_with(ResponseTemplate::new(200).set_body_json(listing(&[])))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(r".*/action/compile$"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .mount(&server)
+                .await;
+
+            let (is_err, v) = compile_against(&server, "APP", None, "ZZNOPKG.*").await;
+            assert_eq!(is_err, Some(true), "{v}");
+            assert_eq!(v["error_code"], "NOT_FOUND", "{v}");
+            let msg = v["error"].as_str().unwrap();
+            assert!(msg.contains("ZZNOPKG."), "the filter must be named: {v}");
+            assert!(
+                !msg.contains("scanned 0 CLS document(s)"),
+                "a narrowed listing must not claim the namespace is empty: {v}"
+            );
+            assert_eq!(v["listing_narrowed"], true, "{v}");
+            assert_eq!(v["listing_filter"], "ZZNOPKG.", "{v}");
+            assert_eq!(v["candidates_scanned"], 0, "{v}");
+        });
+    }
+
+    /// #93, the verbatim repro: an EXACT target in a namespace that does not exist answered
+    /// `IRIS_UNREACHABLE` + "Check IRIS_HOST and IRIS_WEB_PORT" while IRIS was answering
+    /// perfectly on that host and port. The 404 body is zero bytes, so the fix asks the
+    /// root descriptor a second question.
+    #[test]
+    fn a_missing_namespace_is_named_instead_of_blaming_the_host_and_port() {
+        rt().block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path_regex(r".*/action/compile$"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/api/atelier/$"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(root_descriptor(&["APP", "USER"])),
+                )
+                .mount(&server)
+                .await;
+
+            let (is_err, v) = compile_against(&server, "APP", Some("ZZNOSUCHNS"), "Foo.Bar").await;
+            assert_eq!(is_err, Some(true), "{v}");
+            assert_eq!(v["error_code"], "NAMESPACE_NOT_FOUND", "{v}");
+            assert_eq!(v["namespace"], "ZZNOSUCHNS", "{v}");
+            assert_eq!(
+                v["available_namespaces"],
+                serde_json::json!(["APP", "USER"]),
+                "#93 asks for the namespaces that DO exist: {v}"
+            );
+            let text = v.to_string();
+            assert!(
+                !text.contains("Check IRIS_HOST"),
+                "the host/port hint is the wrong advice here and must not survive: {v}"
+            );
+            assert!(
+                v["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("not accessible to user"),
+                "the list reflects ACCESS, not raw existence — say so: {v}"
+            );
+        });
+    }
+
+    /// #93 false-positive guard: Atelier serves `/v8/app/docnames/CLS` happily and
+    /// `resolve_namespace` passes the caller's string through verbatim, so a case-sensitive
+    /// comparison would invent a NAMESPACE_NOT_FOUND for a namespace that works. Pinned as
+    /// a test, not a comment.
+    #[test]
+    fn a_namespace_that_differs_only_in_case_is_not_reported_as_missing() {
+        rt().block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path_regex(r".*/action/compile$"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/api/atelier/$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(root_descriptor(&["APP"])))
+                .mount(&server)
+                .await;
+
+            let (is_err, v) = compile_against(&server, "APP", Some("app"), "Foo.Bar").await;
+            assert_eq!(is_err, Some(true), "{v}");
+            assert_ne!(
+                v["error_code"], "NAMESPACE_NOT_FOUND",
+                "'app' IS 'APP' — today's error must survive: {v}"
+            );
+            assert_eq!(v["error_code"], "IRIS_UNREACHABLE", "{v}");
+        });
+    }
+
+    /// #93 on the wildcard listing arm: a 404 used to become LISTING_UNAVAILABLE, which
+    /// never said the namespace does not exist and never named the ones that do.
+    #[test]
+    fn a_wildcard_in_a_missing_namespace_names_the_namespace_not_the_listing() {
+        rt().block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path_regex(r".*/docnames/CLS$"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/api/atelier/$"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(root_descriptor(&["APP", "USER"])),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(r".*/action/compile$"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .mount(&server)
+                .await;
+
+            let (is_err, v) = compile_against(&server, "APP", Some("ZZNOSUCHNS"), "APPPKG.*").await;
+            assert_eq!(is_err, Some(true), "{v}");
+            assert_eq!(v["error_code"], "NAMESPACE_NOT_FOUND", "{v}");
+            assert_eq!(
+                v["available_namespaces"],
+                serde_json::json!(["APP", "USER"]),
+                "{v}"
+            );
+        });
+    }
+
+    /// #93 "cannot tell": a wrong IRIS_WEB_PREFIX 404s the listing AND the root descriptor,
+    /// and that is exactly the case the host/port advice is right for. `None` from
+    /// `accessible_namespaces` must never become a positive claim about a namespace —
+    /// today's error survives verbatim, still saying nothing was compiled.
+    #[test]
+    fn a_blind_root_descriptor_keeps_todays_error_instead_of_guessing() {
+        rt().block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path_regex(r".*/docnames/CLS$"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/api/atelier/$"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(r".*/action/compile$"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .mount(&server)
+                .await;
+
+            let (is_err, v) = compile_against(&server, "APP", Some("ZZNOSUCHNS"), "APPPKG.*").await;
+            assert_eq!(is_err, Some(true), "{v}");
+            assert_eq!(v["error_code"], "LISTING_UNAVAILABLE", "{v}");
+            assert!(
+                v["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Nothing was compiled"),
+                "{v}"
+            );
+        });
+    }
+}
+
+// ── Issue #94: server-side narrowing of the /docnames listing ─────────────────
+#[cfg(test)]
+mod wildcard_listing_filter_tests {
+    use super::*;
+
+    /// The prefix handed to `?filter=`, per pattern shape.
+    #[test]
+    fn wildcard_listing_filter_takes_the_literal_prefix() {
+        assert_eq!(wildcard_listing_filter("MyApp.*"), Some("MyApp."));
+        assert_eq!(wildcard_listing_filter("MyApp.*.cls"), Some("MyApp."));
+        assert_eq!(wildcard_listing_filter("MyApp.Sub.*"), Some("MyApp.Sub."));
+        assert_eq!(
+            wildcard_listing_filter("WebTerminal.C*"),
+            Some("WebTerminal.C")
+        );
+        // Mid-pattern star: the prefix is still everything before the FIRST `*`.
+        assert_eq!(wildcard_listing_filter("Pkg.*.Foo"), Some("Pkg."));
+        // The leading `%` of a system package must survive — in LIKE it only broadens.
+        assert_eq!(wildcard_listing_filter("%Pkg.*"), Some("%Pkg."));
+        // No wildcard at all: nothing to narrow (this path never fetches a listing).
+        assert_eq!(wildcard_listing_filter("MyApp.Foo"), None);
+    }
+
+    /// Unqualified patterns have no prefix. They are already refused before any fetch;
+    /// the helper must not answer `Some("")`, which would mean `Name Like '%%'`.
+    #[test]
+    fn wildcard_listing_filter_refuses_an_unqualified_pattern() {
+        assert_eq!(wildcard_listing_filter("*"), None);
+        assert_eq!(wildcard_listing_filter("*.cls"), None);
+        assert_eq!(wildcard_listing_filter("*Foo"), None);
+    }
+
+    /// #94 injection guard. `%Api.Atelier.v1:GetDocNames` builds `Name Like '%<filter>%'`
+    /// by STRING CONCATENATION, and a probe with `filter=%27` returned 200 with an EMPTY
+    /// content array — so an unguarded quote narrows WRONGLY rather than failing loudly,
+    /// i.e. a wildcard compile that silently skips classes. Rejection fails SAFE: no
+    /// filter, full listing, exactly today's behaviour.
+    #[test]
+    fn wildcard_listing_filter_rejects_anything_that_could_reach_the_like_clause() {
+        for pattern in [
+            "Foo'.*",
+            "Foo';--.*",
+            "Foo\".*",
+            "Foo /*x*/.*",
+            "Foo\n.*",
+            "Ens\u{00e9}.*",
+        ] {
+            assert_eq!(
+                wildcard_listing_filter(pattern),
+                None,
+                "'{pattern}' must fall back to the unfiltered listing"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -7485,6 +8030,82 @@ mod docname_expansion_tests {
             {"cat":"CLS","db":"APP-CODE","gen":false,"name":"WebTerminal.Core.cls",
              "ts":"2026-08-01 09:00:00.000","upd":true}
         ]}})
+    }
+
+    /// #94 THE test that matters: the server-side `?filter=` narrowing must be a pure
+    /// SUPERSET of what the client regex selects, so every expansion outcome is unchanged.
+    ///
+    /// `filter=X` is `Name Like '%X%'` — a CONTAINS match — and `docname_pattern_regex` is
+    /// `(?i)^…$` anchored on the same literal prefix, so any name the regex matches begins
+    /// with that prefix, therefore contains it, therefore survives the filter. This test
+    /// simulates the server by keeping only the elements a `LIKE '%prefix%'` would keep,
+    /// then asserts the expansion is identical either way.
+    ///
+    /// `Pkg.*.Foo` is the load-bearing case: its prefix is `Pkg.` while its matches are
+    /// deeper, so it is what breaks FIRST if a future IRIS ever makes `filter` an anchored
+    /// or prefix match — flipping the relation to a subset and making a wildcard compile
+    /// silently skip documents while reporting success. If this test ever goes red, the
+    /// narrowing must be removed, not the assertion.
+    fn filtered_like_the_server_would(body: &serde_json::Value, prefix: &str) -> serde_json::Value {
+        // Case-insensitive, matching the measured behaviour of the Atelier LIKE filter.
+        let needle = prefix.to_lowercase();
+        let kept: Vec<serde_json::Value> = body["result"]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|d| {
+                let name = d
+                    .as_str()
+                    .or_else(|| d.get("name").and_then(|n| n.as_str()))
+                    .unwrap();
+                name.to_lowercase().contains(&needle)
+            })
+            .cloned()
+            .collect();
+        serde_json::json!({"result": {"content": kept}})
+    }
+
+    /// A listing with enough shape to make narrowing observable: sub-packages, a system
+    /// class, and near-miss names that the filter keeps but the regex must still reject.
+    fn wide_body() -> serde_json::Value {
+        serde_json::json!({"result":{"content":[
+            {"cat":"CLS","name":"%Api.Atelier.v1.cls"},
+            {"cat":"CLS","name":"%Api.DocDB.v1.cls"},
+            {"cat":"CLS","name":"APPPKG.FoundationProduction.cls"},
+            {"cat":"CLS","name":"APPPKG.Sub.Helper.cls"},
+            {"cat":"CLS","name":"APPPKGX.NotMine.cls"},
+            {"cat":"CLS","name":"Pkg.Class.Foo.cls"},
+            {"cat":"CLS","name":"Pkg.Class.Bar.cls"},
+            {"cat":"CLS","name":"Pkg.Other.Foo.cls"},
+            {"cat":"CLS","name":"Pkg.Foo.cls"},
+            {"cat":"CLS","name":"Elsewhere.APPPKG.Shadow.cls"},
+            {"cat":"CLS","name":"WebTerminal.Common.cls"}
+        ]}})
+    }
+
+    #[test]
+    fn a_server_narrowed_listing_expands_to_exactly_the_same_documents() {
+        for body in [object_body(), wide_body()] {
+            for pattern in [
+                "APPPKG.*",
+                "APPPKG.*.cls",
+                "APPPKG.Sub.*",
+                "Pkg.Class.*",
+                "Pkg.*.Foo",
+                "%Api.*",
+                "WebTerminal.C*",
+                "ZZNOPKG.*",
+            ] {
+                let prefix = wildcard_listing_filter(pattern)
+                    .unwrap_or_else(|| panic!("'{pattern}' must yield a filter prefix"));
+                let narrowed = filtered_like_the_server_would(&body, prefix);
+                assert_eq!(
+                    expand_wildcard_target(&docnames_in_body(&body), pattern),
+                    expand_wildcard_target(&docnames_in_body(&narrowed), pattern),
+                    "'{pattern}': server-side narrowing changed the expansion"
+                );
+            }
+        }
     }
 
     /// The shape older builds return — the only one the old code handled. Must keep working.

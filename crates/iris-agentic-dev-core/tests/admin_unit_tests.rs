@@ -15,9 +15,31 @@ fn result_text(r: &rmcp::model::CallToolResult) -> serde_json::Value {
 
 // ── T004/T030: ADMIN_WRITE_DISABLED without IRIS_ADMIN_TOOLS ─────────────────
 
+// #91: this was THREE `#[test]`s — `write_actions_disabled_without_env`,
+// `write_allowed_with_env_set` and `write_not_allowed_without_env` — and they RACED.
+// `IRIS_ADMIN_TOOLS` is process-global, cargo runs all three on parallel threads in this
+// one binary, and each one's `set_var`/`remove_var` lands inside another's window.
+// Measured before the merge: 7 of 12 `cargo test` runs red, and 10 of 25 raw-binary runs,
+// with BOTH directions observed — `write_allowed_with_env_set` (was :197) failing because
+// a sibling removed the var, and `write_not_allowed_without_env` (was :204) failing
+// because a sibling set it. The action loop is the third participant, not a bystander:
+// every `*_impl` consults the same variable through `admin_write_allowed`
+// (src/tools/admin.rs:422) before it looks at the connection.
+//
+// Merging them into one sequential function gives the binary exactly ONE env-var
+// timeline. Same fix and same rationale as #85 (tests/unit/test_skills_unit.rs:112).
+// No assertion is lost; each phase is labelled so a future red says which one failed.
 #[test]
-fn write_actions_disabled_without_env() {
+fn admin_write_env_gate() {
+    // ── phase 1: unset -> the helper itself says no ──────────────────────────
     std::env::remove_var("IRIS_ADMIN_TOOLS");
+    assert!(
+        !admin_write_allowed(),
+        "phase 1 (was write_not_allowed_without_env): admin_write_allowed() must be false \
+         with IRIS_ADMIN_TOOLS unset"
+    );
+
+    // ── phase 2: unset -> every write action refuses ─────────────────────────
     let rt = rt();
 
     let actions: &[&str] = &[
@@ -47,10 +69,22 @@ fn write_actions_disabled_without_env() {
         let v = result_text(&r);
         assert_eq!(
             v["error_code"], "ADMIN_WRITE_DISABLED",
-            "action '{}' should return ADMIN_WRITE_DISABLED without IRIS_ADMIN_TOOLS",
+            "phase 2 (was write_actions_disabled_without_env): action '{}' should return \
+             ADMIN_WRITE_DISABLED without IRIS_ADMIN_TOOLS",
             action
         );
     }
+
+    // ── phase 3: set -> the helper says yes ──────────────────────────────────
+    std::env::set_var("IRIS_ADMIN_TOOLS", "1");
+    assert!(
+        admin_write_allowed(),
+        "phase 3 (was write_allowed_with_env_set): admin_write_allowed() must be true with \
+         IRIS_ADMIN_TOOLS=1"
+    );
+
+    // Leave the process as we found it for anything that runs after us.
+    std::env::remove_var("IRIS_ADMIN_TOOLS");
 }
 
 // ── T005: list_users never contains password ──────────────────────────────────
@@ -191,15 +225,7 @@ fn webapp_type_inference() {
 
 // ── admin_write_allowed helper ────────────────────────────────────────────────
 
-#[test]
-fn write_allowed_with_env_set() {
-    std::env::set_var("IRIS_ADMIN_TOOLS", "1");
-    assert!(admin_write_allowed());
-    std::env::remove_var("IRIS_ADMIN_TOOLS");
-}
-
-#[test]
-fn write_not_allowed_without_env() {
-    std::env::remove_var("IRIS_ADMIN_TOOLS");
-    assert!(!admin_write_allowed());
-}
+// #91: `write_allowed_with_env_set` and `write_not_allowed_without_env` used to live here.
+// Both assertions survive, as phases 3 and 1 of `admin_write_env_gate` at the top of this
+// file — they cannot be separate `#[test]`s because they share one process-global variable
+// with each other and with the write-action loop. See the comment there.

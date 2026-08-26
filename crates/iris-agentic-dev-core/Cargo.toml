@@ -202,3 +202,11 @@ path = "tests/unit/test_sql_translate.rs"
 [[test]]
 name = "test_sql_translate_e2e"
 path = "tests/integration/test_sql_translate_e2e.rs"
+
+# Declared explicitly only so every test target is visible in one file (#95). Cargo
+# auto-discovers tests/*.rs, so this target already existed and already ran — but it
+# appeared in no [[test]] block, which is why the CI gate derives its target list from
+# `cargo metadata` rather than from this file.
+[[test]]
+name = "transport_e2e"
+path = "tests/transport_e2e.rs"
