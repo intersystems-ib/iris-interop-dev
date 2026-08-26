@@ -144,8 +144,8 @@ fn mcp_server_tools_list_returns_interop_profile() {
 
     let tool_names: Vec<_> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
-    // Interop profile (this fork's default toolset) exposes exactly the interop
-    // keep-list: 20 tools, plus the 3 added by the 056 interop-depth port.
+    // Interop profile (this fork's default toolset) exposes exactly the 23-tool
+    // interop keep-list (INTEROP_TOOLS).
     assert_eq!(
         tool_names.len(),
         23,

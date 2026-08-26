@@ -58,17 +58,29 @@ pub use scm::ScmParams;
 /// Read from `IRIS_TOOLSET` env var or `--toolset` CLI flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Toolset {
-    /// Every tool the binary carries (54 as of 0.8.3). NOT this fork's default — the
-    /// `--toolset` flag defaults to `interop`; baseline is opt-in via IRIS_TOOLSET/--toolset.
+    /// 54 tools advertised (measured 2026-08-26 on v0.8.3). NOT this fork's default —
+    /// `--toolset` defaults to `interop`; baseline is opt-in via IRIS_TOOLSET/--toolset.
+    /// Note this is already a pruned router: the 58 tools the `#[tool_router]` macro
+    /// registers minus the 4 merged-only ones.
     Baseline,
-    /// 29 tools — stub tools/actions removed; no merged tools.
+    /// 50 tools advertised (measured 2026-08-26). Baseline minus the 4 NOT_IMPLEMENTED
+    /// stubs (skill_propose, skill_optimize, skill_share, skill_community_install).
+    /// No merged dispatchers. Not this fork's default.
     Nostub,
-    /// 23 tools — stubs removed + 4 merger groups consolidated.
+    /// 46 tools advertised (measured 2026-08-26). Nostub (50) minus 8 — the 4 debug_*
+    /// folded into iris_debug, the 3 container tools folded into iris_containers, and
+    /// agent_info dropped outright — plus the 4 merged-only tools iris_debug,
+    /// iris_containers, iris_admin, iris_get_log. 50 - 8 + 4 = 46.
+    /// Not this fork's default.
     Merged,
-    /// ~20 tools — interop-skills-focused profile (see `INTEROP_TOOLS`).
-    /// Keeps only the tools the iris-interop skills actually exercise; everything
-    /// else (skill_*/kb_*/agent_*/generate_*/individual debug_*/container/scm) is pruned.
-    /// Default for this fork. Additive: tool *code* is unchanged so upstream stays mergeable.
+    /// 23 tools advertised (measured 2026-08-26) — exactly `INTEROP_TOOLS`. THIS FORK'S
+    /// DEFAULT: `--toolset` carries `default_value = "interop"` (see
+    /// crates/iris-agentic-dev-bin/src/cmd/mcp.rs). Keeps only the tools the iris-interop
+    /// skills actually exercise; everything else (skill_*/kb_*/agent_*/generate_*/
+    /// individual debug_*/container/scm) is pruned. Two of the 23 (iris_production_item,
+    /// iris_credential_manage) are write-gated off when the connection is not
+    /// write-allowed, so a Live-mode server advertises 21.
+    /// Additive: tool *code* is unchanged so upstream stays mergeable.
     Interop,
 }
 
@@ -93,8 +105,9 @@ impl Toolset {
     }
 }
 
-/// The interop-focused keep-list (Toolset::Interop). Source of truth for the
-/// `Interop` pruning AND the `registered_tool_names()` Interop branch. A unit test
+/// The interop-focused keep-list (Toolset::Interop). Source of truth for the `Interop`
+/// pruning; `registered_tool_names()` now derives from the pruned router for every
+/// toolset, so this list and the advertised surface cannot diverge. A unit test
 /// (`test_interop_toolset_exact`) asserts the live router exposes exactly these,
 /// which also guards against typos / upstream renames.
 pub const INTEROP_TOOLS: &[&str] = &[
@@ -1086,13 +1099,197 @@ pub struct NoParams {}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetLogParams {
-    /// UUID of a stored log entry. If omitted, lists all stored entries.
+    /// The log_id a previous truncated:true result returned. If omitted, lists all
+    /// stored entries. `log_id` is accepted as an alias — that is the name every
+    /// truncating tool emits (issue #78).
+    #[serde(alias = "log_id")]
     pub id: Option<String>,
     /// Max entries to return from the stored result. Must be > 0 if provided.
     pub limit: Option<usize>,
     /// Start index into the stored result. Default 0.
     #[serde(default)]
     pub offset: usize,
+    /// Issue #78: every key serde did not recognise. Captured rather than dropped so a
+    /// mistyped addressing key (`logid`) can be NAMED instead of silently falling through
+    /// to the index listing, which is a different response shape. Not a caller-facing
+    /// parameter: schemars emits no property for a flattened map, only
+    /// `additionalProperties: true` (which `drop_default_additional_properties` removes
+    /// again on the wire).
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Issue #78: the keys iris_get_log tolerates without acting on them.
+///
+/// Not leniency for its own sake. `namespace` is advertised by 11 of the 23 tools in
+/// this fork's default (interop) profile — the only key that spans tool families — and
+/// the agent harness sends it on nearly every call, including the correct index call in
+/// the issue's own repro. It cannot mean anything here: the log store is a single
+/// process-global ring buffer (`log_store::LogStore`) with no namespace dimension, so
+/// ignoring it cannot hide a filter the caller asked for. Rejecting it would turn a call
+/// that is correct today into a hard error.
+const GET_LOG_IGNORED_PARAMS: &[&str] = &["namespace"];
+
+/// The parameters iris_get_log actually reads — named in the error so the next call is a
+/// correction, not another guess (same contract as `no_tests_found_guidance`, issue #47).
+const GET_LOG_VALID_PARAMS: &[&str] = &["id", "limit", "offset"];
+
+/// Issue #78: what an empty index must say. `{"logs":[]}` alone reads as "there is no
+/// relevant log", which is the wrong and expensive conclusion the issue documents.
+const EMPTY_LOG_INDEX_NOTE: &str = "Empty because no tool in THIS session has truncated \
+    its output yet. This store holds only results a PREVIOUS tool marked truncated:true \
+    and handed back a log_id for — it is NOT the IRIS event log. To read IRIS \
+    interoperability logs use iris_interop_query with what='logs' (Ens_Util.Log entries; \
+    filter with component / session_id / since_id), or what='trace' with session_id (one \
+    message flow plus its Event Log events).";
+
+/// Issue #78: leftover keys that must not be swallowed. Sorted, so the message is
+/// deterministic. Keys beginning with `_` are skipped: those are client/protocol
+/// extension markers (`_meta`), never tool parameters.
+fn unknown_get_log_params(extra: &serde_json::Map<String, serde_json::Value>) -> Vec<String> {
+    let mut keys: Vec<String> = extra
+        .keys()
+        .filter(|k| !k.starts_with('_'))
+        .filter(|k| !GET_LOG_IGNORED_PARAMS.contains(&k.as_str()))
+        .cloned()
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// Issue #78: `logid`, `logId`, `LOG-ID` all mean `log_id`, which serde already aliases to
+/// `id`. Normalise away case and separators so the error can name the fix.
+fn is_log_id_near_miss(key: &str) -> bool {
+    let norm: String = key
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    matches!(
+        norm.as_str(),
+        "logid" | "logids" | "loguuid" | "entryid" | "logentryid"
+    )
+}
+
+/// Issue #78: all of iris_get_log, as a free function over the store. The handler touches
+/// no IRIS connection, so this is unit-testable with nothing but a `LogStore` — no
+/// connection, no runtime. Mirrors `search::handle_iris_search`, which is already handed
+/// the store rather than `&self`.
+fn get_log_impl(
+    store: &Arc<std::sync::Mutex<log_store::LogStore>>,
+    p: GetLogParams,
+) -> Result<CallToolResult, McpError> {
+    // #78: a mistyped addressing key must never fall through to the index form. `id`
+    // absent + an unrecognised key present means the caller asked for something this tool
+    // does not offer; answering with the index is a DIFFERENT RESPONSE SHAPE that reads as
+    // "the log is empty" — the failure this issue was filed for. With `id` present the
+    // shape is unambiguous (the entry, or LOG_NOT_FOUND), so an extra key is harmless there.
+    if p.id.is_none() {
+        let unknown = unknown_get_log_params(&p.extra);
+        if !unknown.is_empty() {
+            let named = unknown
+                .iter()
+                .map(|k| format!("'{k}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut extra = serde_json::json!({
+                "unknown_params": unknown,
+                "valid_params": GET_LOG_VALID_PARAMS,
+                "hint": "Pass `id` (alias `log_id`) — the value a previous truncated:true \
+                         result returned — to retrieve that result; limit/offset paginate it. \
+                         Call iris_get_log with NO parameters to list the stored entries. \
+                         `namespace` is accepted and ignored (the store is process-global).",
+            });
+            if unknown.iter().any(|k| is_log_id_near_miss(k)) {
+                extra["did_you_mean"] = serde_json::json!(["id"]);
+            }
+            return envelope::fail_with(
+                "INVALID_PARAMS",
+                &format!(
+                    "iris_get_log: unknown parameter(s) {named}. This call did NOT list the \
+                     log index — an unrecognised parameter is an error here, not a different mode."
+                ),
+                extra,
+            );
+        }
+    }
+
+    match p.id {
+        None => {
+            // List all non-expired entries
+            let summaries = store.lock().map(|mut s| s.list()).unwrap_or_default();
+            let empty = summaries.is_empty();
+            let mut out = serde_json::json!({
+                "success": true,
+                "logs": summaries,
+            });
+            if empty {
+                // #78: an empty index must say what this store is and is NOT, or the
+                // agent concludes "no logs exist" and stops looking.
+                out["note"] = serde_json::Value::String(EMPTY_LOG_INDEX_NOTE.to_string());
+            }
+            ok_json(out)
+        }
+        Some(ref id) => {
+            // Validate limit
+            if let Some(lim) = p.limit {
+                if lim == 0 {
+                    return err_json("INVALID_PARAMS", "limit must be > 0");
+                }
+            }
+
+            // Check TTL / existence first
+            let get_result = store
+                .lock()
+                .map(|s| s.get(id))
+                .unwrap_or(log_store::GetResult::NotFound);
+
+            match get_result {
+                log_store::GetResult::NotFound => err_json(
+                    "LOG_NOT_FOUND",
+                    &format!("No log entry found with id '{}'", id),
+                ),
+                log_store::GetResult::Expired => err_json(
+                    "LOG_EXPIRED",
+                    &format!("Log entry '{}' has expired (TTL exceeded)", id),
+                ),
+                log_store::GetResult::Found(_) => {
+                    // Now handle pagination
+                    let paginated = store
+                        .lock()
+                        .ok()
+                        .and_then(|s| s.get_paginated(id, p.limit, p.offset));
+
+                    match paginated {
+                        None => err_json(
+                            "LOG_EXPIRED",
+                            &format!("Log entry '{}' expired during retrieval", id),
+                        ),
+                        Some((result, has_more, total_count)) => {
+                            if p.limit.is_some() {
+                                ok_json(serde_json::json!({
+                                    "success": true,
+                                    "log_id": id,
+                                    "total_count": total_count,
+                                    "offset": p.offset,
+                                    "limit": p.limit,
+                                    "has_more": has_more,
+                                    "result": result,
+                                }))
+                            } else {
+                                ok_json(serde_json::json!({
+                                    "success": true,
+                                    "log_id": id,
+                                    "total_count": total_count,
+                                    "result": result,
+                                }))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1737,35 +1934,20 @@ pub struct IrisTools {
 
 #[tool_router]
 impl IrisTools {
+    /// Baseline-toolset constructor. Delegates to `with_registry_and_toolset` so the
+    /// router is PRUNED the same way every other constructor prunes it — it used to
+    /// stamp `toolset: Toolset::Baseline` while assigning the raw 58-tool
+    /// `Self::tool_router()`, i.e. it carried the 4 merged-only tools baseline does not
+    /// advertise. Harmless only while `registered_tool_names` ignored the router; now
+    /// that it derives from the router (2026-08-26) the two must agree.
     pub fn new(iris: Option<IrisConnection>) -> anyhow::Result<Self> {
-        let client = Arc::new(IrisConnection::http_client()?);
-        let conn_state = match iris {
-            Some(c) => ConnectionState::from_iris(c, ConnectionSource::EnvVars, None),
-            None => ConnectionState::new_disconnected(ConnectionSource::EnvVars),
-        };
-        let log_max = std::env::var("IRIS_LOG_STORE_MAX")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(50usize);
-        let log_ttl = std::env::var("IRIS_LOG_TTL_MINUTES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(60u64);
-        Ok(Self {
-            connection: Arc::new(std::sync::Mutex::new(conn_state)),
-            config_watcher: Arc::new(std::sync::Mutex::new(None)),
-            registry: Arc::new(crate::skills::SkillRegistry::new()),
-            client,
-            history: Arc::new(std::sync::Mutex::new(VecDeque::with_capacity(50))),
-            elicitation_store: Arc::new(ElicitationStore::new()),
-            checkout_cache: Arc::new(crate::elicitation::CheckoutCache::new()),
-            log_store: Arc::new(std::sync::Mutex::new(log_store::LogStore::new(
-                log_max, log_ttl,
-            ))),
-            metadata_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            toolset: Toolset::Baseline,
-            tool_router: Self::tool_router(),
-        })
+        Self::with_registry_and_toolset(
+            iris,
+            crate::skills::SkillRegistry::new(),
+            Toolset::Baseline,
+            None,
+            None,
+        )
     }
     /// Convenience constructor for tests — same as `new` but with explicit toolset.
     pub fn new_with_toolset(
@@ -1783,127 +1965,21 @@ impl IrisTools {
 
     /// Returns the set of tool names registered for the current toolset.
     /// Used by tests and by the benchmark harness to build valid_tool_names.
+    ///
+    /// Derived from the live `tool_router` for EVERY toolset. The router is built in
+    /// `with_registry_and_toolset`, which applies toolset pruning AND the write gate,
+    /// so this can never disagree with what `tools/list` advertises.
+    /// (Until 2026-08-26 the non-Interop tiers used a hardcoded list last audited
+    /// against v0.4.x; it had drifted 17 tools short and carried one phantom —
+    /// `iris_admin`, which the router removes for baseline/nostub. The tests that
+    /// guarded it compared the hardcoded list against itself, so the drift was
+    /// invisible; `test_toolset_counts_match_doc_comments` now pins the real numbers.)
     pub fn registered_tool_names(&self) -> std::collections::HashSet<String> {
-        // The Interop profile is pruned directly from the live router, so derive its
-        // names from the router itself — always in sync, no hardcoded duplicate to drift.
-        if self.toolset == Toolset::Interop {
-            return self
-                .tool_router
-                .list_all()
-                .into_iter()
-                .map(|t| t.name.to_string())
-                .collect();
-        }
-        // Authoritative baseline list — 34 tools matching v0.4.x (audit 2026-04-28).
-        // REST(14) + Docker(16) + Local(4) = 34
-        // 34 - stubs(4) = nostub(30); 30 - merged_removed(10) + merged_added(4) = merged(24)
-        // Note: iris_symbols_local is no longer a stub (025-symbols-local-ts)
-        let all_tools: &[&str] = &[
-            // REST — 14
-            "iris_compile",
-            "iris_execute",
-            "iris_doc",
-            "iris_query",
-            "iris_symbols",
-            "iris_symbols_local",
-            "docs_introspect",
-            "iris_search",
-            "iris_info",
-            "iris_macro",
-            "iris_table_info",
-            "resolve_dynamic_dispatch",
-            "extract_message_map_routing",
-            "find_subclass_implementations",
-            "debug_capture_packet",
-            "debug_get_error_logs",
-            "iris_generate",
-            "iris_generate_class",
-            // Docker exec
-            "iris_test",
-            "debug_map_int_to_cls",
-            "debug_source_map",
-            "iris_source_control",
-            "skill",
-            "skill_propose",
-            "skill_optimize",
-            // Local/CLI — 4
-            "skill_share",
-            "skill_community",
-            "skill_community_install",
-            "kb",
-            // Interoperability — available in all tiers (036: removed individual stubs)
-            "iris_production",
-            "iris_interop_query",
-            "iris_production_item",
-            "iris_credential_list",
-            "iris_credential_manage",
-            "iris_lookup_manage",
-            "iris_lookup_transfer",
-            // 026-admin-tools
-            "iris_admin",
-            // 034-live-connection-reload
-            "check_config",
-        ];
-
-        // Tools removed in nostub — 4 stubs returning NOT_IMPLEMENTED
-        // iris_symbols_local is NO LONGER a stub (025-symbols-local-ts)
-        let stub_tools: &[&str] = &[
-            "skill_propose",
-            "skill_optimize",
-            "skill_share",
-            "skill_community_install",
-        ];
-
-        // Tools removed in merged (on top of stubs)
-        // 036: individual interop stubs removed entirely; merged dispatchers now in all tiers
-        let merged_removed: &[&str] = &[
-            "debug_capture_packet",
-            "debug_get_error_logs",
-            "debug_map_int_to_cls",
-            "debug_source_map",
-        ];
-        let merged_removed_2: &[&str] = &[] as &[&str]; // placeholder
-        let merged_added: &[&str] = &[
-            "iris_debug",
-            "iris_containers",
-            // 026-admin-tools
-            "iris_admin",
-            // 027-progressive-disclosure
-            "iris_get_log",
-        ];
-
-        let mut names: std::collections::HashSet<String> =
-            all_tools.iter().map(|s| s.to_string()).collect();
-
-        match self.toolset {
-            Toolset::Interop => unreachable!("derived from router and returned early above"),
-            Toolset::Baseline => {}
-            Toolset::Nostub => {
-                for s in stub_tools {
-                    names.remove(*s);
-                }
-            }
-            Toolset::Merged => {
-                for s in stub_tools {
-                    names.remove(*s);
-                }
-                for s in merged_removed {
-                    names.remove(*s);
-                }
-                let _ = merged_removed_2; // unused in this path
-                for s in merged_added {
-                    names.insert(s.to_string());
-                }
-                // Apply write-gate: remove write-only tools if not write-allowed
-                if !self.write_tools_enabled() {
-                    let write_gated: &[&str] = &["iris_production_item", "iris_credential_manage"];
-                    for s in write_gated {
-                        names.remove(*s);
-                    }
-                }
-            }
-        }
-        names
+        self.tool_router
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect()
     }
 
     pub fn with_registry(
@@ -4135,77 +4211,112 @@ Methods:
         )
     }
 
-    #[tool(description = "List all synthesized skills in the registry.")]
+    // ── ^SKILLS readers (issue #119) ─────────────────────────────────────────
+    // All three used to hand-build JSON by concatenating the RAW pipe-delimited value
+    // into an array literal, never emitting the subscript (the skill NAME). serde then
+    // rejected the payload and every failure fell through to an empty list / NOT_FOUND —
+    // indistinguishable from "no IRIS". The assembly now lives in ONE place,
+    // `skills_tools::skills_list_json_code` / `skills_describe_json_code`, which uses
+    // %DynamicArray + %ToJSON so IRIS does the escaping.
+
+    #[tool(
+        description = "List all synthesized skills in the ^SKILLS registry (name, description, usage_count, created_at)."
+    )]
     async fn skill_list(&self, _: Parameters<NoParams>) -> Result<CallToolResult, McpError> {
-        if let Some(iris) = self.iris_arc().as_deref() {
-            let code = "Set key=\"\" Set result=\"[\" Set sep=\"\" For { Set key=$Order(^SKILLS(key)) Quit:key=\"\" Set skill=$Get(^SKILLS(key)) Set result=result_sep_skill Set sep=\",\" } Set result=result_\"]\" Write result";
-            if let Ok(output) = iris
-                .execute(code, &crate::tools::skills_tools::skills_namespace())
-                .await
-            {
-                if let Ok(skills) = serde_json::from_str::<serde_json::Value>(output.trim()) {
-                    let count = skills.as_array().map(|a| a.len()).unwrap_or(0);
-                    return ok_json(serde_json::json!({"skills": skills, "count": count}));
-                }
+        let ns = skills_tools::skills_namespace();
+        let Some(iris) = self.iris_arc() else {
+            return skills_tools::skills_read_fail(
+                "skill_list",
+                &ns,
+                skills_tools::SkillsReadError::Unreachable("no IRIS connection configured".into()),
+            );
+        };
+        let code = skills_tools::skills_list_json_code(None, false);
+        match skills_tools::read_skills_json(&iris, &code, &ns).await {
+            Ok(skills) => {
+                let count = skills.as_array().map(|a| a.len()).unwrap_or(0);
+                ok_json(serde_json::json!({
+                    "success": true, "skills": skills, "count": count,
+                    "namespace": ns, "source": "^SKILLS"
+                }))
             }
+            Err(e) => skills_tools::skills_read_fail("skill_list", &ns, e),
         }
-        ok_json(serde_json::json!({"skills": [], "count": 0}))
     }
 
-    #[tool(description = "Describe a skill by name.")]
+    #[tool(description = "Describe one skill in the ^SKILLS registry by name.")]
     async fn skill_describe(
         &self,
         Parameters(p): Parameters<SkillNameParams>,
     ) -> Result<CallToolResult, McpError> {
-        if let Some(iris) = self.iris_arc().as_deref() {
-            let code = format!("Write $Get(^SKILLS({}))", os_str_expr(&p.name));
-            if let Ok(output) = iris
-                .execute(&code, &crate::tools::skills_tools::skills_namespace())
-                .await
-            {
-                if let Ok(skill) = serde_json::from_str::<serde_json::Value>(output.trim()) {
-                    return ok_json(serde_json::json!({"success": true, "skill": skill}));
-                }
+        let ns = skills_tools::skills_namespace();
+        let Some(iris) = self.iris_arc() else {
+            return skills_tools::skills_read_fail(
+                "skill_describe",
+                &ns,
+                skills_tools::SkillsReadError::Unreachable("no IRIS connection configured".into()),
+            );
+        };
+        // #119: was `Write $Get(^SKILLS(name))` parsed as JSON — a pipe-delimited string
+        // never parses, so this tool returned NOT_FOUND for every skill that existed.
+        let code = skills_tools::skills_describe_json_code(&p.name);
+        match skills_tools::read_skills_json(&iris, &code, &ns).await {
+            Ok(v) if v.get("found").and_then(|f| f.as_i64()) == Some(1) => {
+                ok_json(serde_json::json!({
+                    "success": true, "name": p.name, "skill": v,
+                    "namespace": ns, "source": "^SKILLS"
+                }))
             }
+            // The `found` sentinel is what separates "IRIS answered, no such skill" from
+            // "IRIS never answered" — an empty payload cannot tell them apart.
+            Ok(_) => envelope::fail_with(
+                "NOT_FOUND",
+                &format!(
+                    "Skill '{}' not found in ^SKILLS (namespace '{}')",
+                    p.name, ns
+                ),
+                serde_json::json!({"namespace": ns, "source": "^SKILLS"}),
+            ),
+            Err(e) => skills_tools::skills_read_fail("skill_describe", &ns, e),
         }
-        err_json("NOT_FOUND", &format!("Skill '{}' not found", p.name))
     }
 
     #[tool(
-        description = "Search synthesized skills by name and description. Returns skills whose name or description contains the query terms."
+        description = "Search the ^SKILLS registry by name and description. Returns skills whose name or description contains the query (case-insensitive substring)."
     )]
     async fn skill_search(
         &self,
         Parameters(p): Parameters<SkillSearchParams>,
     ) -> Result<CallToolResult, McpError> {
-        if let Some(iris) = self.iris_arc().as_deref() {
-            let query_lower = p.query.to_lowercase();
-            let q = query_lower.replace('"', "");
-            let code = format!(
-                concat!(
-                    r#"Set key="",results="[",sep="" "#,
-                    r#"For {{ Set key=$Order(^SKILLS(key)) Quit:key="" "#,
-                    r#"Set skill=$Get(^SKILLS(key)) "#,
-                    r#"If ($ZConvert(skill,"L")["{0}")||($ZConvert(key,"L")["{0}") "#,
-                    r#"{{ Set results=results_sep_skill Set sep="," }} }} "#,
-                    r#"Set results=results_"]" Write results"#
-                ),
-                q
+        let ns = skills_tools::skills_namespace();
+        let Some(iris) = self.iris_arc() else {
+            return skills_tools::skills_read_fail(
+                "skill_search",
+                &ns,
+                skills_tools::SkillsReadError::Unreachable("no IRIS connection configured".into()),
             );
-            if let Ok(output) = iris
-                .execute(&code, &crate::tools::skills_tools::skills_namespace())
-                .await
-            {
-                if let Ok(skills) = serde_json::from_str::<Vec<serde_json::Value>>(output.trim()) {
-                    let limited: Vec<_> = skills.into_iter().take(p.top_k).collect();
-                    let count = limited.len();
-                    return ok_json(
-                        serde_json::json!({"query": p.query, "results": limited, "count": count}),
-                    );
-                }
+        };
+        // #67: the needle goes through os_str_expr inside the builder. The old form
+        // hand-stripped quotes (`query_lower.replace('"', "")`) and interpolated the
+        // result raw into an ObjectScript literal — a query with a newline could not
+        // compile at all.
+        let query_lower = p.query.to_lowercase();
+        let code = skills_tools::skills_list_json_code(Some(&query_lower), false);
+        match skills_tools::read_skills_json(&iris, &code, &ns).await {
+            Ok(skills) => {
+                let all = skills.as_array().cloned().unwrap_or_default();
+                let matched = all.len();
+                // top_k of 0 used to silently return nothing; clamp to at least 1.
+                let limited: Vec<_> = all.into_iter().take(p.top_k.max(1)).collect();
+                let count = limited.len();
+                ok_json(serde_json::json!({
+                    "success": true, "query": p.query, "results": limited,
+                    "count": count, "matched": matched,
+                    "namespace": ns, "source": "^SKILLS"
+                }))
             }
+            Err(e) => skills_tools::skills_read_fail("skill_search", &ns, e),
         }
-        ok_json(serde_json::json!({"query": p.query, "results": [], "count": 0}))
     }
 
     #[tool(description = "Remove a skill from the registry by name.")]
@@ -5442,87 +5553,15 @@ Methods:
     // ── iris_get_log (027 — progressive disclosure, Merged tier only) ──────────
 
     #[tool(
-        description = "Retrieve a stored result by log_id from the progressive disclosure store. With id: returns the full result (optionally paginated with limit/offset). Without id: lists all stored log entries with their IDs, tools, timestamps, and total counts. Use after any tool returns truncated:true."
+        description = "Retrieve a result a PREVIOUS tool truncated, from this server's in-memory result store. This is NOT the IRIS event log — for interoperability logs use iris_interop_query (what=logs, or what=trace with session_id). With id (alias: log_id — the value a truncated:true result handed back): returns the full result, optionally paginated with limit/offset. With NO parameters: lists the stored entries (id, tool, timestamp, total_count). Any other parameter name is an error, not a fallback to the listing. Use after any tool returns truncated:true."
     )]
     async fn iris_get_log(
         &self,
         Parameters(p): Parameters<GetLogParams>,
     ) -> Result<CallToolResult, McpError> {
-        match p.id {
-            None => {
-                // List all non-expired entries
-                let summaries = self
-                    .log_store
-                    .lock()
-                    .map(|mut s| s.list())
-                    .unwrap_or_default();
-                ok_json(serde_json::json!({
-                    "success": true,
-                    "logs": summaries,
-                }))
-            }
-            Some(ref id) => {
-                // Validate limit
-                if let Some(lim) = p.limit {
-                    if lim == 0 {
-                        return err_json("INVALID_PARAMS", "limit must be > 0");
-                    }
-                }
-
-                // Check TTL / existence first
-                let get_result = self
-                    .log_store
-                    .lock()
-                    .map(|s| s.get(id))
-                    .unwrap_or(log_store::GetResult::NotFound);
-
-                match get_result {
-                    log_store::GetResult::NotFound => err_json(
-                        "LOG_NOT_FOUND",
-                        &format!("No log entry found with id '{}'", id),
-                    ),
-                    log_store::GetResult::Expired => err_json(
-                        "LOG_EXPIRED",
-                        &format!("Log entry '{}' has expired (TTL exceeded)", id),
-                    ),
-                    log_store::GetResult::Found(_) => {
-                        // Now handle pagination
-                        let paginated = self
-                            .log_store
-                            .lock()
-                            .ok()
-                            .and_then(|s| s.get_paginated(id, p.limit, p.offset));
-
-                        match paginated {
-                            None => err_json(
-                                "LOG_EXPIRED",
-                                &format!("Log entry '{}' expired during retrieval", id),
-                            ),
-                            Some((result, has_more, total_count)) => {
-                                if p.limit.is_some() {
-                                    ok_json(serde_json::json!({
-                                        "success": true,
-                                        "log_id": id,
-                                        "total_count": total_count,
-                                        "offset": p.offset,
-                                        "limit": p.limit,
-                                        "has_more": has_more,
-                                        "result": result,
-                                    }))
-                                } else {
-                                    ok_json(serde_json::json!({
-                                        "success": true,
-                                        "log_id": id,
-                                        "total_count": total_count,
-                                        "result": result,
-                                    }))
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // #78: the body lives in the free function `get_log_impl` so it is unit-testable
+        // with nothing but a LogStore — this handler reaches no IRIS connection at all.
+        get_log_impl(&self.log_store, p)
     }
 }
 
@@ -5552,6 +5591,7 @@ impl ServerHandler for IrisTools {
         for tool in tools.iter_mut() {
             let schema = std::sync::Arc::make_mut(&mut tool.input_schema);
             normalize_schema_openapi3(schema);
+            drop_default_additional_properties(schema);
         }
         Ok(rmcp::model::ListToolsResult {
             tools,
@@ -5645,6 +5685,18 @@ fn normalize_schema_openapi3(schema: &mut serde_json::Map<String, serde_json::Va
             serde_json::json!({"type": "null"}),
         ]),
     );
+}
+
+/// Issue #78: `#[serde(flatten)]` on GetLogParams makes schemars emit
+/// `"additionalProperties": true` — JSON Schema's DEFAULT, so dropping it changes nothing
+/// for any validator, and it keeps every advertised inputSchema byte-identical to the
+/// pre-#78 one. No tool in either profile emits this keyword today; strict clients are the
+/// reason `AnyParams` carries a hand-written JsonSchema impl (see also #113/#115).
+/// Top level only — a nested `additionalProperties` would be load-bearing.
+fn drop_default_additional_properties(schema: &mut serde_json::Map<String, serde_json::Value>) {
+    if schema.get("additionalProperties") == Some(&serde_json::Value::Bool(true)) {
+        schema.remove("additionalProperties");
+    }
 }
 
 fn parse_iris_error_string(s: &str) -> Option<(String, i64)> {
@@ -5888,7 +5940,9 @@ mod config_watcher_tests {
 
 #[cfg(test)]
 mod schema_normalization_tests {
+    use super::drop_default_additional_properties;
     use super::normalize_schema_openapi3;
+    use super::GetLogParams;
     use super::DOCKER_REQUIRED_HINT;
 
     #[test]
@@ -5998,6 +6052,66 @@ mod schema_normalization_tests {
             conn_src_pos < host_pos,
             "connection_source must appear before host in check_config output (got positions {conn_src_pos} vs {host_pos})"
         );
+    }
+
+    // ── Issue #78: GetLogParams' advertised schema ───────────────────────────
+
+    /// The flattened leftover-capture map must not leak a property, and the one keyword it
+    /// does add (`additionalProperties: true`, JSON Schema's default) must be stripped on
+    /// the wire — no tool in either profile emits that keyword, and strict clients are why
+    /// `AnyParams` carries a hand-written JsonSchema impl (#113/#115).
+    #[test]
+    fn get_log_input_schema_still_advertises_exactly_id_limit_offset() {
+        let schema = serde_json::to_value(schemars::schema_for!(GetLogParams)).unwrap();
+        let props = schema["properties"].as_object().unwrap();
+        let mut keys: Vec<&str> = props.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["id", "limit", "offset"],
+            "the #[serde(flatten)] capture must not surface as a caller-facing parameter"
+        );
+        assert!(
+            props["id"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("log_id"),
+            "the alias must be documented where the agent reads it: {}",
+            props["id"]["description"]
+        );
+        assert_eq!(
+            schema["additionalProperties"],
+            serde_json::Value::Bool(true),
+            "schemars emits exactly this for a flattened map — if that changes, revisit \
+             drop_default_additional_properties"
+        );
+
+        let mut obj = schema.as_object().unwrap().clone();
+        drop_default_additional_properties(&mut obj);
+        assert!(
+            obj.get("additionalProperties").is_none(),
+            "the advertised schema must stay byte-identical to the pre-#78 one"
+        );
+    }
+
+    /// `normalize_schema_openapi3` lists "additionalProperties" among the keys it relocates
+    /// into an `anyOf` branch — but only where the schema has a nullable TYPE ARRAY.
+    /// GetLogParams' top level is `"type": "object"`, so it must never take that path.
+    #[test]
+    fn normalize_leaves_the_get_log_object_schema_intact() {
+        let schema = serde_json::to_value(schemars::schema_for!(GetLogParams)).unwrap();
+        let mut obj = schema.as_object().unwrap().clone();
+        normalize_schema_openapi3(&mut obj);
+        assert!(
+            obj["properties"]["id"]["anyOf"].is_array(),
+            "the nullable rewrite must still fire on Option<String>: {obj:?}"
+        );
+        assert_eq!(
+            obj["additionalProperties"],
+            serde_json::Value::Bool(true),
+            "the object level must not be rewritten into an anyOf branch"
+        );
+        assert!(obj.get("anyOf").is_none(), "{obj:?}");
     }
 
     // ── DOCKER_REQUIRED remediation hint ─────────────────────────────────────
@@ -6346,5 +6460,244 @@ mod no_tests_found_guidance_tests {
         let cands = v(&["Wk47.Tests.SmokeTest"]);
         let (_, dym) = no_tests_found_guidance("wk47.tests", "APP", &cands, false);
         assert_eq!(dym, v(&["Wk47.Tests.SmokeTest"]));
+    }
+}
+
+// ── Issue #78: iris_get_log addressing ────────────────────────────────────────
+#[cfg(test)]
+mod get_log_params_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    fn empty_store() -> Arc<Mutex<log_store::LogStore>> {
+        Arc::new(Mutex::new(log_store::LogStore::new(50, 60)))
+    }
+
+    /// Stores `n` entries, each holding `items` result rows. Returns the store and the ids.
+    fn store_with(n: usize, items: usize) -> (Arc<Mutex<log_store::LogStore>>, Vec<String>) {
+        let store = empty_store();
+        let mut ids = Vec::new();
+        {
+            let mut s = store.lock().unwrap();
+            for i in 0..n {
+                let rows: Vec<serde_json::Value> =
+                    (0..items).map(|j| serde_json::json!({"row": j})).collect();
+                let id = log_store::new_log_id();
+                s.store(log_store::LogEntry {
+                    id: id.clone(),
+                    tool: format!("iris_test_{i}"),
+                    created_at: std::time::Instant::now(),
+                    preview: rows.iter().take(1).cloned().collect(),
+                    full_result: serde_json::Value::Array(rows.clone()),
+                    total_count: rows.len(),
+                });
+                ids.push(id);
+            }
+        }
+        (store, ids)
+    }
+
+    fn parse(v: serde_json::Value) -> GetLogParams {
+        serde_json::from_value(v).expect("GetLogParams must deserialize")
+    }
+
+    fn payload(r: &CallToolResult) -> serde_json::Value {
+        let text = match &r.content[0].raw {
+            RawContent::Text(t) => &t.text,
+            _ => panic!("expected text content"),
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    fn call(
+        store: &Arc<Mutex<log_store::LogStore>>,
+        args: serde_json::Value,
+    ) -> (CallToolResult, serde_json::Value) {
+        let r = get_log_impl(store, parse(args)).unwrap();
+        let v = payload(&r);
+        (r, v)
+    }
+
+    /// Criterion 1: `log_id` is the name every truncating tool emits
+    /// (`log_store::apply_truncation`), so it must address the same entry as `id`.
+    #[test]
+    fn log_id_alias_reaches_the_same_entry_as_id() {
+        let (store, ids) = store_with(1, 3);
+        let (r1, v1) = call(&store, serde_json::json!({"log_id": ids[0]}));
+        let (r2, v2) = call(&store, serde_json::json!({"id": ids[0]}));
+        assert_ne!(r1.is_error, Some(true));
+        assert_ne!(r2.is_error, Some(true));
+        assert_eq!(v1, v2, "log_id and id must be the same addressing key");
+        assert_eq!(v1["total_count"], 3);
+    }
+
+    /// The issue's headline: `log_id` on a missing entry used to return the INDEX
+    /// (`{"logs":[],"success":true}`), a different response shape that reads as
+    /// "no logs exist". It must be LOG_NOT_FOUND, and it must carry no `logs` key.
+    #[test]
+    fn log_id_on_a_missing_entry_is_log_not_found_not_the_index() {
+        let store = empty_store();
+        let (r, v) = call(
+            &store,
+            serde_json::json!({"namespace": "APP", "log_id": "1"}),
+        );
+        assert_eq!(r.is_error, Some(true));
+        assert_eq!(v["error_code"], "LOG_NOT_FOUND");
+        assert!(
+            v.get("logs").is_none(),
+            "the index shape must never answer an addressed call: {v}"
+        );
+    }
+
+    /// Criterion 2: a mistyped addressing key is named, not swallowed.
+    #[test]
+    fn a_mistyped_addressing_key_is_an_error_that_names_it() {
+        let store = empty_store();
+        let (r, v) = call(
+            &store,
+            serde_json::json!({"namespace": "APP", "logid": "1"}),
+        );
+        assert_eq!(r.is_error, Some(true));
+        assert_eq!(v["error_code"], "INVALID_PARAMS");
+        assert!(
+            v["error"].as_str().unwrap().contains("'logid'"),
+            "the error must name the offending key: {v}"
+        );
+        assert_eq!(v["unknown_params"], serde_json::json!(["logid"]));
+        assert_eq!(
+            v["valid_params"],
+            serde_json::json!(["id", "limit", "offset"])
+        );
+        assert_eq!(v["did_you_mean"], serde_json::json!(["id"]));
+        assert!(
+            v.get("logs").is_none(),
+            "an error must not also look like the index: {v}"
+        );
+    }
+
+    /// Criterion 4 (no regression): `namespace` is sprayed by the harness on nearly every
+    /// call, including the correct index call, so it must stay ignorable.
+    #[test]
+    fn bare_namespace_still_lists_the_index() {
+        let store = empty_store();
+        for args in [
+            serde_json::json!({"namespace": "APP"}),
+            serde_json::json!({}),
+        ] {
+            let (r, v) = call(&store, args.clone());
+            assert_ne!(r.is_error, Some(true), "{args} must not be an error");
+            assert_eq!(v["success"], true);
+            assert!(v["logs"].is_array(), "{v}");
+        }
+    }
+
+    #[test]
+    fn namespace_does_not_suppress_a_populated_index() {
+        let (store, _ids) = store_with(2, 1);
+        let (r, v) = call(&store, serde_json::json!({"namespace": "APP"}));
+        assert_ne!(r.is_error, Some(true));
+        assert_eq!(v["logs"].as_array().unwrap().len(), 2);
+        assert!(
+            v.get("note").is_none(),
+            "the note is for the EMPTY index only — it would be noise here: {v}"
+        );
+    }
+
+    /// Criterion 3: an empty index must say what this store is and is NOT, and must point
+    /// at the tools that really read IRIS logs. The tool names are pinned deliberately —
+    /// the whole value of the note is that they are real.
+    #[test]
+    fn the_empty_index_says_what_this_store_is_and_is_not() {
+        let store = empty_store();
+        let (_r, v) = call(&store, serde_json::json!({}));
+        let note = v["note"].as_str().expect("empty index must carry a note");
+        for needle in [
+            "truncated:true",
+            "log_id",
+            "NOT the IRIS event log",
+            "iris_interop_query",
+            "what='logs'",
+            "what='trace'",
+        ] {
+            assert!(note.contains(needle), "note must mention {needle}: {note}");
+        }
+    }
+
+    /// The unknown-key check is deliberately gated on `id.is_none()`: with `id` present the
+    /// response shape is unambiguous, so an extra key cannot be mistaken for the index.
+    #[test]
+    fn an_unknown_key_alongside_id_still_answers_the_id() {
+        let store = empty_store();
+        let (r, v) = call(
+            &store,
+            serde_json::json!({"id": "nope", "tool": "iris_test"}),
+        );
+        assert_eq!(r.is_error, Some(true));
+        assert_eq!(v["error_code"], "LOG_NOT_FOUND");
+    }
+
+    /// `_meta` and friends are client/protocol markers, never tool parameters.
+    #[test]
+    fn underscore_prefixed_keys_are_never_reported() {
+        let store = empty_store();
+        let (r, v) = call(&store, serde_json::json!({"_meta": {"x": 1}}));
+        assert_ne!(r.is_error, Some(true));
+        assert!(v["logs"].is_array(), "{v}");
+    }
+
+    #[test]
+    fn near_miss_normalisation() {
+        for k in [
+            "logid",
+            "logId",
+            "LOG-ID",
+            "log id",
+            "entryid",
+            "log_entry_id",
+        ] {
+            assert!(is_log_id_near_miss(k), "{k} must be a near miss");
+        }
+        for k in ["session_id", "tool", "namespace", "limit", "id"] {
+            assert!(!is_log_id_near_miss(k), "{k} must NOT be a near miss");
+        }
+    }
+
+    #[test]
+    fn unknown_params_are_sorted_for_a_deterministic_message() {
+        let store = empty_store();
+        let (_r, v) = call(&store, serde_json::json!({"zeta": 1, "alpha": 2}));
+        assert_eq!(v["unknown_params"], serde_json::json!(["alpha", "zeta"]));
+    }
+
+    /// `#[serde(flatten)]` switches the struct onto serde's buffered content deserializer —
+    /// pin that limit/offset still deserialize and validate exactly as before.
+    #[test]
+    fn pagination_and_limit_validation_survive_the_flatten() {
+        let (store, ids) = store_with(1, 5);
+        let (r, v) = call(
+            &store,
+            serde_json::json!({"id": ids[0], "limit": 2, "offset": 0}),
+        );
+        assert_ne!(r.is_error, Some(true));
+        assert_eq!(v["total_count"], 5);
+        assert_eq!(v["has_more"], true);
+        assert_eq!(v["result"].as_array().unwrap().len(), 2);
+
+        let (r, v) = call(&store, serde_json::json!({"id": ids[0], "limit": 0}));
+        assert_eq!(r.is_error, Some(true));
+        assert_eq!(v["error_code"], "INVALID_PARAMS");
+        assert!(v["error"].as_str().unwrap().contains("limit must be > 0"));
+    }
+
+    /// Both addressing keys at once is a serde `duplicate field` error, which rmcp surfaces
+    /// as a JSON-RPC -32602 frame — NOT the issue-#2 envelope. Loud rather than silent, which
+    /// is the property that matters here; pinned so a future reader is not surprised by it.
+    #[test]
+    fn both_id_and_log_id_is_rejected_rather_than_listing_the_index() {
+        assert!(
+            serde_json::from_value::<GetLogParams>(serde_json::json!({"id": "a", "log_id": "b"}))
+                .is_err(),
+            "two addressing keys must not silently resolve to one"
+        );
     }
 }

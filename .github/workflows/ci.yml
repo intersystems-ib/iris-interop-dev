@@ -35,7 +35,8 @@ jobs:
             --test manifest_tests \
             --test skills_tests \
             --test vscode_config_tests \
-            --test mcp_handshake
+            --test mcp_handshake \
+            --test test_toolset
         env:
           RUST_LOG: warn
 

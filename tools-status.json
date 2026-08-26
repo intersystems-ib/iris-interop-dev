@@ -1,6 +1,6 @@
 {
-  "_comment": "Per-tool validation gate for the iris-interop-dev (interop-profile) fork. A tool is 'OK' only when its named unit AND e2e tests exist and pass. scripts/validate-tools.sh checks this. Statuses: OK = unit+e2e green; unit-ok = unit green, e2e pending (needs interop-enabled namespace); profile-only = present in the 20-tool interop profile (verified by mcp_handshake) but no dedicated behaviour test yet. Both execution transports (HTTP/Atelier REST and Docker-exec) are validated by transport_e2e.",
-  "profile": "interop (20 tools, default)",
+  "_comment": "Per-tool validation gate for the iris-interop-dev (interop-profile) fork. A tool is 'OK' only when its named unit AND e2e tests exist and pass. scripts/validate-tools.sh checks this. Statuses: OK = unit+e2e green; unit-ok = unit green, e2e pending (needs interop-enabled namespace); profile-only = present in the 23-tool interop profile (verified by mcp_handshake) but no dedicated behaviour test yet. Both execution transports (HTTP/Atelier REST and Docker-exec) are validated by transport_e2e.",
+  "profile": "interop (23 tools, default)",
   "transports": {
     "http_atelier_rest": {
       "test": "transport_e2e::http_transport_executes_and_captures_output",
@@ -18,7 +18,7 @@
   "profile_surface": {
     "test": "mcp_handshake::mcp_server_tools_list_returns_interop_profile",
     "status": "OK",
-    "note": "asserts exactly the 20 interop tools, meta tools pruned"
+    "note": "asserts exactly the 23 interop tools, meta tools pruned"
   },
   "tools": [
     {
@@ -101,9 +101,9 @@
     },
     {
       "tool": "iris_get_log",
-      "unit": null,
+      "unit": "tools::get_log_params_tests (12) + schema_normalization_tests (2)",
       "e2e": null,
-      "status": "profile-only"
+      "status": "unit-ok"
     },
     {
       "tool": "iris_debug",
@@ -137,6 +137,24 @@
     },
     {
       "tool": "find_subclass_implementations",
+      "unit": null,
+      "e2e": null,
+      "status": "profile-only"
+    },
+    {
+      "tool": "iris_message_body",
+      "unit": "interop_unit_tests::message_body_is_blocked_under_the_default_policy + redact_hl7v2_* (3)",
+      "e2e": null,
+      "status": "unit-ok"
+    },
+    {
+      "tool": "iris_business_rule_info",
+      "unit": "interop_unit_tests::business_rule_info_rejects_an_unknown_action + business_rule_get_requires_a_rule_name",
+      "e2e": null,
+      "status": "unit-ok"
+    },
+    {
+      "tool": "iris_production_diff",
       "unit": null,
       "e2e": null,
       "status": "profile-only"
