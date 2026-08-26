@@ -622,11 +622,14 @@ impl IrisConnection {
                 }
             }
         }
+        // Issue #80: same colon-vs-space prefix defect as iris_compile's own console loop,
+        // a second consumer away (iris_doc{mode:put, compile:true}.compile_errors, and
+        // iris_compile's local-source upload path). Shares the one parser so the two cannot
+        // drift apart again.
         for line in &console {
-            if let Some(rest) = line.trim().strip_prefix("ERROR ") {
-                let rest = rest.to_string();
-                if errors.iter().all(|e| !e.contains(&rest)) {
-                    errors.push(rest);
+            if let Some(d) = crate::tools::parse_console_diag(line, "ERROR:", "ERROR ") {
+                if errors.iter().all(|e| !e.contains(&d.text)) {
+                    errors.push(d.text);
                 }
             }
         }

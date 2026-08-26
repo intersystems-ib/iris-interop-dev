@@ -111,18 +111,25 @@ fn test_agent_info_params_missing_what_fails() {
 
 // ── skills_namespace env var ──────────────────────────────────────────────────
 
+// #85: `skills_namespace` now takes the connection. The connection-fed cases live in the
+// lib test `skills_namespace_tests`, so this binary keeps exactly ONE env-var timeline.
+//
+// These were two `#[test]`s (`test_skills_namespace_default` and
+// `test_skills_namespace_env_override`) and they RACED: `OBJECTSCRIPT_SKILLMCP_NAMESPACE`
+// is process-global, cargo runs both on parallel threads in this one binary, and the
+// `remove_var` in the first landed between the `set_var` and the read in the second —
+// reproduced here at ~1 run in 20, failing with `left: "USER", right: "SKILLS"`. The race
+// predates #85 (identical shape at f1b3df8); merging them into one sequential function is
+// the fix, and no assertion is lost.
 #[test]
-fn test_skills_namespace_default() {
+fn test_skills_namespace_env_precedence() {
     // Remove env var if set, verify fallback
     std::env::remove_var("OBJECTSCRIPT_SKILLMCP_NAMESPACE");
-    let ns = iris_agentic_dev_core::tools::skills_tools::skills_namespace();
+    let ns = iris_agentic_dev_core::tools::skills_tools::skills_namespace(None);
     assert_eq!(ns, "USER");
-}
 
-#[test]
-fn test_skills_namespace_env_override() {
     std::env::set_var("OBJECTSCRIPT_SKILLMCP_NAMESPACE", "SKILLS");
-    let ns = iris_agentic_dev_core::tools::skills_tools::skills_namespace();
+    let ns = iris_agentic_dev_core::tools::skills_tools::skills_namespace(None);
     assert_eq!(ns, "SKILLS");
     std::env::remove_var("OBJECTSCRIPT_SKILLMCP_NAMESPACE");
 }

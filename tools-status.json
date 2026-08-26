@@ -47,7 +47,7 @@
     },
     {
       "tool": "iris_compile",
-      "unit": "test_compile_params",
+      "unit": "test_compile_params + tools::docname_expansion_tests (21) + tools::console_diag_tests (9)",
       "e2e": "test_compile_cmd / test_e2e",
       "status": "OK"
     },
@@ -101,7 +101,7 @@
     },
     {
       "tool": "iris_get_log",
-      "unit": "tools::get_log_params_tests (12) + schema_normalization_tests (2)",
+      "unit": "tools::get_log_params_tests (34) + schema_normalization_tests::get_log_* (3) + schema_normalization_tests::the_advertised_schema_does_not_ship_the_rust_struct_name + log_store_tests::test_get_paginated_* (5)",
       "e2e": null,
       "status": "unit-ok"
     },

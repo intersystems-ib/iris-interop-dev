@@ -26,8 +26,20 @@ jobs:
       # Unit + handshake tests — no live IRIS needed.
       # Integration tests (test_mcp_iris, test_e2e_all_tools, test_scm, discovery_tests,
       # interop_e2e_tests) require IRIS_HOST/IRIS_WEB_PORT; run them locally.
-      - run: |
-          cargo test -p iris-agentic-dev-core --lib \
+      # KNOWN FLAKES — if this gate goes red, check these before calling it a regression:
+      #   * mcp_server_startup_latency_under_100ms — load sensitive; re-run it alone.
+      #   * manifest_tests::test_resolve_github_* — live GitHub API. Unauthenticated GitHub
+      #     allows 60 requests/hour PER IP, shared by every job on the runner, and reports
+      #     exhaustion as HTTP 403 — which reads like a permissions bug, not a flake (#87).
+      #     Those four tests no longer run here: they are opt-in behind IRIS_DEV_LIVE_GITHUB
+      #     and covered offline by the *_offline wiremock tests in the same target. The live
+      #     canary runs in the advisory step below.
+      # --no-fail-fast: without it a failure in an earlier --test target means the later ones
+      # never execute and print nothing, which reads as "passed" (#87). Cargo still exits
+      # non-zero if any target failed.
+      - name: Unit + handshake gate (offline, required)
+        run: |
+          cargo test --no-fail-fast -p iris-agentic-dev-core --lib \
             --test test_compile_params \
             --test test_doc_params \
             --test test_elicitation \
@@ -39,6 +51,21 @@ jobs:
             --test test_toolset
         env:
           RUST_LOG: warn
+      # #86: these two tests were red at master and were in no gate, so nobody saw it.
+      - name: Plugin dispatch gate (#86)
+        run: cargo test --no-fail-fast -p iris-agentic-dev --test plugin_dispatch_tests
+        env:
+          RUST_LOG: warn
+      # Advisory: exercises the real api.github.com path with the token Actions injects
+      # (1000 req/hr per repo, not 60 per IP). continue-on-error so a GitHub-side outage
+      # or limit can never redden the required gate above.
+      - name: Live GitHub resolver canary (advisory)
+        continue-on-error: true
+        run: cargo test --no-fail-fast -p iris-agentic-dev-core --test manifest_tests -- --nocapture
+        env:
+          RUST_LOG: warn
+          IRIS_DEV_LIVE_GITHUB: "1"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   benchmark-lint:
     runs-on: ubuntu-latest

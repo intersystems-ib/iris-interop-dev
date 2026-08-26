@@ -250,8 +250,35 @@ fn learning_enabled() -> bool {
         .unwrap_or(true)
 }
 
-pub fn skills_namespace() -> String {
-    std::env::var("OBJECTSCRIPT_SKILLMCP_NAMESPACE").unwrap_or_else(|_| "USER".to_string())
+/// Namespace that holds `^SKILLS` / `^KBCHUNKS` (issue #85).
+///
+/// `OBJECTSCRIPT_SKILLMCP_NAMESPACE` -> the CONNECTION's namespace -> `USER`.
+///
+/// The old form read only the env var and defaulted to `USER`, so on the documented dev
+/// environment (`IRIS_NAMESPACE=APP`) every `skill_*` tool read `^SKILLS` in a namespace
+/// the operator never selected and answered `{"count":0,"skills":[]}` with `success:true`
+/// — a false empty registry, the exact misreading #119 set out to kill. Verified live:
+/// a skill plainly present in APP was invisible to `skill_list` until
+/// `OBJECTSCRIPT_SKILLMCP_NAMESPACE=APP` was set, and `skill action=propose` WROTE its
+/// new skill into USER at the same time.
+///
+/// The connection namespace is NOT re-read from `IRIS_NAMESPACE` here.
+/// `IrisConnection.namespace` is where every input settles — `--namespace`,
+/// `IRIS_NAMESPACE`, `.iris-agentic-dev.toml`, container/port discovery — so
+/// `interop::resolve_namespace` is reused verbatim rather than adding a fourth reader of
+/// the env var that would drift from it (and would miss the `--host --namespace`
+/// explicit-flag path entirely).
+///
+/// `resolve_namespace` also treats a blank override as absent, which matters: the value
+/// reaches `iris session IRIS -U <ns>` in `IrisConnection::execute`, and `-U ""` is not a
+/// namespace.
+///
+/// EVERY reader AND writer of `^SKILLS`/`^KBCHUNKS` resolves through this ONE function —
+/// that is why it takes the connection instead of letting call sites decide, and why a
+/// read/write namespace split cannot arise.
+pub fn skills_namespace(iris: Option<&IrisConnection>) -> String {
+    let explicit = std::env::var("OBJECTSCRIPT_SKILLMCP_NAMESPACE").ok();
+    crate::tools::interop::resolve_namespace(explicit.as_deref(), iris)
 }
 
 async fn xecute(
@@ -287,7 +314,7 @@ pub async fn handle_skill(
         );
     }
 
-    let ns = skills_namespace();
+    let ns = skills_namespace(Some(iris));
 
     match p.action.as_str() {
         "list" => {
@@ -439,7 +466,7 @@ pub async fn handle_skill_community(
                 .map(|s| (s.name.clone(), s.description.clone(), s.content.clone()));
             match skill_opt {
                 Some((sname, sdesc, scontent)) => {
-                    let ns = skills_namespace();
+                    let ns = skills_namespace(Some(iris));
                     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
                     let code = skills_set_code(&sname, &sdesc, &scontent, &now);
                     xecute(iris, client, &code, &ns).await.unwrap_or_default();
@@ -484,7 +511,7 @@ pub async fn handle_kb(
         );
     }
 
-    let ns = skills_namespace();
+    let ns = skills_namespace(Some(iris));
 
     match p.action.as_str() {
         "index" => {
@@ -573,7 +600,7 @@ pub async fn handle_agent_info(
 ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
     match p.what.as_str() {
         "stats" => {
-            let ns = skills_namespace();
+            let ns = skills_namespace(Some(iris));
             let code = "set count=0 set key=\"\" for { set key=$order(^SKILLS(key)) quit:key=\"\"  set count=count+1 } write count";
             let skill_count: usize = xecute(iris, client, code, &ns)
                 .await
@@ -978,5 +1005,56 @@ mod objectscript_escaping_tests {
         assert!(code.contains(r#"$find($zconvert("#), "{code}");
         // No filter at all when no needle was given.
         assert!(!skills_list_json_code(None, false).contains("continue:"));
+    }
+}
+
+#[cfg(test)]
+mod skills_namespace_tests {
+    use super::skills_namespace;
+    use crate::iris::connection::{DiscoverySource, IrisConnection};
+
+    /// `skills_namespace` reads the connection's NAMESPACE and nothing else — nothing here
+    /// is ever dialled. The URL is an RFC 2606 `.invalid` host so it cannot be mistaken for
+    /// a real instance: it read `http://localhost:43080`, which is a live dev IRIS on the
+    /// maintainer's machine, and a test URL that resolves is one edit away from a test that
+    /// talks to it.
+    fn conn(ns: &str) -> IrisConnection {
+        IrisConnection::new(
+            "http://never-dialled.invalid",
+            ns,
+            "_SYSTEM",
+            "SYS",
+            DiscoverySource::EnvVar,
+        )
+    }
+
+    /// Issue #85 — the whole fallback chain, in ONE test function on purpose:
+    /// `OBJECTSCRIPT_SKILLMCP_NAMESPACE` is process-global and cargo runs tests in
+    /// parallel threads, so splitting these into four `#[test]`s would race.
+    #[test]
+    fn skills_namespace_fallback_chain() {
+        std::env::remove_var("OBJECTSCRIPT_SKILLMCP_NAMESPACE");
+
+        // 1. No override -> the CONNECTION's namespace. This is the bug: it used to
+        //    answer "USER" for an operator running IRIS_NAMESPACE=APP, and every
+        //    skill_* tool then reported a false empty registry with success:true.
+        assert_eq!(skills_namespace(Some(&conn("APP"))), "APP");
+
+        // 2. No override and no connection -> USER (unchanged last resort).
+        assert_eq!(skills_namespace(None), "USER");
+
+        // 3. The explicit override still wins over the connection — for anyone who
+        //    deliberately centralises ^SKILLS in one namespace.
+        std::env::set_var("OBJECTSCRIPT_SKILLMCP_NAMESPACE", "SKILLS");
+        assert_eq!(skills_namespace(Some(&conn("APP"))), "SKILLS");
+        assert_eq!(skills_namespace(None), "SKILLS");
+
+        // 4. A blank override is not a namespace — it would reach
+        //    `iris session IRIS -U ""` — so it falls through to the connection.
+        std::env::set_var("OBJECTSCRIPT_SKILLMCP_NAMESPACE", "   ");
+        assert_eq!(skills_namespace(Some(&conn("APP"))), "APP");
+        assert_eq!(skills_namespace(None), "USER");
+
+        std::env::remove_var("OBJECTSCRIPT_SKILLMCP_NAMESPACE");
     }
 }

@@ -443,12 +443,16 @@ fn test_get_paginated_has_more_true() {
         total_count: 5,
     };
     let id = s.store(entry);
-    let result = s.get_paginated(&id, Some(2), 0);
-    assert!(result.is_some());
-    let (items, has_more, total) = result.unwrap();
-    assert_eq!(items.as_array().unwrap().len(), 2);
-    assert!(has_more, "has_more should be true when more items remain");
-    assert_eq!(total, 5);
+    let page = s
+        .get_paginated(&id, Some(2), 0)
+        .expect("entry must be found");
+    assert_eq!(page.result.as_array().unwrap().len(), 2);
+    assert!(
+        page.has_more,
+        "has_more should be true when more items remain"
+    );
+    assert_eq!(page.total, 5);
+    assert!(page.sliced, "an array entry really is paginated");
 }
 
 #[test]
@@ -465,9 +469,86 @@ fn test_get_paginated_last_page() {
     };
     let id = s.store(entry);
     // Offset=4, limit=2 → only 1 item left → has_more false
-    let (items_val, has_more, _total) = s.get_paginated(&id, Some(2), 4).unwrap();
-    assert_eq!(items_val.as_array().unwrap().len(), 1);
-    assert!(!has_more, "has_more should be false on last page");
+    let page = s.get_paginated(&id, Some(2), 4).unwrap();
+    assert_eq!(page.result.as_array().unwrap().len(), 1);
+    assert!(!page.has_more, "has_more should be false on last page");
+}
+
+/// Issue #83: `iris_test` — the tool the store's own hint sends the agent to — stores an
+/// OBJECT (`{test_suites, raw_output}`), not a list. `limit`/`offset` were accepted and
+/// silently dropped for it: one real log_id answered six different pagination arguments
+/// with the byte-identical 1712-byte payload. Nothing can be sliced out of an object, but
+/// that has to be REPORTED, or the response asserts a page it never took.
+#[test]
+fn test_get_paginated_object_result_reports_that_it_was_not_sliced() {
+    let mut s = LogStore::new(50, 60);
+    let stored = json!({
+        "test_suites": [{"name": "S", "tests": 4}],
+        "raw_output": "All PASSED",
+    });
+    let id = s.store(LogEntry {
+        id: new_log_id(),
+        tool: "iris_test".to_string(),
+        created_at: Instant::now(),
+        preview: vec![],
+        full_result: stored.clone(),
+        total_count: 4,
+    });
+    for (limit, offset) in [(None, 0), (Some(1), 0), (None, 1), (None, 99), (Some(1), 2)] {
+        let page = s.get_paginated(&id, limit, offset).unwrap();
+        assert_eq!(
+            page.result, stored,
+            "the whole object must come back intact"
+        );
+        assert!(
+            !page.sliced,
+            "limit={limit:?} offset={offset} cannot slice an object — saying otherwise \
+             claims a page that was never applied"
+        );
+        assert!(!page.has_more, "nothing was skipped, so nothing remains");
+        assert_eq!(page.total, 4);
+        assert_eq!(page.tool, "iris_test");
+    }
+}
+
+/// An offset past the end of a list yields an empty page, never the whole list, and never
+/// `has_more: true`.
+#[test]
+fn test_get_paginated_offset_past_the_end_is_empty_not_whole() {
+    let mut s = LogStore::new(50, 60);
+    let items: Vec<Value> = (0..5).map(|i| json!(i)).collect();
+    let id = s.store(LogEntry {
+        id: new_log_id(),
+        tool: "iris_compile".to_string(),
+        created_at: Instant::now(),
+        preview: vec![],
+        full_result: Value::Array(items),
+        total_count: 5,
+    });
+    let page = s.get_paginated(&id, None, 99).unwrap();
+    assert!(page.result.as_array().unwrap().is_empty());
+    assert!(!page.has_more);
+    assert!(page.sliced);
+    assert_eq!(page.total, 5);
+}
+
+/// `offset + limit` was computed unguarded, so a wire-sized offset panicked the debug
+/// build outright. `take_index` accepts any u64 that fits a usize, so this is reachable.
+#[test]
+fn test_get_paginated_huge_offset_does_not_overflow() {
+    let mut s = LogStore::new(50, 60);
+    let items: Vec<Value> = (0..3).map(|i| json!(i)).collect();
+    let id = s.store(LogEntry {
+        id: new_log_id(),
+        tool: "iris_compile".to_string(),
+        created_at: Instant::now(),
+        preview: vec![],
+        full_result: Value::Array(items),
+        total_count: 3,
+    });
+    let page = s.get_paginated(&id, Some(usize::MAX), usize::MAX).unwrap();
+    assert!(page.result.as_array().unwrap().is_empty());
+    assert!(!page.has_more);
 }
 
 // ── read_inline_threshold ─────────────────────────────────────────────────────

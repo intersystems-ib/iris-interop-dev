@@ -199,6 +199,50 @@ fn mcp_server_tools_list_returns_interop_profile() {
         );
     }
 
+    // #82: the advertised inputSchema is shipped to every client on every tools/list, so
+    // a Rust `///` on a params struct becomes wire traffic — schemars promotes it to the
+    // schema's top-level `description`. The #82 rationale landed there as 761 characters
+    // of maintainer commentary (serde, schemars, private function names, issue numbers) on
+    // iris_get_log, the only tool of the 23 carrying a top-level description at all.
+    // Nothing caught it: the schema tests assert properties, never prose. This does, at
+    // the wire, for every tool.
+    for tool in tools {
+        let name = tool["name"].as_str().unwrap_or("?");
+        let schema = tool["inputSchema"].to_string();
+        // Markers that can ONLY be Rust. `#[` and `fn ` were in this list and had to come
+        // out: both are substring matches on ordinary prose, so a future description
+        // reading "…returns fn signatures…" would redden a required gate for a
+        // non-problem. The attribute prefixes below are the real syntax; the rest are
+        // identifiers no caller-facing sentence contains.
+        for jargon in [
+            "serde",
+            "schemars",
+            "JsonSchema",
+            "Deserialize",
+            "#[serde",
+            "#[schemars",
+            "#[derive",
+            "drop_default_additional_properties",
+            "GetLogIssue",
+        ] {
+            assert!(
+                !schema.contains(jargon),
+                "tool '{name}' ships Rust-internal commentary ('{jargon}') in its \
+                 advertised inputSchema — that is context spent on every tools/list. \
+                 Keep the rationale in the source as a `//` comment: {schema}"
+            );
+        }
+        // The same leak by another route: schemars puts the params STRUCT NAME in the
+        // schema's top-level `title` (`GetLogParams`, `CompileParams`, …). It names
+        // nothing the caller can act on — the tool already has a `name` — and it went out
+        // on every tools/list until `drop_struct_name_title` stripped it here.
+        assert!(
+            tool["inputSchema"].get("title").is_none(),
+            "tool '{name}' advertises a top-level schema title — that is the Rust struct \
+             name: {schema}"
+        );
+    }
+
     child.kill().ok();
 }
 
