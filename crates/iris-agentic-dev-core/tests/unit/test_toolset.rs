@@ -213,14 +213,16 @@ fn test_merged_excludes_original_interop_production_tools() {
     }
 }
 
-/// Merged must have exactly 33 tools (added iris_table_info in feat-038-040).
+/// Merged must advertise exactly 46 tools (measured 2026-08-26; 50 - 8 + 4).
+/// Renamed: the old `test_merged_tool_count_is_23` contradicted its own assertion (33),
+/// and both numbers came from a hardcoded list that had drifted away from the router.
 #[test]
-fn test_merged_tool_count_is_23() {
+fn test_merged_tool_count() {
     let tools = IrisTools::new_with_toolset(None, Toolset::Merged).expect("IrisTools::new");
     let count = tools.registered_tool_names().len();
     assert_eq!(
-        count, 33,
-        "Merged toolset must have exactly 33 tools, got {}",
+        count, 46,
+        "Merged toolset must advertise exactly 46 tools, got {}",
         count
     );
     // iris_get_log must be registered in Merged (027-progressive-disclosure)
@@ -330,4 +332,118 @@ fn test_interop_excludes_meta_tools() {
             excluded
         );
     }
+}
+
+// ── Anti-drift: the counts the Toolset doc comments claim ────────────────────
+//
+// Until 2026-08-26 `registered_tool_names()` built the non-Interop tiers from a hardcoded
+// list last audited against v0.4.x. It had drifted 17 tools short and carried one phantom
+// (`iris_admin`, which the router removes for baseline/nostub), and NOTHING caught it:
+// the tests that guarded it compared the hardcoded list against itself, so they were
+// tautological. These tests pin the real, router-derived numbers.
+
+/// Baseline advertises 54 — the 58 the `#[tool_router]` macro registers minus the 4
+/// merged-only ones.
+#[test]
+fn test_baseline_tool_count() {
+    let n = IrisTools::new_with_toolset(None, Toolset::Baseline)
+        .expect("IrisTools::new")
+        .registered_tool_names()
+        .len();
+    assert_eq!(
+        n, 54,
+        "Baseline must advertise exactly 54 tools (Toolset::Baseline doc comment says 54), got {}",
+        n
+    );
+}
+
+/// `test_nostub_tool_count` only asserts baseline-minus-4, so it stayed green through the
+/// whole drift. Pin the absolute number too.
+#[test]
+fn test_nostub_tool_count_absolute() {
+    let n = IrisTools::new_with_toolset(None, Toolset::Nostub)
+        .expect("IrisTools::new")
+        .registered_tool_names()
+        .len();
+    assert_eq!(n, 50, "Nostub must advertise exactly 50 tools, got {}", n);
+}
+
+/// The single regression gate for the four doc-comment numbers. A failure here means the
+/// tool surface moved: update `Toolset`'s doc comments in src/tools/mod.rs, or explain
+/// the change.
+#[test]
+fn test_toolset_counts_match_doc_comments() {
+    for (ts, expected) in [
+        (Toolset::Baseline, 54usize),
+        (Toolset::Nostub, 50),
+        (Toolset::Merged, 46),
+        (Toolset::Interop, 23),
+    ] {
+        let n = IrisTools::new_with_toolset(None, ts)
+            .expect("IrisTools::new")
+            .registered_tool_names()
+            .len();
+        assert_eq!(
+            n, expected,
+            "Toolset::{:?} advertises {} tools but src/tools/mod.rs documents {} — update \
+             the doc comment or explain the change",
+            ts, n, expected
+        );
+    }
+    // Two independent anchors for the interop number: the keep-list and the router.
+    assert_eq!(
+        iris_agentic_dev_core::tools::INTEROP_TOOLS.len(),
+        23,
+        "INTEROP_TOOLS is the interop profile — it must agree with the measured count"
+    );
+}
+
+/// The merged-only tools must not leak into baseline/nostub. `iris_admin` is the one the
+/// stale hardcoded list got wrong: it claimed baseline advertised a tool the router
+/// explicitly removes. `test_iris_get_log_absent_from_baseline_and_nostub` covers one of
+/// the four; this generalises it.
+#[test]
+fn test_baseline_excludes_merged_only_tools() {
+    let baseline = IrisTools::new_with_toolset(None, Toolset::Baseline)
+        .expect("IrisTools::new")
+        .registered_tool_names();
+    let nostub = IrisTools::new_with_toolset(None, Toolset::Nostub)
+        .expect("IrisTools::new")
+        .registered_tool_names();
+    for t in [
+        "iris_debug",
+        "iris_containers",
+        "iris_admin",
+        "iris_get_log",
+    ] {
+        assert!(
+            !baseline.contains(t),
+            "{t} is merged-only and must NOT be in Baseline"
+        );
+        assert!(
+            !nostub.contains(t),
+            "{t} is merged-only and must NOT be in Nostub"
+        );
+    }
+}
+
+/// `IrisTools::new()` stamps `Toolset::Baseline`, so its router must be the pruned
+/// baseline router — it used to assign the raw 58-tool one.
+#[test]
+fn test_new_uses_pruned_baseline_router() {
+    let via_new = IrisTools::new(None)
+        .expect("IrisTools::new")
+        .registered_tool_names();
+    let via_toolset = IrisTools::new_with_toolset(None, Toolset::Baseline)
+        .expect("IrisTools::new")
+        .registered_tool_names();
+    assert_eq!(
+        via_new.len(),
+        54,
+        "new() claims Toolset::Baseline, so it must advertise the baseline surface"
+    );
+    assert_eq!(
+        via_new, via_toolset,
+        "new() and new_with_toolset(_, Baseline) must register the same tools"
+    );
 }

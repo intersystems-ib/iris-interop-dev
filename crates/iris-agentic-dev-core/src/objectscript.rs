@@ -6,45 +6,67 @@
 //! span source lines, and `build_exec_class` splits generated code on `\n`, so
 //! control characters must never appear inside a literal; they are spliced in
 //! via `$CHAR(n,...)` instead.
+//!
+//! #119 follow-up: the same is true of every NON-ASCII character. Generated
+//! source reaches IRIS over two transports, and only one of them is charset
+//! transparent: `execute_via_generator` PUTs the source as UTF-8 JSON, but
+//! `IrisConnection::execute` pipes it into `docker exec -i <c> iris session`,
+//! whose stdin is decoded 8-bit — the two UTF-8 bytes of `é` arrive as the two
+//! characters `Ã©`, and a CJK character arrives as three. A search needle or a
+//! skill name embedded as a raw literal therefore silently stops matching the
+//! data actually stored in IRIS. So the output of `os_str_expr` is always pure
+//! 7-bit ASCII: anything outside `0x20..=0x7E` is spliced via `$CHAR`, which
+//! means the source survives ANY transport byte-for-byte.
 
 /// Render `s` as a single-line ObjectScript *expression* that evaluates to
-/// exactly `s`: printable runs become quoted literals with `"` doubled,
-/// control characters become `$CHAR(n,...)` splices.
+/// exactly `s`: printable-ASCII runs become quoted literals with `"` doubled,
+/// everything else (control characters AND all non-ASCII) becomes a
+/// `$CHAR(n,...)` splice, so the rendered expression is pure ASCII.
 ///
 /// `os_str_expr(r#"say "hi""#)` → `"say ""hi"""`
 /// `os_str_expr("a\r\nb")` → `"a"_$CHAR(13,10)_"b"`
+/// `os_str_expr("café")` → `"caf"_$CHAR(233)`
+///
+/// A character outside the BMP is spliced as its two UTF-16 surrogate code
+/// units — that is how IRIS stores it. `$CHAR` of a code point above 65535
+/// does NOT round-trip: on IRIS 2026.2 `$char(128512)` returns the EMPTY
+/// string (verified live), so splicing the raw code point would silently drop
+/// the character.
 pub fn os_str_expr(s: &str) -> String {
     if s.is_empty() {
         return "\"\"".into();
     }
     let mut parts: Vec<String> = Vec::new();
     let mut lit = String::new();
-    let mut ctl: Vec<u32> = Vec::new();
+    let mut spliced: Vec<u32> = Vec::new();
     let flush_lit = |lit: &mut String, parts: &mut Vec<String>| {
         if !lit.is_empty() {
             parts.push(format!("\"{}\"", lit.replace('"', "\"\"")));
             lit.clear();
         }
     };
-    let flush_ctl = |ctl: &mut Vec<u32>, parts: &mut Vec<String>| {
-        if !ctl.is_empty() {
-            let codes: Vec<String> = ctl.iter().map(|c| c.to_string()).collect();
+    let flush_spliced = |spliced: &mut Vec<u32>, parts: &mut Vec<String>| {
+        if !spliced.is_empty() {
+            let codes: Vec<String> = spliced.iter().map(|c| c.to_string()).collect();
             parts.push(format!("$CHAR({})", codes.join(",")));
-            ctl.clear();
+            spliced.clear();
         }
     };
+    let mut utf16 = [0u16; 2];
     for ch in s.chars() {
         let code = ch as u32;
-        if code < 0x20 || code == 0x7f {
-            flush_lit(&mut lit, &mut parts);
-            ctl.push(code);
-        } else {
-            flush_ctl(&mut ctl, &mut parts);
+        if (0x20..0x7f).contains(&code) {
+            flush_spliced(&mut spliced, &mut parts);
             lit.push(ch);
+        } else {
+            flush_lit(&mut lit, &mut parts);
+            for unit in ch.encode_utf16(&mut utf16) {
+                spliced.push(*unit as u32);
+            }
         }
     }
     flush_lit(&mut lit, &mut parts);
-    flush_ctl(&mut ctl, &mut parts);
+    flush_spliced(&mut spliced, &mut parts);
     parts.join("_")
 }
 
@@ -99,9 +121,47 @@ mod tests {
         assert_eq!(os_str_expr("\n"), "$CHAR(10)");
     }
 
+    /// #119: a raw non-ASCII literal does NOT survive `docker exec … iris session`
+    /// (8-bit stdin turns the two UTF-8 bytes of `ñ` into two characters), so it is
+    /// spliced as `$CHAR` — the same treatment control characters already got.
     #[test]
-    fn unicode_passes_through() {
-        assert_eq!(os_str_expr("señal"), "\"señal\"");
+    fn non_ascii_is_char_spliced_not_written_raw() {
+        assert_eq!(os_str_expr("señal"), "\"se\"_$CHAR(241)_\"al\"");
+        assert_eq!(os_str_expr("café"), "\"caf\"_$CHAR(233)");
+        // A run of non-ASCII collapses into ONE $CHAR list.
+        assert_eq!(os_str_expr("中文"), "$CHAR(20013,25991)");
+        assert_eq!(
+            os_str_expr("producción"),
+            "\"producci\"_$CHAR(243)_\"n\"",
+            "the shipped Spanish trigger vocabulary must round-trip"
+        );
+    }
+
+    /// A code point above the BMP must be spliced as its two UTF-16 units: verified
+    /// live on IRIS 2026.2, `$char(128512)` returns "" (length 0) while
+    /// `$char(55357,56832)` returns the emoji.
+    #[test]
+    fn astral_chars_are_spliced_as_utf16_surrogate_pairs() {
+        assert_eq!(os_str_expr("😀"), "$CHAR(55357,56832)");
+        assert!(!os_str_expr("😀").contains("128512"));
+    }
+
+    /// The whole point: generated source is transport-independent because it is 7-bit.
+    #[test]
+    fn every_expr_is_pure_ascii() {
+        for s in [
+            "señal",
+            "café ñ 中文 description",
+            "unicode-café-中",
+            "😀 mixed \u{7f} and \t",
+            "producción/notificación",
+        ] {
+            let expr = os_str_expr(s);
+            assert!(
+                expr.is_ascii(),
+                "generated source must be pure ASCII to survive an 8-bit transport: {expr}"
+            );
+        }
     }
 
     #[test]
@@ -111,6 +171,7 @@ mod tests {
             r#"<entry table="G" key="M">1</entry>"#,
             "multi\nline\r\nwith\ttabs",
             "quote\"and'apostrophe",
+            "acentuación \"citada\" 中",
         ];
         for s in samples {
             let expr = os_str_expr(s);

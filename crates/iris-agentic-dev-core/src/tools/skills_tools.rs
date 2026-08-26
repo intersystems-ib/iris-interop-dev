@@ -17,6 +17,219 @@ fn skills_set_code(name: &str, description: &str, body: &str, now: &str) -> Stri
         os_str_expr(now),
     )
 }
+// ── ^SKILLS → JSON (issue #119, upstream intersystems-community/iris-agentic-dev#119) ──
+//
+// Every reader of `^SKILLS` has to turn a pipe-delimited global into JSON. Hand-rolling
+// that concatenation is what broke `skill_list`/`skill_search`/`skill_describe` in
+// `tools/mod.rs`: they pasted the RAW value into an array literal, never emitted the
+// subscript (the skill NAME), and `serde_json` then rejected the whole payload — silently,
+// as an empty registry. These builders are the ONE place that assembly happens.
+//
+// `$translate(x, q_$CHAR(13,10), "   ")` — the form the `handle_skill` arms below used —
+// is not enough either: it neutralises quote/CR/LF but NOT backslash, which JSON also
+// requires escaped. Verified against IRIS 2026.2, name `a\qb`:
+//     $translate form -> {"name":"a\qb"}   <- serde: `Invalid \escape`, silently []
+//     %ToJSON form    -> {"name":"a\\qb"}  <- correct
+//
+// `%DynamicObject`/`%DynamicArray` + `%ToJSON()` escapes for us. Verified live:
+//     name `quo"te`   -> "quo\"te"          (lossless)
+//     desc with CRLF  -> "desc\r\nline2"    (escaped — payload stays on ONE line)
+//     empty global    -> []                 (not `]`)
+//
+// The pipe is NOT escaped and must not be: it is the storage delimiter `skills_set_code`
+// writes, so `$piece` truncates a description at its first pipe. That is a `^SKILLS`
+// on-disk-format limitation, not a JSON one — the emitted JSON stays valid either way.
+// Changing it means changing the storage format; deliberately out of scope for #119.
+//
+// `do arr.%ToJSON(st)` streams into a temp stream. `write arr.%ToJSON()` would materialise
+// the whole document as one string and can hit <MAXSTRING> on a large registry.
+//
+// The leading/trailing `write !` fence the payload onto its own line: the transport is
+// `docker exec -i <c> iris session`, which interleaves `USER>` prompts with output, and
+// `strip_iris_banner` only drops a prompt line with nothing else on it.
+//
+// #119 follow-up — the payload must also be pure 7-bit ASCII. `%ToJSON` emits a non-ASCII
+// character RAW, and the transport is a `docker exec` terminal device, which is not charset
+// transparent: verified live on IRIS 2026.2, `^SKILLS("unicode-café-中")` came back as
+// `{"name":"unicode-caf<0xE9>-?"}` — the CJK characters replaced by literal `?` by the
+// device and `é` emitted as the single byte 0xE9, which `String::from_utf8_lossy` in
+// `IrisConnection::execute` then turned into U+FFFD. isError was false and success was
+// true: a silently wrong answer, exactly the class of bug #119 exists to kill. So every
+// character above 0x7E is re-emitted as a `\uXXXX` JSON escape (`os_json_ascii_emit`)
+// before it ever reaches the device. `\uXXXX` is valid JSON everywhere a raw character is,
+// `serde_json` decodes it back to the original character, and an ASCII payload cannot be
+// mangled by ANY device translation table.
+
+const SKILLS_GLOBAL: &str = "^SKILLS";
+
+/// Statements that write the JSON of `var` (a `%DynamicObject`/`%DynamicArray`) to the
+/// current device as pure ASCII, fenced onto its own line.
+///
+/// `%ToJSON(st)` streams into a temp stream rather than materialising the document as a
+/// string (<MAXSTRING> on a large registry), then each chunk is re-emitted with every
+/// character above 0x7E replaced by its `\uXXXX` JSON escape.
+///
+/// Chunking is safe at any boundary: IRIS holds an astral character as a UTF-16 surrogate
+/// PAIR, each half is escaped independently, and `😀` reassembles in the JSON
+/// text no matter which chunk each half landed in. (This is why the escape is applied to
+/// the JSON text and not `$zconvert(x,"O","UTF8")` to each value: splitting a surrogate
+/// pair across a `$zconvert` call would corrupt it, and UTF-8 bytes 0x80-0x9F are not
+/// guaranteed to survive the device's output translation table either.)
+fn os_json_ascii_emit(var: &str) -> String {
+    format!(
+        r#"set st=##class(%Stream.TmpCharacter).%New() do {var}.%ToJSON(st) do st.Rewind() write ! while 'st.AtEnd {{ set ch=st.Read(4000) set esc="" for i=1:1:$length(ch) {{ set c=$ascii(ch,i) set esc=esc_$select(c<128:$char(c),1:"\u"_$extract("000"_$zhex(c),*-3,*)) }} write esc }} write !"#
+    )
+}
+
+/// ObjectScript that writes a JSON array of `^SKILLS` entries to the current device.
+///
+/// `filter_lower` is an ALREADY-lowercased substring matched against `name|value`;
+/// `None` (or `Some("")`) lists everything — `$find(x,"")` is 1, so an empty needle
+/// matches every row. `include_body` adds the potentially large skill body; `list`/`search`
+/// leave it out so a listing does not ship every body.
+pub(crate) fn skills_list_json_code(filter_lower: Option<&str>, include_body: bool) -> String {
+    let body = if include_body {
+        r#""body":($piece(data,"|",2)),"#
+    } else {
+        ""
+    };
+    // #67: the needle is embedded from Rust, so it goes through os_str_expr — never
+    // through a hand-rolled `replace('"', "")`, which cannot survive a control character.
+    //
+    // The haystack is name + description + body, NOT `key_"|"_data`: `data` is the
+    // pipe-delimited record, so the old form put a `|` in every haystack and a search for
+    // "|" matched the entire registry. Joining the extracted pieces with a space means a
+    // pipe only matches when a field genuinely contains one.
+    let filter = match filter_lower.unwrap_or("") {
+        "" => String::new(),
+        f => format!(
+            r#"continue:'$find($zconvert(key_" "_$piece(data,"|",1)_" "_$piece(data,"|",2),"L"),{})  "#,
+            os_str_expr(f)
+        ),
+    };
+    format!(
+        r#"set arr=[] set key="" for {{ set key=$order({g}(key)) quit:key=""  set data=$get({g}(key)) {filter}do arr.%Push({{"name":(key),"description":($piece(data,"|",1)),{body}"usage_count":(+$piece(data,"|",3)),"created_at":($piece(data,"|",4))}}) }} {emit}"#,
+        g = SKILLS_GLOBAL,
+        filter = filter,
+        body = body,
+        emit = os_json_ascii_emit("arr")
+    )
+}
+
+/// ObjectScript that writes ONE `^SKILLS` entry as a JSON object, or `{"found":0}` when
+/// the subscript does not exist.
+///
+/// The `found` sentinel is what lets the caller tell "IRIS answered, no such skill" from
+/// "IRIS never answered" — an empty payload cannot, because a dropped connection produces
+/// one too. `$data(...)=0` rather than `data=""` so a skill stored with an empty value is
+/// still reported as found.
+pub(crate) fn skills_describe_json_code(name: &str) -> String {
+    format!(
+        r#"set skname={n} set data=$get({g}(skname)) if $data({g}(skname))=0 {{ set o={{"found":0}} }} else {{ set o={{"found":1,"name":(skname),"description":($piece(data,"|",1)),"body":($piece(data,"|",2)),"usage_count":(+$piece(data,"|",3)),"created_at":($piece(data,"|",4))}} }} {emit}"#,
+        n = os_str_expr(name),
+        g = SKILLS_GLOBAL,
+        emit = os_json_ascii_emit("o")
+    )
+}
+
+/// Why a `^SKILLS` read produced no data. #119: collapsing these two into "return an
+/// empty list" is the bug — a caller cannot tell a broken payload from an empty registry,
+/// and both look identical to "IRIS unreachable".
+#[derive(Debug)]
+pub(crate) enum SkillsReadError {
+    /// Never got an answer: no connection, no IRIS_CONTAINER, docker/HTTP failure.
+    Unreachable(String),
+    /// Got an answer that is not the JSON we asked for. Carries what came back.
+    Unparseable { raw: String, parse_error: String },
+}
+
+/// Last line of `raw` that starts a JSON value. `docker exec … iris session` can leave a
+/// `USER>` prompt on the payload's own line, and `strip_iris_banner` only drops a prompt
+/// line with nothing else on it — so pick the payload out rather than trusting `trim()`.
+pub(crate) fn extract_json_line(raw: &str) -> &str {
+    // `rfind` (not `find`): take the LAST candidate line, so a banner or a prompt echoed
+    // before the payload cannot win over the payload itself. clippy::filter_next requires
+    // this form over `.filter(..).next_back()`.
+    raw.lines()
+        .map(str::trim)
+        .rfind(|l| l.starts_with('[') || l.starts_with('{'))
+        .unwrap_or("")
+}
+
+/// Run one of the builders above and parse what comes back. The single read path for
+/// every `^SKILLS` reader in the crate.
+pub(crate) async fn read_skills_json(
+    iris: &IrisConnection,
+    code: &str,
+    ns: &str,
+) -> Result<serde_json::Value, SkillsReadError> {
+    let raw = iris
+        .execute(code, ns)
+        .await
+        .map_err(|e| SkillsReadError::Unreachable(e.to_string()))?;
+    classify_skills_payload(&raw)
+}
+
+/// Classify what came back off the wire. Split out from `read_skills_json` so the
+/// empty-payload rule below is testable without a live connection.
+///
+/// #119 follow-up: `IrisConnection::execute` discards the child's exit status, so a
+/// `docker exec` that FAILED — missing or stopped container, daemon down, permission
+/// denied — comes back as `Ok("")` rather than an error. Every builder above ends in a
+/// `write`, so a reachable IRIS always answers something: an empty registry writes `[]`,
+/// not nothing at all. Empty therefore means the transport produced no output, and
+/// calling that `Unparseable` would make the tool assert "IRIS WAS reachable" about an
+/// instance it never reached — a worse answer than the empty list this fix replaced.
+pub(crate) fn classify_skills_payload(raw: &str) -> Result<serde_json::Value, SkillsReadError> {
+    if raw.trim().is_empty() {
+        return Err(SkillsReadError::Unreachable(
+            "the execution transport returned no output at all (a failed `docker exec` exits \
+             non-zero with empty stdout, which reaches this crate as an empty payload)"
+                .into(),
+        ));
+    }
+    let line = extract_json_line(raw);
+    serde_json::from_str(line).map_err(|e| SkillsReadError::Unparseable {
+        raw: raw.chars().take(400).collect(),
+        parse_error: e.to_string(),
+    })
+}
+
+/// Turn a `SkillsReadError` into the envelope (issue #2 — one failure surface).
+/// `DOCKER_REQUIRED` is the code `skill_forget` already uses for an unreachable IRIS, so
+/// callers that branch on it keep working; `SKILLS_PARSE_FAILED` is new and says
+/// explicitly that IRIS WAS reached.
+pub(crate) fn skills_read_fail(
+    tool: &str,
+    ns: &str,
+    e: SkillsReadError,
+) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+    match e {
+        SkillsReadError::Unreachable(err) => crate::tools::envelope::fail_with(
+            "DOCKER_REQUIRED",
+            &format!(
+                "{tool} could not reach IRIS to read ^SKILLS in namespace '{ns}': {err}. \
+                 Set IRIS_CONTAINER=<container_name>.{}",
+                super::DOCKER_REQUIRED_HINT
+            ),
+            serde_json::json!({"namespace": ns, "source": "^SKILLS"}),
+        ),
+        SkillsReadError::Unparseable { raw, parse_error } => crate::tools::envelope::fail_with(
+            "SKILLS_PARSE_FAILED",
+            &format!(
+                "{tool} read ^SKILLS in namespace '{ns}' but could not parse the response as \
+                 JSON: {parse_error}. IRIS WAS reachable — this is NOT an empty registry."
+            ),
+            serde_json::json!({
+                "namespace": ns,
+                "source": "^SKILLS",
+                "parse_error": parse_error,
+                "raw_excerpt": raw,
+            }),
+        ),
+    }
+}
+
 use crate::tools::ToolCallEntry;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -78,45 +291,48 @@ pub async fn handle_skill(
 
     match p.action.as_str() {
         "list" => {
-            // Bug 9: use separator variable so empty global yields "[]" not "]".
-            // #67: a JSON quote inside an ObjectScript literal is $CHAR(34), never \" —
-            // backslash escapes nothing, so the old form was not valid ObjectScript and this
-            // tool could only ever answer []. Stored values are stripped of quotes/newlines
-            // so the assembled JSON stays parseable.
-            let code = "set q=$CHAR(34) set key=\"\" set out=\"[\" set sep=\"\" for  { set key=$order(^SKILLS(key)) quit:key=\"\"  set data=$get(^SKILLS(key)) set out=out_sep_\"{\"_q_\"name\"_q_\":\"_q_$translate(key,q_$CHAR(13,10),\"   \")_q_\",\"_q_\"description\"_q_\":\"_q_$translate($piece(data,\"|\",1),q_$CHAR(13,10),\"   \")_q_\",\"_q_\"usage_count\"_q_\":\"_+$piece(data,\"|\",3)_\"}\" set sep=\",\" } set out=out_\"]\" write out";
-            let raw = xecute(iris, client, code, &ns).await.unwrap_or_default();
-            let skills: serde_json::Value =
-                serde_json::from_str(&raw).unwrap_or(serde_json::json!([]));
-            ok_json(serde_json::json!({"success": true, "skills": skills}))
+            // #119: was a hand-built `$translate` embed that emitted `\q` for a name
+            // containing a backslash — invalid JSON, silently swallowed by unwrap_or([]).
+            let code = skills_list_json_code(None, false);
+            match read_skills_json(iris, &code, &ns).await {
+                Ok(skills) => ok_json(serde_json::json!({
+                    "success": true, "skills": skills,
+                    "namespace": ns, "source": "^SKILLS"
+                })),
+                Err(e) => skills_read_fail("skill(action=list)", &ns, e),
+            }
         }
         "describe" => {
             let name = p.name.as_deref().unwrap_or("");
-            let code = format!("set data=$get(^SKILLS({})) write data", os_str_expr(name));
-            let raw = xecute(iris, client, &code, &ns).await.unwrap_or_default();
-            if raw.is_empty() {
-                return err_json("NOT_FOUND", &format!("Skill '{}' not found", name));
+            let code = skills_describe_json_code(name);
+            match read_skills_json(iris, &code, &ns).await {
+                // #119: `found` is the sentinel — an empty payload used to mean BOTH
+                // "no such skill" and "the read failed". `usage_count` is now a number,
+                // matching what action=list already returned.
+                Ok(v) if v.get("found").and_then(|f| f.as_i64()) == Some(1) => {
+                    ok_json(serde_json::json!({
+                        "success": true,
+                        "name": name,
+                        "description": v.get("description").cloned().unwrap_or(serde_json::json!("")),
+                        "body": v.get("body").cloned().unwrap_or(serde_json::json!("")),
+                        "usage_count": v.get("usage_count").cloned().unwrap_or(serde_json::json!(0)),
+                        "created_at": v.get("created_at").cloned().unwrap_or(serde_json::json!("")),
+                    }))
+                }
+                Ok(_) => err_json("NOT_FOUND", &format!("Skill '{}' not found", name)),
+                Err(e) => skills_read_fail("skill(action=describe)", &ns, e),
             }
-            let parts: Vec<&str> = raw.splitn(4, '|').collect();
-            ok_json(serde_json::json!({
-                "success": true,
-                "name": name,
-                "description": parts.first().unwrap_or(&""),
-                "body": parts.get(1).unwrap_or(&""),
-                "usage_count": parts.get(2).unwrap_or(&"0"),
-                "created_at": parts.get(3).unwrap_or(&""),
-            }))
         }
         "search" => {
             let query = p.query.as_deref().unwrap_or("").to_lowercase();
-            // Bug 9: use separator variable so empty results yield "[]" not "]".
-            let code = format!(
-                "set q=$CHAR(34) set key=\"\" set out=\"[\" set sep=\"\" for {{ set key=$order(^SKILLS(key)) quit:key=\"\"  set data=$get(^SKILLS(key)) if $find($zconvert(key_data,\"L\"),{})>0 {{ set out=out_sep_\"{{\"_q_\"name\"_q_\":\"_q_$translate(key,q_$CHAR(13,10),\"   \")_q_\",\"_q_\"description\"_q_\":\"_q_$translate($piece(data,\"|\",1),q_$CHAR(13,10),\"   \")_q_\"}}\" set sep=\",\" }} }} set out=out_\"]\" write out",
-                os_str_expr(&query)
-            );
-            let raw = xecute(iris, client, &code, &ns).await.unwrap_or_default();
-            let results: serde_json::Value =
-                serde_json::from_str(&raw).unwrap_or(serde_json::json!([]));
-            ok_json(serde_json::json!({"success": true, "query": query, "results": results}))
+            let code = skills_list_json_code(Some(&query), false);
+            match read_skills_json(iris, &code, &ns).await {
+                Ok(results) => ok_json(serde_json::json!({
+                    "success": true, "query": query, "results": results,
+                    "namespace": ns, "source": "^SKILLS"
+                })),
+                Err(e) => skills_read_fail("skill(action=search)", &ns, e),
+            }
         }
         "forget" => {
             let name = p.name.as_deref().unwrap_or("");
@@ -433,5 +649,334 @@ mod objectscript_escaping_tests {
             1,
             "generated code stays on one line: {code}"
         );
+    }
+
+    // ── #119: ^SKILLS -> JSON assembly ───────────────────────────────────────
+
+    /// The bug: the value went in, the subscript (the skill NAME) never did.
+    #[test]
+    fn list_code_emits_the_subscript_as_name() {
+        let code = skills_list_json_code(None, false);
+        assert!(code.contains(r#""name":(key)"#), "{code}");
+        assert!(code.contains("$order(^SKILLS(key))"), "{code}");
+        assert!(
+            code.contains(r#""created_at":($piece(data,"|",4))"#),
+            "{code}"
+        );
+    }
+
+    /// The raw value must never be concatenated into the array literal again.
+    #[test]
+    fn list_code_never_concatenates_the_raw_value() {
+        let code = skills_list_json_code(None, false);
+        assert!(!code.contains("_sep_skill"), "{code}");
+        assert!(!code.contains("result_sep"), "{code}");
+        assert!(code.contains("%Push"), "{code}");
+        assert!(code.contains("%ToJSON"), "{code}");
+    }
+
+    /// `do arr.%ToJSON(st)` streams into a temp stream; `write arr.%ToJSON()` (or
+    /// `set j=arr.%ToJSON()`) materialises the whole document as one string and can hit
+    /// <MAXSTRING> on a large registry.
+    #[test]
+    fn list_code_streams_rather_than_materialising() {
+        let code = skills_list_json_code(None, false);
+        assert!(code.contains("do arr.%ToJSON(st)"), "{code}");
+        assert!(code.contains("%Stream.TmpCharacter"), "{code}");
+        assert!(!code.contains("write arr.%ToJSON"), "{code}");
+        assert!(!code.contains("=arr.%ToJSON"), "{code}");
+    }
+
+    /// #67: the search needle is embedded from Rust, so it goes through os_str_expr.
+    #[test]
+    fn search_needle_is_quote_doubled_never_backslashed() {
+        let code = skills_list_json_code(Some(r#"say "hi""#), false);
+        assert!(code.contains(r#""say ""hi""""#), "{code}");
+        assert!(
+            !code.contains(r#"\""#),
+            "no C-style escaping may survive: {code}"
+        );
+    }
+
+    /// A literal cannot span a source line, and build_exec_class splits on '\n'.
+    #[test]
+    fn search_needle_with_a_newline_is_char_spliced_and_stays_one_line() {
+        let code = skills_list_json_code(Some("a\nb"), false);
+        assert!(code.contains("$CHAR(10)"), "{code}");
+        assert!(!code.contains(r#"\n"#), "{code}");
+        assert_eq!(code.lines().count(), 1, "{code}");
+    }
+
+    /// An empty needle must not emit a filter at all: `$find(x,"")` is 1, so a `continue:`
+    /// clause would be dead code, and `None`/`Some("")` must not diverge.
+    #[test]
+    fn an_empty_filter_is_the_same_as_no_filter() {
+        let none = skills_list_json_code(None, false);
+        let empty = skills_list_json_code(Some(""), false);
+        assert_eq!(none, empty);
+        assert!(!none.contains("continue:"), "{none}");
+        assert!(skills_list_json_code(Some("x"), false).contains("continue:'$find("));
+    }
+
+    /// list/search must not ship every skill body; describe must.
+    #[test]
+    fn body_is_opt_in() {
+        assert!(!skills_list_json_code(None, false).contains(r#""body""#));
+        assert!(skills_list_json_code(None, true).contains(r#""body":($piece(data,"|",2))"#));
+        assert!(skills_describe_json_code("x").contains(r#""body":($piece(data,"|",2))"#));
+    }
+
+    /// A skill name is user data and can hold a quote.
+    #[test]
+    fn describe_code_escapes_the_name_and_carries_the_found_sentinel() {
+        let code = skills_describe_json_code(r#"quo"te"#);
+        assert!(code.contains(r#""quo""te""#), "{code}");
+        assert!(!code.contains(r#"\""#), "{code}");
+        assert!(code.contains(r#"{"found":0}"#), "{code}");
+        assert!(code.contains(r#""found":1"#), "{code}");
+        assert!(code.contains("$data(^SKILLS(skname))=0"), "{code}");
+        assert_eq!(code.lines().count(), 1, "{code}");
+    }
+
+    /// The payload must be fenced onto its own line: the docker-exec transport
+    /// interleaves `USER>` prompts and strip_iris_banner only drops BARE prompt lines.
+    #[test]
+    fn every_builder_fences_its_payload_with_newlines() {
+        for code in [
+            skills_list_json_code(None, false),
+            skills_list_json_code(Some("q"), true),
+            skills_describe_json_code("n"),
+        ] {
+            assert!(code.contains("do st.Rewind() write ! while "), "{code}");
+            assert!(code.trim_end().ends_with("write !"), "{code}");
+            assert_eq!(
+                code.lines().count(),
+                1,
+                "generated code stays one line: {code}"
+            );
+        }
+    }
+
+    // ── #119 follow-up: non-ASCII must survive an 8-bit transport ─────────────
+    //
+    // Live repro this pins (IRIS 2026.2, ^SKILLS("unicode-café-中") seeded over the HTTP
+    // path, read back over docker exec): skill_list answered
+    //     {"name":"unicode-caf\u{fffd}-?","description":"caf\u{fffd} \u{fffd} ?? description"}
+    // with isError:false / success:true, and skill_describe answered NOT_FOUND — byte for
+    // byte the same envelope as a skill that really does not exist.
+
+    /// RECEIVE: the payload must leave IRIS as pure ASCII, because the docker-exec
+    /// terminal device replaces a CJK character with `?` and emits `é` as one byte.
+    #[test]
+    fn every_builder_emits_a_pure_ascii_payload() {
+        for code in [
+            skills_list_json_code(None, false),
+            skills_list_json_code(Some("café"), true),
+            skills_describe_json_code("unicode-café-中"),
+        ] {
+            assert!(
+                code.is_ascii(),
+                "generated source must be pure ASCII: {code}"
+            );
+            // every char above 0x7E is re-emitted as \uXXXX before it reaches the device
+            assert!(code.contains(r#"$select(c<128:$char(c),1:"\u""#), "{code}");
+            assert!(code.contains("$extract(\"000\"_$zhex(c),*-3,*)"), "{code}");
+        }
+    }
+
+    /// SEND: the needle and the skill name are embedded from Rust, so a raw non-ASCII
+    /// literal would be re-decoded 8-bit by `iris session` and stop matching the data.
+    /// This is what made skill_describe answer a FALSE NOT_FOUND.
+    #[test]
+    fn a_non_ascii_needle_and_name_are_char_spliced() {
+        let code = skills_list_json_code(Some("café"), false);
+        assert!(code.contains("$CHAR(233)"), "{code}");
+        assert!(
+            !code.contains("café"),
+            "no raw non-ASCII may survive: {code}"
+        );
+
+        let code = skills_describe_json_code("unicode-café-中");
+        assert!(
+            code.contains(r#"set skname="unicode-caf"_$CHAR(233)"#),
+            "{code}"
+        );
+        assert!(code.contains("$CHAR(20013)"), "{code}");
+        assert_eq!(code.lines().count(), 1, "{code}");
+    }
+
+    /// The escaping contract itself, checked against what live IRIS actually emitted for
+    /// the `os_json_ascii_emit` loop — `serde_json` must decode it back to the ORIGINAL
+    /// characters, including an astral character carried as a UTF-16 surrogate pair.
+    #[test]
+    fn ascii_escaped_payloads_decode_back_to_the_original_characters() {
+        // Captured verbatim from IRIS 2026.2 running the emit loop over
+        // {"name":"unicode-"_$char(233)_"-"_$char(20013),"desc":"caf"_$char(233)_" plain"}
+        let live = r#"{"name":"unicode-\u00E9-\u4E2D","desc":"caf\u00E9 plain"}"#;
+        assert!(live.is_ascii(), "the wire payload must be 7-bit");
+        let v: serde_json::Value = serde_json::from_str(live).expect("must parse");
+        assert_eq!(v["name"], "unicode-é-中");
+        assert_eq!(v["desc"], "café plain");
+
+        // Astral: IRIS holds 😀 as the surrogate pair 55357/56832 and escapes each half.
+        // Captured verbatim for {"emoji":$char(55357)_$char(56832)}.
+        let live = r#"{"emoji":"\uD83D\uDE00"}"#;
+        let v: serde_json::Value = serde_json::from_str(live).expect("must parse");
+        assert_eq!(v["emoji"], "😀");
+
+        // And the shape the bug produced must NOT be mistaken for the fixed one.
+        let corrupted = "{\"name\":\"unicode-\u{fffd}-?\"}";
+        let v: serde_json::Value = serde_json::from_str(corrupted).unwrap();
+        assert_ne!(v["name"], "unicode-é-中");
+    }
+
+    /// Pins the exact bytes the transport can wrap the payload in.
+    #[test]
+    fn extract_json_line_survives_an_interleaved_prompt() {
+        assert_eq!(
+            extract_json_line("USER>\n[{\"a\":1}]\nUSER>"),
+            r#"[{"a":1}]"#
+        );
+        assert_eq!(extract_json_line("\n\n{\"found\":0}\n\n"), r#"{"found":0}"#);
+        assert_eq!(extract_json_line(""), "");
+        assert_eq!(extract_json_line("DOCKER_REQUIRED"), "");
+    }
+
+    /// The parse contract: upstream's repro plus the two shapes captured VERBATIM from
+    /// live IRIS 2026.2. This is the test that would have caught #119 with no IRIS at all.
+    #[test]
+    fn the_old_shapes_do_not_parse_and_the_new_one_does() {
+        // 1. mod.rs skill_list — raw pipe-delimited values concatenated into an array literal.
+        let old_modrs = "[desc|body|0|2026-01-01T00:00:00Z,a|b|c|d|e]";
+        assert!(serde_json::from_str::<serde_json::Value>(old_modrs).is_err());
+
+        // 2. handle_skill "list" — $translate neutralises quote/CR/LF but NOT backslash.
+        let old_translate = r#"[{"name":"a\qb","description":"desc\r","usage_count":0}]"#;
+        assert!(
+            serde_json::from_str::<serde_json::Value>(old_translate).is_err(),
+            "`\\q` is not a valid JSON escape — this is why a backslash in a name silently \
+             produced an empty list"
+        );
+
+        // 3. What %ToJSON actually emitted for the same data on live IRIS.
+        let fixed = r#"[{"name":"quo\"te","description":"desc with \" quote","usage_count":1,"created_at":"2026-01-01T00:00:00Z"},{"name":"a\\qb","description":"desc\\r","usage_count":0,"created_at":""}]"#;
+        let v: Vec<serde_json::Value> = serde_json::from_str(fixed).expect("must parse");
+        assert_eq!(v[0]["name"], r#"quo"te"#);
+        assert_eq!(v[0]["usage_count"], 1);
+        assert_eq!(v[1]["name"], r"a\qb");
+
+        // 4. CRLF is escaped, so the payload is still ONE line — this is what keeps
+        //    strip_iris_banner from re-joining a raw newline INSIDE a JSON string.
+        let crlf =
+            r#"[{"name":"nl","description":"desc\r\nline2","usage_count":0,"created_at":""}]"#;
+        assert_eq!(crlf.lines().count(), 1);
+        let v: Vec<serde_json::Value> = serde_json::from_str(crlf).expect("must parse");
+        assert_eq!(v[0]["description"], "desc\r\nline2");
+
+        // 5. Empty registry is `[]`, not `]`. (Regression guard shared with
+        //    tests/unit/test_tools_fixes.rs::test_skill_list_empty_global_json.)
+        assert!(serde_json::from_str::<serde_json::Value>("[]")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A pipe in a description is truncated by $piece — that is the ^SKILLS storage
+    /// format, NOT a JSON bug. Pin it so nobody "fixes" it inside the JSON builder.
+    #[test]
+    fn a_pipe_in_a_description_truncates_but_still_yields_valid_json() {
+        // Live IRIS, value `a|b|c|d|e`:
+        let observed = r#"[{"name":"pipe","description":"a","usage_count":0,"created_at":"d"}]"#;
+        let v: Vec<serde_json::Value> = serde_json::from_str(observed).expect("valid JSON");
+        assert_eq!(v[0]["description"], "a", "pipe is the storage delimiter");
+    }
+
+    /// #119 criterion 3: three states that used to collapse into one empty list.
+    #[test]
+    fn unreachable_and_unparseable_are_different_error_codes() {
+        fn payload(r: &rmcp::model::CallToolResult) -> serde_json::Value {
+            let text = match &r.content[0].raw {
+                rmcp::model::RawContent::Text(t) => &t.text,
+                _ => panic!("expected text content"),
+            };
+            serde_json::from_str(text).unwrap()
+        }
+
+        let r = skills_read_fail(
+            "skill_list",
+            "USER",
+            SkillsReadError::Unreachable("DOCKER_REQUIRED".into()),
+        )
+        .unwrap();
+        assert_eq!(r.is_error, Some(true));
+        let v = payload(&r);
+        assert_eq!(v["error_code"], "DOCKER_REQUIRED");
+
+        let r = skills_read_fail(
+            "skill_list",
+            "USER",
+            SkillsReadError::Unparseable {
+                raw: "<SYNTAX>zRun+3^Foo".into(),
+                parse_error: "expected value at line 1 column 1".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(r.is_error, Some(true));
+        let v = payload(&r);
+        assert_eq!(v["error_code"], "SKILLS_PARSE_FAILED");
+        assert_eq!(v["raw_excerpt"], "<SYNTAX>zRun+3^Foo");
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap()
+                .contains("NOT an empty registry"),
+            "the message must say IRIS WAS reached: {v}"
+        );
+    }
+    /// #119 follow-up: an empty payload is an UNREACHABLE transport, not malformed JSON.
+    /// `IrisConnection::execute` drops the exit status, so a failed `docker exec` arrives
+    /// as `Ok("")`; classifying that as a parse failure made the tool state "IRIS WAS
+    /// reachable" about a container that does not exist.
+    #[test]
+    fn an_empty_payload_is_unreachable_not_unparseable() {
+        for raw in ["", "   ", "\n", "\r\n  \n"] {
+            match classify_skills_payload(raw) {
+                Err(SkillsReadError::Unreachable(msg)) => {
+                    assert!(msg.contains("no output"), "{msg}")
+                }
+                other => panic!("empty payload must be Unreachable, got {other:?}"),
+            }
+        }
+        // Output that is present but not JSON is still a genuine parse failure.
+        match classify_skills_payload("<SYNTAX>zRun+3^Foo") {
+            Err(SkillsReadError::Unparseable { .. }) => {}
+            other => panic!("non-empty garbage must stay Unparseable, got {other:?}"),
+        }
+        // A reachable but empty registry writes `[]` — that is success, not an error.
+        assert_eq!(
+            classify_skills_payload("[]").unwrap(),
+            serde_json::json!([])
+        );
+    }
+
+    /// #119 follow-up: the search haystack was `key_"|"_data`, and `data` is the
+    /// pipe-delimited record — so every entry contained a `|` and a search for "|"
+    /// returned the entire registry.
+    #[test]
+    fn the_search_haystack_is_the_fields_not_the_delimited_record() {
+        let code = skills_list_json_code(Some("|"), false);
+        assert!(
+            !code.contains(r#"key_"|"_data"#),
+            "the delimiter must not be spliced into the haystack: {code}"
+        );
+        assert!(
+            code.contains(r#"$piece(data,"|",1)_" "_$piece(data,"|",2)"#),
+            "name + description + body is the haystack: {code}"
+        );
+        // The needle itself still goes through os_str_expr (#67).
+        assert!(code.contains(r#"$find($zconvert("#), "{code}");
+        // No filter at all when no needle was given.
+        assert!(!skills_list_json_code(None, false).contains("continue:"));
     }
 }

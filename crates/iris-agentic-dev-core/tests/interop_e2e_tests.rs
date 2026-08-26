@@ -101,11 +101,11 @@ fn tools_list_returns_interop_profile() {
         .expect("no tools array");
     let names: Vec<_> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
-    // Interop profile (fork default): 20 tools; 2 (iris_production_item, iris_credential_manage)
-    // may be write-gated off on a read-only connection, so accept 18-20.
+    // Interop profile (fork default): 23 tools; 2 (iris_production_item, iris_credential_manage)
+    // may be write-gated off on a read-only connection, so accept 21-23.
     assert!(
-        (18..=20).contains(&names.len()),
-        "expected the interop profile (18-20 tools), got {}: {:?}",
+        (21..=23).contains(&names.len()),
+        "expected the interop profile (21-23 tools), got {}: {:?}",
         names.len(),
         names
     );

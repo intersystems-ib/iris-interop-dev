@@ -1,4 +1,4 @@
-//! T079: E2E test — all 20 tools respond without INTERNAL_ERROR.
+//! T079: E2E test — all 23 tools respond without INTERNAL_ERROR.
 //! T080: Steve's web prefix scenario.
 //! Run: IRIS_HOST=localhost IRIS_WEB_PORT=52780 IRIS_USERNAME=SuperUser IRIS_PASSWORD=SYS cargo test --test test_e2e_all_tools
 #![allow(dead_code, clippy::zombie_processes)]
