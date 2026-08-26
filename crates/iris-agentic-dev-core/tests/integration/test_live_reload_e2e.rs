@@ -40,6 +40,10 @@ fn mcp_call_with_toml(
     }
     let mut cmd = Command::new(&bin);
     cmd.args(["mcp"]);
+    // #104: see the note in test_e2e.rs — this harness calls tools the default `interop`
+    // profile prunes, and pruning is now enforced at dispatch rather than only in
+    // `tools/list`. `baseline` is the profile that has them. Overridable by the caller's env.
+    cmd.env("IRIS_TOOLSET", "baseline");
     cmd.env_remove("IRIS_CONTAINER");
     for key in &[
         "IRIS_HOST",
