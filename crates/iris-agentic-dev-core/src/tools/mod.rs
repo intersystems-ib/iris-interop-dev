@@ -3838,10 +3838,10 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
         // #101: what the HTTP leg said, kept for the docker fallback's error message. The
         // `Ok(Err(_))` arm below used to DISCARD it, so a wrong password was reported as
         // DOCKER_REQUIRED — "set IRIS_CONTAINER", an env var with no bearing on the problem.
-        // (Deferred init: the only arm that falls through to docker is the one that sets it.)
-        let http_leg_error: String;
-
-        match gen_result {
+        // Bound as a match EXPRESSION: the other two arms diverge (both `return`), so only
+        // the fall-through arm yields a value. A deferred `let` + assignment trips
+        // clippy::needless_late_init on the CI toolchain (1.98) though not on 1.96.
+        let http_leg_error: String = match gen_result {
             Err(_) => {
                 self.record_call("iris_execute", false);
                 return envelope::fail(
@@ -3924,9 +3924,9 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                 // `docker exec ... iris session` and does not use IRIS_USERNAME/IRIS_PASSWORD
                 // at all, so with a valid IRIS_CONTAINER a wrong Atelier password genuinely IS
                 // recoverable. Only what gets REPORTED when the docker leg also fails changes.
-                http_leg_error = e.to_string();
+                e.to_string()
             }
-        }
+        };
 
         // Fallback: docker exec (requires IRIS_CONTAINER env var).
         let docker_result =
