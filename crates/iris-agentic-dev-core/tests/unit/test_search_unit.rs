@@ -30,7 +30,12 @@ fn test_search_params_full() {
     )
     .unwrap();
     assert_eq!(p.query, "Director");
-    assert_eq!(p.namespace, None); // omitted -> resolved to the connection namespace at call time
+    // #90: the literal above SETS this field, so it must survive as Some. "USER" is
+    // deliberately `resolve_namespace`'s own fallback string (src/tools/interop.rs): this
+    // pins that serde does not special-case it, i.e. an explicitly requested USER still
+    // overrides a connection sitting on another namespace. Omitted -> None is covered by
+    // test_search_params_minimal; a non-default value by test_search_params_custom_namespace.
+    assert_eq!(p.namespace.as_deref(), Some("USER"));
     assert!(p.regex);
     assert!(!p.case_sensitive);
     assert_eq!(p.category.as_deref(), Some("CLS"));

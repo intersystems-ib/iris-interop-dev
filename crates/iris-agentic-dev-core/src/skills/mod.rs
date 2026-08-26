@@ -1,6 +1,10 @@
 use anyhow::{Context, Result};
 use reqwest::Client;
 
+/// Live GitHub raw-content base. Overridable per-call so tests can point at a mock
+/// server (#92, mirroring `manifest::resolve::GITHUB_API` from #87).
+const RAW_GITHUB: &str = "https://raw.githubusercontent.com";
+
 pub struct SkillRegistry {
     skills: Vec<Skill>,
     kb_items: Vec<KbItem>,
@@ -40,7 +44,16 @@ impl SkillRegistry {
         &self.kb_items
     }
 
+    /// Subscribe to a GitHub package, loading its skills and KB items.
     pub async fn load_from_github(&mut self, owner_repo: &str) -> Result<()> {
+        self.load_from_github_at(RAW_GITHUB, owner_repo).await
+    }
+
+    /// Same as [`load_from_github`](Self::load_from_github), against an explicit raw-content
+    /// base URL. The tests drive this with a wiremock server so the subscription path is
+    /// covered offline (#92, same seam as `manifest::resolve::resolve_github_version_at`).
+    pub async fn load_from_github_at(&mut self, raw_base: &str, owner_repo: &str) -> Result<()> {
+        let raw_base = raw_base.trim_end_matches('/');
         let client = Client::builder()
             .user_agent("iris-agentic-dev/0.3.1")
             .build()?;
@@ -49,12 +62,14 @@ impl SkillRegistry {
             .split_once('/')
             .with_context(|| format!("invalid owner/repo: {}", owner_repo))?;
 
-        let manifest = self.fetch_manifest(owner, repo, &client).await?;
+        let manifest = self
+            .fetch_manifest_at(raw_base, owner, repo, &client)
+            .await?;
 
         for skill_path in &manifest.provides_skills {
             let skill_md_url = format!(
-                "https://raw.githubusercontent.com/{}/{}/HEAD/{}/SKILL.md",
-                owner, repo, skill_path
+                "{}/{}/{}/HEAD/{}/SKILL.md",
+                raw_base, owner, repo, skill_path
             );
             if let Ok(content) = fetch_text(&skill_md_url, &client).await {
                 if let Some(name) = extract_frontmatter_field(&content, "name") {
@@ -71,10 +86,7 @@ impl SkillRegistry {
         }
 
         for kb_path in &manifest.provides_kb_items {
-            let kb_url = format!(
-                "https://raw.githubusercontent.com/{}/{}/HEAD/{}",
-                owner, repo, kb_path
-            );
+            let kb_url = format!("{}/{}/{}/HEAD/{}", raw_base, owner, repo, kb_path);
             if let Ok(content) = fetch_text(&kb_url, &client).await {
                 let title = extract_frontmatter_field(&content, "title")
                     .or_else(|| extract_h1_title(&content))
@@ -96,11 +108,14 @@ impl SkillRegistry {
         Ok(())
     }
 
-    async fn fetch_manifest(&self, owner: &str, repo: &str, client: &Client) -> Result<Manifest> {
-        let url = format!(
-            "https://raw.githubusercontent.com/{}/{}/HEAD/iris-agentic-dev.toml",
-            owner, repo
-        );
+    async fn fetch_manifest_at(
+        &self,
+        raw_base: &str,
+        owner: &str,
+        repo: &str,
+        client: &Client,
+    ) -> Result<Manifest> {
+        let url = format!("{}/{}/{}/HEAD/iris-agentic-dev.toml", raw_base, owner, repo);
         let text = fetch_text(&url, client)
             .await
             .with_context(|| format!("no iris-agentic-dev.toml found in {}/{}", owner, repo))?;

@@ -815,6 +815,37 @@ fn e2e_compile_wildcard_package() {
         compiled
     );
 
+    // Issue #94 — the ANTI-STALENESS regression. #94 narrows the /docnames listing
+    // server-side (`?filter=Test022.Wild.`) and DELIBERATELY does not cache it; this is the
+    // test that fails the day someone "optimises" a cache back in. Seed a THIRD class
+    // AFTER the wildcard compile above has already run, then compile the same wildcard
+    // again: a cached listing would answer from the previous expansion, silently skip
+    // Gamma, and still report success:true with a count that looks plausible.
+    let name_c = "Test022.Wild.Gamma.cls";
+    call_tool(
+        "iris_doc",
+        serde_json::json!({"mode":"put","name":name_c,
+            "content":"Class Test022.Wild.Gamma { ClassMethod Run() As %String { Return \"c\" } }",
+            "namespace":"USER"}),
+    );
+    let again = call_tool(
+        "iris_compile",
+        serde_json::json!({"target":"Test022.Wild.*.cls","namespace":"USER","flags":"ck"}),
+    );
+    assert!(
+        again["success"] == true,
+        "re-running the wildcard must succeed: {}",
+        again
+    );
+    assert_eq!(
+        again["targets_compiled"].as_u64().unwrap_or(0),
+        compiled + 1,
+        "the wildcard must expand to EXACTLY one more document than before — a class \
+         written AFTER the previous wildcard compile has to be seen immediately, and a \
+         stale listing here is a silent wrong answer reported as success: {}",
+        again
+    );
+
     // Cleanup
     call_tool(
         "iris_doc",
@@ -823,6 +854,10 @@ fn e2e_compile_wildcard_package() {
     call_tool(
         "iris_doc",
         serde_json::json!({"mode":"delete","name":name_b,"namespace":"USER"}),
+    );
+    call_tool(
+        "iris_doc",
+        serde_json::json!({"mode":"delete","name":name_c,"namespace":"USER"}),
     );
 }
 

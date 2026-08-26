@@ -190,6 +190,49 @@ impl IrisConnection {
         );
     }
 
+    /// Issue #93: the namespaces these credentials can actually reach, read from the
+    /// Atelier root descriptor (`result.content.namespaces`) — the same URL `probe()`
+    /// already fetches for version/api, so transport, auth and prefix handling are
+    /// pre-validated. 439 bytes and ~6 ms on the dev instance.
+    ///
+    /// An Atelier 404 for a MISSING NAMESPACE comes back with a zero-byte body, which is
+    /// byte-for-byte indistinguishable from a 404 for a missing document — so a tool that
+    /// wants to tell those apart has to ask a second question. This is that question.
+    ///
+    /// Fetched fresh at the moment of the question and never cached: a namespace can be
+    /// created while this server runs, and a stale "does not exist" is precisely the wrong
+    /// answer #93 is about. It only ever runs on a path that has ALREADY failed.
+    ///
+    /// `None` always means *cannot tell* — transport error, non-2xx (a wrong
+    /// `IRIS_WEB_PREFIX` 404s here too), or a body without the array (an old or foreign
+    /// server). Callers must keep their own error in that case and never turn `None` into
+    /// a positive claim about a namespace.
+    ///
+    /// The list reflects ACCESSIBILITY, not raw existence: `%Atelier.v1.Utils.General`
+    /// filters to what the authenticated user can reach, so a namespace that exists but is
+    /// invisible to these credentials is absent from it. Messages built from this must say
+    /// so.
+    pub async fn accessible_namespaces(&self, client: &reqwest::Client) -> Option<Vec<String>> {
+        let resp = client
+            .get(self.atelier_url("/"))
+            .basic_auth(&self.username, Some(&self.password))
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            tracing::debug!("Atelier root namespace probe got HTTP {}", resp.status());
+            return None;
+        }
+        let body: serde_json::Value = resp.json().await.ok()?;
+        Some(
+            body["result"]["content"]["namespaces"]
+                .as_array()?
+                .iter()
+                .filter_map(|n| n.as_str().map(str::to_string))
+                .collect(),
+        )
+    }
+
     /// Query `^%SYS("SystemMode")` to detect whether this is a Live instance.
     async fn detect_system_mode(&self, client: &reqwest::Client) -> SystemMode {
         let url = self.versioned_ns_url("%SYS", "/action/query");

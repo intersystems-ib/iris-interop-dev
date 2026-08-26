@@ -231,59 +231,66 @@ fn test_retry_template_contains_errors_placeholder() {
 
 // ── LlmClient::from_env ──────────────────────────────────────────────────────
 
+// #95: this was FOUR `#[test]`s — `test_llm_client_from_env_none_when_model_unset`,
+// `..._none_when_api_key_unset`, `..._some_when_both_set` and
+// `..._anthropic_key_accepted` — and they RACED, the same defect as #91.
+// `IRIS_GENERATE_CLASS_MODEL`, `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` are
+// process-global; cargo runs all four on parallel threads in this one binary.
+//
+// Found by running the widened gate three times rather than once — the first two runs
+// were green. Reproduced afterwards at 2 of 40 raw-binary runs, failing at what was
+// :283 with "should return Some when model and ANTHROPIC_API_KEY are set": the
+// `remove_var("IRIS_GENERATE_CLASS_MODEL")` in the model-unset test lands between the
+// anthropic test's `set_var` and its `LlmClient::from_env()` read, so `from_env` sees no
+// model and correctly returns None. Every ordering of the four has a losing interleaving.
+//
+// The low rate is the point: at 5% this would have read as an unrelated infrastructure
+// blip for months. Merging into one sequential function gives the binary exactly ONE
+// env-var timeline. No assertion is lost; each phase is labelled so a future red says
+// which one failed.
 #[test]
-fn test_llm_client_from_env_none_when_model_unset() {
+fn llm_client_from_env_gate() {
     use iris_agentic_dev_core::generate::LlmClient;
-    std::env::remove_var("IRIS_GENERATE_CLASS_MODEL");
-    // OPENAI_API_KEY may or may not be set — without the model var, must return None
-    let client = LlmClient::from_env();
-    assert!(
-        client.is_none(),
-        "should be None when IRIS_GENERATE_CLASS_MODEL is unset"
-    );
-}
 
-#[test]
-fn test_llm_client_from_env_none_when_api_key_unset() {
-    use iris_agentic_dev_core::generate::LlmClient;
+    // ── phase 1: no model -> None, whatever the keys say ─────────────────────
+    std::env::remove_var("IRIS_GENERATE_CLASS_MODEL");
+    std::env::set_var("OPENAI_API_KEY", "sk-test-key");
+    assert!(
+        LlmClient::from_env().is_none(),
+        "phase 1 (was test_llm_client_from_env_none_when_model_unset): should be None when \
+         IRIS_GENERATE_CLASS_MODEL is unset, even with a key present"
+    );
+
+    // ── phase 2: model but no key -> None ────────────────────────────────────
     std::env::set_var("IRIS_GENERATE_CLASS_MODEL", "gpt-4o");
     std::env::remove_var("OPENAI_API_KEY");
     std::env::remove_var("ANTHROPIC_API_KEY");
-    let client = LlmClient::from_env();
-    // If no API key is available, should return None
-    // (model is set but key is missing)
     assert!(
-        client.is_none(),
-        "should be None when both OPENAI_API_KEY and ANTHROPIC_API_KEY are unset"
+        LlmClient::from_env().is_none(),
+        "phase 2 (was test_llm_client_from_env_none_when_api_key_unset): should be None when \
+         both OPENAI_API_KEY and ANTHROPIC_API_KEY are unset"
     );
-    std::env::remove_var("IRIS_GENERATE_CLASS_MODEL");
-}
 
-#[test]
-fn test_llm_client_from_env_some_when_both_set() {
-    use iris_agentic_dev_core::generate::LlmClient;
-    std::env::set_var("IRIS_GENERATE_CLASS_MODEL", "gpt-4o");
+    // ── phase 3: model + OpenAI key -> Some ──────────────────────────────────
     std::env::set_var("OPENAI_API_KEY", "sk-test-key");
-    let client = LlmClient::from_env();
     assert!(
-        client.is_some(),
-        "should return Some when model and API key are set"
+        LlmClient::from_env().is_some(),
+        "phase 3 (was test_llm_client_from_env_some_when_both_set): should return Some when \
+         model and OPENAI_API_KEY are set"
     );
-    std::env::remove_var("IRIS_GENERATE_CLASS_MODEL");
-    std::env::remove_var("OPENAI_API_KEY");
-}
 
-#[test]
-fn test_llm_client_from_env_anthropic_key_accepted() {
-    use iris_agentic_dev_core::generate::LlmClient;
+    // ── phase 4: model + Anthropic key, no OpenAI key -> Some ────────────────
     std::env::set_var("IRIS_GENERATE_CLASS_MODEL", "claude-3-5-sonnet-20241022");
     std::env::remove_var("OPENAI_API_KEY");
     std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-test-key");
-    let client = LlmClient::from_env();
     assert!(
-        client.is_some(),
-        "should return Some when model and ANTHROPIC_API_KEY are set"
+        LlmClient::from_env().is_some(),
+        "phase 4 (was test_llm_client_from_env_anthropic_key_accepted): should return Some \
+         when model and ANTHROPIC_API_KEY are set"
     );
+
+    // Leave the process as we found it for anything that runs after us.
     std::env::remove_var("IRIS_GENERATE_CLASS_MODEL");
+    std::env::remove_var("OPENAI_API_KEY");
     std::env::remove_var("ANTHROPIC_API_KEY");
 }

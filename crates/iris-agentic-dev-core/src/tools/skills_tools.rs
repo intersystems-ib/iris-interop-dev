@@ -195,6 +195,27 @@ pub(crate) fn classify_skills_payload(raw: &str) -> Result<serde_json::Value, Sk
     })
 }
 
+/// #89: the skill count is the LENGTH of the array `skills_list_json_code` emits — never a
+/// fallback zero. `agent_info(what=stats)` used to run its OWN `write count` loop over
+/// `^SKILLS` and funnel every failure through
+/// `.unwrap_or_default().trim().parse().unwrap_or(0)`, so no IRIS_CONTAINER, a failed
+/// `docker exec` and a `<UNDEFINED>` all printed `skill_count: 0` with `success: true` —
+/// reproduced live against a registry that genuinely held 2 skills, in the same session
+/// where `skill(action=list)` correctly answered DOCKER_REQUIRED.
+///
+/// `[]` is a genuinely empty registry (0). Anything that is not an array means IRIS
+/// answered something we did not ask for: a parse failure, NOT an empty registry.
+/// Deliberately not `map_or(0, …)` — that is the same silent zero, one refactor from
+/// re-opening this issue.
+pub(crate) fn skills_count_from_payload(v: &serde_json::Value) -> Result<usize, SkillsReadError> {
+    v.as_array()
+        .map(Vec::len)
+        .ok_or_else(|| SkillsReadError::Unparseable {
+            raw: v.to_string().chars().take(400).collect(),
+            parse_error: "^SKILLS listing was not a JSON array".into(),
+        })
+}
+
 /// Turn a `SkillsReadError` into the envelope (issue #2 — one failure surface).
 /// `DOCKER_REQUIRED` is the code `skill_forget` already uses for an unreachable IRIS, so
 /// callers that branch on it keep working; `SKILLS_PARSE_FAILED` is new and says
@@ -594,46 +615,60 @@ fn default_limit() -> usize {
 
 pub async fn handle_agent_info(
     iris: &IrisConnection,
-    client: &reqwest::Client,
+    // #89: the ^SKILLS read goes through read_skills_json -> IrisConnection::execute
+    // (docker exec); no HTTP client is used. Kept for signature parity with the siblings.
+    _client: &reqwest::Client,
     p: AgentInfoParams,
     history: &std::sync::Mutex<VecDeque<ToolCallEntry>>,
 ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
     match p.what.as_str() {
         "stats" => {
             let ns = skills_namespace(Some(iris));
-            let code = "set count=0 set key=\"\" for { set key=$order(^SKILLS(key)) quit:key=\"\"  set count=count+1 } write count";
-            let skill_count: usize = xecute(iris, client, code, &ns)
+            // #89: count what `skill(action=list)` lists — SAME builder, SAME namespace
+            // (#85), SAME classification (#119) — so the two tools can no longer disagree
+            // about the registry. This arm was the last ^SKILLS *reader* in the crate that
+            // bypassed read_skills_json, hardcoded the global instead of SKILLS_GLOBAL, and
+            // pinned every failure to 0 with success:true.
+            let code = skills_list_json_code(None, false);
+            let skill_count = match read_skills_json(iris, &code, &ns)
                 .await
-                .unwrap_or_default()
-                .trim()
-                .parse()
-                .unwrap_or(0);
-            let session_calls = history.lock().map(|h| h.len()).unwrap_or(0);
+                .and_then(|v| skills_count_from_payload(&v))
+            {
+                Ok(n) => n,
+                Err(e) => return skills_read_fail("agent_info(what=stats)", &ns, e),
+            };
+            // A poisoned mutex means another tool panicked holding the history; the deque
+            // itself is intact (record_call cannot leave it structurally invalid), so
+            // recover it rather than reporting "0 calls" — the same false zero again.
+            let session_calls = history.lock().unwrap_or_else(|e| e.into_inner()).len();
             ok_json(serde_json::json!({
                 "success": true,
                 "skill_count": skill_count,
                 "session_calls": session_calls,
                 "learning_enabled": learning_enabled(),
+                // #85: which registry the count came from. Every sibling reports these.
+                "namespace": ns,
+                "source": "^SKILLS",
             }))
         }
         "history" => {
             let limit = p.limit;
-            let calls: Vec<serde_json::Value> = history
-                .lock()
-                .map(|h| {
-                    h.iter()
-                        .rev()
-                        .take(limit)
-                        .map(|c| {
-                            serde_json::json!({
-                                "tool": c.tool,
-                                "success": c.success,
-                                "ago_secs": c.timestamp.elapsed().as_secs(),
-                            })
-                        })
-                        .collect()
+            // #89: same poison recovery — `.unwrap_or_default()` on the lock rendered an
+            // unreadable history as `calls: []` with success:true, i.e. "no history"
+            // instead of "history unreadable". Identical behaviour in every non-panic case.
+            let guard = history.lock().unwrap_or_else(|e| e.into_inner());
+            let calls: Vec<serde_json::Value> = guard
+                .iter()
+                .rev()
+                .take(limit)
+                .map(|c| {
+                    serde_json::json!({
+                        "tool": c.tool,
+                        "success": c.success,
+                        "ago_secs": c.timestamp.elapsed().as_secs(),
+                    })
                 })
-                .unwrap_or_default();
+                .collect();
             ok_json(serde_json::json!({"success": true, "calls": calls}))
         }
         other => err_json(
@@ -985,6 +1020,103 @@ mod objectscript_escaping_tests {
             classify_skills_payload("[]").unwrap(),
             serde_json::json!([])
         );
+    }
+
+    /// #89: a count is the LENGTH of the listing, never a fallback zero. The old stats arm
+    /// ran its own `write count` and funnelled every failure through
+    /// `.unwrap_or_default().trim().parse().unwrap_or(0)` — reproduced live saying
+    /// `skill_count: 0` about a registry that held 2 skills, in the same session where
+    /// `skill(action=list)` correctly answered DOCKER_REQUIRED.
+    #[test]
+    fn a_skill_count_is_the_array_length_never_a_fallback_zero() {
+        assert_eq!(
+            skills_count_from_payload(&serde_json::json!([
+                {"name": "a", "description": "x"},
+                {"name": "b", "description": "y"}
+            ]))
+            .unwrap(),
+            2
+        );
+        // An empty registry IS legitimately zero — that is the one true zero.
+        assert_eq!(
+            skills_count_from_payload(&serde_json::json!([])).unwrap(),
+            0
+        );
+        // Anything that is not an array is IRIS answering something we did not ask for.
+        // Deliberately not `map_or(0, ..)`: that is the same silent zero, one refactor from
+        // re-opening this issue.
+        for not_a_list in [
+            serde_json::json!({"found": 0}),
+            serde_json::json!("[]"),
+            serde_json::json!(0),
+            serde_json::json!(null),
+        ] {
+            match skills_count_from_payload(&not_a_list) {
+                Err(SkillsReadError::Unparseable { parse_error, .. }) => {
+                    assert!(parse_error.contains("not a JSON array"), "{parse_error}")
+                }
+                other => panic!("{not_a_list} must not be a count, got {other:?}"),
+            }
+        }
+    }
+
+    /// #89: the three states the old arm collapsed into `{"skill_count":0,"success":true}`.
+    /// No IRIS_CONTAINER and a failed `docker exec` (which reaches this crate as `Ok("")`)
+    /// are DOCKER_REQUIRED; garbage on the wire is SKILLS_PARSE_FAILED. In every case the
+    /// envelope must carry NO count at all — a caller that sees `skill_count` must be able
+    /// to trust it.
+    #[test]
+    fn an_unreadable_registry_is_never_a_count_of_zero() {
+        fn payload(r: &rmcp::model::CallToolResult) -> serde_json::Value {
+            let text = match &r.content[0].raw {
+                rmcp::model::RawContent::Text(t) => &t.text,
+                _ => panic!("expected text content"),
+            };
+            serde_json::from_str(text).unwrap()
+        }
+
+        for (raw, expected_code) in [
+            ("", "DOCKER_REQUIRED"),
+            ("   ", "DOCKER_REQUIRED"),
+            ("<SYNTAX>zRun+3^Foo", "SKILLS_PARSE_FAILED"),
+        ] {
+            let e = classify_skills_payload(raw)
+                .and_then(|v| skills_count_from_payload(&v).map(|_| ()))
+                .expect_err("none of these payloads is a readable registry");
+            let r = skills_read_fail("agent_info(what=stats)", "APP", e).unwrap();
+            assert_eq!(r.is_error, Some(true), "{raw:?}");
+            let v = payload(&r);
+            assert_eq!(v["error_code"], expected_code, "{v}");
+            assert!(v.get("skill_count").is_none(), "no count may survive: {v}");
+            let msg = v["error"].as_str().unwrap();
+            assert!(msg.contains("agent_info(what=stats)"), "{v}");
+            assert!(msg.contains("'APP'"), "#85: name the registry read: {v}");
+            assert_eq!(v["namespace"], "APP", "{v}");
+            assert_eq!(v["source"], "^SKILLS", "{v}");
+        }
+
+        // A payload that parses but is not a list is a parse failure, not a count: this is
+        // the leg `skills_count_from_payload` adds on top of #119's classification.
+        let e = classify_skills_payload("{\"found\":0}")
+            .and_then(|v| skills_count_from_payload(&v).map(|_| ()))
+            .expect_err("an object is not a listing");
+        let v = payload(&skills_read_fail("agent_info(what=stats)", "APP", e).unwrap());
+        assert_eq!(v["error_code"], "SKILLS_PARSE_FAILED", "{v}");
+    }
+
+    /// #89: stats must count what `skill(action=list)` lists — the SAME builder, so the two
+    /// tools can no longer disagree about the registry. The old arm had its own hand-rolled
+    /// `^SKILLS` reader, the last one in the crate to bypass `read_skills_json`.
+    #[test]
+    fn stats_and_skill_list_read_the_registry_the_same_way() {
+        let code = skills_list_json_code(None, false);
+        assert!(code.contains(SKILLS_GLOBAL), "{code}");
+        assert!(
+            !code.contains("write count"),
+            "the private `write count` reader is gone for good: {code}"
+        );
+        // Bodies stay out of a count.
+        assert!(!code.contains(r#""body":"#), "{code}");
     }
 
     /// #119 follow-up: the search haystack was `key_"|"_data`, and `data` is the

@@ -160,6 +160,62 @@ pub async fn ensure_interop_namespace(
     ))
 }
 
+/// Issue #93: an Atelier 404 for a namespace that does not exist arrives with a ZERO-BYTE
+/// body, so it is indistinguishable from a 404 for a missing document — and every caller
+/// guessed wrong. `iris_compile` reported `IRIS_UNREACHABLE` with "Check IRIS_HOST and
+/// IRIS_WEB_PORT" while IRIS was answering perfectly on that very host and port.
+///
+/// Same `Option<Result<…>>` contract as `ensure_interop_namespace` above: `Some` means "I
+/// have a definitive better error for you", `None` means "keep your own". `None` is
+/// returned whenever the root descriptor cannot be read (`accessible_namespaces` = cannot
+/// tell) or the namespace IS in the list — a wrong `IRIS_WEB_PREFIX` 404s the root GET too,
+/// and that is exactly the case the host/port hint is right for.
+///
+/// Call this ONLY on status 404. A 401/403 is credentials and a 5xx is a sick instance;
+/// reporting either as a missing namespace would ship a new wrong answer for an old one.
+///
+/// The comparison is case-insensitive and trimmed: Atelier serves `/v8/app/docnames/CLS`
+/// happily (verified: 200, identical body) and `resolve_namespace` passes the caller's
+/// string through verbatim, so `eq` would invent a false NAMESPACE_NOT_FOUND for a
+/// namespace that works.
+pub async fn namespace_missing_error(
+    iris: &IrisConnection,
+    client: &reqwest::Client,
+    ns: &str,
+    attempted_url: &str,
+) -> Option<Result<CallToolResult, McpError>> {
+    let available = iris.accessible_namespaces(client).await?;
+    if available
+        .iter()
+        .any(|n| n.trim().eq_ignore_ascii_case(ns.trim()))
+    {
+        return None;
+    }
+    Some(crate::tools::envelope::fail_with(
+        crate::tools::ERR_NAMESPACE_NOT_FOUND,
+        &format!(
+            "Namespace '{ns}' does not exist on this IRIS instance, or is not accessible to \
+             user '{user}' — IRIS answered on {base}, the namespace did not. Available \
+             namespaces: {list}.",
+            user = iris.username,
+            base = iris.base_url,
+            list = available.join(", "),
+        ),
+        serde_json::json!({
+            "namespace": ns,
+            "available_namespaces": available,
+            "attempted_url": attempted_url,
+            // Explicit, so the IRIS_UNREACHABLE host/port hint this replaces can never
+            // reappear through `builtin_hint` (envelope.rs).
+            "hint": format!(
+                "Pass namespace= one of the listed namespaces (omitting it targets the \
+                 connection namespace '{}'). Nothing was compiled.",
+                iris.namespace
+            ),
+        }),
+    ))
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ProductionStatusParams {
     #[serde(default = "default_ns")]
@@ -3539,5 +3595,135 @@ mod tests {
             production_name_arg(&serde_json::json!({"name": " P.Prod "})).as_deref(),
             Some("P.Prod")
         );
+    }
+}
+
+// ── Issue #93: "that namespace does not exist" vs "I cannot tell" ─────────────
+#[cfg(test)]
+mod namespace_missing_tests {
+    use super::*;
+    use crate::iris::connection::DiscoverySource;
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// Mount an Atelier root descriptor answering with `namespaces`, then ask about `ns`.
+    async fn ask(namespaces: &[&str], ns: &str) -> Option<serde_json::Value> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/api/atelier/$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": {"content": {"version": "IRIS 2026.1", "api": 8,
+                                       "namespaces": namespaces}}
+            })))
+            .mount(&server)
+            .await;
+        let iris = IrisConnection::new(
+            server.uri(),
+            "APP",
+            "_SYSTEM",
+            "SYS",
+            DiscoverySource::EnvVar,
+        );
+        let client = reqwest::Client::new();
+        let out = namespace_missing_error(&iris, &client, ns, "http://x/attempted").await?;
+        let r = out.unwrap();
+        assert_eq!(r.is_error, Some(true));
+        let text = match &r.content[0].raw {
+            rmcp::model::RawContent::Text(t) => t.text.clone(),
+            _ => panic!("expected text content"),
+        };
+        Some(serde_json::from_str(&text).unwrap())
+    }
+
+    /// A namespace that IS in the list is not missing — whatever else the 404 meant, this
+    /// helper must keep its hands off the caller's error.
+    #[test]
+    fn a_namespace_that_exists_yields_no_error_however_it_is_spelled() {
+        rt().block_on(async {
+            // Case-insensitive and trimmed: `resolve_namespace` passes the caller's string
+            // through verbatim and Atelier serves `/v8/app/...` happily, so `eq` here would
+            // invent a false NAMESPACE_NOT_FOUND for a namespace that works.
+            for spelling in ["APP", "app", "aPp", " APP ", "USER", "user"] {
+                assert!(
+                    ask(&["APP", "USER"], spelling).await.is_none(),
+                    "'{spelling}' is in the list and must not be reported missing"
+                );
+            }
+        });
+    }
+
+    /// The answer #93 asks for: name the namespace, say it may be an ACCESS problem rather
+    /// than a missing namespace, list the ones that ARE reachable, and never let the
+    /// IRIS_UNREACHABLE host/port hint back in.
+    #[test]
+    fn a_missing_namespace_lists_the_ones_that_do_exist() {
+        rt().block_on(async {
+            let v = ask(&["APP", "USER"], "ZZNOSUCHNS")
+                .await
+                .expect("a namespace absent from the list is definitively missing");
+            assert_eq!(v["error_code"], "NAMESPACE_NOT_FOUND", "{v}");
+            assert_eq!(v["namespace"], "ZZNOSUCHNS", "{v}");
+            assert_eq!(
+                v["available_namespaces"],
+                serde_json::json!(["APP", "USER"]),
+                "{v}"
+            );
+            assert_eq!(v["attempted_url"], "http://x/attempted", "{v}");
+            let msg = v["error"].as_str().unwrap();
+            assert!(msg.contains("APP, USER"), "name them in the prose too: {v}");
+            assert!(
+                msg.contains("not accessible to user '_SYSTEM'"),
+                "the list reflects ACCESS, not raw existence: {v}"
+            );
+            assert!(
+                v["hint"].as_str().unwrap().contains("Nothing was compiled"),
+                "{v}"
+            );
+            assert!(!v.to_string().contains("Check IRIS_HOST"), "{v}");
+        });
+    }
+
+    /// `None` means CANNOT TELL and must never become a positive claim. A wrong
+    /// `IRIS_WEB_PREFIX` 404s the root GET as well — the case the host/port hint is
+    /// actually right for — and an old or foreign server answers without the array.
+    #[test]
+    fn an_unreadable_root_descriptor_is_never_a_claim_about_a_namespace() {
+        rt().block_on(async {
+            for body in [
+                ResponseTemplate::new(404),
+                ResponseTemplate::new(500),
+                // 200, but no `namespaces` array (older Atelier).
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"result": {"content": {"version": "IRIS 2019.1"}}}),
+                ),
+            ] {
+                let server = MockServer::start().await;
+                Mock::given(method("GET"))
+                    .and(path_regex(r"^/api/atelier/$"))
+                    .respond_with(body)
+                    .mount(&server)
+                    .await;
+                let iris = IrisConnection::new(
+                    server.uri(),
+                    "APP",
+                    "_SYSTEM",
+                    "SYS",
+                    DiscoverySource::EnvVar,
+                );
+                assert!(
+                    namespace_missing_error(&iris, &reqwest::Client::new(), "ZZNOSUCHNS", "u")
+                        .await
+                        .is_none(),
+                    "a blind probe must leave the caller's error alone"
+                );
+            }
+        });
     }
 }
