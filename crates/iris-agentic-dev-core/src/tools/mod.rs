@@ -1097,17 +1097,52 @@ pub struct CommunityPkgParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct NoParams {}
 
-#[derive(Debug, Deserialize, JsonSchema)]
+// Issue #82: `log_id` is a DECLARED property, not just a serde alias.
+//
+// A `#[serde(alias)]` is invisible to `schemars`, so `log_id` never reached the advertised
+// `inputSchema`. Strict/filtering clients (OpenAI strict function calling, the class of
+// client #73 is about) can only emit properties the schema names, so the one key every
+// truncating tool hands back (`log_id`, see `log_store::apply_truncation`) was unusable.
+// Declaring it as a second field is the only thing that puts it in the generated schema
+// while keeping the derived `JsonSchema` (descriptions, the nullable→anyOf rewrite, and
+// the `additionalProperties: true` that `drop_default_additional_properties` strips).
+//
+// `Deserialize` is hand-written below rather than derived — see `GetLogIssue` (issue #81).
+//
+// Deliberately `//` and not `///`: schemars promotes a struct-level doc comment into the
+// schema's top-level `description`, which is shipped to every client on every tools/list.
+// As `///` this block put 761 characters of maintainer commentary — serde, schemars,
+// private function names, issue numbers — on the wire, and made iris_get_log the only
+// tool of the interop 23 carrying a top-level description at all. The rationale belongs
+// in the source; the CALLER-facing text is the per-property docs below.
+#[derive(Debug, Default, JsonSchema)]
 pub struct GetLogParams {
-    /// The log_id a previous truncated:true result returned. If omitted, lists all
-    /// stored entries. `log_id` is accepted as an alias — that is the name every
-    /// truncating tool emits (issue #78).
-    #[serde(alias = "log_id")]
+    /// The log_id a previous truncated:true result returned. If omitted (and `log_id` is
+    /// omitted too), lists the stored entries. `log_id` is the SAME parameter, declared
+    /// separately so strict clients can emit it (issue #82); pass either one, or the same
+    /// value in both. A number is read as its decimal string (issue #81).
     pub id: Option<String>,
-    /// Max entries to return from the stored result. Must be > 0 if provided.
+    /// Identical to `id` — the name every truncating tool emits in its `log_id` field
+    /// (issue #78). Pass either; passing both with DIFFERENT values is an error.
+    pub log_id: Option<String>,
+    /// Max entries to return. Must be > 0 if provided. Paginates BOTH forms: the stored
+    /// result when an id is given, and the index listing when it is not (issue #83).
+    // The runtime rejects 0 with INVALID_PARAMS, so the schema has to reject it too:
+    // `usize` alone advertises `minimum: 0`, and a client that validates against the
+    // published schema then believes 0 is legal and only learns otherwise from an error.
+    #[schemars(range(min = 1))]
     pub limit: Option<usize>,
-    /// Start index into the stored result. Default 0.
+    /// Start index. Default 0. Paginates both forms (issue #83).
+    // Advertised as nullable even though it is read as a plain `usize`, because that is
+    // the whole point of #82: a strict function-calling client puts EVERY declared
+    // property in `required` and sends `null` for the ones it is not using. `offset` was
+    // the only declared property NOT nullable, so the exact payload
+    // `{"id":null,"log_id":"x","limit":null,"offset":null}` — the one #81/#82 exist to
+    // serve — violated the advertised schema on this one field. The hand-written
+    // `Deserialize` has always read `null` here as "absent" (-> 0); this makes the schema
+    // say so.
     #[serde(default)]
+    #[schemars(with = "Option<usize>")]
     pub offset: usize,
     /// Issue #78: every key serde did not recognise. Captured rather than dropped so a
     /// mistyped addressing key (`logid`) can be NAMED instead of silently falling through
@@ -1117,6 +1152,212 @@ pub struct GetLogParams {
     /// again on the wire).
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+    /// Issue #81: what the deserializer coerced or could not use. Never a wire parameter —
+    /// `Deserialize` fills it, `get_log_impl` decides error vs warning.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub issues: Vec<GetLogIssue>,
+}
+
+/// Issue #81: a parameter problem RECORDED rather than raised.
+///
+/// rmcp turns any `Deserialize` failure into a raw JSON-RPC -32602 frame before the handler
+/// ever runs (`FromContextPart for Parameters<P>` maps every serde error to
+/// `invalid_params`), and that frame carries no `error_code`, no `hint` and no
+/// `valid_params` — it bypasses the issue-#2 envelope completely. Eight distinct payloads
+/// escaped that way, including `{"id":null,"log_id":"x","limit":null,"offset":null}`, which
+/// is exactly the shape a strict function-calling client produces once `log_id` is declared
+/// (issue #82). So `GetLogParams` must NEVER fail to deserialize; what went wrong is
+/// captured here and reported through the envelope instead. Same move issue #57 made for
+/// connection failures.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GetLogIssue {
+    /// Read anyway, and said so: `{"log_id": 12345}` -> `"12345"`. Non-fatal.
+    Coerced {
+        param: &'static str,
+        from: String,
+        to: String,
+    },
+    /// Nothing sensible to be made of it. FATAL — but through the envelope. It must not
+    /// silently become a default: a broken `id` falling through to the index listing is the
+    /// wrong-shape failure issue #78 exists to prevent.
+    WrongType {
+        param: &'static str,
+        expected: &'static str,
+        got: String,
+    },
+    /// `arguments` was not a JSON object. Unreachable through rmcp (it always hands an
+    /// object), reachable from a direct unit test — and must not panic there.
+    NotAnObject { got: String },
+}
+
+impl GetLogIssue {
+    /// The message for issues that must fail the call, or `None` for the tolerable ones.
+    fn fatal_message(&self) -> Option<String> {
+        match self {
+            GetLogIssue::Coerced { .. } => None,
+            GetLogIssue::WrongType {
+                param,
+                expected,
+                got,
+            } => Some(format!("`{param}` must be {expected}, but was {got}")),
+            GetLogIssue::NotAnObject { got } => {
+                Some(format!("parameters must be a JSON object, but were {got}"))
+            }
+        }
+    }
+
+    /// The non-fatal notice for issues the call recovered from, or `None`.
+    fn warning(&self) -> Option<serde_json::Value> {
+        match self {
+            GetLogIssue::Coerced { param, from, to } => {
+                let tail = if *param == "id" || *param == "log_id" {
+                    "Log ids are strings — pass the value a truncated:true result returned, \
+                     verbatim."
+                } else {
+                    "The advertised schema declares it as an integer — pass it as a number."
+                };
+                Some(serde_json::json!({
+                    "code": "COERCED_PARAM",
+                    "param": param,
+                    "message": format!("`{param}` was sent as {from} and read as {to}. {tail}"),
+                }))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Issue #81: name a JSON value's type the way an error message should read it.
+fn json_type_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
+/// Issue #81: one of the two addressing keys. `null` means absent — strict function-calling
+/// clients put EVERY declared property in `required` and send `null` for the ones they are
+/// not using, so `{"id":null,"log_id":"x"}` has to mean "log_id only".
+///
+/// A BLANK string is the same statement in a different dialect, and it has to mean the same
+/// thing. Only `null` was treated as absent, so `{"id":"<valid>","log_id":""}` was a hard
+/// `id`/`log_id` conflict while `{"id":"<valid>","log_id":null}` succeeded — the same
+/// class of failure #81 fixed for `null`, one dialect later. `{"id":""}` alone now falls
+/// back to the index listing instead of answering LOG_NOT_FOUND "with id ''", which named
+/// an id nobody passed.
+fn take_log_id(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    key: &'static str,
+    issues: &mut Vec<GetLogIssue>,
+) -> Option<String> {
+    match map.remove(key) {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) if s.trim().is_empty() => None,
+        Some(serde_json::Value::String(s)) => Some(s),
+        // Log ids look numeric in other tools' output, so a bare number is a reasonable
+        // thing for a client to send. Coerce it, and say so.
+        Some(serde_json::Value::Number(n)) => {
+            let to = n.to_string();
+            issues.push(GetLogIssue::Coerced {
+                param: key,
+                from: format!("the number {n}"),
+                to: format!("the string \"{to}\""),
+            });
+            Some(to)
+        }
+        Some(other) => {
+            issues.push(GetLogIssue::WrongType {
+                param: key,
+                expected: "a string",
+                got: json_type_name(&other).to_string(),
+            });
+            None
+        }
+    }
+}
+
+/// Issue #81: `limit` / `offset`. Mirrors `take_log_id`'s tolerance — a client that
+/// stringifies its numbers is the same client that sends a numeric log id.
+fn take_index(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    key: &'static str,
+    issues: &mut Vec<GetLogIssue>,
+) -> Option<usize> {
+    const EXPECTED: &str = "a non-negative integer";
+    match map.remove(key) {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Number(n)) => {
+            match n.as_u64().and_then(|u| usize::try_from(u).ok()) {
+                Some(u) => Some(u),
+                None => {
+                    issues.push(GetLogIssue::WrongType {
+                        param: key,
+                        expected: EXPECTED,
+                        got: n.to_string(),
+                    });
+                    None
+                }
+            }
+        }
+        Some(serde_json::Value::String(s)) => match s.parse::<usize>() {
+            Ok(u) => {
+                issues.push(GetLogIssue::Coerced {
+                    param: key,
+                    from: format!("the string \"{s}\""),
+                    to: format!("the number {u}"),
+                });
+                Some(u)
+            }
+            Err(_) => {
+                issues.push(GetLogIssue::WrongType {
+                    param: key,
+                    expected: EXPECTED,
+                    got: format!("\"{s}\""),
+                });
+                None
+            }
+        },
+        Some(other) => {
+            issues.push(GetLogIssue::WrongType {
+                param: key,
+                expected: EXPECTED,
+                got: json_type_name(&other).to_string(),
+            });
+            None
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for GetLogParams {
+    /// Issue #81: infallible by construction. Every branch below records and continues; the
+    /// only `?` is `Value::deserialize`, which cannot fail over serde_json's own
+    /// `Deserializer` (and rmcp always hands us a `Value::Object`).
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = serde_json::Value::deserialize(d)?;
+        let mut p = GetLogParams::default();
+        let mut map = match v {
+            serde_json::Value::Object(m) => m,
+            serde_json::Value::Null => serde_json::Map::new(),
+            other => {
+                p.issues.push(GetLogIssue::NotAnObject {
+                    got: json_type_name(&other).to_string(),
+                });
+                return Ok(p);
+            }
+        };
+        p.id = take_log_id(&mut map, "id", &mut p.issues);
+        p.log_id = take_log_id(&mut map, "log_id", &mut p.issues);
+        p.limit = take_index(&mut map, "limit", &mut p.issues);
+        p.offset = take_index(&mut map, "offset", &mut p.issues).unwrap_or(0);
+        // Whatever is left is exactly what `#[serde(flatten)]` used to capture (issue #78).
+        p.extra = map;
+        Ok(p)
+    }
 }
 
 /// Issue #78: the keys iris_get_log tolerates without acting on them.
@@ -1132,7 +1373,48 @@ const GET_LOG_IGNORED_PARAMS: &[&str] = &["namespace"];
 
 /// The parameters iris_get_log actually reads — named in the error so the next call is a
 /// correction, not another guess (same contract as `no_tests_found_guidance`, issue #47).
-const GET_LOG_VALID_PARAMS: &[&str] = &["id", "limit", "offset"];
+/// In schema-declaration order, so the error and the advertised `inputSchema` agree
+/// (issue #82).
+const GET_LOG_VALID_PARAMS: &[&str] = &["id", "log_id", "limit", "offset"];
+
+/// Issue #82: what `logid` / `log-id` / `logId` were reaching for. `log_id` leads: it is
+/// one character from every near miss, AND it is the name every truncating tool emits, so
+/// a client that copies the suggestion straight back gets the key it already had in hand.
+/// `id` follows because it is the shorter of the two identical parameters.
+const GET_LOG_ID_SUGGESTIONS: &[&str] = &["log_id", "id"];
+
+/// The two parameter lists every iris_get_log error and warning carries, always together.
+///
+/// `valid_params` alone said too little. `namespace` is accepted and ignored
+/// (`GET_LOG_IGNORED_PARAMS`) — the hint has always said so in prose, but a client reading
+/// `valid_params` programmatically saw a key that was not in it and concluded the call it
+/// had just made successfully was invalid. Two payload fields, one per constant, written by
+/// one function so the four surfaces that report parameters cannot drift apart.
+///
+/// They stay two fields rather than one merged list: `valid_params` is exactly the set of
+/// DECLARED schema properties, which is what makes it agree with the advertised
+/// `inputSchema` (issue #82). `namespace` is not a property of this tool and must not start
+/// looking like one.
+fn insert_get_log_param_lists(payload: &mut serde_json::Value) {
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert(
+            "valid_params".to_string(),
+            serde_json::json!(GET_LOG_VALID_PARAMS),
+        );
+        obj.insert(
+            "accepted_and_ignored".to_string(),
+            serde_json::json!(GET_LOG_IGNORED_PARAMS),
+        );
+    }
+}
+
+/// Issue #81/#84: one recovery hint, quoted by the fatal envelope, the unknown-key envelope
+/// and the non-fatal warning alike — three surfaces that must not drift apart.
+const GET_LOG_HINT: &str = "Pass `id` or `log_id` (the same parameter) — the value a \
+    previous truncated:true result returned — to retrieve that result; limit/offset \
+    paginate it (both the stored result and the index listing). Call iris_get_log with NO \
+    parameters to list the stored entries. `namespace` is accepted and ignored (the store \
+    is process-global).";
 
 /// Issue #78: what an empty index must say. `{"logs":[]}` alone reads as "there is no
 /// relevant log", which is the wrong and expensive conclusion the issue documents.
@@ -1157,8 +1439,16 @@ fn unknown_get_log_params(extra: &serde_json::Map<String, serde_json::Value>) ->
     keys
 }
 
-/// Issue #78: `logid`, `logId`, `LOG-ID` all mean `log_id`, which serde already aliases to
-/// `id`. Normalise away case and separators so the error can name the fix.
+/// Issue #78: `logid`, `logId`, `LOG-ID` all mean `log_id`, which iris_get_log reads as a
+/// declared parameter (issue #82). Normalise away case and separators so the error can name
+/// the fix.
+///
+/// `id` belongs in the list for the same reason `log_id` does, and it was missing: the
+/// normaliser folds `ID`, `Id` and `id_` down to `id`, which was not a listed spelling, so
+/// the near-miss of the SHORTER addressing key — the one a caller is most likely to fumble
+/// the case of — got no `did_you_mean` while `log-id` did. Only a variant SPELLING can
+/// reach this function: the exact keys `id` and `log_id` are consumed by the deserializer
+/// and never land in `extra`.
 fn is_log_id_near_miss(key: &str) -> bool {
     let norm: String = key
         .chars()
@@ -1167,8 +1457,59 @@ fn is_log_id_near_miss(key: &str) -> bool {
         .collect();
     matches!(
         norm.as_str(),
-        "logid" | "logids" | "loguuid" | "entryid" | "logentryid"
+        "id" | "ids" | "logid" | "logids" | "loguuid" | "entryid" | "logentryid"
     )
+}
+
+/// Issue #78: an unrecognised key with NO id present. The response shape is the whole
+/// problem — answering with the index reads as "the log is empty" — so this is fatal.
+fn unknown_params_error(unknown: &[String]) -> Result<CallToolResult, McpError> {
+    let named = unknown
+        .iter()
+        .map(|k| format!("'{k}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut extra = serde_json::json!({
+        "unknown_params": unknown,
+        "hint": GET_LOG_HINT,
+    });
+    insert_get_log_param_lists(&mut extra);
+    if unknown.iter().any(|k| is_log_id_near_miss(k)) {
+        extra["did_you_mean"] = serde_json::json!(GET_LOG_ID_SUGGESTIONS);
+    }
+    envelope::fail_with(
+        "INVALID_PARAMS",
+        &format!(
+            "iris_get_log: unknown parameter(s) {named}. This call did NOT list the \
+             log index — an unrecognised parameter is an error here, not a different mode."
+        ),
+        extra,
+    )
+}
+
+/// Issue #84: the same unrecognised key WITH an id present. The shape is unambiguous there
+/// (the entry, or LOG_NOT_FOUND), so the call still answers — but the typo must not be
+/// swallowed: the guard used to run only when `id` was absent, so `{"id":X,"logid":"…"}`
+/// left no trace at all and the next call, which may have no id, repeats the mistake.
+fn unknown_params_warning(unknown: &[String]) -> serde_json::Value {
+    let named = unknown
+        .iter()
+        .map(|k| format!("'{k}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut w = serde_json::json!({
+        "code": "UNKNOWN_PARAMS",
+        "message": format!(
+            "iris_get_log ignored unknown parameter(s) {named}. It answered the id you gave; \
+             the next call may not have one, and then this is an error."
+        ),
+        "unknown_params": unknown,
+    });
+    insert_get_log_param_lists(&mut w);
+    if unknown.iter().any(|k| is_log_id_near_miss(k)) {
+        w["did_you_mean"] = serde_json::json!(GET_LOG_ID_SUGGESTIONS);
+    }
+    w
 }
 
 /// Issue #78: all of iris_get_log, as a free function over the store. The handler touches
@@ -1179,79 +1520,147 @@ fn get_log_impl(
     store: &Arc<std::sync::Mutex<log_store::LogStore>>,
     p: GetLogParams,
 ) -> Result<CallToolResult, McpError> {
-    // #78: a mistyped addressing key must never fall through to the index form. `id`
-    // absent + an unrecognised key present means the caller asked for something this tool
-    // does not offer; answering with the index is a DIFFERENT RESPONSE SHAPE that reads as
-    // "the log is empty" — the failure this issue was filed for. With `id` present the
-    // shape is unambiguous (the entry, or LOG_NOT_FOUND), so an extra key is harmless there.
-    if p.id.is_none() {
-        let unknown = unknown_get_log_params(&p.extra);
-        if !unknown.is_empty() {
-            let named = unknown
-                .iter()
-                .map(|k| format!("'{k}'"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let mut extra = serde_json::json!({
-                "unknown_params": unknown,
-                "valid_params": GET_LOG_VALID_PARAMS,
-                "hint": "Pass `id` (alias `log_id`) — the value a previous truncated:true \
-                         result returned — to retrieve that result; limit/offset paginate it. \
-                         Call iris_get_log with NO parameters to list the stored entries. \
-                         `namespace` is accepted and ignored (the store is process-global).",
-            });
-            if unknown.iter().any(|k| is_log_id_near_miss(k)) {
-                extra["did_you_mean"] = serde_json::json!(["id"]);
-            }
-            return envelope::fail_with(
-                "INVALID_PARAMS",
-                &format!(
-                    "iris_get_log: unknown parameter(s) {named}. This call did NOT list the \
-                     log index — an unrecognised parameter is an error here, not a different mode."
-                ),
-                extra,
-            );
+    let unknown = unknown_get_log_params(&p.extra);
+
+    // ── 1. #81: reconcile the two addressing keys. Equal is exactly what a hedging agent
+    //    sends, so accept it silently; different values are a real ambiguity.
+    let (effective_id, conflict) = match (p.id.as_deref(), p.log_id.as_deref()) {
+        (None, None) => (None, None),
+        (Some(a), None) | (None, Some(a)) => (Some(a.to_string()), None),
+        (Some(a), Some(b)) if a == b => (Some(a.to_string()), None),
+        (Some(a), Some(b)) => (None, Some((a.to_string(), b.to_string()))),
+    };
+
+    // ── 2. #81: anything unusable is INVALID_PARAMS through the envelope, never a silent
+    //    default — a broken `id` must NOT fall through to the index listing.
+    let mut fatal: Vec<String> = p
+        .issues
+        .iter()
+        .filter_map(GetLogIssue::fatal_message)
+        .collect();
+    if let Some((a, b)) = &conflict {
+        fatal.push(format!(
+            "`id` and `log_id` are the same parameter but were given different values \
+             ('{a}' vs '{b}') — pass one, or the same value in both"
+        ));
+    }
+    if !fatal.is_empty() {
+        let mut extra = serde_json::json!({
+            "hint": GET_LOG_HINT,
+        });
+        insert_get_log_param_lists(&mut extra);
+        if let Some((a, b)) = &conflict {
+            extra["id"] = serde_json::json!(a);
+            extra["log_id"] = serde_json::json!(b);
         }
+        if !unknown.is_empty() {
+            extra["unknown_params"] = serde_json::json!(unknown);
+        }
+        return envelope::fail_with(
+            "INVALID_PARAMS",
+            &format!("iris_get_log: {}", fatal.join("; ")),
+            extra,
+        );
     }
 
-    match p.id {
+    // ── 3. #83: `limit` now paginates BOTH forms, so it is validated for both. Unguarded,
+    //    `{"limit":0}` on the paginated index would answer `{"logs":[]}` — a fresh instance
+    //    of the "so there are no logs" failure issue #78 was filed for.
+    if p.limit == Some(0) {
+        // The envelope is the whole point of these errors (issue #2): this was the one
+        // INVALID_PARAMS path in the tool that answered with a bare message, so the one
+        // path that did not teach the caller the fix.
+        let mut extra = serde_json::json!({ "hint": GET_LOG_HINT });
+        insert_get_log_param_lists(&mut extra);
+        return envelope::fail_with(
+            "INVALID_PARAMS",
+            "iris_get_log: limit must be > 0 if provided — it caps the page size; omit it \
+             to return everything (the advertised schema says minimum 1)",
+            extra,
+        );
+    }
+
+    // ── 4. #84: the unknown-key guard runs UNCONDITIONALLY now. Without an id it stays
+    //    fatal (the index is a different response shape); with one it becomes a warning on
+    //    an otherwise successful answer, so nothing that works today starts failing.
+    let mut warnings: Vec<serde_json::Value> = Vec::new();
+    if !unknown.is_empty() {
+        if effective_id.is_none() {
+            return unknown_params_error(&unknown);
+        }
+        warnings.push(unknown_params_warning(&unknown));
+    }
+    warnings.extend(p.issues.iter().filter_map(GetLogIssue::warning));
+
+    match effective_id {
         None => {
-            // List all non-expired entries
-            let summaries = store.lock().map(|mut s| s.list()).unwrap_or_default();
-            let empty = summaries.is_empty();
+            // #83: the index paginates with the same limit/offset the entry form uses —
+            // they were advertised and accepted here, but silently ignored.
+            let (summaries, has_more, total) = store
+                .lock()
+                .map(|mut s| s.list_paginated(p.limit, p.offset))
+                .unwrap_or((Vec::new(), false, 0));
             let mut out = serde_json::json!({
                 "success": true,
                 "logs": summaries,
+                "total_count": total,
             });
-            if empty {
-                // #78: an empty index must say what this store is and is NOT, or the
-                // agent concludes "no logs exist" and stops looking.
+            if p.limit.is_some() || p.offset > 0 {
+                // The same block the entry form emits, on the same condition, so the two
+                // forms read identically.
+                out["offset"] = serde_json::json!(p.offset);
+                out["limit"] = serde_json::json!(p.limit);
+                out["has_more"] = serde_json::json!(has_more);
+            }
+            if total == 0 {
+                // #78: an empty index must say what this store is and is NOT, or the agent
+                // concludes "no logs exist" and stops looking. Keyed on the STORE being
+                // empty, never on this PAGE being empty — otherwise pagination turns the
+                // note into a lie.
                 out["note"] = serde_json::Value::String(EMPTY_LOG_INDEX_NOTE.to_string());
+            } else if out["logs"]
+                .as_array()
+                .map(|a| a.is_empty())
+                .unwrap_or(false)
+            {
+                // #83: an offset past the end must not read as "no logs exist" either.
+                out["note"] = serde_json::Value::String(format!(
+                    "No entries at offset {}: the store holds {total}. Retry with a smaller \
+                     offset.",
+                    p.offset
+                ));
+            }
+            if !warnings.is_empty() {
+                out["warnings"] = serde_json::json!(warnings);
             }
             ok_json(out)
         }
         Some(ref id) => {
-            // Validate limit
-            if let Some(lim) = p.limit {
-                if lim == 0 {
-                    return err_json("INVALID_PARAMS", "limit must be > 0");
-                }
-            }
-
             // Check TTL / existence first
             let get_result = store
                 .lock()
                 .map(|s| s.get(id))
                 .unwrap_or(log_store::GetResult::NotFound);
 
+            // #84: a lookup that FAILS is exactly when the caller most needs to learn the
+            // real parameter name, so the warning rides on the error envelope too. With no
+            // warnings the error stays byte-identical to before.
+            let fail = |code: &str, msg: String| -> Result<CallToolResult, McpError> {
+                if warnings.is_empty() {
+                    err_json(code, &msg)
+                } else {
+                    envelope::fail_with(code, &msg, serde_json::json!({"warnings": warnings}))
+                }
+            };
+
             match get_result {
-                log_store::GetResult::NotFound => err_json(
+                log_store::GetResult::NotFound => fail(
                     "LOG_NOT_FOUND",
-                    &format!("No log entry found with id '{}'", id),
+                    format!("No log entry found with id '{id}'"),
                 ),
-                log_store::GetResult::Expired => err_json(
+                log_store::GetResult::Expired => fail(
                     "LOG_EXPIRED",
-                    &format!("Log entry '{}' has expired (TTL exceeded)", id),
+                    format!("Log entry '{id}' has expired (TTL exceeded)"),
                 ),
                 log_store::GetResult::Found(_) => {
                     // Now handle pagination
@@ -1261,29 +1670,63 @@ fn get_log_impl(
                         .and_then(|s| s.get_paginated(id, p.limit, p.offset));
 
                     match paginated {
-                        None => err_json(
+                        None => fail(
                             "LOG_EXPIRED",
-                            &format!("Log entry '{}' expired during retrieval", id),
+                            format!("Log entry '{id}' expired during retrieval"),
                         ),
-                        Some((result, has_more, total_count)) => {
-                            if p.limit.is_some() {
-                                ok_json(serde_json::json!({
-                                    "success": true,
-                                    "log_id": id,
-                                    "total_count": total_count,
-                                    "offset": p.offset,
-                                    "limit": p.limit,
-                                    "has_more": has_more,
-                                    "result": result,
-                                }))
-                            } else {
-                                ok_json(serde_json::json!({
-                                    "success": true,
-                                    "log_id": id,
-                                    "total_count": total_count,
-                                    "result": result,
-                                }))
+                        Some(page) => {
+                            let total_count = page.total;
+                            let mut out = serde_json::json!({
+                                "success": true,
+                                "log_id": id,
+                                "total_count": total_count,
+                                "result": page.result,
+                            });
+                            let asked_to_paginate = p.limit.is_some() || p.offset > 0;
+                            if asked_to_paginate && page.sliced {
+                                // #83: `offset` alone paginates too — it used to be accepted
+                                // and dropped on the floor here, the same defect one branch over.
+                                out["offset"] = serde_json::json!(p.offset);
+                                out["limit"] = serde_json::json!(p.limit);
+                                out["has_more"] = serde_json::json!(page.has_more);
+                                if total_count > 0
+                                    && out["result"]
+                                        .as_array()
+                                        .map(|a| a.is_empty())
+                                        .unwrap_or(false)
+                                {
+                                    // #83: the index rescues an overshot offset with a note.
+                                    // Without the same note here, an empty `result` reads as
+                                    // "this entry is empty" — the wrong-conclusion failure
+                                    // #78 exists to prevent, guarded on one branch only.
+                                    out["note"] = serde_json::Value::String(format!(
+                                        "No items at offset {}: this entry holds {total_count}. \
+                                         Retry with a smaller offset.",
+                                        p.offset
+                                    ));
+                                }
+                            } else if asked_to_paginate {
+                                // #83: the stored result is a single JSON object, not a list,
+                                // so nothing was sliced — `iris_test` stores
+                                // `{test_suites, raw_output}`, and it is the tool this store's
+                                // own hint sends the agent to. Echoing offset/limit/has_more
+                                // here would ASSERT a page that was never taken: `offset:99`
+                                // answering `has_more:false` over a complete payload says "you
+                                // have reached the end" when nothing was skipped. Say what
+                                // actually happened instead.
+                                out["pagination_applied"] = serde_json::Value::Bool(false);
+                                out["note"] = serde_json::Value::String(format!(
+                                    "`limit`/`offset` were ignored: {} stored this result as a \
+                                     single JSON object, not a list, so there is nothing to \
+                                     slice — the WHOLE result is returned and nothing was \
+                                     skipped. Page inside `result` yourself.",
+                                    page.tool
+                                ));
                             }
+                            if !warnings.is_empty() {
+                                out["warnings"] = serde_json::json!(warnings);
+                            }
+                            ok_json(out)
                         }
                     }
                 }
@@ -2249,7 +2692,7 @@ impl IrisTools {
     }
 
     #[tool(
-        description = "Compile an ObjectScript class, routine, or wildcard package on IRIS via Atelier REST. Supports 'MyApp.*.cls' for package-level compilation. Returns structured errors with line numbers, columns, and severity. No Python required."
+        description = "Compile an ObjectScript class, routine, or wildcard package on IRIS via Atelier REST. Wildcards ('MyApp.*', 'MyApp.*.cls') expand CLASS documents only and are guarded: the pattern MUST begin with a literal package prefix before its first '*' (bare '*', '*.cls', '*Foo' are refused as SCOPE_REQUIRED — they would select the whole namespace), and a pattern matching more than 500 documents is refused as TOO_BROAD with the count, so narrow the package rather than retrying. Matching ignores the document suffix, so 'Pkg.Class.*' means the SUBPACKAGE of Pkg.Class, never Pkg.Class itself; a pattern that matches nothing is NOT_FOUND. Compile a .mac/.int/.inc routine by its exact name. Returns structured errors with line numbers, columns, and severity. No Python required."
     )]
     async fn iris_compile(
         &self,
@@ -2362,9 +2805,18 @@ impl IrisTools {
             }
         }
 
-        // Expand wildcards: resolve "MyApp.*.cls" to a list of matching class names.
+        // Expand wildcards: resolve "MyApp.*" / "MyApp.*.cls" to matching document names.
         // Bug 8: use namespace (not iris.namespace) and the correct /docnames/CLS endpoint.
+        // Issue #88: `result.content` elements are OBJECTS on this build, not bare strings —
+        // see `docnames_in_body`. `scanned` is carried so a NOT_FOUND can distinguish "the
+        // pattern matched nothing" from "the listing itself came back empty".
+        let mut scanned = 0usize;
         let targets: Vec<String> = if p.target.contains('*') {
+            // #88: an unqualified pattern is refused BEFORE the listing is fetched — there
+            // is no expansion to inspect, and no reason to pull 10k names to say so.
+            if wildcard_target_is_unqualified(&p.target) {
+                return unqualified_wildcard_error(&p.target, &namespace);
+            }
             let list_url = iris.versioned_ns_url(&namespace, "/docnames/CLS");
             match client
                 .get(&list_url)
@@ -2374,29 +2826,68 @@ impl IrisTools {
             {
                 Ok(resp) if resp.status().is_success() => {
                     let body: serde_json::Value = resp.json().await.unwrap_or_default();
-                    let pattern = p.target.replace('.', "\\.").replace('*', ".*");
-                    let re = regex::Regex::new(&format!("(?i)^{}$", pattern))
-                        .unwrap_or_else(|_| regex::Regex::new(".*").unwrap());
-                    // /docnames/ returns an array of strings, not objects with a "name" key.
-                    body["result"]["content"]
-                        .as_array()
-                        .unwrap_or(&vec![])
-                        .iter()
-                        .filter_map(|d| d.as_str())
-                        .filter(|n| re.is_match(n))
-                        .map(|n| n.to_string())
-                        .collect()
+                    // One pass over the listing, not two: `scanned` and the expansion read
+                    // the same Vec (15810 elements on the dev instance).
+                    let names = docnames_in_body(&body);
+                    scanned = names.len();
+                    match expand_wildcard_target(&names, &p.target) {
+                        // Unreachable — the guard above already returned — but the outcome
+                        // is the pure function's to own, not this call site's.
+                        WildcardExpansion::Unqualified => {
+                            return unqualified_wildcard_error(&p.target, &namespace)
+                        }
+                        WildcardExpansion::TooBroad { matched } => {
+                            return too_broad_wildcard_error(&p.target, &namespace, matched)
+                        }
+                        WildcardExpansion::Matched(t) => t,
+                    }
                 }
-                _ => vec![p.target.clone()],
+                // #88 follow-up: when the listing is unavailable there is NOTHING to expand
+                // against, so the cap and the scope rule cannot be applied. Falling back to
+                // the raw pattern used to hand `Pkg.*` straight to /action/compile with no
+                // expansion, no count and no cap — the guard silently off exactly when the
+                // instance is unhealthy. A wildcard therefore fails here instead of guessing.
+                other => {
+                    let detail = match other {
+                        Ok(resp) => format!("HTTP {}", resp.status().as_u16()),
+                        Err(e) => e.to_string(),
+                    };
+                    return crate::tools::envelope::fail_with(
+                        "LISTING_UNAVAILABLE",
+                        &format!(
+                            "Could not read the class listing for namespace {namespace}, so \
+                             the wildcard '{}' could not be expanded: {detail}. Nothing was \
+                             compiled.",
+                            p.target
+                        ),
+                        serde_json::json!({
+                            "pattern": p.target,
+                            "namespace": namespace,
+                            "listing_url": list_url,
+                            "hint": "Compile a single document by its exact name, which needs \
+                                     no listing. If the namespace is wrong, iris_query can \
+                                     confirm it exists.",
+                        }),
+                    );
+                }
             }
         } else {
             vec![p.target.clone()]
         };
 
         if targets.is_empty() {
+            // #88: the old message was indistinguishable from a genuinely empty namespace.
+            // It also has to say what was NOT searched: the listing is /docnames/CLS, so a
+            // wildcard can never see a .mac/.int/.inc routine, and a bare NOT_FOUND there
+            // reads as "that routine does not exist" when it does and compiles by name.
             return err_json(
                 "NOT_FOUND",
-                &format!("No documents match pattern: {}", p.target),
+                &format!(
+                    "No documents match pattern '{}' — scanned {} CLS document(s) in \
+                     namespace {}. Wildcards expand CLASS documents only: compile a \
+                     .mac/.int/.inc routine by its exact name.",
+                    p.target, scanned, namespace
+                ),
             );
         }
 
@@ -2481,8 +2972,10 @@ impl IrisTools {
         if let Some(status_errors) = body["status"]["errors"].as_array() {
             for se in status_errors {
                 let msg = se["error"].as_str().unwrap_or("Compile error");
+                // #80: `location` is emitted on every entry, including this wrapper, so
+                // the array stays homogeneous once the console parser starts filling it.
                 errors.push(
-                    serde_json::json!({"severity":"error","code":"","line":0,"column":0,"text":msg}),
+                    serde_json::json!({"severity":"error","code":"","line":0,"column":0,"location":"","text":msg}),
                 );
             }
         }
@@ -2490,45 +2983,23 @@ impl IrisTools {
         if errors.is_empty() {
             let summary = body["status"]["summary"].as_str().unwrap_or("");
             if summary.contains("ERROR") {
-                errors.push(serde_json::json!({"severity":"error","code":"","line":0,"column":0,"text":summary}));
+                errors.push(serde_json::json!({"severity":"error","code":"","line":0,"column":0,"location":"","text":summary}));
             }
         }
 
         // Parse console output for per-line errors and warnings.
-        // Atelier compile errors: "  1 ERROR #<code>:<line>: <message>"
-        // Warnings: "  2 WARNING #<code>:<line>: <message>"
+        // Issue #80: this build prefixes per-method diagnostics with "ERROR:" (colon), not
+        // "ERROR " (space) — `parse_console_diag` accepts both, so a class with N broken
+        // methods now yields ~2N individually addressable entries instead of collapsing to
+        // the one status.errors wrapper. `location` is additive: "M1+2" / "Foo.Bar.1".
         for line in &console {
             let text = line.as_str().unwrap_or("");
-            if let Some(rest) = text.trim().strip_prefix("ERROR ") {
-                let parts: Vec<&str> = rest.splitn(3, ':').collect();
-                let (code, line_num, msg) = if parts.len() >= 3 {
-                    (
-                        parts[0].trim(),
-                        parts[1].trim().parse::<u32>().unwrap_or(0),
-                        parts[2].trim(),
-                    )
-                } else {
-                    ("", 0, rest)
-                };
-                // Deduplicate: skip if status.errors already has an identical message
-                let already_have = errors
-                    .iter()
-                    .any(|e| e["text"].as_str().map(|t| t.contains(msg)).unwrap_or(false));
-                if !already_have {
-                    errors.push(serde_json::json!({"severity":"error","code":code,"line":line_num,"column":0,"text":msg}));
+            if let Some(d) = parse_console_diag(text, "ERROR:", "ERROR ") {
+                if !console_diag_already_reported(&errors, &d.text) {
+                    errors.push(serde_json::json!({"severity":"error","code":d.code,"line":d.line,"column":0,"location":d.location,"text":d.text}));
                 }
-            } else if let Some(rest) = text.trim().strip_prefix("WARNING ") {
-                let parts: Vec<&str> = rest.splitn(3, ':').collect();
-                let (code, line_num, msg) = if parts.len() >= 3 {
-                    (
-                        parts[0].trim(),
-                        parts[1].trim().parse::<u32>().unwrap_or(0),
-                        parts[2].trim(),
-                    )
-                } else {
-                    ("", 0, rest)
-                };
-                warnings.push(serde_json::json!({"severity":"warning","code":code,"line":line_num,"column":0,"text":msg}));
+            } else if let Some(d) = parse_console_diag(text, "WARNING:", "WARNING ") {
+                warnings.push(serde_json::json!({"severity":"warning","code":d.code,"line":d.line,"column":0,"location":d.location,"text":d.text}));
             }
         }
 
@@ -4223,8 +4694,12 @@ Methods:
         description = "List all synthesized skills in the ^SKILLS registry (name, description, usage_count, created_at)."
     )]
     async fn skill_list(&self, _: Parameters<NoParams>) -> Result<CallToolResult, McpError> {
-        let ns = skills_tools::skills_namespace();
-        let Some(iris) = self.iris_arc() else {
+        // #85: the namespace comes from the CONNECTION, so take the Arc first. With no
+        // connection there is no namespace to resolve and this falls to "USER" — which is
+        // honest here, because the very next line reports that IRIS was never reached.
+        let iris_opt = self.iris_arc();
+        let ns = skills_tools::skills_namespace(iris_opt.as_deref());
+        let Some(iris) = iris_opt else {
             return skills_tools::skills_read_fail(
                 "skill_list",
                 &ns,
@@ -4249,8 +4724,12 @@ Methods:
         &self,
         Parameters(p): Parameters<SkillNameParams>,
     ) -> Result<CallToolResult, McpError> {
-        let ns = skills_tools::skills_namespace();
-        let Some(iris) = self.iris_arc() else {
+        // #85: the namespace comes from the CONNECTION, so take the Arc first. With no
+        // connection there is no namespace to resolve and this falls to "USER" — which is
+        // honest here, because the very next line reports that IRIS was never reached.
+        let iris_opt = self.iris_arc();
+        let ns = skills_tools::skills_namespace(iris_opt.as_deref());
+        let Some(iris) = iris_opt else {
             return skills_tools::skills_read_fail(
                 "skill_describe",
                 &ns,
@@ -4288,8 +4767,12 @@ Methods:
         &self,
         Parameters(p): Parameters<SkillSearchParams>,
     ) -> Result<CallToolResult, McpError> {
-        let ns = skills_tools::skills_namespace();
-        let Some(iris) = self.iris_arc() else {
+        // #85: the namespace comes from the CONNECTION, so take the Arc first. With no
+        // connection there is no namespace to resolve and this falls to "USER" — which is
+        // honest here, because the very next line reports that IRIS was never reached.
+        let iris_opt = self.iris_arc();
+        let ns = skills_tools::skills_namespace(iris_opt.as_deref());
+        let Some(iris) = iris_opt else {
             return skills_tools::skills_read_fail(
                 "skill_search",
                 &ns,
@@ -4325,12 +4808,10 @@ Methods:
         Parameters(p): Parameters<SkillNameParams>,
     ) -> Result<CallToolResult, McpError> {
         if let Some(iris) = self.iris_arc().as_deref() {
+            // #85: kill the skill in the SAME namespace skill_list reads.
+            let ns = crate::tools::skills_tools::skills_namespace(Some(iris));
             let code = format!("Kill ^SKILLS({}) Write \"OK\"", os_str_expr(&p.name));
-            if iris
-                .execute(&code, &crate::tools::skills_tools::skills_namespace())
-                .await
-                .is_ok()
-            {
+            if iris.execute(&code, &ns).await.is_ok() {
                 return ok_json(serde_json::json!({"success": true, "name": p.name}));
             }
         }
@@ -5553,7 +6034,7 @@ Methods:
     // ── iris_get_log (027 — progressive disclosure, Merged tier only) ──────────
 
     #[tool(
-        description = "Retrieve a result a PREVIOUS tool truncated, from this server's in-memory result store. This is NOT the IRIS event log — for interoperability logs use iris_interop_query (what=logs, or what=trace with session_id). With id (alias: log_id — the value a truncated:true result handed back): returns the full result, optionally paginated with limit/offset. With NO parameters: lists the stored entries (id, tool, timestamp, total_count). Any other parameter name is an error, not a fallback to the listing. Use after any tool returns truncated:true."
+        description = "Retrieve a result a PREVIOUS tool stored, from this server's in-memory result store. This is NOT the IRIS event log — for interoperability logs use iris_interop_query (what=logs, or what=trace with session_id). With id or log_id (the SAME parameter — pass either, or the same value in both — the value a previous result handed back): returns the full result, optionally paginated with limit/offset. With NO id: lists the stored entries (id, tool, timestamp, total_count), paginated with the same limit/offset. Any other parameter name is an error when no id is given, and a warning when one is. Use after any tool returns truncated:true — and after iris_test, which always stores per-test-case detail and returns a log_id even when nothing was truncated."
     )]
     async fn iris_get_log(
         &self,
@@ -5592,6 +6073,7 @@ impl ServerHandler for IrisTools {
             let schema = std::sync::Arc::make_mut(&mut tool.input_schema);
             normalize_schema_openapi3(schema);
             drop_default_additional_properties(schema);
+            drop_struct_name_title(schema);
         }
         Ok(rmcp::model::ListToolsResult {
             tools,
@@ -5699,6 +6181,19 @@ fn drop_default_additional_properties(schema: &mut serde_json::Map<String, serde
     }
 }
 
+/// The Rust struct name schemars puts in the schema's top-level `title` — `GetLogParams`,
+/// `CompileParams`, `QueryParams`, … . It is a private identifier that names nothing the
+/// caller can act on (the tool carries its own `name`), and it goes out to every client on
+/// every tools/list, so it is the same class of leak as a struct-level `///` (#82).
+/// Dropped here, with the other wire-only fixups, rather than by renaming 23 structs.
+///
+/// Top level only: a NESTED `title` can be load-bearing — schemars' default
+/// `{"title":"AnyValue"}` is exactly why `AnyParams` carries a hand-written JsonSchema impl
+/// (#113/#115).
+fn drop_struct_name_title(schema: &mut serde_json::Map<String, serde_json::Value>) {
+    schema.remove("title");
+}
+
 fn parse_iris_error_string(s: &str) -> Option<(String, i64)> {
     use std::sync::OnceLock;
     static RE: OnceLock<regex::Regex> = OnceLock::new();
@@ -5720,6 +6215,318 @@ fn parse_source_line(raw: &str) -> (Option<String>, Option<i64>) {
         );
     }
     (None, None)
+}
+
+// ── Atelier /docnames helpers (issue #88) ─────────────────────────────────────
+
+/// Issue #88: compile an iris_compile wildcard target into a case-insensitive anchored
+/// regex. `*` is "any run of characters"; EVERY other character is literal. An unbuildable
+/// pattern matches NOTHING — the old `.unwrap_or(".*")` fallback would have queued a whole
+/// namespace for recompile on a typo.
+///
+/// The escape has to be total, not just `.`: hand-escaping only the dot left
+/// `? ( ) + | ^ $ { } [ ]` reaching the regex engine verbatim, so a target the caller meant
+/// literally could match documents it does not name. `A|*` is the catastrophic one —
+/// `^A|.*$` anchors the LEFT branch only, so the right branch matches every document in the
+/// namespace and iris_compile POSTs a namespace-wide recompile. `regex::escape` first, then
+/// translate the (now `\*`) wildcards, so nothing but `*` can ever be a metacharacter.
+fn docname_pattern_regex(pattern: &str) -> Option<regex::Regex> {
+    let escaped = regex::escape(pattern).replace("\\*", ".*");
+    regex::Regex::new(&format!("(?i)^{escaped}$")).ok()
+}
+
+/// Issue #88: document names out of an Atelier `/docnames/{cat}` body.
+///
+/// This build (IRIS 2026.1, Atelier v1) returns `result.content` as an array of OBJECTS —
+/// `{"name":"APPPKG.FoundationProduction.cls","cat":"CLS","db":"APP-CODE",…}` — and `name`
+/// carries the extension. Older builds returned bare strings. Only the string shape was
+/// handled (the comment there claimed objects were impossible), so every element yielded
+/// `None`, every wildcard expanded to nothing, and iris_compile answered NOT_FOUND for
+/// targets that exist. Both shapes are read now.
+fn docnames_in_body(body: &serde_json::Value) -> Vec<&str> {
+    body["result"]["content"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|d| {
+                    d.as_str()
+                        .or_else(|| d.get("name").and_then(|n| n.as_str()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Issue #88: an Atelier document name matches a pattern on its STEM — the name minus its
+/// document suffix. `/docnames` names carry the suffix (`APPPKG.Foo.cls`), user patterns
+/// usually do not, and matching the suffixed name directly is what let `Pkg.Class.*` compile
+/// `Pkg.Class` itself: `^Pkg\.Class\..*$` matched the literal document "Pkg.Class.cls"
+/// because the `.cls` filled the `.*`. So a typo'd subpackage came back as a one-class
+/// compile instead of NOT_FOUND. Strip, then match.
+fn docname_stem(name: &str) -> &str {
+    match name.rsplit_once('.') {
+        Some((stem, ext))
+            if matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "cls" | "mac" | "int" | "inc"
+            ) =>
+        {
+            stem
+        }
+        _ => name,
+    }
+}
+
+/// Issue #88: the pattern side of `docname_stem`. A caller who spells the extension out
+/// (`MyPkg.*.cls`) is naming the same documents as `MyPkg.*`, so the pattern loses its
+/// `.cls` too — otherwise it could never match a stem.
+///
+/// ONLY `.cls`. The listing this expands against is `/docnames/CLS`, so `MyPkg.*.mac` keeps
+/// its suffix, matches no stem, and falls through to the NOT_FOUND that tells the caller to
+/// compile a routine by its exact name. Stripping it would silently compile the package's
+/// CLASSES instead — the wrong documents, reported as success.
+fn wildcard_pattern_stem(pattern: &str) -> &str {
+    match pattern.rsplit_once('.') {
+        Some((stem, ext)) if ext.eq_ignore_ascii_case("cls") => stem,
+        _ => pattern,
+    }
+}
+
+/// Issue #88: a wildcard with nothing literal in front of its first `*` — `*`, `*.cls`,
+/// `*Foo`. It names no package, so it selects on the tail alone and its expansion is
+/// bounded only by the size of the namespace. Refused, never expanded: see
+/// `WildcardExpansion::Unqualified`.
+fn wildcard_target_is_unqualified(pattern: &str) -> bool {
+    matches!(pattern.find('*'), Some(0))
+}
+
+/// Issue #88: the most documents ONE wildcard compile may queue.
+///
+/// Picked from the shape of a real namespace, not as a round number. The dev instance's APP
+/// namespace lists 12744 CLS documents, 10094 of them outside the `%` system packages —
+/// and 10094 is exactly what `iris_compile {"target":"*"}` expanded to and POSTed to
+/// /action/compile in ONE request, from a typo, with no dry run and no confirmation.
+///
+/// Across the 1726 distinct two-level packages in that namespace's class dictionary,
+/// exactly TWO hold more than 500: the vendor FHIR trees, HS.FHIR (which this guard now
+/// measures at 3693 documents) and HS.FHIRModel (1081). EVERY other two-level package in
+/// the namespace holds at most 378. So 500 takes whole any package a developer actually
+/// authors, and refuses only whole-library trees and whole-namespace expansions.
+///
+/// Deliberately no `force`/`confirm` escape hatch: that would widen the advertised schema
+/// of a tool in the locked 23-tool interop profile, and a caller who genuinely wants 500+
+/// classes can name the subpackages.
+const WILDCARD_EXPANSION_CAP: usize = 500;
+
+/// Issue #88: what a wildcard compile target expanded to. The two refusals are outcomes,
+/// not errors, so the guard is a pure function the unit tests can drive with no IRIS.
+#[derive(Debug, PartialEq)]
+pub(crate) enum WildcardExpansion {
+    /// Nothing literal precedes the first `*` — refused before the listing is even fetched.
+    Unqualified,
+    /// More than `WILDCARD_EXPANSION_CAP` documents matched. Carries the real count so the
+    /// error can state it.
+    TooBroad { matched: usize },
+    /// The documents to compile, suffix included. EMPTY is a genuine miss and stays
+    /// NOT_FOUND — a typo must never become a compile.
+    Matched(Vec<String>),
+}
+
+/// Issue #88: expand a wildcard compile target against the names in a /docnames body.
+///
+/// `%`-prefixed system documents are reachable only when the pattern itself starts with
+/// `%` — otherwise a package wildcard would drag library classes in behind it.
+fn expand_wildcard_target(names: &[&str], pattern: &str) -> WildcardExpansion {
+    if wildcard_target_is_unqualified(pattern) {
+        return WildcardExpansion::Unqualified;
+    }
+    let re = match docname_pattern_regex(wildcard_pattern_stem(pattern)) {
+        Some(re) => re,
+        None => return WildcardExpansion::Matched(Vec::new()),
+    };
+    let want_system = pattern.starts_with('%');
+    let matched: Vec<&str> = names
+        .iter()
+        .copied()
+        .filter(|n| want_system || !n.starts_with('%'))
+        .filter(|n| re.is_match(docname_stem(n)))
+        .collect();
+    if matched.len() > WILDCARD_EXPANSION_CAP {
+        return WildcardExpansion::TooBroad {
+            matched: matched.len(),
+        };
+    }
+    WildcardExpansion::Matched(matched.into_iter().map(str::to_string).collect())
+}
+
+/// Issue #88: the refusal for a pattern with no package in front of its `*`.
+fn unqualified_wildcard_error(pattern: &str, namespace: &str) -> Result<CallToolResult, McpError> {
+    envelope::fail_with(
+        "SCOPE_REQUIRED",
+        &format!(
+            "iris_compile: target '{pattern}' has nothing before its first '*', so it names \
+             no package and would select on the tail alone — in namespace {namespace} that \
+             is up to every class the namespace holds, compiled in one request. Qualify it \
+             with a package: 'MyApp.*', 'MyApp.Sub.*.cls', or a single document by name."
+        ),
+        serde_json::json!({
+            "target": pattern,
+            "namespace": namespace,
+            "hint": "A wildcard compile target must start with a literal package prefix. \
+                     Nothing was compiled.",
+        }),
+    )
+}
+
+/// Issue #88: the refusal for a qualified pattern that still selects too much.
+fn too_broad_wildcard_error(
+    pattern: &str,
+    namespace: &str,
+    matched: usize,
+) -> Result<CallToolResult, McpError> {
+    envelope::fail_with(
+        "TOO_BROAD",
+        &format!(
+            "iris_compile: target '{pattern}' matches {matched} documents in namespace \
+             {namespace} — more than the {WILDCARD_EXPANSION_CAP} one wildcard compile may \
+             queue. Nothing was compiled. Name a narrower package (add the next level: \
+             'Pkg.Sub.*') or compile the documents one at a time."
+        ),
+        serde_json::json!({
+            "target": pattern,
+            "namespace": namespace,
+            "matched": matched,
+            "limit": WILDCARD_EXPANSION_CAP,
+            "hint": "Narrow the pattern — there is no override flag; a compile this size is \
+                     a namespace-wide recompile, which is what this guard exists to stop.",
+        }),
+    )
+}
+
+// ── Compile-console diagnostics (issue #80) ───────────────────────────────────
+
+/// One diagnostic parsed out of an Atelier compile `console` line (issue #80).
+pub(crate) struct ConsoleDiag {
+    pub(crate) code: String,
+    pub(crate) line: u32,
+    pub(crate) location: String,
+    pub(crate) text: String,
+}
+
+/// Issue #80: is this console diagnostic already in `errors` from `status.errors`?
+///
+/// A plain `contains` was too greedy. The `#5475` wrapper IRIS puts in `status.errors`
+/// embeds the FIRST per-method message verbatim inside a multi-line blob, so containment
+/// against it swallowed exactly one method's diagnostic while every later one survived:
+/// N broken methods yielded N-1 routine-level entries, and a consumer counting them was
+/// quietly off by one. Only a SINGLE-LINE entry can stand in for a console line — that is
+/// the case the dedup was written for (one status error repeating one console line, minus
+/// its `ERROR ` prefix). A multi-line wrapper is a summary of many, never a substitute.
+fn console_diag_already_reported(errors: &[serde_json::Value], text: &str) -> bool {
+    errors.iter().any(|e| {
+        e["text"]
+            .as_str()
+            .map(|t| !t.contains('\n') && t.contains(text))
+            .unwrap_or(false)
+    })
+}
+
+/// A console line that is only a document name. IRIS repeats `ERROR: Foo.Bar.cls` once per
+/// routine error as a header; it carries no diagnostic of its own.
+fn is_bare_docname(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    (lower.ends_with(".cls")
+        || lower.ends_with(".mac")
+        || lower.ends_with(".int")
+        || lower.ends_with(".inc"))
+        && !s.contains(' ')
+        && !s.contains('(')
+        && !s.contains(':')
+}
+
+/// Issue #80: parse one compile-console line, accepting BOTH the `KEYWORD:` and the
+/// `KEYWORD ` prefix.
+///
+/// This build emits per-method errors with a COLON —
+///   `ERROR: Foo.Bar.cls(M1+2) #1002: Invalid character in tag : '$$$X' : Offset:15 […]`
+///   `ERROR:  Foo.Bar.1(3) : MPP5610 : Referenced macro not defined: 'X'`
+/// while the parser only matched `ERROR ` (space), so the 24 real per-method errors of a
+/// 12-broken-method class collapsed into the single `status.errors` wrapper entry and the
+/// agent had to recompile once per macro to discover them.
+///
+/// `text` keeps the WHOLE line after the prefix: the old `splitn(3, ':')` re-slicing
+/// mangled any message that itself contained a colon (measured on
+/// `ERROR #5373: Class 'X', used by 'Y:property:P1', does not exist`, which it cut down to
+/// `property:P1', does not exist`).
+pub(crate) fn parse_console_diag(
+    raw: &str,
+    colon_prefix: &str,
+    space_prefix: &str,
+) -> Option<ConsoleDiag> {
+    let t = raw.trim();
+    let rest = t
+        .strip_prefix(colon_prefix)
+        .or_else(|| t.strip_prefix(space_prefix))?
+        .trim();
+    if rest.is_empty() || is_bare_docname(rest) {
+        return None;
+    }
+    let paren = match (rest.find('('), rest.find(')')) {
+        (Some(open), Some(close)) if open < close => {
+            // Only a BARE document/routine name immediately followed by `(` is a location.
+            // A parenthesis inside prose (`Class 'X' (generated)`) is not.
+            let head = &rest[..open];
+            if head.is_empty() || head.contains(' ') || head.contains(':') {
+                None
+            } else {
+                Some((head, &rest[open + 1..close], rest[close + 1..].trim_start()))
+            }
+        }
+        _ => None,
+    };
+    let (code, line, location) = match paren {
+        Some((head, inner, tail)) => {
+            // `Foo.Bar.1(3) : MPP5610 : msg` — a routine line number, so the routine name
+            // is the location. `Foo.Bar.cls(M1+2) #1002: msg` — a label+offset, which IS
+            // the location and has no line number.
+            let (line, location) = match inner.trim().parse::<u32>() {
+                Ok(n) => (n, head.to_string()),
+                Err(_) => (0, inner.trim().to_string()),
+            };
+            let code = if let Some(after) = tail.strip_prefix('#') {
+                after.split(':').next().unwrap_or("").trim().to_string()
+            } else if let Some(after) = tail.strip_prefix(':') {
+                after.split(':').next().unwrap_or("").trim().to_string()
+            } else {
+                String::new()
+            };
+            (code, line, location)
+        }
+        None => {
+            // Classic space-prefixed shapes: `#5373: msg` and `#5001:12: msg`.
+            let mut parts = rest.trim_start_matches('#').split(':');
+            let code = parts
+                .next()
+                .filter(|c| !c.is_empty() && c.chars().all(|ch| ch.is_ascii_digit()))
+                .unwrap_or("")
+                .to_string();
+            let line = if code.is_empty() {
+                0
+            } else {
+                parts
+                    .next()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    .unwrap_or(0)
+            };
+            (code, line, String::new())
+        }
+    };
+    Some(ConsoleDiag {
+        code,
+        line,
+        location,
+        text: rest.to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -5941,9 +6748,11 @@ mod config_watcher_tests {
 #[cfg(test)]
 mod schema_normalization_tests {
     use super::drop_default_additional_properties;
+    use super::drop_struct_name_title;
     use super::normalize_schema_openapi3;
     use super::GetLogParams;
     use super::DOCKER_REQUIRED_HINT;
+    use super::GET_LOG_VALID_PARAMS;
 
     #[test]
     fn test_normalize_nullable_integer() {
@@ -6056,20 +6865,24 @@ mod schema_normalization_tests {
 
     // ── Issue #78: GetLogParams' advertised schema ───────────────────────────
 
-    /// The flattened leftover-capture map must not leak a property, and the one keyword it
-    /// does add (`additionalProperties: true`, JSON Schema's default) must be stripped on
-    /// the wire — no tool in either profile emits that keyword, and strict clients are why
-    /// `AnyParams` carries a hand-written JsonSchema impl (#113/#115).
+    /// Issue #82: `log_id` must be a DECLARED property, not just a serde alias — a strict
+    /// or filtering client can only emit what the schema names, and `log_id` is the key
+    /// every truncating tool hands back. The flattened leftover-capture map must still not
+    /// leak a property, and the one keyword it does add (`additionalProperties: true`, JSON
+    /// Schema's default) must still be stripped on the wire — no tool in either profile
+    /// emits that keyword, and strict clients are why `AnyParams` carries a hand-written
+    /// JsonSchema impl (#113/#115).
     #[test]
-    fn get_log_input_schema_still_advertises_exactly_id_limit_offset() {
+    fn get_log_input_schema_declares_log_id() {
         let schema = serde_json::to_value(schemars::schema_for!(GetLogParams)).unwrap();
         let props = schema["properties"].as_object().unwrap();
         let mut keys: Vec<&str> = props.keys().map(String::as_str).collect();
         keys.sort();
         assert_eq!(
             keys,
-            vec!["id", "limit", "offset"],
-            "the #[serde(flatten)] capture must not surface as a caller-facing parameter"
+            vec!["id", "limit", "log_id", "offset"],
+            "#82: log_id must be declared; the #[serde(flatten)] capture and the #81 issue \
+             log must not surface as caller-facing parameters"
         );
         assert!(
             props["id"]["description"]
@@ -6078,6 +6891,14 @@ mod schema_normalization_tests {
                 .contains("log_id"),
             "the alias must be documented where the agent reads it: {}",
             props["id"]["description"]
+        );
+        assert!(
+            props["log_id"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("id"),
+            "log_id's description must say it is the same parameter as id: {}",
+            props["log_id"]["description"]
         );
         assert_eq!(
             schema["additionalProperties"],
@@ -6094,6 +6915,96 @@ mod schema_normalization_tests {
         );
     }
 
+    /// The published schema must agree with what the runtime accepts. Two disagreements
+    /// shipped with #82/#83, and both punish exactly the strict client those issues exist
+    /// to serve: `limit` advertised `minimum: 0` while the runtime answers INVALID_PARAMS
+    /// for 0, and `offset` was the ONE declared property that was not nullable — so
+    /// `{"id":null,"log_id":"x","limit":null,"offset":null}`, the payload a client that
+    /// puts every declared property in `required` produces, violated the very schema it
+    /// was validating against.
+    #[test]
+    fn get_log_schema_agrees_with_the_runtime_on_limit_and_offset() {
+        let mut schema = serde_json::to_value(schemars::schema_for!(GetLogParams)).unwrap();
+        let obj = schema.as_object_mut().unwrap();
+        normalize_schema_openapi3(obj);
+        let props = obj["properties"].clone();
+
+        let limit = &props["limit"]["anyOf"][0];
+        assert_eq!(limit["type"], "integer", "{limit}");
+        assert!(
+            limit["minimum"].as_u64() == Some(1) || limit["exclusiveMinimum"].as_u64() == Some(0),
+            "the runtime rejects limit 0, so the schema must too: {limit}"
+        );
+
+        for name in GET_LOG_VALID_PARAMS {
+            let branches = props[*name]["anyOf"].as_array().unwrap_or_else(|| {
+                panic!(
+                    "`{name}` must be nullable, so it must normalise to anyOf: {}",
+                    props[*name]
+                )
+            });
+            assert!(
+                branches.iter().any(|b| b["type"] == "null"),
+                "`{name}` must accept null — a strict client sends null for every declared \
+                 property it is not using: {}",
+                props[*name]
+            );
+        }
+    }
+
+    /// schemars puts the Rust struct name in the schema's top-level `title`, and every
+    /// tools/list ships it to every client. It names nothing the caller can act on.
+    #[test]
+    fn the_advertised_schema_does_not_ship_the_rust_struct_name() {
+        let mut schema = serde_json::to_value(schemars::schema_for!(GetLogParams)).unwrap();
+        let obj = schema.as_object_mut().unwrap();
+        assert_eq!(
+            obj["title"], "GetLogParams",
+            "schemars stopped emitting the struct name — if so, drop_struct_name_title is \
+             dead code and can go"
+        );
+        drop_struct_name_title(obj);
+        assert!(obj.get("title").is_none(), "{obj:?}");
+        // Nested titles are load-bearing (schemars' `{"title":"AnyValue"}` is why AnyParams
+        // has a hand-written impl) — only the top level is dropped.
+        let mut nested = serde_json::json!({"properties": {"x": {"title": "AnyValue"}}});
+        let obj = nested.as_object_mut().unwrap();
+        drop_struct_name_title(obj);
+        assert_eq!(obj["properties"]["x"]["title"], "AnyValue");
+    }
+
+    /// Issue #82, the part that reached the wire by accident: schemars promotes a
+    /// STRUCT-level `///` into the schema's top-level `description`, and `inputSchema` is
+    /// shipped to every client on every tools/list. The #82 rationale sat there as 761
+    /// characters naming serde, schemars, `drop_default_additional_properties` and issue
+    /// numbers — context spent on every call, and the only top-level description in the
+    /// interop 23. Per-property docs are caller-facing and stay; the rationale is a `//`
+    /// comment in the source.
+    #[test]
+    fn get_log_schema_ships_no_maintainer_commentary() {
+        let schema = serde_json::to_value(schemars::schema_for!(GetLogParams)).unwrap();
+        assert!(
+            schema.get("description").is_none(),
+            "a struct-level `///` became wire traffic — make it `//`: {}",
+            schema["description"]
+        );
+        let text = schema.to_string();
+        for jargon in [
+            "serde",
+            "schemars",
+            "Deserialize",
+            "drop_default_additional_properties",
+            "GetLogIssue",
+        ] {
+            assert!(
+                !text.contains(jargon),
+                "the advertised schema names the Rust internal '{jargon}': {text}"
+            );
+        }
+        // …and the caller-facing property docs are still there.
+        assert!(schema["properties"]["limit"]["description"].is_string());
+    }
+
     /// `normalize_schema_openapi3` lists "additionalProperties" among the keys it relocates
     /// into an `anyOf` branch — but only where the schema has a nullable TYPE ARRAY.
     /// GetLogParams' top level is `"type": "object"`, so it must never take that path.
@@ -6105,6 +7016,10 @@ mod schema_normalization_tests {
         assert!(
             obj["properties"]["id"]["anyOf"].is_array(),
             "the nullable rewrite must still fire on Option<String>: {obj:?}"
+        );
+        assert!(
+            obj["properties"]["log_id"]["anyOf"].is_array(),
+            "#82: the newly declared log_id must take the same nullable path as id: {obj:?}"
         );
         assert_eq!(
             obj["additionalProperties"],
@@ -6463,6 +7378,645 @@ mod no_tests_found_guidance_tests {
     }
 }
 
+// ── Issue #88: /docnames wildcard expansion ───────────────────────────────────
+#[cfg(test)]
+mod wildcard_listing_failure_tests {
+    use super::*;
+    use crate::iris::connection::{DiscoverySource, IrisConnection};
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// #88 follow-up: the guard lives on the expansion, so when the LISTING cannot be read
+    /// there is nothing to apply it to. The old `_ => vec![p.target.clone()]` fallback handed
+    /// the raw pattern to /action/compile — the cap and the scope rule silently off exactly
+    /// when the instance is unhealthy. Every other #88 test drives the pure expansion; this
+    /// one drives the call site, which is where the hole was.
+    #[test]
+    fn a_wildcard_fails_when_the_listing_cannot_be_read_and_never_reaches_compile() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let server = MockServer::start().await;
+
+            // The listing is down...
+            Mock::given(method("GET"))
+                .and(path_regex(r".*/docnames/CLS$"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&server)
+                .await;
+            // ...and /action/compile must NEVER be called. `expect(0)` is asserted on drop.
+            Mock::given(method("POST"))
+                .and(path_regex(r".*/action/compile$"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .mount(&server)
+                .await;
+
+            let conn = IrisConnection::new(
+                server.uri(),
+                "APP",
+                "_SYSTEM",
+                "SYS",
+                DiscoverySource::EnvVar,
+            );
+            let tools = IrisTools::new_with_toolset(Some(conn), Toolset::Interop).unwrap();
+
+            let r = tools
+                .iris_compile(rmcp::handler::server::wrapper::Parameters(CompileParams {
+                    target: "APPPKG.*".into(),
+                    flags: "cuk".into(),
+                    namespace: None,
+                    force_writable: false,
+                    inline: false,
+                }))
+                .await
+                .expect("the tool must answer, not error out of the transport");
+
+            assert_eq!(r.is_error, Some(true), "a wildcard must FAIL, not guess");
+            let text = match &r.content[0].raw {
+                rmcp::model::RawContent::Text(t) => t.text.clone(),
+                _ => panic!("expected text content"),
+            };
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(v["error_code"], "LISTING_UNAVAILABLE", "{v}");
+            assert!(
+                v["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Nothing was compiled"),
+                "the caller must be told nothing happened: {v}"
+            );
+            assert_eq!(v["pattern"], "APPPKG.*");
+        });
+    }
+}
+
+#[cfg(test)]
+mod docname_expansion_tests {
+    use super::*;
+
+    /// The exact production pair: parse the listing once, expand over it. `iris_compile`
+    /// calls these two in this order.
+    fn expand(body: &serde_json::Value, pattern: &str) -> WildcardExpansion {
+        expand_wildcard_target(&docnames_in_body(body), pattern)
+    }
+
+    /// The documents a pattern would compile. Panics on a refusal — the refusal tests below
+    /// assert the outcome itself, so anything reaching this helper is expected to expand.
+    fn expand_wildcard_targets(body: &serde_json::Value, pattern: &str) -> Vec<String> {
+        match expand(body, pattern) {
+            WildcardExpansion::Matched(v) => v,
+            other => panic!("'{pattern}' was refused, expected an expansion: {other:?}"),
+        }
+    }
+
+    /// Verbatim element shape from `GET /api/atelier/v1/APP/docnames/CLS` on IRIS 2026.1 —
+    /// objects, and `name` carries the `.cls` extension. Both facts broke the old parser.
+    fn object_body() -> serde_json::Value {
+        serde_json::json!({"status":{"errors":[],"summary":""},"console":[],"result":{"content":[
+            {"cat":"CLS","db":"IRISLIB","gen":false,"name":"%Api.Atelier.v1.cls",
+             "ts":"2026-04-07 15:16:26.154","upd":true},
+            {"cat":"CLS","db":"APP-CODE","gen":false,"name":"APPPKG.FoundationProduction.cls",
+             "ts":"2026-08-01 09:00:00.000","upd":true},
+            {"cat":"CLS","db":"APP-CODE","gen":false,"name":"WebTerminal.Common.cls",
+             "ts":"2026-08-01 09:00:00.000","upd":true},
+            {"cat":"CLS","db":"APP-CODE","gen":false,"name":"WebTerminal.Core.cls",
+             "ts":"2026-08-01 09:00:00.000","upd":true}
+        ]}})
+    }
+
+    /// The shape older builds return — the only one the old code handled. Must keep working.
+    fn string_body() -> serde_json::Value {
+        serde_json::json!({"result":{"content":[
+            "APPPKG.FoundationProduction.cls", "WebTerminal.Common.cls"
+        ]}})
+    }
+
+    /// The exact call from the issue: NOT_FOUND before the fix, on a class that exists.
+    #[test]
+    fn test_expand_object_shape_package_wildcard() {
+        assert_eq!(
+            expand_wildcard_targets(&object_body(), "APPPKG.*"),
+            vec!["APPPKG.FoundationProduction.cls"]
+        );
+    }
+
+    #[test]
+    fn test_expand_object_shape_prefix_wildcard() {
+        assert_eq!(
+            expand_wildcard_targets(&object_body(), "WebTerminal.C*"),
+            vec!["WebTerminal.Common.cls", "WebTerminal.Core.cls"]
+        );
+    }
+
+    #[test]
+    fn test_expand_string_shape_still_works() {
+        assert_eq!(
+            expand_wildcard_targets(&string_body(), "APPPKG.*"),
+            vec!["APPPKG.FoundationProduction.cls"]
+        );
+        assert_eq!(
+            expand_wildcard_targets(&string_body(), "WebTerminal.C*"),
+            vec!["WebTerminal.Common.cls"]
+        );
+    }
+
+    #[test]
+    fn test_expand_pattern_with_explicit_extension() {
+        assert_eq!(
+            expand_wildcard_targets(&object_body(), "APPPKG.*.cls"),
+            expand_wildcard_targets(&object_body(), "APPPKG.*")
+        );
+    }
+
+    /// The half of the bug the issue's suggested one-liner missed: `name` carries `.cls`,
+    /// so a pattern with a non-wildcard tail matches nothing unless the name is stripped
+    /// to its stem first.
+    #[test]
+    fn test_expand_matches_when_pattern_omits_extension() {
+        assert_eq!(
+            expand_wildcard_targets(&object_body(), "APPPKG.FoundationProductio*n"),
+            vec!["APPPKG.FoundationProduction.cls"]
+        );
+        assert!(
+            expand_wildcard_targets(&object_body(), "APPPKG.FoundationProductio*nX").is_empty()
+        );
+    }
+
+    /// A `%` pattern reaches the system documents; nothing else does.
+    #[test]
+    fn test_expand_reaches_system_docs_only_for_a_system_pattern() {
+        assert_eq!(
+            expand_wildcard_targets(&object_body(), "%Api.*"),
+            vec!["%Api.Atelier.v1.cls"]
+        );
+        // The one pattern that could otherwise pull `%Api.Atelier.v1` in behind a package
+        // wildcard is a leading `*` — and that is refused outright, below.
+        assert!(!expand_wildcard_targets(&object_body(), "APPPKG.*")
+            .iter()
+            .any(|n| n.starts_with('%')));
+    }
+
+    // ── #88 follow-up: the guard. Before it, `iris_compile {"target":"*"}` expanded to
+    //    every non-% class in the namespace (10094 in APP) and POSTed them all to
+    //    /action/compile in ONE request — no dry run, no confirmation, from a typo. ──
+
+    /// (a) Nothing literal before the first `*`: refused, never expanded.
+    #[test]
+    fn test_unqualified_wildcard_is_refused_not_expanded() {
+        for pattern in ["*", "*.cls", "*Foo", "*.*", "**"] {
+            assert_eq!(
+                expand(&object_body(), pattern),
+                WildcardExpansion::Unqualified,
+                "'{pattern}' names no package — it must be refused, not expanded"
+            );
+        }
+    }
+
+    /// …and the same patterns are refused by the predicate the handler calls BEFORE it
+    /// fetches a 15810-name listing, so the refusal costs no round trip.
+    #[test]
+    fn test_unqualified_is_decided_from_the_pattern_alone() {
+        for pattern in ["*", "*.cls", "*Foo"] {
+            assert!(wildcard_target_is_unqualified(pattern), "{pattern}");
+        }
+        for pattern in ["APPPKG.*", "WebTerminal.C*", "%Api.*", "Odd\\Name*", "A*"] {
+            assert!(!wildcard_target_is_unqualified(pattern), "{pattern}");
+        }
+    }
+
+    /// A body of `n` classes in one package — the shape a real package wildcard meets.
+    fn package_body(n: usize) -> serde_json::Value {
+        let content: Vec<serde_json::Value> = (0..n)
+            .map(|i| serde_json::json!({"cat":"CLS","name":format!("Big.Pkg.C{i}.cls")}))
+            .collect();
+        serde_json::json!({ "result": { "content": content } })
+    }
+
+    /// (b) A qualified pattern that still selects too much is refused WITH the count.
+    #[test]
+    fn test_expansion_over_the_cap_is_refused_with_the_count() {
+        assert_eq!(
+            expand(&package_body(WILDCARD_EXPANSION_CAP + 1), "Big.Pkg.*"),
+            WildcardExpansion::TooBroad {
+                matched: WILDCARD_EXPANSION_CAP + 1
+            }
+        );
+        // The count is the REAL one, not the cap: the error has to tell the caller how far
+        // over they are, or "narrow it" is a guess.
+        assert_eq!(
+            expand(&package_body(4000), "Big.Pkg.*"),
+            WildcardExpansion::TooBroad { matched: 4000 }
+        );
+    }
+
+    /// The cap is inclusive — exactly `WILDCARD_EXPANSION_CAP` documents still compile, so
+    /// the boundary is not an off-by-one refusal.
+    #[test]
+    fn test_expansion_at_the_cap_still_compiles() {
+        match expand(&package_body(WILDCARD_EXPANSION_CAP), "Big.Pkg.*") {
+            WildcardExpansion::Matched(v) => assert_eq!(v.len(), WILDCARD_EXPANSION_CAP),
+            other => panic!("{WILDCARD_EXPANSION_CAP} documents must compile: {other:?}"),
+        }
+    }
+
+    /// The refusal is on the MATCH count, not the listing size: a narrow pattern over a
+    /// huge namespace is fine.
+    #[test]
+    fn test_a_narrow_pattern_over_a_huge_listing_is_not_too_broad() {
+        let mut body = package_body(4000);
+        body["result"]["content"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"cat":"CLS","name":"Small.Pkg.Only.cls"}));
+        assert_eq!(
+            expand_wildcard_targets(&body, "Small.Pkg.*"),
+            vec!["Small.Pkg.Only.cls"]
+        );
+    }
+
+    /// (d) `Pkg.Class.*` is the SUBPACKAGE of Pkg.Class, never Pkg.Class itself.
+    ///
+    /// It compiled it before: /docnames names carry the extension, so `^Pkg\.Class\..*$`
+    /// matched the literal document "Pkg.Class.cls" — the `.cls` filled the `.*`. A typo'd
+    /// subpackage came back as a successful one-class compile instead of NOT_FOUND.
+    #[test]
+    fn test_trailing_wildcard_does_not_match_the_parent_document() {
+        let body = serde_json::json!({"result":{"content":[
+            {"cat":"CLS","name":"Pkg.Class.cls"},
+            {"cat":"CLS","name":"Pkg.Class.Sub.cls"}
+        ]}});
+        // The subpackage exists: only IT is selected.
+        assert_eq!(
+            expand_wildcard_targets(&body, "Pkg.Class.*"),
+            vec!["Pkg.Class.Sub.cls"]
+        );
+        // Spelling the extension out must not change that.
+        assert_eq!(
+            expand_wildcard_targets(&body, "Pkg.Class.*.cls"),
+            vec!["Pkg.Class.Sub.cls"]
+        );
+        // And a typo'd subpackage is a MISS — an empty expansion the caller sees as
+        // NOT_FOUND — not a quiet compile of the parent class.
+        let only_parent = serde_json::json!({"result":{"content":[
+            {"cat":"CLS","name":"Pkg.Class.cls"}
+        ]}});
+        assert!(
+            expand_wildcard_targets(&only_parent, "Pkg.Class.*").is_empty(),
+            "'Pkg.Class.*' must not compile 'Pkg.Class'"
+        );
+        assert!(expand_wildcard_targets(&only_parent, "Pkg.Clas.*").is_empty());
+    }
+
+    /// The stem strip is on the pattern too, and ONLY for `.cls`: the listing is
+    /// /docnames/CLS, so a `.mac` wildcard must match nothing and fall through to the
+    /// NOT_FOUND that says "compile a routine by its exact name" — not silently compile
+    /// the package's classes.
+    #[test]
+    fn test_routine_extension_wildcards_match_no_class() {
+        for pattern in ["APPPKG.*.mac", "APPPKG.*.int", "APPPKG.*.inc"] {
+            assert!(
+                expand_wildcard_targets(&object_body(), pattern).is_empty(),
+                "'{pattern}' asks for a routine; the CLS listing holds none"
+            );
+        }
+    }
+
+    #[test]
+    fn test_expand_is_case_insensitive() {
+        assert_eq!(
+            expand_wildcard_targets(&object_body(), "apppkg.*"),
+            vec!["APPPKG.FoundationProduction.cls"]
+        );
+    }
+
+    /// A pattern that matches nothing must expand to nothing — the old `.unwrap_or(".*")`
+    /// fallback would have turned a typo into a namespace-wide recompile.
+    #[test]
+    fn test_expand_unmatchable_pattern_returns_empty() {
+        // `[` is a literal character in a docname pattern, so this asks for a document
+        // whose name begins `A[` — there is none.
+        assert!(expand_wildcard_targets(&object_body(), "A[*").is_empty());
+        assert!(expand_wildcard_targets(&object_body(), "ZzNoSuchPkg.*").is_empty());
+    }
+
+    /// `*` is the ONLY metacharacter. Everything else is literal, and a target that names
+    /// no real document must compile no real document.
+    ///
+    /// Measured against live IRIS before the escape was made total: `ZZVerify88.Goo?dA*`
+    /// and `ZZVerify88.G(o)odA*` both returned success:true and compiled ZZVerify88.GoodA,
+    /// a class neither pattern names.
+    #[test]
+    fn test_expand_treats_regex_metacharacters_as_literal() {
+        for pattern in [
+            "APPPKG.Foundatio?nProduction*", // `?` made the preceding char optional
+            "APPPKG.(F)oundationProduction*", // a group matched its own contents
+            "APPPKG.Foundation+Production*",
+            "APPPKG.FoundationProductio{1}n*",
+            "APPPKG.FoundationProduction$*",
+            "APPPKG.^FoundationProduction*",
+        ] {
+            assert!(
+                expand_wildcard_targets(&object_body(), pattern).is_empty(),
+                "'{pattern}' names no document, so it must compile none"
+            );
+        }
+    }
+
+    /// The escalation: one `|` anchored `^` to the LEFT branch only, so the right branch
+    /// matched EVERY document the namespace lists (12744 on the dev instance) and
+    /// iris_compile would have POSTed a namespace-wide recompile with flags "cuk".
+    #[test]
+    fn test_a_pipe_in_a_target_cannot_select_the_whole_namespace() {
+        for pattern in [
+            "APPPKG.FoundationProduction|*",
+            "A|*",
+            "APPPKG.FoundationProduction|WebTerminal.Common",
+        ] {
+            let got = expand_wildcard_targets(&object_body(), pattern);
+            assert!(
+                got.is_empty(),
+                "'{pattern}' must be read literally, not as regex alternation — it \
+                 selected {got:?}"
+            );
+        }
+        // `*|APPPKG.*` now never even reaches the matcher: it starts with `*`.
+        assert_eq!(
+            expand(&object_body(), "*|APPPKG.*"),
+            WildcardExpansion::Unqualified
+        );
+        // …while the same names, spelled as the two real targets they are, still work.
+        assert_eq!(
+            expand_wildcard_targets(&object_body(), "APPPKG.FoundationProduction*"),
+            vec!["APPPKG.FoundationProduction.cls"]
+        );
+    }
+
+    /// A backslash is a literal character in a document name pattern, not an escape.
+    #[test]
+    fn test_backslash_is_literal() {
+        let body = serde_json::json!({"result":{"content":["Odd\\Name.cls", "OddName.cls"]}});
+        assert_eq!(
+            expand_wildcard_targets(&body, "Odd\\Name*"),
+            vec!["Odd\\Name.cls"]
+        );
+    }
+
+    /// (a)/(b) again, at the surface the caller actually reads. A refusal is only useful if
+    /// it names the problem AND the way out; the cap one has to carry the count, or
+    /// "narrow it" is a guess.
+    #[test]
+    fn test_refusal_envelopes_name_the_pattern_and_the_fix() {
+        let payload = |r: &CallToolResult| -> serde_json::Value {
+            let text = match &r.content[0].raw {
+                rmcp::model::RawContent::Text(t) => &t.text,
+                _ => panic!("expected text content"),
+            };
+            serde_json::from_str(text).unwrap()
+        };
+
+        let r = unqualified_wildcard_error("*", "APP").unwrap();
+        assert_eq!(r.is_error, Some(true));
+        let v = payload(&r);
+        assert_eq!(v["error_code"], "SCOPE_REQUIRED");
+        let msg = v["error"].as_str().unwrap();
+        assert!(msg.contains("'*'") && msg.contains("APP"), "{msg}");
+        assert!(msg.contains("Qualify it with a package"), "{msg}");
+
+        let r = too_broad_wildcard_error("HS.FHIR.*", "APP", 3719).unwrap();
+        assert_eq!(r.is_error, Some(true));
+        let v = payload(&r);
+        assert_eq!(v["error_code"], "TOO_BROAD");
+        assert_eq!(v["matched"], 3719);
+        assert_eq!(v["limit"], WILDCARD_EXPANSION_CAP);
+        let msg = v["error"].as_str().unwrap();
+        assert!(
+            msg.contains("3719"),
+            "the COUNT must be in the message: {msg}"
+        );
+        assert!(msg.contains("HS.FHIR.*"), "{msg}");
+        assert!(
+            msg.contains("Nothing was compiled"),
+            "the caller must know the refusal was total: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_docnames_in_body_ignores_junk_elements() {
+        let body = serde_json::json!({"result":{"content":[
+            42, null, {"nope": 1}, "Ok.cls"
+        ]}});
+        assert_eq!(docnames_in_body(&body), vec!["Ok.cls"]);
+    }
+
+    #[test]
+    fn test_docnames_in_body_missing_result() {
+        assert!(docnames_in_body(&serde_json::json!({})).is_empty());
+    }
+}
+
+// ── Issue #80: compile-console diagnostics ────────────────────────────────────
+#[cfg(test)]
+mod console_diag_tests {
+    use super::*;
+
+    fn err(raw: &str) -> Option<ConsoleDiag> {
+        parse_console_diag(raw, "ERROR:", "ERROR ")
+    }
+
+    /// Real line captured from this build: `ERROR:` with a colon, which the old
+    /// `strip_prefix("ERROR ")` never matched.
+    #[test]
+    fn test_error_colon_method_line() {
+        let d = err(
+            "ERROR: Zz.Broken.cls(M1+2) #1002: Invalid character in tag : \
+             '$$$Zz8880UndefinedMacro1' : Offset:15 [M1+1^Zz.Broken.1]",
+        )
+        .expect("a colon-prefixed diagnostic must parse");
+        assert_eq!(d.code, "1002");
+        assert_eq!(d.location, "M1+2");
+        assert_eq!(d.line, 0);
+        assert!(d.text.starts_with("Zz.Broken.cls(M1+2)"), "{}", d.text);
+        assert!(
+            d.text.contains("Offset:15"),
+            "the whole line must survive — the old splitn(3, ':') cut it: {}",
+            d.text
+        );
+    }
+
+    #[test]
+    fn test_error_colon_routine_line() {
+        let d = err("ERROR:  Zz.Broken.1(3) : MPP5610 : Referenced macro not defined: 'X'")
+            .expect("a routine-level diagnostic must parse");
+        assert_eq!(d.code, "MPP5610");
+        assert_eq!(d.line, 3);
+        assert_eq!(d.location, "Zz.Broken.1");
+    }
+
+    /// IRIS repeats a bare document name as a header once per routine error; it carries
+    /// nothing and must not inflate the count (or the truncation threshold).
+    #[test]
+    fn test_error_colon_bare_docname_is_skipped() {
+        assert!(err("ERROR: Zz.Broken.cls").is_none());
+        assert!(err("ERROR: ").is_none());
+    }
+
+    /// Regression guard for the old re-slicing: the message contains colons of its own.
+    #[test]
+    fn test_error_space_shape_still_parsed() {
+        let d = err("ERROR #5373: Class 'Zz8880No.Such.Type1', used by 'Zz.Broken2:property:P1', does not exist")
+            .expect("the classic space-prefixed shape must still parse");
+        assert_eq!(d.code, "5373");
+        assert_eq!(d.line, 0);
+        assert!(d.text.ends_with("does not exist"), "{}", d.text);
+        assert!(d.text.contains("Zz8880No.Such.Type1"), "{}", d.text);
+    }
+
+    #[test]
+    fn test_error_space_shape_with_line() {
+        let d = err("ERROR #5001:12: Something bad").expect("must parse");
+        assert_eq!(d.code, "5001");
+        assert_eq!(d.line, 12);
+    }
+
+    /// A parenthesis inside prose is not a location.
+    #[test]
+    fn test_parenthesis_in_prose_is_not_a_location() {
+        let d = err("ERROR #5030: An error occurred while compiling class (Zz.Broken)")
+            .expect("must parse");
+        assert_eq!(d.code, "5030");
+        assert_eq!(d.location, "");
+    }
+
+    #[test]
+    fn test_text_line_is_not_an_error() {
+        for raw in [
+            " TEXT:     set x = $$$Zz8880UndefinedMacro1",
+            "Compilation started on 08/26/2026 10:00:00 with qualifiers 'cuk'",
+            "Detected 16 errors during compilation in 0.005s.",
+            "Skipping class Zz.Broken2",
+            "Compilation finished successfully in 0.003s.",
+        ] {
+            assert!(err(raw).is_none(), "{raw} must not be a diagnostic");
+        }
+    }
+
+    /// The WARNING shape is unmeasured on this build — assert only that the same parser
+    /// recognises both prefixes, not that IRIS emits either one.
+    #[test]
+    fn test_warning_colon_and_space() {
+        for raw in [
+            "WARNING: Zz.Broken.cls(M1+2) #6001: Something questionable",
+            "WARNING #6001:4: Something questionable",
+        ] {
+            let d = parse_console_diag(raw, "WARNING:", "WARNING ")
+                .unwrap_or_else(|| panic!("{raw} must parse"));
+            assert_eq!(d.code, "6001");
+        }
+        assert!(parse_console_diag(
+            "ERROR: Zz.Broken.cls(M1+2) #1002: x",
+            "WARNING:",
+            "WARNING "
+        )
+        .is_none());
+    }
+
+    /// The #80 arithmetic, offline: a 12-broken-method class produced 65 console lines and
+    /// "Detected 24 errors during compilation". Today's parser finds ONE (the status.errors
+    /// wrapper). The new one finds enough to clear the default IRIS_INLINE_COMPILE
+    /// threshold of 20, which is what makes compile truncation reachable at all.
+    #[test]
+    fn test_broken_class_console_now_clears_the_truncation_threshold() {
+        let mut console: Vec<String> =
+            vec!["Compilation started on 08/26/2026 10:00:00 with qualifiers 'cuk'".into()];
+        for i in 0..12 {
+            console.push("ERROR: Zz.Broken3.cls".into());
+            console.push(format!(
+                "ERROR:  Zz.Broken3.1({}) : MPP5610 : Referenced macro not defined: 'Zz{i}'",
+                i + 3
+            ));
+            console.push(format!(" TEXT:     set x = $$$Zz{i}"));
+        }
+        for i in 0..12 {
+            console.push(format!(
+                "ERROR: Zz.Broken3.cls(M{i}+2) #1002: Invalid character in tag : '$$$Zz{i}' : \
+                 Offset:15 [M{i}+1^Zz.Broken3.1]"
+            ));
+            console.push(format!(" TEXT:     set x = $$$Zz{i}"));
+        }
+        console.push("Detected 24 errors during compilation in 0.007s.".into());
+
+        // The status.errors wrapper the real response carries first. Verbatim shape from
+        // the live run: a MULTI-LINE blob that embeds the FIRST per-method message inside
+        // itself. Under a plain `contains` dedup that swallowed macro 1's routine-level
+        // entry while macros 2-12 survived — N broken methods, N-1 entries.
+        let mut errors: Vec<serde_json::Value> = vec![serde_json::json!({
+            "severity":"error","code":"","line":0,"column":0,"location":"",
+            "text":"ERROR #5475: Error compiling routine: Zz.Broken3.  Errors:  \
+                    Zz.Broken3.cls\r\nERROR:  Zz.Broken3.1(3) : MPP5610 : Referenced macro \
+                    not defined: 'Zz0'\r\n TEXT: \tset x = $$$Zz0"
+        })];
+        for raw in &console {
+            if let Some(d) = parse_console_diag(raw, "ERROR:", "ERROR ") {
+                if !console_diag_already_reported(&errors, &d.text) {
+                    errors.push(serde_json::json!({
+                        "severity":"error","code":d.code,"line":d.line,
+                        "column":0,"location":d.location,"text":d.text
+                    }));
+                }
+            }
+        }
+        assert_eq!(
+            errors.len(),
+            25,
+            "1 status.errors wrapper + 12 MPP5610 + 12 #1002; the 12 repeated bare-docname \
+             headers must be dropped, and the multi-line wrapper must NOT swallow the \
+             first method's entry: {errors:#?}"
+        );
+        // The asymmetry the substring dedup introduced: every broken method must be
+        // individually addressable, the first one included.
+        for i in 0..12 {
+            assert!(
+                errors.iter().any(|e| {
+                    e["code"] == "MPP5610"
+                        && e["text"]
+                            .as_str()
+                            .unwrap_or("")
+                            .contains(&format!("'Zz{i}'"))
+                }),
+                "macro Zz{i} has no routine-level entry of its own: {errors:#?}"
+            );
+        }
+        // …and a status error that really does repeat a console line is still deduped.
+        let single = vec![serde_json::json!({
+            "severity":"error","code":"","line":0,"column":0,"location":"",
+            "text":"ERROR #5373: Class 'No.Such', used by 'Zz.Broken3:property:P1', does not exist"
+        })];
+        let d = parse_console_diag(
+            "ERROR #5373: Class 'No.Such', used by 'Zz.Broken3:property:P1', does not exist",
+            "ERROR:",
+            "ERROR ",
+        )
+        .expect("must parse");
+        assert!(
+            console_diag_already_reported(&single, &d.text),
+            "a single-line status error still stands in for its console line"
+        );
+        assert!(
+            errors.len() > log_store::read_inline_threshold("IRIS_INLINE_COMPILE", 20),
+            "truncation must now be reachable in the default profile"
+        );
+        // Every per-method entry must be individually addressable, and every entry —
+        // the status.errors wrapper included — must carry the key.
+        assert!(errors.iter().all(|e| e["location"].is_string()));
+        assert!(errors[1..]
+            .iter()
+            .all(|e| !e["location"].as_str().unwrap_or("").is_empty()));
+    }
+}
+
 // ── Issue #78: iris_get_log addressing ────────────────────────────────────────
 #[cfg(test)]
 mod get_log_params_tests {
@@ -6497,8 +8051,47 @@ mod get_log_params_tests {
         (store, ids)
     }
 
+    /// Stores one entry under an EXACT id (the numeric-coercion tests need a known id).
+    fn store_one_with_id(id: &str, items: usize) -> Arc<Mutex<log_store::LogStore>> {
+        let store = empty_store();
+        let rows: Vec<serde_json::Value> =
+            (0..items).map(|j| serde_json::json!({"row": j})).collect();
+        store.lock().unwrap().store(log_store::LogEntry {
+            id: id.to_string(),
+            tool: "iris_test".to_string(),
+            created_at: std::time::Instant::now(),
+            preview: rows.iter().take(1).cloned().collect(),
+            full_result: serde_json::Value::Array(rows.clone()),
+            total_count: rows.len(),
+        });
+        store
+    }
+
+    /// The shape `iris_test` really stores (mod.rs builds `{test_suites, raw_output}`) —
+    /// an OBJECT, not a list. `iris_test` is the tool this store's own empty-index note
+    /// sends the agent to, so it is the entry shape pagination meets in practice.
+    fn store_object_entry(total: usize) -> (Arc<Mutex<log_store::LogStore>>, String) {
+        let store = empty_store();
+        let id = log_store::new_log_id();
+        store.lock().unwrap().store(log_store::LogEntry {
+            id: id.clone(),
+            tool: "iris_test".to_string(),
+            created_at: std::time::Instant::now(),
+            preview: vec![],
+            full_result: serde_json::json!({
+                "test_suites": [{"name": "S", "tests": total}],
+                "raw_output": "All PASSED",
+            }),
+            total_count: total,
+        });
+        (store, id)
+    }
+
+    /// Issue #81: this `expect` is itself an assertion — rmcp turns any deserialize failure
+    /// into a raw JSON-RPC -32602 that bypasses the issue-#2 envelope, so EVERY payload in
+    /// this module must survive `from_value`.
     fn parse(v: serde_json::Value) -> GetLogParams {
-        serde_json::from_value(v).expect("GetLogParams must deserialize")
+        serde_json::from_value(v).expect("#81: GetLogParams must never fail to deserialize")
     }
 
     fn payload(r: &CallToolResult) -> serde_json::Value {
@@ -6566,9 +8159,16 @@ mod get_log_params_tests {
         assert_eq!(v["unknown_params"], serde_json::json!(["logid"]));
         assert_eq!(
             v["valid_params"],
-            serde_json::json!(["id", "limit", "offset"])
+            // #82: log_id is a declared parameter now, so the error names it too.
+            serde_json::json!(["id", "log_id", "limit", "offset"])
         );
-        assert_eq!(v["did_you_mean"], serde_json::json!(["id"]));
+        assert_eq!(
+            v["did_you_mean"],
+            serde_json::json!(["log_id", "id"]),
+            "#82: `logid` is one edit from the DECLARED `log_id`, and log_id is the name \
+             the truncating tool handed the caller — suggesting only `id` sends them to \
+             the parameter they were not reaching for: {v}"
+        );
         assert!(
             v.get("logs").is_none(),
             "an error must not also look like the index: {v}"
@@ -6623,8 +8223,9 @@ mod get_log_params_tests {
         }
     }
 
-    /// The unknown-key check is deliberately gated on `id.is_none()`: with `id` present the
-    /// response shape is unambiguous, so an extra key cannot be mistaken for the index.
+    /// With `id` present the response shape is unambiguous, so an extra key cannot be
+    /// mistaken for the index — the call still answers the id. Issue #84: it is no longer
+    /// SILENT about the key, though; the guard used to run only when `id` was absent.
     #[test]
     fn an_unknown_key_alongside_id_still_answers_the_id() {
         let store = empty_store();
@@ -6634,6 +8235,11 @@ mod get_log_params_tests {
         );
         assert_eq!(r.is_error, Some(true));
         assert_eq!(v["error_code"], "LOG_NOT_FOUND");
+        assert_eq!(
+            v["warnings"][0]["unknown_params"],
+            serde_json::json!(["tool"]),
+            "#84: the typo must be named even though the id was answered: {v}"
+        );
     }
 
     /// `_meta` and friends are client/protocol markers, never tool parameters.
@@ -6654,12 +8260,100 @@ mod get_log_params_tests {
             "log id",
             "entryid",
             "log_entry_id",
+            // The `id` family. These reached the caller with no `did_you_mean` at all: the
+            // normaliser folds them to `id`, which was not a listed spelling, so the near
+            // miss of the SHORTER addressing key — the one whose case is easiest to
+            // fumble — was the one the tool stayed silent about.
+            "ID",
+            "Id",
+            "id_",
+            "i-d",
         ] {
             assert!(is_log_id_near_miss(k), "{k} must be a near miss");
         }
-        for k in ["session_id", "tool", "namespace", "limit", "id"] {
+        for k in ["session_id", "tool", "namespace", "limit"] {
             assert!(!is_log_id_near_miss(k), "{k} must NOT be a near miss");
         }
+        // The exact declared keys never reach this function — the deserializer consumes
+        // them — so listing them here would test nothing. What matters is that a VARIANT
+        // spelling of either one gets the same suggestion.
+        let store = empty_store();
+        for k in ["ID", "Id", "id_", "log-id"] {
+            let (_r, v) = call(&store, serde_json::json!({ k: "whatever" }));
+            assert_eq!(
+                v["did_you_mean"],
+                serde_json::json!(GET_LOG_ID_SUGGESTIONS),
+                "'{k}' is one keystroke from an addressing key and must be told so: {v}"
+            );
+        }
+    }
+
+    /// A BLANK addressing key means absent, exactly as `null` does (#81). Only `null` was
+    /// treated that way, so `{"id":"<valid>","log_id":""}` was a hard conflict while the
+    /// same payload with `null` succeeded — one dialect of "I am not using this field"
+    /// worked and the other failed.
+    #[test]
+    fn a_blank_addressing_key_is_absent_not_a_conflict() {
+        let (store, ids) = store_with(1, 3);
+        for blank in ["", "   "] {
+            let (r, v) = call(&store, serde_json::json!({"id": ids[0], "log_id": blank}));
+            assert_ne!(r.is_error, Some(true), "'{blank}' must not conflict: {v}");
+            assert_eq!(v["total_count"], 3);
+
+            let (r, v) = call(&store, serde_json::json!({"id": blank, "log_id": ids[0]}));
+            assert_ne!(r.is_error, Some(true), "'{blank}' must not conflict: {v}");
+            assert_eq!(v["total_count"], 3);
+        }
+    }
+
+    /// …and a blank id ALONE falls back to the index, rather than answering LOG_NOT_FOUND
+    /// "with id ''" — an id nobody passed.
+    #[test]
+    fn a_blank_id_alone_lists_the_index() {
+        let (store, _ids) = store_with(2, 1);
+        for args in [
+            serde_json::json!({"id": ""}),
+            serde_json::json!({"log_id": ""}),
+            serde_json::json!({"id": "", "log_id": ""}),
+        ] {
+            let (r, v) = call(&store, args.clone());
+            assert_ne!(r.is_error, Some(true), "{args} -> {v}");
+            assert_eq!(v["total_count"], 2, "{args} -> {v}");
+            assert!(v["logs"].is_array(), "{args} -> {v}");
+        }
+    }
+
+    /// Every surface that reports parameters reports BOTH lists. `namespace` is accepted
+    /// and ignored, but it was absent from `valid_params`, so a client reading that array
+    /// programmatically concluded the call it had just made successfully was invalid.
+    #[test]
+    fn every_param_report_names_the_accepted_and_ignored_keys() {
+        let (store, ids) = store_with(1, 3);
+        let reports = [
+            // unknown key, no id -> fatal
+            call(&store, serde_json::json!({"nope": 1})).1,
+            // unknown key WITH an id -> warning on a successful answer
+            call(&store, serde_json::json!({"id": ids[0], "nope": 1})).1["warnings"][0].clone(),
+            // unusable value -> fatal
+            call(&store, serde_json::json!({"id": []})).1,
+            // limit 0 -> fatal
+            call(&store, serde_json::json!({"limit": 0})).1,
+        ];
+        for v in reports {
+            assert_eq!(
+                v["valid_params"],
+                serde_json::json!(GET_LOG_VALID_PARAMS),
+                "{v}"
+            );
+            assert_eq!(
+                v["accepted_and_ignored"],
+                serde_json::json!(["namespace"]),
+                "a key the tool accepts must not read as invalid: {v}"
+            );
+        }
+        // …and `namespace` is genuinely accepted: it is never reported as unknown.
+        let (r, v) = call(&store, serde_json::json!({"namespace": "APP"}));
+        assert_ne!(r.is_error, Some(true), "{v}");
     }
 
     #[test]
@@ -6669,8 +8363,9 @@ mod get_log_params_tests {
         assert_eq!(v["unknown_params"], serde_json::json!(["alpha", "zeta"]));
     }
 
-    /// `#[serde(flatten)]` switches the struct onto serde's buffered content deserializer —
-    /// pin that limit/offset still deserialize and validate exactly as before.
+    /// `GetLogParams` carries a hand-written `Deserialize` (issue #81) alongside the
+    /// leftover-capture map — pin that limit/offset still deserialize and validate exactly
+    /// as before.
     #[test]
     fn pagination_and_limit_validation_survive_the_flatten() {
         let (store, ids) = store_with(1, 5);
@@ -6687,17 +8382,436 @@ mod get_log_params_tests {
         assert_eq!(r.is_error, Some(true));
         assert_eq!(v["error_code"], "INVALID_PARAMS");
         assert!(v["error"].as_str().unwrap().contains("limit must be > 0"));
+        assert!(
+            v["hint"].is_string() && v["valid_params"].is_array(),
+            "this was the one INVALID_PARAMS in the tool that taught the caller nothing: {v}"
+        );
     }
 
-    /// Both addressing keys at once is a serde `duplicate field` error, which rmcp surfaces
-    /// as a JSON-RPC -32602 frame — NOT the issue-#2 envelope. Loud rather than silent, which
-    /// is the property that matters here; pinned so a future reader is not surprised by it.
+    // ── Issue #82: the advertised schema and the deserializer must agree ──────
+
+    /// Anti-drift guard for the hand-written `Deserialize` (issue #81): a property declared
+    /// on the struct but never read would appear in the schema, land in the leftover
+    /// capture, and then be reported as an unknown parameter the server itself advertises.
     #[test]
-    fn both_id_and_log_id_is_rejected_rather_than_listing_the_index() {
+    fn every_declared_property_is_read_by_the_deserializer() {
+        let schema = serde_json::to_value(schemars::schema_for!(GetLogParams)).unwrap();
+        let props = schema["properties"].as_object().unwrap().clone();
+        assert!(!props.is_empty());
+        for key in props.keys() {
+            let sample = match key.as_str() {
+                "id" | "log_id" => serde_json::json!("x"),
+                "limit" => serde_json::json!(1),
+                "offset" => serde_json::json!(0),
+                other => panic!(
+                    "#82: '{other}' is advertised but this test has no sample for it — teach \
+                     it one, and teach GetLogParams::deserialize to read the property"
+                ),
+            };
+            let mut m = serde_json::Map::new();
+            m.insert(key.clone(), sample);
+            let p = parse(serde_json::Value::Object(m));
+            assert!(
+                p.extra.is_empty(),
+                "advertised property '{key}' fell through to the leftover capture, so the \
+                 unknown-parameter guard would reject a schema-conformant call"
+            );
+            assert!(
+                p.issues.is_empty(),
+                "advertised property '{key}' produced {:?} for a schema-conformant value",
+                p.issues
+            );
+        }
+    }
+
+    // ── Issue #81: nothing escapes as a raw JSON-RPC -32602 ───────────────────
+
+    /// The invariant. rmcp maps every `Deserialize` error to `invalid_params` BEFORE the
+    /// handler runs, so such a frame carries no `error_code`, no `hint` and no
+    /// `valid_params` — it bypasses the issue-#2 envelope entirely. Each payload marked
+    /// below was measured as a hard -32602 against the pre-fix build.
+    #[test]
+    fn no_arguments_payload_ever_fails_to_deserialize() {
+        for args in [
+            serde_json::json!({"id": "x", "log_id": "x"}), // -32602: duplicate field `id`
+            serde_json::json!({"id": "a", "log_id": "b"}), // -32602: duplicate field `id`
+            serde_json::json!({"log_id": 12345}),          // -32602: invalid type: integer
+            serde_json::json!({"id": 12345}),              // -32602: invalid type: integer
+            serde_json::json!({"limit": "5"}),             // -32602: expected usize
+            serde_json::json!({"offset": -1}),             // -32602: expected usize
+            serde_json::json!({"id": null, "log_id": "x"}), // -32602: duplicate field `id`
+            // The shape OpenAI strict function calling produces once log_id is declared
+            // (#82): every property in `required`, `null` for the unused ones.
+            serde_json::json!({"id": null, "log_id": null, "limit": null, "offset": null}),
+            serde_json::json!({"offset": 1.5}),
+            serde_json::json!({"id": true}),
+            serde_json::json!({"limit": []}),
+            serde_json::json!({"id": {"a": 1}}),
+            serde_json::json!({}),
+            serde_json::Value::Null,
+        ] {
+            assert!(
+                serde_json::from_value::<GetLogParams>(args.clone()).is_ok(),
+                "#81: {args} must reach the handler, not bounce at the rmcp edge"
+            );
+        }
+    }
+
+    /// Equal `id` and `log_id` is exactly what a hedging agent sends. Accept it silently.
+    #[test]
+    fn equal_id_and_log_id_is_accepted() {
+        let (store, ids) = store_with(1, 3);
+        let (r1, v1) = call(&store, serde_json::json!({"id": ids[0], "log_id": ids[0]}));
+        let (_r2, v2) = call(&store, serde_json::json!({"id": ids[0]}));
+        assert_ne!(r1.is_error, Some(true));
+        assert_eq!(v1, v2, "the same value in both keys must change nothing");
+        assert!(v1.get("warnings").is_none(), "and must add no noise: {v1}");
+    }
+
+    /// Replaces `both_id_and_log_id_is_rejected_rather_than_listing_the_index`, which pinned
+    /// the serde `duplicate field` -32602. That frame WAS loud rather than silent — the
+    /// property that mattered — but it was loud OUTSIDE the envelope. Same property, now
+    /// carried by the envelope, and strictly more is asserted: both values are named.
+    #[test]
+    fn different_id_and_log_id_is_invalid_params_naming_both() {
+        let store = empty_store();
+        let (r, v) = call(&store, serde_json::json!({"id": "a", "log_id": "b"}));
+        assert_eq!(r.is_error, Some(true));
+        assert_eq!(v["error_code"], "INVALID_PARAMS");
+        let msg = v["error"].as_str().unwrap();
+        assert!(msg.contains("'a'") && msg.contains("'b'"), "{v}");
+        assert_eq!(v["id"], "a");
+        assert_eq!(v["log_id"], "b");
+        assert!(v["valid_params"].is_array(), "{v}");
         assert!(
-            serde_json::from_value::<GetLogParams>(serde_json::json!({"id": "a", "log_id": "b"}))
-                .is_err(),
-            "two addressing keys must not silently resolve to one"
+            v.get("logs").is_none(),
+            "two addressing keys must not silently resolve to the index: {v}"
         );
+    }
+
+    /// Log ids look numeric in other tools' output, so a bare number is a reasonable thing
+    /// for a client to send. Read it, and say so — never bounce it, and never fall through
+    /// to the index.
+    #[test]
+    fn a_numeric_log_id_is_coerced_not_rejected() {
+        let store = store_one_with_id("12345", 3);
+        let (r, v) = call(&store, serde_json::json!({"log_id": 12345}));
+        assert_ne!(r.is_error, Some(true), "{v}");
+        assert_eq!(v["log_id"], "12345");
+        assert_eq!(v["total_count"], 3);
+        assert_eq!(v["warnings"][0]["code"], "COERCED_PARAM");
+        assert_eq!(v["warnings"][0]["param"], "log_id");
+
+        let empty = empty_store();
+        let (r, v) = call(&empty, serde_json::json!({"log_id": 12345}));
+        assert_eq!(r.is_error, Some(true));
+        assert_eq!(v["error_code"], "LOG_NOT_FOUND");
+        assert!(v["error"].as_str().unwrap().contains("'12345'"), "{v}");
+        assert!(v.get("logs").is_none(), "{v}");
+    }
+
+    /// The strict-function-calling shape: a hard -32602 before the fix.
+    #[test]
+    fn all_nulls_is_the_index_form() {
+        let (store, _ids) = store_with(2, 1);
+        let (r, v) = call(
+            &store,
+            serde_json::json!({"id": null, "log_id": null, "limit": null, "offset": null}),
+        );
+        assert_ne!(r.is_error, Some(true), "{v}");
+        assert_eq!(v["success"], true);
+        assert_eq!(v["logs"].as_array().unwrap().len(), 2);
+    }
+
+    /// The anti-silent-default guard. Never-failing deserialization moves the failure from
+    /// the protocol edge into the handler, so an unusable value MUST still be fatal — a
+    /// broken `id` quietly becoming `None` would answer with the index, which is the
+    /// wrong-shape failure issue #78 exists to prevent.
+    #[test]
+    fn an_unusable_value_is_invalid_params_and_never_the_index() {
+        let (store, _ids) = store_with(2, 1);
+        for (args, param) in [
+            (serde_json::json!({"id": {"a": 1}}), "id"),
+            (serde_json::json!({"id": true}), "id"),
+            (serde_json::json!({"log_id": []}), "log_id"),
+            (serde_json::json!({"limit": "abc"}), "limit"),
+            (serde_json::json!({"offset": -1}), "offset"),
+            (serde_json::json!({"offset": 1.5}), "offset"),
+        ] {
+            let (r, v) = call(&store, args.clone());
+            assert_eq!(r.is_error, Some(true), "{args} must fail: {v}");
+            assert_eq!(v["error_code"], "INVALID_PARAMS", "{v}");
+            assert!(
+                v["error"].as_str().unwrap().contains(param),
+                "the error must name `{param}`: {v}"
+            );
+            assert!(v["hint"].is_string(), "and carry the envelope's hint: {v}");
+            assert!(
+                v.get("logs").is_none(),
+                "{args} must never fall through to the index: {v}"
+            );
+        }
+    }
+
+    /// #83 made `limit` paginate the index too, so `limit must be > 0` has to hold for both
+    /// forms. Unguarded, `{"limit":0}` would answer `{"logs":[]}` — a fresh instance of the
+    /// exact "so there are no logs" failure this cluster exists to prevent.
+    #[test]
+    fn limit_zero_is_rejected_in_the_index_form_too() {
+        let (store, _ids) = store_with(3, 1);
+        let (r, v) = call(&store, serde_json::json!({"limit": 0}));
+        assert_eq!(r.is_error, Some(true));
+        assert_eq!(v["error_code"], "INVALID_PARAMS");
+        assert!(v["error"].as_str().unwrap().contains("limit must be > 0"));
+        assert!(
+            v["hint"].is_string() && v["valid_params"].is_array(),
+            "every INVALID_PARAMS from this tool carries the envelope, this one included: {v}"
+        );
+        assert!(v.get("logs").is_none(), "{v}");
+    }
+
+    // ── Issue #83: the index paginates, in the entry form's shape ─────────────
+
+    /// `limit` and `offset` were advertised and accepted here and then dropped on the floor:
+    /// `{}`, `{"limit":1}`, `{"offset":99}` and `{"limit":1,"offset":2}` all returned the
+    /// byte-identical full index.
+    #[test]
+    fn the_index_paginates_with_limit_and_offset() {
+        let (store, _ids) = store_with(5, 1);
+
+        let (_r, v) = call(&store, serde_json::json!({"limit": 2}));
+        assert_eq!(v["logs"].as_array().unwrap().len(), 2);
+        assert_eq!(v["total_count"], 5);
+        assert_eq!(v["offset"], 0);
+        assert_eq!(v["limit"], 2);
+        assert_eq!(v["has_more"], true);
+
+        let (_r, v) = call(&store, serde_json::json!({"limit": 2, "offset": 4}));
+        assert_eq!(v["logs"].as_array().unwrap().len(), 1);
+        assert_eq!(v["has_more"], false);
+
+        let (_r, v) = call(&store, serde_json::json!({"offset": 2}));
+        assert_eq!(v["logs"].as_array().unwrap().len(), 3);
+        assert_eq!(v["total_count"], 5);
+        assert_eq!(v["has_more"], false);
+        assert_eq!(v["limit"], serde_json::Value::Null);
+    }
+
+    /// #83 asks the index to match the entry form's shape EXACTLY. Encoded as an assertion
+    /// rather than a comment: the two responses may differ only in what they carry the rows
+    /// in (`logs` vs `result` + `log_id`).
+    #[test]
+    fn the_paginated_index_shape_matches_the_entry_form() {
+        let (store, ids) = store_with(3, 5);
+        let (_r, index) = call(&store, serde_json::json!({"limit": 2}));
+        let (_r, entry) = call(&store, serde_json::json!({"id": ids[0], "limit": 2}));
+        for key in ["success", "total_count", "offset", "limit", "has_more"] {
+            assert!(index.get(key).is_some(), "index is missing {key}: {index}");
+            assert!(entry.get(key).is_some(), "entry is missing {key}: {entry}");
+        }
+        let mut index_only: Vec<&str> = index
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|k| entry.get(k.as_str()).is_none())
+            .map(String::as_str)
+            .collect();
+        index_only.sort();
+        assert_eq!(index_only, vec!["logs"], "{index}");
+        let mut entry_only: Vec<&str> = entry
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|k| index.get(k.as_str()).is_none())
+            .map(String::as_str)
+            .collect();
+        entry_only.sort();
+        assert_eq!(entry_only, vec!["log_id", "result"], "{entry}");
+    }
+
+    /// A plain `{}` index call must not sprout pagination noise it did not ask for.
+    #[test]
+    fn an_unpaginated_index_is_unchanged_apart_from_total_count() {
+        let (store, _ids) = store_with(3, 1);
+        let (r, v) = call(&store, serde_json::json!({}));
+        assert_ne!(r.is_error, Some(true));
+        assert_eq!(v["logs"].as_array().unwrap().len(), 3);
+        assert_eq!(v["total_count"], 3);
+        for key in ["offset", "limit", "has_more", "note", "warnings"] {
+            assert!(v.get(key).is_none(), "{key} must not appear: {v}");
+        }
+    }
+
+    /// The trap pagination introduces: `EMPTY_LOG_INDEX_NOTE` says "no tool in THIS session
+    /// has truncated its output yet". Keyed on the PAGE being empty rather than the STORE,
+    /// that becomes a lie on a store holding three entries.
+    #[test]
+    fn an_offset_past_the_end_does_not_claim_the_store_is_empty() {
+        let (store, _ids) = store_with(3, 1);
+        let (r, v) = call(&store, serde_json::json!({"offset": 99}));
+        assert_ne!(r.is_error, Some(true));
+        assert_eq!(v["logs"].as_array().unwrap().len(), 0);
+        assert_eq!(v["total_count"], 3);
+        let note = v["note"].as_str().expect("an empty page must say why: {v}");
+        assert!(
+            !note.contains("no tool in THIS session"),
+            "the store is NOT empty: {note}"
+        );
+        assert!(note.contains("99") && note.contains("3"), "{note}");
+    }
+
+    /// …and the genuine empty-store note must survive the new code path.
+    #[test]
+    fn the_empty_store_note_survives_pagination() {
+        let store = empty_store();
+        for args in [
+            serde_json::json!({"limit": 1}),
+            serde_json::json!({"offset": 5}),
+        ] {
+            let (_r, v) = call(&store, args.clone());
+            assert_eq!(v["note"], EMPTY_LOG_INDEX_NOTE, "{args}");
+            assert_eq!(v["total_count"], 0);
+        }
+    }
+
+    /// #83 one branch over: `offset` with no `limit` was accepted and ignored on the ENTRY
+    /// form too. `offset: 0` stays byte-identical to the old behaviour.
+    #[test]
+    fn offset_without_limit_paginates_the_entry_form_too() {
+        let (store, ids) = store_with(1, 5);
+        let (r, v) = call(&store, serde_json::json!({"id": ids[0], "offset": 3}));
+        assert_ne!(r.is_error, Some(true));
+        assert_eq!(v["result"].as_array().unwrap().len(), 2);
+        assert_eq!(v["total_count"], 5);
+        assert_eq!(v["offset"], 3);
+        assert_eq!(v["has_more"], false);
+    }
+
+    /// #83's real target. `iris_test` stores an OBJECT, so there is no list to slice:
+    /// `{id}`, `{id,limit:1}`, `{id,offset:1}`, `{id,offset:3}`, `{id,limit:1,offset:2}` and
+    /// `{id,offset:99}` all returned the byte-identical payload — measured, six identical
+    /// sha256s over 1712 bytes with all four test cases every time. Returning everything is
+    /// the only thing an object CAN do; claiming otherwise is not. The response must say
+    /// that pagination did not apply, and must NOT echo has_more.
+    #[test]
+    fn pagination_on_an_object_entry_says_it_did_not_apply() {
+        let (store, id) = store_object_entry(4);
+        let (_r, whole) = call(&store, serde_json::json!({"id": id}));
+        for args in [
+            serde_json::json!({"id": id, "limit": 1}),
+            serde_json::json!({"id": id, "offset": 1}),
+            serde_json::json!({"id": id, "offset": 99}),
+            serde_json::json!({"id": id, "limit": 1, "offset": 2}),
+        ] {
+            let (r, v) = call(&store, args.clone());
+            assert_ne!(r.is_error, Some(true), "{args} must still answer: {v}");
+            assert_eq!(
+                v["result"], whole["result"],
+                "an object cannot be sliced, so the whole result is correct: {args}"
+            );
+            assert_eq!(
+                v["pagination_applied"], false,
+                "{args} must not leave the caller believing it got a page: {v}"
+            );
+            assert!(
+                v.get("has_more").is_none(),
+                "`has_more:false` over a COMPLETE payload reads as 'you reached the end' \
+                 when nothing was skipped: {args} -> {v}"
+            );
+            let note = v["note"].as_str().unwrap_or_default();
+            assert!(
+                note.contains("iris_test") && note.contains("not a list"),
+                "the note must name the tool and the shape: {note}"
+            );
+        }
+    }
+
+    /// …and an object entry asked for NO pagination stays byte-identical to before: no
+    /// note, no pagination_applied, nothing new on the wire.
+    #[test]
+    fn an_unpaginated_object_entry_is_unchanged() {
+        let (store, id) = store_object_entry(4);
+        let (r, v) = call(&store, serde_json::json!({"id": id}));
+        assert_ne!(r.is_error, Some(true));
+        assert_eq!(v["total_count"], 4);
+        for key in ["offset", "limit", "has_more", "note", "pagination_applied"] {
+            assert!(v.get(key).is_none(), "{key} must not appear: {v}");
+        }
+    }
+
+    /// #83 asymmetry: the index rescues an overshot offset with a note, the entry form did
+    /// not. A bare empty `result` is the same "so there is nothing here" misread #78 was
+    /// filed for — it must be guarded on BOTH branches, not one.
+    #[test]
+    fn an_offset_past_the_end_of_an_entry_says_why_it_is_empty() {
+        let (store, ids) = store_with(1, 5);
+        let (r, v) = call(&store, serde_json::json!({"id": ids[0], "offset": 99}));
+        assert_ne!(r.is_error, Some(true));
+        assert!(v["result"].as_array().unwrap().is_empty());
+        assert_eq!(v["total_count"], 5);
+        assert_eq!(v["has_more"], false);
+        let note = v["note"].as_str().expect("an empty page must say why: {v}");
+        assert!(note.contains("99") && note.contains('5'), "{note}");
+
+        // A page that is empty because the ENTRY is empty must not claim an offset problem.
+        let (_r, v) = call(&store, serde_json::json!({"id": ids[0], "limit": 2}));
+        assert!(v.get("note").is_none(), "a full page needs no note: {v}");
+    }
+
+    // ── Issue #84: the guard runs unconditionally, non-fatally with an id ─────
+
+    /// The headline: `{"id":X,"logid":"garbage"}` was byte-identical to `{"id":X}` — the
+    /// typo left no trace at all. It must be reported, and the call must NOT start failing.
+    #[test]
+    fn a_typo_alongside_a_valid_id_is_warned_about_not_swallowed() {
+        let (store, ids) = store_with(1, 3);
+        let (r, v) = call(
+            &store,
+            serde_json::json!({"id": ids[0], "logid": "garbage", "limit": 2}),
+        );
+        assert_ne!(
+            r.is_error,
+            Some(true),
+            "a warning must not fail the call: {v}"
+        );
+        assert_eq!(v["success"], true);
+        assert_eq!(v["total_count"], 3);
+        assert!(v["result"].is_array(), "{v}");
+        assert_eq!(v["warnings"][0]["code"], "UNKNOWN_PARAMS");
+        assert_eq!(
+            v["warnings"][0]["unknown_params"],
+            serde_json::json!(["logid"])
+        );
+        assert_eq!(
+            v["warnings"][0]["did_you_mean"],
+            serde_json::json!(["log_id", "id"]),
+            "the warning path must suggest the same pair as the error path: {v}"
+        );
+    }
+
+    /// A failed lookup is when the caller most needs to learn the real parameter name.
+    #[test]
+    fn a_typo_alongside_an_unknown_id_warns_on_the_error_too() {
+        let store = empty_store();
+        let (r, v) = call(&store, serde_json::json!({"id": "nope", "logid": "x"}));
+        assert_eq!(r.is_error, Some(true));
+        assert_eq!(v["error_code"], "LOG_NOT_FOUND");
+        assert_eq!(v["warnings"][0]["code"], "UNKNOWN_PARAMS");
+    }
+
+    /// Both issue-#78 exemptions must hold on the newly-live path: `namespace` is sprayed by
+    /// the harness on nearly every call and `_meta` is a protocol marker. Neither may become
+    /// a warning, or the noise floor rises on every single get_log call.
+    #[test]
+    fn ignored_and_underscore_keys_never_warn_with_an_id() {
+        let (store, ids) = store_with(1, 3);
+        let (r, with_noise) = call(
+            &store,
+            serde_json::json!({"id": ids[0], "namespace": "APP", "_meta": {"progressToken": 1}}),
+        );
+        let (_r, bare) = call(&store, serde_json::json!({"id": ids[0]}));
+        assert_ne!(r.is_error, Some(true));
+        assert_eq!(with_noise, bare, "the exemptions must be invisible");
+        assert!(with_noise.get("warnings").is_none(), "{with_noise}");
     }
 }

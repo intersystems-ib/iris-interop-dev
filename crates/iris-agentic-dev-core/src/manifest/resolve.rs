@@ -140,9 +140,22 @@ fn resolve_version(req: &VersionReq, source: &ResolvedSource) -> Result<Version>
     }
 }
 
+/// Live GitHub REST base. Overridable per-call so tests can point at a mock server (#87).
+const GITHUB_API: &str = "https://api.github.com";
+
 /// Fetch GitHub tags and return the highest version satisfying `req`.
 /// Exported for use in async tests.
 pub async fn resolve_github_version_async(
+    req: &VersionReq,
+    source: &ResolvedSource,
+) -> Result<Version> {
+    resolve_github_version_at(GITHUB_API, req, source).await
+}
+
+/// Same as [`resolve_github_version_async`], against an explicit API base URL.
+/// The tests drive this with a wiremock server so tag selection is covered offline (#87).
+pub async fn resolve_github_version_at(
+    api_base: &str,
     req: &VersionReq,
     source: &ResolvedSource,
 ) -> Result<Version> {
@@ -152,16 +165,58 @@ pub async fn resolve_github_version_async(
     };
 
     let url = format!(
-        "https://api.github.com/repos/{}/{}/tags?per_page=100",
-        owner, repo
+        "{}/repos/{}/{}/tags?per_page=100",
+        api_base.trim_end_matches('/'),
+        owner,
+        repo
     );
     let client = reqwest::Client::builder()
         .user_agent("iris-agentic-dev/resolver")
         .build()?;
 
-    let resp = client.get(&url).send().await?;
+    // #87: unauthenticated GitHub allows 60 requests/hour PER IP, shared by every job on a
+    // runner. A token lifts that to 1000/hr per repo (the token Actions injects) or 5000/hr
+    // (a PAT). The value is only ever put in a header — never logged, never in an error.
+    let token = std::env::var("GITHUB_TOKEN")
+        .or_else(|_| std::env::var("GH_TOKEN"))
+        .ok()
+        .filter(|t| !t.trim().is_empty());
+
+    let mut request = client
+        .get(&url)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28");
+    if let Some(token) = &token {
+        request = request.bearer_auth(token);
+    }
+
+    let resp = request.send().await?;
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         anyhow::bail!("GitHub repo {}/{} not found", owner, repo);
+    }
+    // #87: say "rate limit" out loud. A bare "GitHub API returned 403" reads like a
+    // permissions bug and cost a full red gate during the #78/#119 review.
+    let rate_limited = matches!(
+        resp.status(),
+        reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::TOO_MANY_REQUESTS
+    ) && resp
+        .headers()
+        .get("x-ratelimit-remaining")
+        .and_then(|v| v.to_str().ok())
+        == Some("0");
+    if rate_limited {
+        anyhow::bail!(
+            "GitHub API rate limit exceeded while resolving {}/{} ({} request). \
+             Set GITHUB_TOKEN to raise the 60 requests/hour that unauthenticated \
+             callers share per IP.",
+            owner,
+            repo,
+            if token.is_some() {
+                "authenticated"
+            } else {
+                "unauthenticated"
+            }
+        );
     }
     if !resp.status().is_success() {
         anyhow::bail!(

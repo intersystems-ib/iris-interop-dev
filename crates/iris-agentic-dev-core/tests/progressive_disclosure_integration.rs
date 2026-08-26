@@ -150,23 +150,49 @@ fn two_tool_calls(
 
 // ── T021/T027: iris_compile truncation chain ──────────────────────────────────
 
-/// Compile a non-existent wildcard target — IRIS returns compile errors for missing docs,
-/// giving us a reliable >20 error count without needing a specific broken class.
-/// Alternatively: compile USER.*.cls when USER has no classes → 0 errors (below threshold),
-/// so we create a deliberately broken class first.
+/// Seed one deliberately broken class, then compile a namespace-LOCAL wildcard so the
+/// error count clears the threshold.
+///
+/// Issue #88: this used to compile `%Library.*.cls` in USER, which was inert only because
+/// every wildcard expanded to nothing and the tool answered NOT_FOUND (the `SKIP:` branch
+/// below). Now that expansion works, that target would POST several hundred %Library
+/// classes to /action/compile with flags "cuk" — so it is replaced by a seeded, disposable
+/// package this test owns and deletes.
 #[test]
 #[ignore = "requires live iris-dev-iris container"]
 fn test_e2e_compile_truncation() {
     assert!(iris_available(), "set IRIS_HOST to run e2e tests");
 
-    // Compile a target that will produce errors: use a non-existent specific class
-    // which gives a compile error in most IRIS instances.
-    // We also try %SYSTEM.*.cls (system namespace) with a very low threshold.
-    // Strategy: try USER namespace first; if empty, use %Library namespace.
+    // A class whose method bodies reference an undefined macro: routine-level errors fan
+    // out (~2 diagnostics per method), unlike class-descriptor errors which abort at the
+    // first one ("Skipping class") no matter how many are present.
+    let broken_cls = "Test027.Trunc.Broken.cls";
+    let mut src = String::from("Class Test027.Trunc.Broken\n{\n");
+    for i in 0..12 {
+        src.push_str(&format!(
+            "ClassMethod M{i}() As %String\n{{\nset x = $$$Test027UndefinedMacro{i}\nReturn x\n}}\n\n"
+        ));
+    }
+    src.push_str("}\n");
+    tool_call(
+        "iris_doc",
+        serde_json::json!({"mode":"put","name":broken_cls,"content":src,
+            "namespace":"USER","compile":false}),
+        &[],
+    );
+
     let result = tool_call(
         "iris_compile",
-        serde_json::json!({"target": "%Library.*.cls", "namespace": "USER"}),
+        serde_json::json!({"target": "Test027.Trunc.*", "namespace": "USER"}),
         &[("IRIS_INLINE_COMPILE", "2")],
+    );
+
+    // Delete the seeded class immediately — the assertions below return early on several
+    // paths, and nothing after this point needs it.
+    tool_call(
+        "iris_doc",
+        serde_json::json!({"mode":"delete","name":broken_cls,"namespace":"USER"}),
+        &[],
     );
 
     println!(

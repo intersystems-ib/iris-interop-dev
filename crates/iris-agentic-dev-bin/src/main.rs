@@ -1,5 +1,6 @@
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use std::ffi::OsString;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -36,6 +37,14 @@ enum Commands {
     Init(cmd::init::InitCommand),
     /// Install packages from iris-dev.toml
     Install(cmd::install::InstallCommand),
+    // #86: any other leading token is a plugin invocation — `iris-interop-dev <name> [args…]`
+    // execs `iris-agentic-dev-<name>` from PATH. Declaring this variant is what turns on clap's
+    // allow_external_subcommands; without it clap exits 2 with "unrecognized subcommand" and the
+    // fallback below is unreachable. OsString (not String) so a non-UTF-8 argument reaches the
+    // plugin intact instead of dying at parse time. clap's derive requires this exact spelling —
+    // `Vec<std::ffi::OsString>` is rejected by the macro.
+    #[command(external_subcommand)]
+    External(Vec<OsString>),
 }
 
 /// A file handle shared by the tracing layer. Cloned per write; a poisoned lock is
@@ -137,13 +146,28 @@ async fn main() -> Result<()> {
         Some(Commands::Compile(cmd)) => cmd.run().await,
         Some(Commands::Init(cmd)) => cmd.run().await,
         Some(Commands::Install(cmd)) => cmd.run().await,
+        Some(Commands::External(argv)) => {
+            // clap always puts the command name first; stay defensive rather than index.
+            let Some((name, rest)) = argv.split_first() else {
+                eprintln!(
+                    "iris-interop-dev: empty command. Run `iris-interop-dev --help` for usage."
+                );
+                std::process::exit(1);
+            };
+            // #86: the built-in names come from clap, so the "not a built-in subcommand
+            // (…)" message and the near-miss tip cannot drift from the actual CLI.
+            let command = Cli::command();
+            let builtins: Vec<&str> = command
+                .get_subcommands()
+                .map(|c| c.get_name())
+                .filter(|n| *n != "external")
+                .collect();
+            // Never returns Ok: it execs the plugin, or exits 1 with a message when
+            // no such plugin is on PATH.
+            cmd::plugin::try_dispatch_plugin(&name.to_string_lossy(), rest, &builtins)
+        }
         None => {
-            // Check for iris-agentic-dev-* plugin on PATH before giving up
-            let args: Vec<String> = std::env::args().collect();
-            if args.len() > 1 {
-                cmd::plugin::try_dispatch_plugin(&args[1], &args[2..])?;
-            }
-            eprintln!("Run `iris-agentic-dev --help` for usage.");
+            eprintln!("Run `iris-interop-dev --help` for usage.");
             std::process::exit(1);
         }
     }

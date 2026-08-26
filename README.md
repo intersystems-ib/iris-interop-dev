@@ -215,6 +215,7 @@ server — run the ISC Web Gateway container alongside IRIS and point `web_port`
 | `IRIS_TOOLSET` | `interop` | Tool surface: `interop` (23 tools) or `baseline` (full upstream surface). Same as `--toolset` |
 | `IRIS_LOG_FILE` | _(empty)_ | Mirror server traces to this file — the only trace that outlives an MCP session |
 | `OBJECTSCRIPT_WORKSPACE` | `$PWD` | Workspace root for `.iris-agentic-dev.toml` lookup |
+| `OBJECTSCRIPT_SKILLMCP_NAMESPACE` | _(connection namespace)_ | Namespace holding the `^SKILLS` / `^KBCHUNKS` registry (baseline toolset). Defaults to the connection namespace (`IRIS_NAMESPACE` / `--namespace`); set it only to centralise the registry in one namespace |
 
 ---
 

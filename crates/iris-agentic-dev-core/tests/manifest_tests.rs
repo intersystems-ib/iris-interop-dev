@@ -195,11 +195,169 @@ bad-dep = { version = "not-a-semver-version!!", github = "owner/repo" }
 }
 
 // ── T041: resolve_version GitHub integration ────────────────────────────────
+//
+// #87: these four tests called api.github.com unauthenticated on EVERY run.
+// Unauthenticated GitHub allows 60 requests/hour per IP, shared by every job on a
+// runner, so a busy runner fails them with a 403 that reads nothing like a network
+// flake — and the two `is_err()` ones passed for the WRONG reason under that 403,
+// reporting fake coverage. The resolver logic now has deterministic offline coverage
+// below; these stay as a live integration canary, opt-in via IRIS_DEV_LIVE_GITHUB=1.
+// Set GITHUB_TOKEN as well and the resolver authenticates.
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+fn live_github_enabled() -> bool {
+    let on = std::env::var("IRIS_DEV_LIVE_GITHUB")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            !v.is_empty() && v != "0" && v != "false"
+        })
+        .unwrap_or(false);
+    if !on {
+        eprintln!(
+            "SKIP: live GitHub API test — set IRIS_DEV_LIVE_GITHUB=1 to run it \
+             (GITHUB_TOKEN is honoured when present). Offline coverage of the same \
+             logic runs unconditionally in the *_offline tests."
+        );
+    }
+    on
+}
+
+async fn mock_github_tags(names: &[&str]) -> MockServer {
+    let server = MockServer::start().await;
+    let body = serde_json::Value::Array(
+        names
+            .iter()
+            .map(|n| serde_json::json!({ "name": n }))
+            .collect(),
+    );
+    Mock::given(method("GET"))
+        .and(path("/repos/intersystems-community/iris-dev/tags"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&server)
+        .await;
+    server
+}
+
+fn iris_dev_source() -> iris_agentic_dev_core::manifest::resolve::ResolvedSource {
+    iris_agentic_dev_core::manifest::resolve::ResolvedSource::GitHub {
+        owner: "intersystems-community".to_string(),
+        repo: "iris-dev".to_string(),
+    }
+}
+
+// ── offline: the tag→semver selection logic, no network, deterministic ──────
+
+#[tokio::test]
+async fn resolve_github_any_version_picks_highest_tag_offline() {
+    use iris_agentic_dev_core::manifest::resolve::resolve_github_version_at;
+    use semver::VersionReq;
+    // deliberately unsorted, mixed "v"-prefixed and bare, plus a non-semver tag
+    let server = mock_github_tags(&["v0.2.0", "v0.4.7", "v0.3.1", "0.4.2", "nightly"]).await;
+    let v = resolve_github_version_at(
+        &server.uri(),
+        &VersionReq::parse("*").unwrap(),
+        &iris_dev_source(),
+    )
+    .await
+    .expect("should resolve");
+    assert_eq!(v.to_string(), "0.4.7", "must pick the highest matching tag");
+}
+
+#[tokio::test]
+async fn resolve_github_specific_range_offline() {
+    use iris_agentic_dev_core::manifest::resolve::resolve_github_version_at;
+    use semver::VersionReq;
+    let server = mock_github_tags(&["v0.2.0", "v0.3.1", "v0.4.2", "v0.4.7", "v1.0.0"]).await;
+    let v = resolve_github_version_at(
+        &server.uri(),
+        &VersionReq::parse("^0.4").unwrap(),
+        &iris_dev_source(),
+    )
+    .await
+    .expect("should resolve ^0.4");
+    assert_eq!((v.major, v.minor, v.patch), (0, 4, 7));
+}
+
+#[tokio::test]
+async fn resolve_github_unsatisfiable_range_errors_offline() {
+    use iris_agentic_dev_core::manifest::resolve::resolve_github_version_at;
+    use semver::VersionReq;
+    let server = mock_github_tags(&["v0.2.0", "v0.4.7"]).await;
+    let err = resolve_github_version_at(
+        &server.uri(),
+        &VersionReq::parse("^99.0").unwrap(),
+        &iris_dev_source(),
+    )
+    .await
+    .expect_err("unsatisfiable range must be Err");
+    // assert on the REASON — under the old live tests a 403 satisfied is_err() too
+    assert!(
+        err.to_string().contains("satisfy version requirement"),
+        "wrong failure reason: {err}"
+    );
+}
+
+#[tokio::test]
+async fn resolve_github_nonexistent_repo_errors_offline() {
+    use iris_agentic_dev_core::manifest::resolve::{resolve_github_version_at, ResolvedSource};
+    use semver::VersionReq;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    let source = ResolvedSource::GitHub {
+        owner: "intersystems-community".to_string(),
+        repo: "this-repo-does-not-exist-xyz123".to_string(),
+    };
+    let err = resolve_github_version_at(&server.uri(), &VersionReq::parse("*").unwrap(), &source)
+        .await
+        .expect_err("404 must be Err");
+    assert!(
+        err.to_string().contains("not found"),
+        "wrong failure reason: {err}"
+    );
+}
+
+/// #87: a rate-limited response must say so, not just "403".
+#[tokio::test]
+async fn resolve_github_rate_limit_error_names_the_limit() {
+    use iris_agentic_dev_core::manifest::resolve::resolve_github_version_at;
+    use semver::VersionReq;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(403)
+                .insert_header("x-ratelimit-remaining", "0")
+                .insert_header("x-ratelimit-limit", "60"),
+        )
+        .mount(&server)
+        .await;
+    let err = resolve_github_version_at(
+        &server.uri(),
+        &VersionReq::parse("*").unwrap(),
+        &iris_dev_source(),
+    )
+    .await
+    .expect_err("rate limit must be Err");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("rate limit"),
+        "must name the rate limit: {msg}"
+    );
+    assert!(msg.contains("GITHUB_TOKEN"), "must name the remedy: {msg}");
+}
+
+// ── live canary: opt-in, authenticated when GITHUB_TOKEN is set ─────────────
 
 /// GitHub tag resolution picks the highest matching version.
 /// Uses intersystems-community/iris-dev which has known tags v0.2.0..v0.4.7.
 #[tokio::test]
 async fn test_resolve_github_any_version_succeeds() {
+    if !live_github_enabled() {
+        return;
+    }
     use iris_agentic_dev_core::manifest::resolve::{resolve_github_version_async, ResolvedSource};
     use semver::VersionReq;
     let req = VersionReq::parse("*").unwrap();
@@ -223,6 +381,9 @@ async fn test_resolve_github_any_version_succeeds() {
 
 #[tokio::test]
 async fn test_resolve_github_specific_range() {
+    if !live_github_enabled() {
+        return;
+    }
     use iris_agentic_dev_core::manifest::resolve::{resolve_github_version_async, ResolvedSource};
     use semver::VersionReq;
     let req = VersionReq::parse("^0.4").unwrap();
@@ -239,6 +400,9 @@ async fn test_resolve_github_specific_range() {
 
 #[tokio::test]
 async fn test_resolve_github_unsatisfiable_range_errors() {
+    if !live_github_enabled() {
+        return;
+    }
     use iris_agentic_dev_core::manifest::resolve::{resolve_github_version_async, ResolvedSource};
     use semver::VersionReq;
     let req = VersionReq::parse("^99.0").unwrap();
@@ -246,12 +410,24 @@ async fn test_resolve_github_unsatisfiable_range_errors() {
         owner: "intersystems-community".to_string(),
         repo: "iris-dev".to_string(),
     };
-    let result = resolve_github_version_async(&req, &source).await;
-    assert!(result.is_err(), "unsatisfiable range should return Err");
+    let err = resolve_github_version_async(&req, &source)
+        .await
+        .expect_err("unsatisfiable range should return Err");
+    // #87: assert on the REASON. A bare is_err() is satisfied by ANY failure — under a 403
+    // rate limit (the flake this canary exists to survive) and under a 401 from a bad
+    // GITHUB_TOKEN, this test reported `ok` while the resolver never reached the version
+    // comparison at all. That is fake coverage: green canary, broken live path.
+    assert!(
+        err.to_string().contains("satisfy version requirement"),
+        "the resolver must have compared tags and found none — wrong failure reason: {err}"
+    );
 }
 
 #[tokio::test]
 async fn test_resolve_github_nonexistent_repo_errors() {
+    if !live_github_enabled() {
+        return;
+    }
     use iris_agentic_dev_core::manifest::resolve::{resolve_github_version_async, ResolvedSource};
     use semver::VersionReq;
     let req = VersionReq::parse("*").unwrap();
@@ -259,6 +435,13 @@ async fn test_resolve_github_nonexistent_repo_errors() {
         owner: "intersystems-community".to_string(),
         repo: "this-repo-does-not-exist-xyz123".to_string(),
     };
-    let result = resolve_github_version_async(&req, &source).await;
-    assert!(result.is_err(), "nonexistent repo should return Err");
+    let err = resolve_github_version_async(&req, &source)
+        .await
+        .expect_err("nonexistent repo should return Err");
+    // #87: the same fake-coverage guard — this must be GitHub's 404, not a 401/403 that
+    // would have failed for any repo name at all.
+    assert!(
+        err.to_string().contains("not found"),
+        "the resolver must have seen a 404 for the repo — wrong failure reason: {err}"
+    );
 }

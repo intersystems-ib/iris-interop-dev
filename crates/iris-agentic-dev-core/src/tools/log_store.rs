@@ -43,6 +43,27 @@ pub enum GetResult {
     Expired,
 }
 
+// ── Page ────────────────────────────────────────────────────────────────────
+
+/// One page of a stored entry, as `get_paginated` returns it (issue #83).
+pub struct Page {
+    /// What `iris_get_log` returns as `result`: the requested slice when the stored value
+    /// is a list, the whole stored value when it is not.
+    pub result: Value,
+    /// Items remain after this page. Always false when `sliced` is false — nothing was
+    /// skipped, so there is nothing left over to report.
+    pub has_more: bool,
+    /// Length of the stored list, or the entry's own `total_count` when it is not a list.
+    pub total: usize,
+    /// Whether `limit`/`offset` were actually applied. False means the stored result is a
+    /// single JSON object or scalar: it cannot be sliced, and the caller must say so
+    /// rather than echo pagination keys over a complete payload.
+    pub sliced: bool,
+    /// The tool that stored the entry — named in the "this result is not a list" note so
+    /// the agent knows which output shape it is actually holding.
+    pub tool: String,
+}
+
 // ── LogStore ─────────────────────────────────────────────────────────────────
 
 /// Process-global ring buffer of LogEntry values.
@@ -104,36 +125,77 @@ impl LogStore {
             .collect()
     }
 
+    /// Issue #83: the index paginates with the same limit/offset the entry form uses —
+    /// both were advertised and accepted by iris_get_log's index mode and then ignored.
+    /// Returns `(page, has_more, total)` — the same three facts `get_paginated` reports,
+    /// so the two call sites in `get_log_impl` read alike. A summary list is always
+    /// sliceable, so there is no `sliced` flag to carry here. `total` is always the FULL
+    /// entry count, never the page length: the "this store is empty" note keys on it
+    /// (issue #78) and must not start lying just because a page came back short.
+    pub fn list_paginated(
+        &mut self,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> (Vec<LogSummary>, bool, usize) {
+        let all = self.list(); // evicts expired first
+        let total = all.len();
+        let page: Vec<LogSummary> = match limit {
+            Some(lim) => all.into_iter().skip(offset).take(lim).collect(),
+            None => all.into_iter().skip(offset).collect(),
+        };
+        let has_more = offset.saturating_add(page.len()) < total;
+        (page, has_more, total)
+    }
+
     /// Remove entries past TTL.
     pub fn evict_expired(&mut self) {
         let ttl = Duration::from_secs(self.ttl_minutes * 60);
         self.entries.retain(|e| e.created_at.elapsed() <= ttl);
     }
 
-    /// Retrieve a paginated slice from a stored entry's full_result array.
-    /// Returns (items, has_more).  If full_result is not an array, returns it whole.
-    pub fn get_paginated(
-        &self,
-        id: &str,
-        limit: Option<usize>,
-        offset: usize,
-    ) -> Option<(Value, bool, usize)> {
+    /// Retrieve one page of a stored entry (issue #83).
+    ///
+    /// Only a JSON ARRAY can be sliced. `iris_test` — the tool this store's own hint tells
+    /// the agent to use, and the one guaranteed to populate it — stores an OBJECT
+    /// (`{test_suites, raw_output}`), and so does every other non-list result. Whether the
+    /// page was really taken is REPORTED (`Page::sliced`) instead of being left for the
+    /// caller to assume: returning the whole value while echoing the caller's `limit` and
+    /// `offset` back at them claims a page that was never applied, which is worse than the
+    /// silent no-op it replaced — `{"offset":99}` answered `has_more:false` over a complete
+    /// payload, i.e. "you have reached the end" when nothing had been skipped.
+    pub fn get_paginated(&self, id: &str, limit: Option<usize>, offset: usize) -> Option<Page> {
         let ttl = Duration::from_secs(self.ttl_minutes * 60);
         let entry = self.entries.iter().find(|e| e.id == id)?;
         if entry.created_at.elapsed() > ttl {
             return None; // expired — caller checks GetResult separately
         }
-        match limit {
-            None => Some((entry.full_result.clone(), false, entry.total_count)),
-            Some(lim) => {
-                if let Some(arr) = entry.full_result.as_array() {
-                    let slice: Vec<Value> = arr.iter().skip(offset).take(lim).cloned().collect();
-                    let has_more = offset + lim < arr.len();
-                    Some((Value::Array(slice), has_more, arr.len()))
-                } else {
-                    Some((entry.full_result.clone(), false, entry.total_count))
-                }
+        match entry.full_result.as_array() {
+            Some(arr) => {
+                // `offset` with no `limit` used to be accepted and dropped on the floor —
+                // the identical silent no-op issue #83 names for the index form, one
+                // branch away. offset 0 with no limit stays byte-identical to before.
+                let items: Vec<Value> = match limit {
+                    Some(lim) => arr.iter().skip(offset).take(lim).cloned().collect(),
+                    None => arr.iter().skip(offset).cloned().collect(),
+                };
+                // `offset + lim` overflowed (a debug-build panic) on the u64-sized offsets
+                // the wire now accepts; counting what the page actually holds cannot.
+                let has_more = offset.saturating_add(items.len()) < arr.len();
+                Some(Page {
+                    result: Value::Array(items),
+                    has_more,
+                    total: arr.len(),
+                    sliced: true,
+                    tool: entry.tool.clone(),
+                })
             }
+            None => Some(Page {
+                result: entry.full_result.clone(),
+                has_more: false,
+                total: entry.total_count,
+                sliced: false,
+                tool: entry.tool.clone(),
+            }),
         }
     }
 

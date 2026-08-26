@@ -795,21 +795,25 @@ fn e2e_compile_wildcard_package() {
         serde_json::json!({"target":"Test022.Wild.*.cls","namespace":"USER","flags":"ck"}),
     );
 
-    // Must not crash and must return a structured response
-    assert!(
-        result["success"] == true || result["error_code"].is_string(),
-        "wildcard compile must return structured response: {}",
+    // Issue #88: NOT_FOUND used to be accepted here, which is exactly how the bug shipped —
+    // the two classes above were just seeded, so a wildcard that matches nothing is the
+    // defect, not a tolerable outcome.
+    assert_ne!(
+        result["error_code"], "NOT_FOUND",
+        "the two seeded classes must be found by the wildcard: {}",
         result
     );
-    // If it succeeded, targets_compiled should be >= 2
-    if result["success"] == true {
-        let compiled = result["targets_compiled"].as_u64().unwrap_or(0);
-        assert!(
-            compiled >= 2,
-            "wildcard compile Test022.Wild.* should compile at least 2 classes, got: {}",
-            compiled
-        );
-    }
+    assert!(
+        result["success"] == true,
+        "wildcard compile must succeed: {}",
+        result
+    );
+    let compiled = result["targets_compiled"].as_u64().unwrap_or(0);
+    assert!(
+        compiled >= 2,
+        "wildcard compile Test022.Wild.* should compile at least 2 classes, got: {}",
+        compiled
+    );
 
     // Cleanup
     call_tool(
