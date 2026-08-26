@@ -354,47 +354,48 @@ mod env_guard {
         c
     }
 
+    /// #114: what "Live" means changed, deliberately.
+    ///
+    /// This test used to assert that `iris_credential_manage` and `iris_production_item`
+    /// DISAPPEAR on a Live connection. That was wrong in both directions. It let five
+    /// write-capable tools through — `iris_doc {mode:put}`, `iris_execute`, `iris_compile`,
+    /// `iris_lookup_manage {action:set}` and `iris_test` all dispatched and reached IRIS —
+    /// while blocking reads: removing `iris_production_item` wholesale took `get_settings`
+    /// with it, so a Live instance could not even be inspected.
+    ///
+    /// The contract now: every tool stays listed and reachable on every connection, reads
+    /// are never refused, and a MUTATING call is refused unless the connection is
+    /// write-allowed. `mutating_call` is the decision and is tested exhaustively in
+    /// `tools::write_gate_tests`; this pins the half that lives on `IrisTools`.
     #[test]
-    fn write_tools_absent_when_live() {
+    fn live_mode_keeps_every_tool_reachable_and_gates_only_writes() {
         std::env::remove_var("IRIS_ALLOW_PROD");
         let tools =
             IrisTools::new_with_toolset(Some(conn_with_mode(SystemMode::Live)), Toolset::Merged)
                 .unwrap();
         let names = tools.registered_tool_names();
-        // Write-gated tools must not appear when Live
+
+        // Nothing is hidden any more — hiding a tool hides its read actions too.
+        for tool in [
+            "iris_credential_manage",
+            "iris_production_item",
+            "iris_credential_list",
+            "iris_lookup_manage",
+        ] {
+            assert!(
+                names.contains(tool),
+                "'{tool}' must stay LISTED on a Live connection — the gate refuses writes,                  it does not remove tools"
+            );
+            assert!(
+                tools.is_tool_reachable(tool),
+                "'{tool}' must stay REACHABLE on a Live connection"
+            );
+        }
+
+        // The connection is the thing that is read-only, and the server knows it.
         assert!(
-            !names.contains("iris_credential_manage"),
-            "iris_credential_manage must be absent in Live mode"
-        );
-        assert!(
-            !names.contains("iris_production_item"),
-            "iris_production_item must be absent in Live mode"
-        );
-        // #104: absent from the LISTING is not the guarantee this test is for. The gate
-        // is only a gate if the tool cannot be CALLED, and until the `#[tool_handler]`
-        // router binding was fixed those were two different routers — this file's
-        // assertions above passed unchanged against a server that ran both tools on
-        // demand. `is_tool_reachable` reads the map the dispatcher resolves against.
-        assert!(
-            !tools.is_tool_reachable("iris_credential_manage"),
-            "iris_credential_manage must not DISPATCH in Live mode, not merely be unlisted"
-        );
-        assert!(
-            !tools.is_tool_reachable("iris_production_item"),
-            "iris_production_item must not DISPATCH in Live mode, not merely be unlisted"
-        );
-        assert!(
-            tools.is_tool_reachable("iris_credential_list"),
-            "the read-only sibling must still dispatch"
-        );
-        // Read tools must still be present
-        assert!(
-            names.contains("iris_credential_list"),
-            "iris_credential_list must be present in Live mode"
-        );
-        assert!(
-            names.contains("iris_lookup_manage"),
-            "iris_lookup_manage must be present in Live mode"
+            !tools.write_tools_enabled(),
+            "a Live connection must not be write-allowed without IRIS_ALLOW_PROD"
         );
     }
 

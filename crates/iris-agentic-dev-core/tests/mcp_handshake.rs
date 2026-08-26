@@ -132,6 +132,77 @@ fn mcp_server_starts_and_responds_to_initialize() {
     child.kill().ok();
 }
 
+/// #114: a write-disallowed connection must still advertise every tool and answer reads.
+///
+/// The old gate removed two tool names from the router, which hid their READ actions too —
+/// `iris_production_item` gone meant `get_settings` gone — while five genuinely
+/// write-capable tools went through untouched. This server is aimed at DEVELOPMENT
+/// instances, so a blocked read is the expensive failure, not the safe one.
+///
+/// `IRIS_NAMESPACE=PROD` makes `is_write_allowed()` false without needing a Live instance.
+/// No IRIS is reachable here (port 9), which is the point: the gate decides before any
+/// connection is used, so the refusal and the pass-through are both observable offline.
+#[test]
+fn a_write_disallowed_connection_still_lists_every_tool() {
+    let bin = iris_dev_bin();
+    if !bin.exists() {
+        eprintln!("Skipping: iris-agentic-dev binary not found");
+        return;
+    }
+
+    let mut child = Command::new(&bin)
+        .arg("mcp")
+        .env("IRIS_WEB_PORT", "9")
+        .env("IRIS_NAMESPACE", "PROD")
+        .env_remove("IRIS_ALLOW_PROD")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn iris-agentic-dev mcp");
+
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    send_jsonrpc(
+        &mut stdin,
+        1,
+        "initialize",
+        r#"{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}"#,
+    );
+    let _ = read_jsonrpc(&mut reader);
+    stdin
+        .write_all(
+            b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\",\"params\":{}}\n",
+        )
+        .unwrap();
+    stdin.flush().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    send_jsonrpc(&mut stdin, 2, "tools/list", "{}");
+    let listed = read_jsonrpc(&mut reader);
+    let names: Vec<String> = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["name"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(
+        names.len(),
+        23,
+        "the write gate must not shrink the tool list — it used to advertise 21 here, and \
+         the two it removed took their read actions with them: {names:?}"
+    );
+    for tool in ["iris_production_item", "iris_credential_manage"] {
+        assert!(
+            names.contains(&tool.to_string()),
+            "'{tool}' must stay listed on a write-disallowed connection: {names:?}"
+        );
+    }
+
+    child.kill().ok();
+}
+
 /// #112: every tool that takes parameters must SAY SO in its advertised schema.
 ///
 /// Ten of the 23 interop tools shipped `{"type":"object"}` — no properties, no `required` —
