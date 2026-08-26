@@ -84,6 +84,26 @@ pub async fn handle_iris_info(
     };
 
     if !resp.status().is_success() {
+        // #108: a 404 here had two very different causes and one bare answer. A wrong
+        // IRIS_WEB_PREFIX and a nonexistent namespace both produced `NOT_FOUND` with no
+        // hint — iris_info was the last Atelier-backed tool not reaching the shared
+        // classifier, which names the prefix in the first case and lists the accessible
+        // namespaces in the second. `Undetermined` means the root probe could not tell,
+        // and the status-coded error below still stands.
+        if resp.status().as_u16() == 404 {
+            if let crate::tools::interop::FourOhFour::Explained(e) =
+                crate::tools::interop::classify_404(
+                    iris,
+                    client,
+                    ns,
+                    &url,
+                    &format!("Nothing was read for what='{}'.", p.what),
+                )
+                .await
+            {
+                return e;
+            }
+        }
         // #101: IRIS answered — it is reachable by definition. This said IRIS_UNREACHABLE for
         // every status, so a wrong password sent the caller to debug networking.
         return crate::tools::envelope::http_status_fail("iris_info", resp.status(), &url);
@@ -206,6 +226,11 @@ pub async fn handle_iris_macro(
                 Ok(v) => v,
                 Err(e) => return crate::tools::envelope::transport_fail("handle_iris_macro", &e.to_string()),
             };
+            // Same #106 shape: a refused getmacro POST used to answer `success:true` with a
+            // null result, i.e. "that macro does not exist" for a call IRIS never ran.
+            if !resp.status().is_success() {
+                return crate::tools::envelope::http_status_fail("iris_macro", resp.status(), &url);
+            }
             let body: serde_json::Value = resp.json().await.unwrap_or_default();
             ok_json(
                 serde_json::json!({"success": true, "name": name, "action": action, "result": body["result"]}),
@@ -330,6 +355,62 @@ fn default_type() -> String {
     "class".to_string()
 }
 
+/// The outcome of reading an Atelier `/action/query` response inside this module.
+///
+/// #106: `iris_generate` parsed its context queries with `.unwrap_or_default()` and never
+/// looked at the status. A 401 therefore became `existing_classes: []`, and the tool went
+/// on to instruct the model *"Use package prefix 'MyApp' to match existing classes in this
+/// namespace"* — advice derived entirely from a request IRIS had rejected. That is worse
+/// than a wrong error code: it launders an auth failure into a confident instruction to a
+/// model. An empty namespace and a refused request are different facts and must not share
+/// a response shape.
+enum QueryRead {
+    Body(serde_json::Value),
+    /// Already-rendered refusal envelope — the caller returns it unchanged.
+    Failed(Result<rmcp::model::CallToolResult, rmcp::ErrorData>),
+}
+
+/// Read a `/action/query` response through the SAME interpreter `query_once` uses (#105),
+/// so a refusal cannot be mistaken for an empty answer here either.
+async fn read_query_context(tool: &str, resp: reqwest::Response, url: &str) -> QueryRead {
+    use crate::iris::connection::{interpret_query_response, QueryOutcome};
+    let status = resp.status();
+    let text = match resp.text().await {
+        Ok(t) => t,
+        Err(e) => {
+            return QueryRead::Failed(crate::tools::envelope::transport_fail(tool, &e.to_string()))
+        }
+    };
+    match interpret_query_response(status, &text) {
+        QueryOutcome::Rows(body) => QueryRead::Body(body),
+        QueryOutcome::IrisError(msg) => QueryRead::Failed(crate::tools::envelope::fail_with(
+            "SQL_ERROR",
+            &msg,
+            serde_json::json!({
+                "attempted_url": url,
+                "hint": "IRIS rejected the introspection query this tool runs to gather \
+                         context. No context was gathered; nothing was generated.",
+            }),
+        )),
+        QueryOutcome::HttpError { status, .. } => {
+            QueryRead::Failed(crate::tools::envelope::http_status_fail(tool, status, url))
+        }
+        QueryOutcome::NonJson { snippet, .. } => {
+            QueryRead::Failed(crate::tools::envelope::fail_with(
+                "IRIS_REQUEST_FAILED",
+                &format!("non-JSON response from {url}: {snippet}"),
+                serde_json::json!({
+                    "attempted_url": url,
+                    "http_status": status.as_u16(),
+                    "hint": "IRIS answered, but not with JSON — typically a proxy error page or \
+                             an HTML login redirect in front of the Atelier API. No context was \
+                             gathered; this is not an empty namespace.",
+                }),
+            ))
+        }
+    }
+}
+
 pub async fn handle_iris_generate(
     iris: &IrisConnection,
     client: &reqwest::Client,
@@ -364,7 +445,10 @@ pub async fn handle_iris_generate(
                     )
                 }
             };
-            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            let body = match read_query_context("iris_generate", resp, &query_url).await {
+                QueryRead::Body(b) => b,
+                QueryRead::Failed(e) => return e,
+            };
             let methods = body["result"]["content"].clone();
 
             let prompt = format!(
@@ -413,7 +497,10 @@ pub async fn handle_iris_generate(
                     )
                 }
             };
-            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            let body = match read_query_context("iris_generate", resp, &query_url).await {
+                QueryRead::Body(b) => b,
+                QueryRead::Failed(e) => return e,
+            };
             let existing: Vec<String> = body["result"]["content"]
                 .as_array()
                 .unwrap_or(&vec![])

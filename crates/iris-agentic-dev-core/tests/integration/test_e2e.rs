@@ -110,6 +110,16 @@ fn mcp_call_timeout(
 
     let mut cmd = Command::new(&bin);
     cmd.args(["mcp"]);
+    // #104: this suite exercises the TOOL SURFACE, not the toolset policy — it calls
+    // iris_info, iris_macro, iris_generate, iris_search and the four debug_* tools, none of
+    // which the fork's default `interop` profile carries. They answered anyway, because
+    // pruning was listing-only: `#[tool_handler]`'s default router expression built a fresh
+    // UNPRUNED router per call, so the pruned instance router governed `tools/list` alone.
+    // Now that dispatch honours the pruning, a pruned tool is correctly refused — so this
+    // harness has to ask for the toolset that actually HAS the tools it tests. `baseline`
+    // covers every tool called here (none is merged-only). Set BEFORE the caller's env so a
+    // test that wants a different profile can still override it.
+    cmd.env("IRIS_TOOLSET", "baseline");
     for (k, v) in env_vars {
         cmd.env(k, v);
     }

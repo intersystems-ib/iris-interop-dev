@@ -422,6 +422,16 @@ pub struct ConnectionState {
     pub loaded_at: std::time::SystemTime,
     pub write_tools_enabled: bool,
     pub config_parse_error: Option<String>,
+    /// #110: the connection the CLI flags / workspace config described, kept so a LATER
+    /// re-probe targets the same instance instead of falling back to env-var discovery.
+    /// `None` means discovery was env/docker-driven and a retry can rediscover from scratch.
+    pub discovery_seed: Option<IrisConnection>,
+    /// True while the startup discovery task is still running. Separates "the probe has
+    /// not answered yet" from "nothing is configured" — two states that had one message.
+    pub discovery_pending: bool,
+    /// When the last lazy re-probe ran, so a genuinely absent IRIS is not probed on every
+    /// single tool call.
+    pub last_retry: Option<std::time::Instant>,
 }
 
 impl ConnectionState {
@@ -433,6 +443,9 @@ impl ConnectionState {
             loaded_at: std::time::SystemTime::now(),
             write_tools_enabled: true,
             config_parse_error: None,
+            discovery_seed: None,
+            discovery_pending: false,
+            last_retry: None,
         }
     }
 
@@ -449,6 +462,9 @@ impl ConnectionState {
             loaded_at: std::time::SystemTime::now(),
             write_tools_enabled,
             config_parse_error: None,
+            discovery_seed: None,
+            discovery_pending: false,
+            last_retry: None,
         }
     }
 }
@@ -1994,8 +2010,45 @@ pub fn build_test_detail(suites: &[SuiteRow], methods: &[MethodRow]) -> serde_js
     serde_json::json!({"test_suites": suite_jsons})
 }
 
-fn iris_unreachable() -> McpError {
-    McpError::invalid_request("IRIS_UNREACHABLE: no IRIS connection. Set IRIS_HOST and IRIS_WEB_PORT env vars, or ensure IRIS is reachable on a discoverable port (52773, 41773, 51773, 8080).", None)
+/// #110: "discovery has not answered yet" and "nothing is configured" had one message,
+/// and it only described the second. A user with IRIS_HOST set correctly was told to set
+/// IRIS_HOST — so the report reads as "the MCP tools are broken", and the actual cause
+/// (a probe that missed its window on a loaded machine) is nowhere in the text.
+fn iris_unreachable_detail(pending: bool, configured: bool) -> McpError {
+    let msg = if pending {
+        "IRIS_UNREACHABLE: IRIS discovery is still running — the startup probe has not \
+         answered yet. This is usually a slow container start or a loaded machine, not a \
+         configuration problem. Retry this call in a few seconds; the connection is adopted \
+         as soon as the probe completes, and every tool call re-probes after a cooldown."
+    } else if configured {
+        "IRIS_UNREACHABLE: IRIS is configured (IRIS_HOST / IRIS_CONTAINER is set) but the \
+         probe did not reach it. Check that the instance is up and the web port is right — \
+         `curl <host>:<port>/api/atelier/` should return JSON. call check_config to see the \
+         host, port, namespace and user this server is actually using. The probe is retried \
+         on later tool calls, so a session started before IRIS was ready recovers on its own."
+    } else {
+        "IRIS_UNREACHABLE: no IRIS connection. Set IRIS_HOST and IRIS_WEB_PORT env vars, or \
+         ensure IRIS is reachable on a discoverable port (52773, 41773, 51773, 8080)."
+    };
+    McpError::invalid_request(msg.to_string(), None)
+}
+
+/// Whether the environment names an IRIS to connect to at all.
+fn iris_is_configured() -> bool {
+    ["IRIS_HOST", "IRIS_CONTAINER"]
+        .iter()
+        .any(|k| std::env::var(k).is_ok_and(|v| !v.trim().is_empty()))
+}
+
+/// How long to wait before a disconnected session re-probes. Short enough that a session
+/// started 20 seconds before its container heals on its own; long enough that a machine
+/// with no IRIS at all is not probed on every tool call.
+fn discovery_retry_cooldown() -> std::time::Duration {
+    let secs = std::env::var("IRIS_DISCOVERY_RETRY_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(15);
+    std::time::Duration::from_secs(secs)
 }
 fn ok_json(v: serde_json::Value) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![Content::text(v.to_string())]))
@@ -2193,6 +2246,192 @@ pub fn validate_read_only_sql(sql: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Rows in an Atelier query body, or 0 when there are none.
+fn row_count(body: &serde_json::Value) -> usize {
+    body["result"]["content"]
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0)
+}
+
+/// #107: what the class dictionary says about a class that introspected to nothing.
+/// The three states need three different actions, and `Undetermined` is deliberately one
+/// of them — a failed existence check must not become a claim in either direction.
+#[derive(Debug, PartialEq)]
+enum ClassPresence {
+    Compiled,
+    /// The .cls exists but has never been compiled, so the Compiled* tables are empty for
+    /// it. Reads identically to "absent" through %Dictionary.CompiledMethod alone.
+    DefinedNotCompiled,
+    Absent,
+    /// The check itself failed. Say nothing rather than guess.
+    Undetermined,
+}
+
+/// One round trip for both dictionary tables — this runs only when introspection came back
+/// empty, so the happy path is untouched.
+async fn class_presence(
+    iris: &IrisConnection,
+    client: &reqwest::Client,
+    namespace: &str,
+    class_name: &str,
+) -> ClassPresence {
+    let sql = "SELECT 1 AS IsCompiled FROM %Dictionary.CompiledClass WHERE Name = ? \
+               UNION ALL \
+               SELECT 0 AS IsCompiled FROM %Dictionary.ClassDefinition WHERE Name = ?";
+    let params = vec![
+        serde_json::Value::String(class_name.to_string()),
+        serde_json::Value::String(class_name.to_string()),
+    ];
+    let body = match iris.query(sql, params, namespace, client).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!("class_presence check failed for {class_name}: {e}");
+            return ClassPresence::Undetermined;
+        }
+    };
+    let rows = match body["result"]["content"].as_array() {
+        Some(r) => r,
+        None => return ClassPresence::Undetermined,
+    };
+    if rows.is_empty() {
+        return ClassPresence::Absent;
+    }
+    // IRIS returns the column as a number or a numeric string depending on the driver path.
+    let compiled = rows.iter().any(|r| {
+        let v = &r["IsCompiled"];
+        v.as_i64() == Some(1) || v.as_str() == Some("1")
+    });
+    if compiled {
+        ClassPresence::Compiled
+    } else {
+        ClassPresence::DefinedNotCompiled
+    }
+}
+
+/// Names one segment away from `class_name`, so the caller's next call is a correction
+/// rather than another guess — the #62 treatment `iris_test` already gives NO_TESTS_FOUND.
+/// Searches the parent package, which is where a typo's real class almost always lives.
+/// Returns `(suggestions, classes_in_package)`.
+async fn near_miss_classes(
+    iris: &IrisConnection,
+    client: &reqwest::Client,
+    namespace: &str,
+    class_name: &str,
+) -> (Vec<String>, usize) {
+    let prefix = match class_name.rfind('.') {
+        Some(i) => &class_name[..=i],
+        None => class_name,
+    };
+    let body = match iris
+        .query(
+            "SELECT TOP 200 Name FROM %Dictionary.CompiledClass WHERE Name %STARTSWITH ? ORDER BY Name",
+            vec![serde_json::Value::String(prefix.to_string())],
+            namespace,
+            client,
+        )
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!("near-miss lookup failed for {class_name}: {e}");
+            return (vec![], 0);
+        }
+    };
+    let all: Vec<String> = body["result"]["content"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| r["Name"].as_str().map(str::to_string))
+                .filter(|c| !c.eq_ignore_ascii_case(class_name))
+                .collect()
+        })
+        .unwrap_or_default();
+    (rank_near_misses(class_name, &all), all.len())
+}
+
+/// Which of `candidates` are plausibly the class the caller MEANT.
+///
+/// The whole package is not an answer — "did you mean one of these 20?" is the same guess
+/// the caller already made. Two things count as a near miss: a full-name prefix relation
+/// in either direction (`A.B` for `A.B.C`, the #62 rule `iris_test` uses), and a shared
+/// opening on the FINAL segment, which is where typos land (`Ens.Util.LogXX` → `Ens.Util.Log`).
+/// Three characters is the floor — below that every class in the package "matches".
+fn rank_near_misses(class_name: &str, candidates: &[String]) -> Vec<String> {
+    fn last_segment(n: &str) -> &str {
+        n.rsplit('.').next().unwrap_or(n)
+    }
+    fn shared_prefix_len(a: &str, b: &str) -> usize {
+        a.chars()
+            .zip(b.chars())
+            .take_while(|(x, y)| x.eq_ignore_ascii_case(y))
+            .count()
+    }
+    let lower = class_name.to_lowercase();
+    let target_seg = last_segment(class_name).to_lowercase();
+
+    let mut scored: Vec<(usize, &String)> = candidates
+        .iter()
+        .filter_map(|c| {
+            let cl = c.to_lowercase();
+            if cl.starts_with(&lower) || lower.starts_with(&cl) {
+                // A whole-name prefix relation is the strongest signal there is.
+                return Some((usize::MAX, c));
+            }
+            let n = shared_prefix_len(last_segment(&cl), &target_seg);
+            (n >= 3).then_some((n, c))
+        })
+        .collect();
+    // Longest shared opening first; name order breaks ties so the output is deterministic.
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+    scored.into_iter().take(5).map(|(_, c)| c.clone()).collect()
+}
+
+pub const ERR_CLASS_NOT_FOUND: &str = "CLASS_NOT_FOUND";
+
+/// The #107 envelope. Kept out of `docs_introspect` so the message is testable without a
+/// connection.
+fn class_not_found_error(
+    class_name: &str,
+    namespace: &str,
+    candidates: &[String],
+    in_package: usize,
+) -> Result<CallToolResult, McpError> {
+    let mut extra = serde_json::json!({
+        "class_name": class_name,
+        "namespace": namespace,
+        "classes_in_package": in_package,
+    });
+    let absent = format!(
+        "Class '{class_name}' does not exist in namespace '{namespace}' — it is in neither \
+         %Dictionary.CompiledClass nor %Dictionary.ClassDefinition. Nothing was introspected. \
+         (An empty methods/properties list would have meant a class that exists and has no \
+         members, which is a different fact.)"
+    );
+    let msg = if !candidates.is_empty() {
+        extra["did_you_mean"] = serde_json::json!(candidates);
+        format!(
+            "Class '{class_name}' does not exist in namespace '{namespace}'. Did you mean: {}? \
+             Nothing was introspected.",
+            candidates.join(", ")
+        )
+    } else if in_package > 0 {
+        // The package is real and the class is not — worth saying, because it rules out
+        // "wrong namespace" without listing every class in it.
+        format!(
+            "{absent} Its package does exist here and holds {in_package} compiled class(es), \
+             none of them a near match."
+        )
+    } else {
+        absent
+    };
+    extra["hint"] = serde_json::json!(
+        "Check the name with iris_doc(mode='head', name='<class>.cls'), or compile the class \
+         first if it has not been compiled in this namespace."
+    );
+    envelope::fail_with(ERR_CLASS_NOT_FOUND, &msg, extra)
 }
 
 /// Issue #102: the failure envelope `docs_introspect` never had. Names the namespace when a
@@ -2413,9 +2652,16 @@ pub struct IrisTools {
     pub metadata_cache: Arc<dict::MetadataCache>,
     /// Active toolset — controls which tools are registered.
     pub toolset: Toolset,
-    #[allow(dead_code)] // used by #[tool_router] macro-generated code
+    /// The PRUNED router. Both `list_tools` and `call_tool` read this one — see the
+    /// `#[tool_handler(router = ...)]` note on the ServerHandler impl.
     tool_router: ToolRouter<IrisTools>,
 }
+
+/// Write-capable tools the gate removes when the connection is not write-allowed
+/// (Live system mode, or a production-looking namespace without IRIS_ALLOW_PROD).
+/// Named so the dispatch rejection in `call_tool` can tell "gated" from "not in this
+/// toolset" — the two have completely different fixes.
+pub(crate) const WRITE_GATED_TOOLS: &[&str] = &["iris_production_item", "iris_credential_manage"];
 
 #[tool_router]
 impl IrisTools {
@@ -2465,6 +2711,17 @@ impl IrisTools {
             .into_iter()
             .map(|t| t.name.to_string())
             .collect()
+    }
+
+    /// Whether `name` would actually DISPATCH — `has_route` consults the same map
+    /// `ToolRouter::call` looks the name up in, so this is reachability, not listing.
+    ///
+    /// `registered_tool_names()` answers a different question (what tools/list
+    /// advertises). Until #104 the two could disagree completely, because dispatch ran
+    /// against a fresh unpruned router; asserting only on the listing is what let that
+    /// survive. Prefer this one for anything that is meant to be a GUARD.
+    pub fn is_tool_reachable(&self, name: &str) -> bool {
+        self.tool_router.has_route(name)
     }
 
     pub fn with_registry(
@@ -2565,8 +2822,7 @@ impl IrisTools {
                 // Remove write-capable tools if not allowed (issue #26 env guard).
                 // iris_production_item is write-capable; available in all tiers but gated on prod.
                 if !write_tools_enabled {
-                    let write_gated: &[&str] = &["iris_production_item", "iris_credential_manage"];
-                    for name in write_gated {
+                    for name in WRITE_GATED_TOOLS {
                         router.remove_route(name);
                     }
                 }
@@ -2613,18 +2869,87 @@ impl IrisTools {
 
     /// Returns the active IRIS connection, or IRIS_UNREACHABLE if not connected.
     fn get_iris(&self) -> Result<Arc<IrisConnection>, McpError> {
-        self.connection
-            .lock()
-            .unwrap()
-            .iris
-            .clone()
-            .ok_or_else(iris_unreachable)
+        let (iris, pending) = {
+            let c = self.connection.lock().unwrap();
+            (c.iris.clone(), c.discovery_pending)
+        };
+        iris.ok_or_else(|| iris_unreachable_detail(pending, iris_is_configured()))
+    }
+
+    /// #110: a connection missed at startup used to poison the whole session — `iris`
+    /// stayed `None` for its lifetime and every tool answered IRIS_UNREACHABLE while IRIS
+    /// was up the entire time. The 2-second startup cap is a real window to miss: it was
+    /// hit twice on a machine running concurrent `cargo clippy --all-targets`, and it
+    /// presents as "the MCP tools are broken", not "the probe was slow". A room of laptops
+    /// starting containers at once is exactly that load profile.
+    ///
+    /// So: re-probe lazily, on the first tool call that needs a connection, behind a
+    /// cooldown. Seeded with whatever the CLI flags / workspace config described, so a
+    /// retry targets the same instance rather than falling back to env discovery.
+    async fn retry_discovery(&self) {
+        let (seed, wait) = {
+            let c = self.connection.lock().unwrap();
+            if c.iris.is_some() || c.discovery_pending {
+                // Connected, or the startup task is still running and will adopt its own
+                // result — a second concurrent probe would only add load.
+                return;
+            }
+            let cooldown = discovery_retry_cooldown();
+            let too_soon = c.last_retry.is_some_and(|t| t.elapsed() < cooldown);
+            (c.discovery_seed.clone(), !too_soon)
+        };
+        if !wait {
+            return;
+        }
+        self.connection.lock().unwrap().last_retry = Some(std::time::Instant::now());
+
+        match crate::iris::discovery::discover_iris(seed.clone()).await {
+            crate::iris::discovery::IrisDiscovery::Found(c) => {
+                tracing::info!(
+                    base_url = %c.base_url,
+                    "IRIS reached on a lazy re-probe — the session recovered without a restart"
+                );
+                let source = self.connection.lock().unwrap().source.clone();
+                let mut state = ConnectionState::from_iris(c, source, None);
+                state.discovery_seed = seed;
+                state.last_retry = Some(std::time::Instant::now());
+                *self.connection.lock().unwrap() = state;
+            }
+            _ => {
+                tracing::debug!("lazy IRIS re-probe found nothing; will retry after the cooldown");
+            }
+        }
+    }
+
+    /// Adopt a connection discovered after startup, or by any other out-of-band route.
+    /// The write gate is re-evaluated per call (see `call_tool`), so a late connection to a
+    /// Live instance is gated even though the router was built while disconnected.
+    pub fn adopt_connection(&self, conn: IrisConnection, source: ConnectionSource) {
+        let seed = self.connection.lock().unwrap().discovery_seed.clone();
+        let mut state = ConnectionState::from_iris(conn, source, None);
+        state.discovery_seed = seed;
+        *self.connection.lock().unwrap() = state;
+    }
+
+    /// Record what a re-probe should target, and whether startup discovery is still running.
+    pub fn set_discovery_state(&self, seed: Option<IrisConnection>, pending: bool) {
+        let mut c = self.connection.lock().unwrap();
+        c.discovery_seed = seed;
+        c.discovery_pending = pending;
+    }
+
+    /// Startup discovery has finished (successfully or not) — stop reporting "still running".
+    pub fn clear_discovery_pending(&self) {
+        self.connection.lock().unwrap().discovery_pending = false;
     }
 
     /// Check for config file changes then return the active connection.
     /// Use this in tool handlers instead of get_iris() to enable hot-reload (034).
     async fn get_iris_reloaded(&self) -> Result<Arc<IrisConnection>, McpError> {
         self.check_reload().await;
+        // #110: heal a session that started before IRIS was ready, instead of answering
+        // IRIS_UNREACHABLE for its whole lifetime. No-op when connected.
+        self.retry_discovery().await;
         self.get_iris()
     }
 
@@ -2734,7 +3059,7 @@ impl IrisTools {
     }
 
     #[tool(
-        description = "Compile an ObjectScript class, routine, or wildcard package on IRIS via Atelier REST. Wildcards ('MyApp.*', 'MyApp.*.cls') expand CLASS documents only and are guarded: the pattern MUST begin with a literal package prefix before its first '*' (bare '*', '*.cls', '*Foo' are refused as SCOPE_REQUIRED — they would select the whole namespace), and a pattern matching more than 500 documents is refused as TOO_BROAD with the count, so narrow the package rather than retrying. Matching ignores the document suffix, so 'Pkg.Class.*' means the SUBPACKAGE of Pkg.Class, never Pkg.Class itself; a pattern that matches nothing is NOT_FOUND. Compile a .mac/.int/.inc routine by its exact name. Returns structured errors with line numbers, columns, and severity. No Python required."
+        description = "Compile an ObjectScript class, routine, or wildcard package on IRIS via Atelier REST. Wildcards ('MyApp.*', 'MyApp.*.cls') expand CLASS documents only and are guarded: the pattern MUST begin with a literal package prefix before its first '*' (bare '*', '*.cls', '*Foo' are refused as SCOPE_REQUIRED — they would select the whole namespace), and a pattern matching more than 500 documents is refused as TOO_BROAD with the count, so narrow the package rather than retrying. Matching ignores the document suffix, so 'Pkg.Class.*' means the SUBPACKAGE of Pkg.Class, never Pkg.Class itself; a pattern that matches nothing is NOT_FOUND. Atelier's listing omits Hidden and generated classes, so a wildcard cannot expand them: any that match are named in `not_expanded` with a count, and are NOT compiled — compile those by exact name. Compile a .mac/.int/.inc routine by its exact name. Returns structured errors with line numbers, columns, and severity. No Python required."
     )]
     async fn iris_compile(
         &self,
@@ -3194,20 +3519,85 @@ impl IrisTools {
         if let Some(uri) = open_uri {
             resp["open_uri"] = serde_json::Value::String(uri);
         }
-        // #100 on the SUCCESS path. The listing blindness does not only produce false
-        // NOT_FOUNDs; it under-compiles and reports that as success. Reproduced live:
-        // `iris_compile {"target":"EnsPortal.*Maps"}` returned success:true /
-        // targets_compiled:1 while EnsPortal.InterfaceMaps also matches the pattern and was
-        // silently never compiled. A genuine fix needs the cross-check on the happy path,
-        // which costs a query on every successful wildcard compile; this discloses the
-        // limitation instead, as a string literal — zero round trips, so the "the
-        // cross-check never runs on the happy path" cost rule holds absolutely.
+        // #100 on the SUCCESS path, finished by #109. The listing blindness does not only
+        // produce false NOT_FOUNDs; it under-compiles and reports that as success.
+        // Reproduced live: `iris_compile {"target":"EnsPortal.*Maps"}` returned success:true
+        // / targets_compiled:1 while EnsPortal.InterfaceMaps — Hidden=1, same pattern — was
+        // silently never compiled.
+        //
+        // #100 disclosed that generically, as a fixed string, to keep the happy path at
+        // #94's ~42 ms. That was not enough: a caller reading `success: true` has no reason
+        // to look, and the specific class was never named. So the cross-check now runs here
+        // too and NAMES what it skipped. The cost is bounded by construction — a wildcard
+        // must already carry a literal package prefix before its first `*` (SCOPE_REQUIRED),
+        // so the LIKE is always anchored and indexed — and it is one indexed SELECT against
+        // a POST /action/compile that takes orders of magnitude longer. "Unavailable" is
+        // reported as unavailable, never as "nothing was skipped".
         if p.target.contains('*') {
-            resp["expansion_source"] = serde_json::Value::String(
-                "atelier /docnames/CLS — Hidden and generated classes are not listed and were \
-                 not expanded; compile those by exact name"
-                    .into(),
-            );
+            let compiled: std::collections::HashSet<String> = targets
+                .iter()
+                .map(|t| docname_stem(t).to_string())
+                .collect();
+            resp["expansion_source"] = serde_json::Value::String("atelier /docnames/CLS".into());
+            match not_listable_crosscheck(&iris, client, &p.target, &namespace).await {
+                CrossCheck::Found { rows, truncated } => {
+                    let skipped: Vec<&NotListable> = rows
+                        .iter()
+                        .filter(|r| !compiled.contains(&r.name))
+                        .collect();
+                    resp["not_expanded_count"] = serde_json::json!(skipped.len());
+                    resp["not_expanded_truncated"] = serde_json::json!(truncated);
+                    resp["not_expanded"] = serde_json::Value::Array(
+                        skipped
+                            .iter()
+                            .take(NOT_LISTABLE_NAMES_SHOWN)
+                            .map(|r| {
+                                serde_json::json!({
+                                    "name": r.name,
+                                    "hidden": r.hidden,
+                                    "generated_by": r.generated_by,
+                                })
+                            })
+                            .collect(),
+                    );
+                    if !skipped.is_empty() {
+                        let names: Vec<&str> = skipped
+                            .iter()
+                            .map(|r| r.name.as_str())
+                            .take(NOT_LISTABLE_NAMES_SHOWN)
+                            .collect();
+                        resp["expansion_note"] = serde_json::Value::String(format!(
+                            "{} class(es) also match '{}' but are Hidden or generated, so \
+                             /docnames/CLS does not list them and they were NOT compiled: {}{}. \
+                             Compile them by exact name if you meant to include them.",
+                            skipped.len(),
+                            p.target,
+                            names.join(", "),
+                            if skipped.len() > names.len() {
+                                format!(" (showing {} of {})", names.len(), skipped.len())
+                            } else {
+                                String::new()
+                            },
+                        ));
+                    }
+                }
+                CrossCheck::NoSuchClass => {
+                    // Every class matching the pattern is in the listing — nothing was
+                    // skipped, and that is now a checked fact rather than an untested hope.
+                    resp["not_expanded_count"] = serde_json::json!(0);
+                    resp["not_expanded"] = serde_json::json!([]);
+                }
+                CrossCheck::Unavailable(why) => {
+                    resp["not_expanded_count"] = serde_json::Value::Null;
+                    resp["expansion_note"] = serde_json::Value::String(format!(
+                        "Hidden and generated classes are not listed by /docnames/CLS and were \
+                         not expanded. The %Dictionary.ClassDefinition cross-check that would \
+                         say whether any such class matches '{}' could not be run ({why}), so \
+                         this compile is not proof that none were skipped.",
+                        p.target
+                    ));
+                }
+            }
         }
 
         // Progressive disclosure (027): truncate errors array when count exceeds threshold.
@@ -4081,49 +4471,73 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
         let namespace = interop::resolve_namespace(p.namespace.as_deref(), Some(&iris));
         let client = self.http_client();
         let query_url = iris.versioned_ns_url(&namespace, "/action/query");
-        let resp = match client
-            .post(&query_url)
-            .basic_auth(&iris.username, Some(&iris.password))
-            .json(&serde_json::json!({"query": p.query, "parameters": p.parameters}))
-            .send()
+
+        // #105: `iris_query` used to carry its own copy of this request — which meant its own
+        // (drifted) response reading AND no retry at all, while every `query`-backed tool rode
+        // out transient drops. One OpenCode campaign run took four consecutive
+        // IRIS_UNREACHABLEs here over ~190s of a sandbox blip that the shared retry absorbs.
+        // Now the request, the retry policy and the reading are all shared; what stays local
+        // is the PRESENTATION — SQL_ERROR with the table hints, and the #93 404 probe.
+        let params: Vec<serde_json::Value> = p
+            .parameters
+            .iter()
+            .map(|v| serde_json::Value::String(v.clone()))
+            .collect();
+        let outcome = match iris
+            .query_outcome(&p.query, params, &namespace, client)
             .await
         {
-            Ok(v) => v,
+            Ok(o) => o,
             Err(e) => return crate::tools::envelope::transport_fail("iris_query", &e.to_string()),
         };
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            // #93 first: the 404 body is ZERO bytes, so the transport alone cannot tell a
-            // missing namespace from a missing endpoint — ask the root descriptor. `None`
-            // means cannot tell, and the status-coded error below survives.
-            if status.as_u16() == 404 {
-                if let Some(missing) = interop::namespace_missing_error(
-                    &iris,
-                    client,
-                    &namespace,
-                    &query_url,
-                    "No rows were read.",
-                )
-                .await
-                {
-                    return missing;
+        let body = match outcome {
+            crate::iris::connection::QueryOutcome::Rows(body) => body,
+            crate::iris::connection::QueryOutcome::HttpError { status, .. } => {
+                // #93 first: the 404 body is ZERO bytes, so the transport alone cannot tell a
+                // missing namespace from a missing endpoint — ask the root descriptor. `None`
+                // means cannot tell, and the status-coded error below survives.
+                if status.as_u16() == 404 {
+                    if let Some(missing) = interop::namespace_missing_error(
+                        &iris,
+                        client,
+                        &namespace,
+                        &query_url,
+                        "No rows were read.",
+                    )
+                    .await
+                    {
+                        return missing;
+                    }
                 }
+                // #101, the filed repro: this answered IRIS_UNREACHABLE + "Check IRIS_HOST and
+                // IRIS_WEB_PORT" for a 401 while IRIS was answering perfectly on that very host
+                // and port. An HTTP *response* is proof of reachability. The hint goes with the
+                // code: `http_status_fail` attaches `attempted_url` (useful) and lets
+                // `builtin_hint` supply the credentials advice (correct), instead of hard-coding
+                // networking advice that was wrong for every status.
+                self.record_call("iris_query", false);
+                return envelope::http_status_fail("iris_query", status, &query_url);
             }
-            // #101, the filed repro: this answered IRIS_UNREACHABLE + "Check IRIS_HOST and
-            // IRIS_WEB_PORT" for a 401 while IRIS was answering perfectly on that very host
-            // and port. An HTTP *response* is proof of reachability. The hint goes with the
-            // code: `http_status_fail` attaches `attempted_url` (useful) and lets
-            // `builtin_hint` supply the credentials advice (correct), instead of hard-coding
-            // networking advice that was wrong for every status.
-            return envelope::http_status_fail("iris_query", status, &query_url);
-        }
-
-        let body: serde_json::Value = resp.json().await.unwrap_or_default();
-
-        if let Some(errors) = body["status"]["errors"].as_array() {
-            if !errors.is_empty() {
-                let msg = errors[0]["error"].as_str().unwrap_or("SQL error");
+            // A 200 whose body is not JSON is a proxy error page or an HTML login redirect,
+            // NOT an empty result set. `unwrap_or_default()` used to make it the latter:
+            // `{"success":true,"rows":[],"count":0}` — a confident wrong answer, and the
+            // exact shape #102 was filed about, surviving in the one tool that copy missed.
+            crate::iris::connection::QueryOutcome::NonJson { status, snippet } => {
+                self.record_call("iris_query", false);
+                return envelope::fail_with(
+                    "IRIS_REQUEST_FAILED",
+                    &format!("non-JSON response from {query_url}: {snippet}"),
+                    serde_json::json!({
+                        "attempted_url": query_url,
+                        "http_status": status.as_u16(),
+                        "hint": "IRIS answered, but not with JSON — typically a proxy error \
+                                 page or an HTML login redirect in front of the Atelier API. \
+                                 No rows were read; this is not an empty result set.",
+                    }),
+                );
+            }
+            crate::iris::connection::QueryOutcome::IrisError(msg) => {
+                let msg = msg.as_str();
                 self.record_call("iris_query", false);
                 let mut extra = serde_json::json!({});
                 // 84/447 workshop failures were guesses at nonexistent tables — route the
@@ -4146,7 +4560,7 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                 }
                 return envelope::fail_with("SQL_ERROR", msg, extra);
             }
-        }
+        };
 
         let rows = body["result"]["content"]
             .as_array()
@@ -4740,6 +5154,47 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                 return introspect_failure(&iris, client, &namespace, &p.class_name, &e).await
             }
         };
+        // #107: "no members" and "no such class" arrived in the same shape —
+        // `{"methods":[],"properties":[],"success":true}` — which reads as "this class
+        // exists and is empty". An agent introspecting before writing code concludes there
+        // is nothing to call and generates against a class that was never there.
+        //
+        // The check is on the EMPTY path only: a class with any member never pays for it,
+        // and a class with none is exactly the case that is ambiguous. `Undetermined` keeps
+        // the empty answer rather than inventing a second wrong fact.
+        let empty = row_count(&methods) == 0 && row_count(&props) == 0;
+        if empty {
+            match class_presence(&iris, client, &namespace, &p.class_name).await {
+                ClassPresence::Absent => {
+                    let (candidates, in_package) =
+                        near_miss_classes(&iris, client, &namespace, &p.class_name).await;
+                    return class_not_found_error(
+                        &p.class_name,
+                        &namespace,
+                        &candidates,
+                        in_package,
+                    );
+                }
+                ClassPresence::DefinedNotCompiled => {
+                    return envelope::fail_with(
+                        "CLASS_NOT_COMPILED",
+                        &format!(
+                            "Class '{}' exists in namespace '{}' but is not compiled, so it has \
+                             no compiled methods or properties to introspect. Nothing was read.",
+                            p.class_name, namespace
+                        ),
+                        serde_json::json!({
+                            "class_name": p.class_name,
+                            "namespace": namespace,
+                            "hint": "Compile it first: iris_compile(target='<class>.cls'). \
+                                     docs_introspect reads %Dictionary.CompiledMethod / \
+                                     CompiledProperty, which are populated by compilation.",
+                        }),
+                    );
+                }
+                ClassPresence::Compiled | ClassPresence::Undetermined => {}
+            }
+        }
         ok_json(
             serde_json::json!({"success": true, "class_name": p.class_name, "methods": methods["result"]["content"], "properties": props["result"]["content"]}),
         )
@@ -6454,7 +6909,18 @@ Methods:
     }
 }
 
-#[tool_handler]
+// `router = self.tool_router` is LOAD-BEARING, not decoration. The macro's default
+// router expression is `Self::tool_router()` — a FRESH, UNPRUNED router built on every
+// single tools/call. Dispatch therefore never saw toolset pruning or the write gate:
+// `remove_route` mutates the instance field, which only our `list_tools` override read.
+// The result was a server that hid tools from the listing and happily ran them anyway
+// (#104: under `interop`, `iris_search` — not in INTEROP_TOOLS — returned real data over
+// the wire; under `baseline`, so did the pruned `iris_get_log`). Binding dispatch to the
+// same pruned router makes every `remove_route` in `with_registry_and_toolset`
+// authoritative, including the write gate at ~line 2568 that is supposed to keep
+// iris_credential_manage / iris_production_item away from a Live instance.
+// `toolset_pruning_is_enforced_at_dispatch` in tests/unit/test_toolset.rs guards this.
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for IrisTools {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
@@ -6466,6 +6932,37 @@ impl ServerHandler for IrisTools {
                 "iris-interop-dev: streamlined MCP tools for IRIS Interoperability development."
                     .to_string(),
             )
+    }
+
+    /// Override call_tool ONLY to replace rmcp's bare `tool not found` with a message
+    /// that says WHY the tool is unreachable. The macro would generate this exact body
+    /// minus the pre-check; the routing itself is unchanged.
+    ///
+    /// Three causes produce the same rmcp error and have three different fixes:
+    /// the name is not a tool at all; the tool exists but this toolset prunes it
+    /// (restart with --toolset baseline); or it is write-gated off because the
+    /// connection is Live (set IRIS_ALLOW_PROD=1, deliberately). Rebuilding the full
+    /// router to tell them apart is only on the rejection path, never on a live call.
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if !self.tool_router.has_route(&request.name) {
+            return Err(self.unreachable_tool_error(&request.name));
+        }
+        // The router prunes write tools ONCE, at construction. The connection can change
+        // afterwards and the router is never rebuilt: `check_reload` (034) re-probes from a
+        // changed .iris-agentic-dev.toml and can land on a Live instance, and #110's lazy
+        // re-probe adopts a connection into a router that was built while disconnected —
+        // when there was no connection to gate on. Both would hand a Live instance the
+        // write tools. Re-checking here costs a slice scan of two names and makes the gate
+        // follow the CURRENT connection rather than the one that existed at startup.
+        if WRITE_GATED_TOOLS.contains(&request.name.as_ref()) && self.connected_but_read_only() {
+            return Err(self.unreachable_tool_error(&request.name));
+        }
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await
     }
 
     /// Override list_tools to rewrite JSON Schema 2020-12 nullable types to OpenAPI 3.0 anyOf.
@@ -6488,6 +6985,63 @@ impl ServerHandler for IrisTools {
             next_cursor: None,
             meta: None,
         })
+    }
+}
+
+impl IrisTools {
+    /// There IS a connection and it is not write-allowed — a Live system mode, or a
+    /// production-looking namespace without IRIS_ALLOW_PROD. Disconnected is deliberately
+    /// NOT this: those calls fail with IRIS_UNREACHABLE anyway, and reporting them as
+    /// write-gated would name the wrong problem.
+    fn connected_but_read_only(&self) -> bool {
+        self.connection
+            .lock()
+            .unwrap()
+            .iris
+            .as_ref()
+            .is_some_and(|c| !c.is_write_allowed())
+    }
+
+    /// Explain why `name` did not dispatch. See `call_tool` for why this exists.
+    fn unreachable_tool_error(&self, name: &str) -> McpError {
+        let exists_unpruned = Self::tool_router().has_route(name);
+        if !exists_unpruned {
+            return McpError::invalid_params(
+                format!("Unknown tool '{name}'. Call tools/list for the tools this server offers."),
+                Some(serde_json::json!({
+                    "error_code": "UNKNOWN_TOOL",
+                    "tool": name,
+                    "toolset": self.toolset.as_str(),
+                })),
+            );
+        }
+        if WRITE_GATED_TOOLS.contains(&name) && self.connected_but_read_only() {
+            return McpError::invalid_params(
+                format!(
+                    "Tool '{name}' is write-capable and this connection is not write-allowed \
+                     (Live system mode, or a production-looking namespace). It was not called. \
+                     Set IRIS_ALLOW_PROD=1 only if writing to this instance is intended."
+                ),
+                Some(serde_json::json!({
+                    "error_code": "WRITE_GATED",
+                    "tool": name,
+                    "toolset": self.toolset.as_str(),
+                })),
+            );
+        }
+        McpError::invalid_params(
+            format!(
+                "Tool '{name}' exists but is not part of the '{ts}' toolset, so it was not \
+                 called. Restart the server with --toolset baseline (or IRIS_TOOLSET=baseline) \
+                 to reach it.",
+                ts = self.toolset.as_str()
+            ),
+            Some(serde_json::json!({
+                "error_code": "TOOL_NOT_IN_TOOLSET",
+                "tool": name,
+                "toolset": self.toolset.as_str(),
+            })),
+        )
     }
 }
 
@@ -8197,6 +8751,360 @@ mod no_tests_found_guidance_tests {
     }
 }
 
+/// #110: three different unreachable states had one message, and it described only the
+/// third. A user with IRIS_HOST set correctly was told to set IRIS_HOST.
+#[cfg(test)]
+mod unreachable_message_tests {
+    use super::*;
+
+    fn msg(pending: bool, configured: bool) -> String {
+        iris_unreachable_detail(pending, configured)
+            .message
+            .to_string()
+    }
+
+    /// The probe has not answered yet. Telling this user to set IRIS_HOST sends them to
+    /// debug a configuration that is already correct — the reported failure mode.
+    #[test]
+    fn a_pending_probe_says_so_and_does_not_blame_the_configuration() {
+        let m = msg(true, true);
+        assert!(m.contains("still running"), "{m}");
+        assert!(m.contains("Retry"), "{m}");
+        assert!(
+            !m.contains("Set IRIS_HOST"),
+            "the configuration is not the problem here: {m}"
+        );
+    }
+
+    /// Configured, probe finished, still no connection: the instance is the thing to check.
+    #[test]
+    fn a_configured_but_unreachable_instance_points_at_the_instance() {
+        let m = msg(false, true);
+        assert!(m.contains("configured"), "{m}");
+        assert!(
+            m.contains("api/atelier"),
+            "a check they can actually run: {m}"
+        );
+        assert!(m.contains("recovers"), "say the session will retry: {m}");
+    }
+
+    /// Nothing configured — the original message, still correct for the case it was
+    /// written for.
+    #[test]
+    fn an_unconfigured_server_still_gets_the_setup_instructions() {
+        let m = msg(false, false);
+        assert!(m.contains("Set IRIS_HOST"), "{m}");
+        assert!(m.contains("52773"), "{m}");
+    }
+
+    /// All three are distinguishable — a caller (or a log grep) can tell them apart.
+    #[test]
+    fn the_three_states_do_not_share_a_message() {
+        let all = [msg(true, true), msg(false, true), msg(false, false)];
+        for (i, a) in all.iter().enumerate() {
+            for b in all.iter().skip(i + 1) {
+                assert_ne!(a, b, "two states share one message");
+            }
+        }
+    }
+}
+
+/// #107: the near-miss ranking `docs_introspect` uses when a class does not exist.
+/// Pure — no connection, no IRIS.
+#[cfg(test)]
+mod near_miss_tests {
+    use super::*;
+
+    fn v(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A typo in the final segment is the case this exists for.
+    #[test]
+    fn a_typo_in_the_last_segment_finds_the_real_class() {
+        let pkg = v(&[
+            "Ens.Util.Log",
+            "Ens.Util.LogBase",
+            "Ens.Util.Calendar",
+            "Ens.Util.File",
+        ]);
+        let got = rank_near_misses("Ens.Util.LogXX", &pkg);
+        assert_eq!(got, v(&["Ens.Util.Log", "Ens.Util.LogBase"]));
+    }
+
+    /// Handing back the whole package is the same guess the caller already made. A
+    /// package with nothing resembling the name must produce NO suggestions, so the
+    /// caller is told the class is absent rather than offered twenty wrong ones.
+    #[test]
+    fn an_unrelated_package_yields_no_suggestions() {
+        let pkg = v(&["Ens.Util.Calendar", "Ens.Util.File", "Ens.Util.IO"]);
+        assert!(rank_near_misses("Ens.Util.Zebra", &pkg).is_empty());
+    }
+
+    /// Two characters in common is every class in a package; three is a name.
+    #[test]
+    fn the_shared_opening_floor_is_three_characters() {
+        let pkg = v(&["A.Foobar", "A.Foxtrot"]);
+        // "Foo" shares 3 with Foobar, 2 with Foxtrot.
+        assert_eq!(rank_near_misses("A.Foo", &pkg), v(&["A.Foobar"]));
+    }
+
+    /// The #62 rule: a whole-name prefix relation in either direction outranks any
+    /// last-segment overlap, and is reported first.
+    #[test]
+    fn a_whole_name_prefix_relation_ranks_first() {
+        let pkg = v(&["Ejercicio3.Tests.BO.SQLTest", "Ejercicio3.Teardown"]);
+        let got = rank_near_misses("Ejercicio3.Te", &pkg);
+        assert_eq!(got[0], "Ejercicio3.Teardown");
+        assert!(got.contains(&"Ejercicio3.Tests.BO.SQLTest".to_string()));
+    }
+
+    /// A suggestion identical to the input is not a correction — following it re-sends
+    /// the same call. (The SQL filters exact matches; this pins the ranking half.)
+    #[test]
+    fn the_list_is_capped_and_deterministic() {
+        let pkg = v(&[
+            "P.Logger",
+            "P.Logging",
+            "P.LogItem",
+            "P.LogFile",
+            "P.LogSink",
+            "P.LogTail",
+        ]);
+        let got = rank_near_misses("P.Log", &pkg);
+        assert_eq!(got.len(), 5, "at most five, or it is a package dump again");
+        assert_eq!(
+            got,
+            rank_near_misses("P.Log", &pkg),
+            "must be deterministic"
+        );
+    }
+
+    /// The envelope must never read as "exists and is empty", with or without candidates.
+    #[test]
+    fn the_envelope_says_absent_not_empty() {
+        for (candidates, in_package) in [(v(&[]), 0usize), (v(&["A.Bar"]), 4usize)] {
+            let r = class_not_found_error("A.Baz", "APP", &candidates, in_package).unwrap();
+            let text = match &r.content[0].raw {
+                rmcp::model::RawContent::Text(t) => t.text.clone(),
+                _ => panic!("expected text"),
+            };
+            let j: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(j["error_code"], ERR_CLASS_NOT_FOUND);
+            assert_eq!(j["success"], serde_json::json!(false));
+            assert!(
+                j.get("methods").is_none() && j.get("properties").is_none(),
+                "a class that does not exist has no member lists, not empty ones: {j}"
+            );
+            assert!(j["error"].as_str().unwrap().contains("does not exist"));
+        }
+    }
+}
+
+/// #105: `iris_query` and the `query_once`-backed tools must read the SAME response the
+/// same way. They did not: `iris_query` carried a private copy of the HTTP path that had
+/// drifted twice. These drive the tool handler and `IrisConnection::query` against ONE
+/// mock and assert they agree — a copy that drifts again fails here.
+#[cfg(test)]
+mod query_parity_tests {
+    use super::*;
+    use crate::iris::connection::{DiscoverySource, IrisConnection};
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    fn conn(server: &MockServer) -> IrisConnection {
+        IrisConnection::new(
+            server.uri(),
+            "APP",
+            "_SYSTEM",
+            "SYS",
+            DiscoverySource::EnvVar,
+        )
+    }
+
+    /// Run `iris_query` against the mock and return its parsed envelope.
+    async fn tool_answer(server: &MockServer) -> serde_json::Value {
+        let tools = IrisTools::new_with_toolset(Some(conn(server)), Toolset::Interop).unwrap();
+        let r = tools
+            .iris_query(rmcp::handler::server::wrapper::Parameters(QueryParams {
+                query: "SELECT 1".into(),
+                parameters: vec![],
+                namespace: None,
+                force: false,
+            }))
+            .await
+            .expect("the tool must answer, not error out of the transport");
+        let text = match &r.content[0].raw {
+            rmcp::model::RawContent::Text(t) => t.text.clone(),
+            _ => panic!("expected text content"),
+        };
+        serde_json::from_str(&text).unwrap()
+    }
+
+    /// Run the connection-level path (`query` → `query_once`) against the same mock.
+    async fn conn_answer(server: &MockServer) -> Result<serde_json::Value, String> {
+        let c = conn(server);
+        let client = reqwest::Client::new();
+        c.query("SELECT 1", vec![], "APP", &client)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn mock_query(status: u16, body: &str) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r".*/action/query$"))
+            .respond_with(ResponseTemplate::new(status).set_body_string(body.to_string()))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// A 200 carrying HTML is a proxy page or a login redirect, not an empty result set.
+    /// `unwrap_or_default()` in the duplicate turned it into `{"success":true,"count":0}` —
+    /// a confident wrong answer — while the sibling reported the body verbatim.
+    #[test]
+    fn non_json_200_is_not_an_empty_result_set() {
+        rt().block_on(async {
+            let server = mock_query(200, "<html>oops not json</html>").await;
+
+            let tool = tool_answer(&server).await;
+            assert_ne!(
+                tool["success"],
+                serde_json::json!(true),
+                "a 200 with a non-JSON body must not be reported as a successful query: {tool}"
+            );
+            assert_eq!(tool["error_code"], "IRIS_REQUEST_FAILED", "got: {tool}");
+            assert!(
+                tool["error"].as_str().unwrap().contains("oops not json"),
+                "the body IRIS actually sent should survive into the error: {tool}"
+            );
+            assert!(
+                tool.get("rows").is_none() && tool.get("count").is_none(),
+                "no row count may be reported for a query that read no rows: {tool}"
+            );
+
+            let conn = conn_answer(&server).await;
+            let conn_err = conn.expect_err("the connection path must fail too");
+            assert!(
+                conn_err.contains("non-JSON response"),
+                "both paths must agree this was not JSON, got: {conn_err}"
+            );
+        });
+    }
+
+    /// Atelier puts the real diagnostic in the BODY of a 400. A status-first read replaced
+    /// `ERROR #16002` with a bare `HTTP 400 Bad Request` in the tool while the sibling kept
+    /// it. Body-first, in both.
+    #[test]
+    fn atelier_errors_beat_the_http_status_in_both_paths() {
+        rt().block_on(async {
+            let server = mock_query(
+                400,
+                r#"{"status":{"errors":[{"error":"ERROR #16002: Invalid JSON Content"}]}}"#,
+            )
+            .await;
+
+            let tool = tool_answer(&server).await;
+            assert_eq!(
+                tool["error_code"], "SQL_ERROR",
+                "IRIS's own diagnostic must win over the HTTP status: {tool}"
+            );
+            assert!(
+                tool["error"].as_str().unwrap().contains("ERROR #16002"),
+                "the Atelier error text must survive byte-for-byte: {tool}"
+            );
+
+            let conn_err = conn_answer(&server)
+                .await
+                .expect_err("the connection path must fail too");
+            assert!(
+                conn_err.contains("ERROR #16002"),
+                "both paths must surface the same Atelier text, got: {conn_err}"
+            );
+        });
+    }
+
+    /// #105, the half the first pass missed. Sharing the response READER left `iris_query`
+    /// still issuing its own request — and therefore still with no retry, while every
+    /// `query`-backed tool rode out transient drops. The OpenCode campaign logs show the
+    /// cost: one run took four consecutive IRIS_UNREACHABLEs from `iris_query` across ~190s
+    /// of a sandbox blip, with `check_config` answering fine in between.
+    #[test]
+    fn a_transient_5xx_is_retried_rather_than_reported() {
+        rt().block_on(async {
+            let server = MockServer::start().await;
+            // Two failures, then the real answer — exactly what a restarting instance does.
+            Mock::given(method("POST"))
+                .and(path_regex(r".*/action/query$"))
+                .respond_with(ResponseTemplate::new(503))
+                .up_to_n_times(2)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(r".*/action/query$"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_string(
+                        r#"{"status":{"errors":[]},"result":{"content":[{"N":1}]}}"#,
+                    ),
+                )
+                .mount(&server)
+                .await;
+
+            let tool = tool_answer(&server).await;
+            assert_eq!(
+                tool["success"],
+                serde_json::json!(true),
+                "the third attempt succeeded — the caller must never see the first two: {tool}"
+            );
+            assert_eq!(tool["count"], 1, "{tool}");
+        });
+    }
+
+    /// The retry must not paper over a DETERMINISTIC failure. A SQL error is the same on
+    /// every attempt, so retrying it only delays the answer.
+    #[test]
+    fn a_sql_error_is_answered_immediately_not_retried() {
+        rt().block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path_regex(r".*/action/query$"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(
+                    r#"{"status":{"errors":[{"error":"SQLCODE: -30 Table not found"}]}}"#,
+                ))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let tool = tool_answer(&server).await;
+            assert_eq!(tool["error_code"], "SQL_ERROR", "{tool}");
+        });
+    }
+
+    /// The happy path still works — otherwise the two tests above would pass on a tool
+    /// that rejects everything.
+    #[test]
+    fn a_good_query_still_returns_its_rows() {
+        rt().block_on(async {
+            let server = mock_query(
+                200,
+                r#"{"status":{"errors":[]},"result":{"content":[{"Expression_1":1}]}}"#,
+            )
+            .await;
+            let tool = tool_answer(&server).await;
+            assert_eq!(tool["success"], serde_json::json!(true), "got: {tool}");
+            assert_eq!(tool["count"], 1, "got: {tool}");
+        });
+    }
+}
+
 // ── Issue #88: /docnames wildcard expansion ───────────────────────────────────
 #[cfg(test)]
 mod wildcard_listing_failure_tests {
@@ -8772,13 +9680,16 @@ mod wildcard_listing_failure_tests {
         });
     }
 
-    /// #100, THE COST GUARD. The cross-check is inside `if targets.is_empty()`, reachable
-    /// only after a listing that returned 200 and matched nothing, so a successful compile
-    /// pays exactly zero extra round trips. `expect(0)` on `/action/query` is asserted when
-    /// the server drops: this is the test that fails the day someone "helpfully" hoists the
-    /// cross-check above the emptiness check.
+    /// THE COST GUARD, restated for #109. It used to read `expect(0)`: the cross-check was
+    /// forbidden on the happy path, to hold #94's ~42 ms. #109 changed that deliberately —
+    /// a partial match that silently skips a Hidden sibling and reports `success: true` is
+    /// a wrong answer, and no latency budget buys that back. So the rule is now ONE query
+    /// per successful wildcard compile, and this test pins the number: `expect(1)` fails on
+    /// a second query per compile just as loudly as the old `expect(0)` failed on the first.
+    /// (Measured against the dev instance: ~70–110 ms for an anchored, indexed LIKE — a
+    /// wildcard must carry a literal package prefix before its `*`, so it always is one.)
     #[test]
-    fn the_cross_check_never_runs_on_the_happy_path() {
+    fn the_cross_check_runs_exactly_once_on_the_happy_path() {
         rt().block_on(async {
             let server = MockServer::start().await;
             mount_listing(
@@ -8787,7 +9698,15 @@ mod wildcard_listing_failure_tests {
                 &["APPPKG.FoundationProduction.cls", "APPPKG.Sub.Helper.cls"],
             )
             .await;
-            mount_query(&server, class_rows(&[]), 0).await;
+            mount_query(
+                &server,
+                class_rows(&[
+                    ("APPPKG.FoundationProduction", false, ""),
+                    ("APPPKG.Sub.Helper", false, ""),
+                ]),
+                1,
+            )
+            .await;
             Mock::given(method("POST"))
                 .and(path_regex(r".*/action/compile$"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(clean_compile()))
@@ -8798,20 +9717,110 @@ mod wildcard_listing_failure_tests {
             let (is_err, v) = compile_against(&server, "APP", None, "APPPKG.*").await;
             assert_eq!(is_err, Some(false), "{v}");
             assert_eq!(v["targets_compiled"], 2, "{v}");
+            // The dictionary and the listing agree — nothing was skipped, and that is a
+            // CHECKED zero, not an assumed one.
+            assert_eq!(v["not_expanded_count"], 0, "{v}");
+            assert!(
+                v.get("expansion_note").is_none(),
+                "no omission, so no note to add: {v}"
+            );
         });
     }
 
-    /// #100 C: the success payload over-claims too. Reproduced live:
-    /// `iris_compile {"target":"EnsPortal.*Maps"}` returns success:true /
-    /// targets_compiled:1 while EnsPortal.InterfaceMaps also matches and was silently never
-    /// compiled. A genuine fix needs the cross-check on the happy path, which the cost rule
-    /// above forbids — so the limitation is DISCLOSED, as a string literal costing nothing.
+    /// #109, the filed repro, at the call site. `EnsPortal.*Maps` matches two classes in
+    /// %Dictionary.ClassDefinition — RecordMaps (listable) and InterfaceMaps (Hidden=1) —
+    /// and /docnames/CLS offers only the first. The compile then reported `success: true`,
+    /// `targets_compiled: 1`, and named nothing. A caller had no reason to look.
     #[test]
-    fn the_happy_path_payload_discloses_what_the_listing_omits() {
+    fn a_partial_wildcard_match_names_the_siblings_it_skipped() {
+        rt().block_on(async {
+            let server = MockServer::start().await;
+            mount_listing(&server, "EnsPortal.", &["EnsPortal.RecordMaps.cls"]).await;
+            mount_query(
+                &server,
+                class_rows(&[
+                    ("EnsPortal.RecordMaps", false, ""),
+                    ("EnsPortal.InterfaceMaps", true, ""),
+                ]),
+                1,
+            )
+            .await;
+            Mock::given(method("POST"))
+                .and(path_regex(r".*/action/compile$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(clean_compile()))
+                .mount(&server)
+                .await;
+
+            let (is_err, v) = compile_against(&server, "APP", None, "EnsPortal.*Maps").await;
+            assert_eq!(is_err, Some(false), "{v}");
+            assert_eq!(v["targets_compiled"], 1, "{v}");
+            assert_eq!(v["not_expanded_count"], 1, "{v}");
+            assert_eq!(
+                v["not_expanded"][0]["name"], "EnsPortal.InterfaceMaps",
+                "the skipped class must be NAMED, not merely alluded to: {v}"
+            );
+            assert_eq!(v["not_expanded"][0]["hidden"], true, "{v}");
+            let note = v["expansion_note"].as_str().unwrap_or_default();
+            assert!(
+                note.contains("EnsPortal.InterfaceMaps") && note.contains("NOT compiled"),
+                "the prose must say what was left out: {v}"
+            );
+            // The compile itself must be unchanged — disclosure, not a behaviour change.
+            assert_eq!(
+                compile_payloads(&server).await,
+                vec![serde_json::json!(["EnsPortal.RecordMaps.cls"])],
+                "naming the omission must not silently start compiling Hidden classes"
+            );
+        });
+    }
+
+    /// "We could not check" must not render as "nothing was skipped". A failed cross-check
+    /// leaves `not_expanded_count` null and says so — the #89/#119 rule, on the success path.
+    #[test]
+    fn an_unavailable_cross_check_is_not_reported_as_a_clean_expansion() {
         rt().block_on(async {
             let server = MockServer::start().await;
             mount_listing(&server, "APPPKG.", &["APPPKG.FoundationProduction.cls"]).await;
-            mount_query(&server, class_rows(&[]), 0).await;
+            Mock::given(method("POST"))
+                .and(path_regex(r".*/action/query$"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(r".*/action/compile$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(clean_compile()))
+                .mount(&server)
+                .await;
+
+            let (is_err, v) = compile_against(&server, "APP", None, "APPPKG.*").await;
+            assert_eq!(is_err, Some(false), "the compile itself succeeded: {v}");
+            assert!(
+                v["not_expanded_count"].is_null(),
+                "an unrunnable check is not a zero: {v}"
+            );
+            let note = v["expansion_note"].as_str().unwrap_or_default();
+            assert!(
+                note.contains("could not be run") && note.contains("not proof"),
+                "say that nothing was settled: {v}"
+            );
+        });
+    }
+
+    /// The success payload still names its source, so a reader knows the expansion came
+    /// from the CLS listing rather than from the class dictionary. (#100 carried the whole
+    /// caveat in this string because nothing checked; #109 checks, so the caveat lives in
+    /// `expansion_note` only when there is something to caveat.)
+    #[test]
+    fn the_happy_path_payload_names_its_expansion_source() {
+        rt().block_on(async {
+            let server = MockServer::start().await;
+            mount_listing(&server, "APPPKG.", &["APPPKG.FoundationProduction.cls"]).await;
+            mount_query(
+                &server,
+                class_rows(&[("APPPKG.FoundationProduction", false, "")]),
+                1,
+            )
+            .await;
             Mock::given(method("POST"))
                 .and(path_regex(r".*/action/compile$"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(clean_compile()))
@@ -8820,10 +9829,7 @@ mod wildcard_listing_failure_tests {
 
             let (is_err, v) = compile_against(&server, "APP", None, "APPPKG.*").await;
             assert_eq!(is_err, Some(false), "{v}");
-            let src = v["expansion_source"].as_str().unwrap_or_default();
-            assert!(src.contains("Hidden"), "{v}");
-            assert!(src.contains("generated"), "{v}");
-            assert!(src.contains("exact name"), "{v}");
+            assert_eq!(v["expansion_source"], "atelier /docnames/CLS", "{v}");
         });
     }
 
@@ -10639,10 +11645,52 @@ mod http_status_answer_tests {
         (r.is_error, payload(&r))
     }
 
-    /// (a)+(b) The two answers that must NOT change. `methods:[]` for a class that genuinely
-    /// has none is the control captured live — turning THAT into an error would be a new bug.
+    /// The control that must NOT change: a class that EXISTS and genuinely has no members
+    /// still answers `methods: []` on a success envelope. #107 turns the *other* empty case
+    /// into an error, and this is what keeps that from swallowing the legitimate one.
     #[test]
-    fn introspect_still_answers_an_empty_method_list_for_an_unknown_class() {
+    fn introspect_still_answers_an_empty_method_list_for_a_class_that_exists() {
+        rt().block_on(async {
+            let server = MockServer::start().await;
+            // The existence check runs only because the member lists came back empty; it is
+            // the one query whose SQL names %Dictionary.CompiledClass. Answer THAT one with
+            // a row, and the class exists with no members. Mounted FIRST — wiremock matches
+            // in insertion order, so the catch-all below must come second.
+            Mock::given(method("POST"))
+                .and(path_regex(r".*/action/query$"))
+                .and(wiremock::matchers::body_string_contains(
+                    "%Dictionary.CompiledClass WHERE Name",
+                ))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(
+                        serde_json::json!({"result": {"content": [{"IsCompiled": 1}]}}),
+                    ),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(r".*/action/query$"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"result": {"content": []}})),
+                )
+                .mount(&server)
+                .await;
+            let (is_err, v) = introspect(&server, "APP").await;
+            assert_ne!(is_err, Some(true), "{v}");
+            assert_eq!(v["success"], true, "{v}");
+            assert_eq!(v["methods"], serde_json::json!([]), "{v}");
+            assert_eq!(v["properties"], serde_json::json!([]), "{v}");
+        });
+    }
+
+    /// #107: the same empty member lists, but the class is in neither dictionary table.
+    /// This used to be indistinguishable from the test above — `{"methods":[],
+    /// "properties":[],"success":true}` for `No.Such.Class.At.All` — so an agent
+    /// introspecting before writing code concluded the class was empty and generated
+    /// against nothing.
+    #[test]
+    fn introspect_reports_a_nonexistent_class_as_missing_not_as_empty() {
         rt().block_on(async {
             let server = server_with(
                 "POST",
@@ -10652,10 +11700,15 @@ mod http_status_answer_tests {
             )
             .await;
             let (is_err, v) = introspect(&server, "APP").await;
-            assert_ne!(is_err, Some(true), "{v}");
-            assert_eq!(v["success"], true, "{v}");
-            assert_eq!(v["methods"], serde_json::json!([]), "{v}");
-            assert_eq!(v["properties"], serde_json::json!([]), "{v}");
+            assert_eq!(is_err, Some(true), "{v}");
+            assert_eq!(v["error_code"], ERR_CLASS_NOT_FOUND, "{v}");
+            assert_eq!(v["success"], false, "{v}");
+            assert!(
+                v.get("methods").is_none() && v.get("properties").is_none(),
+                "a class that does not exist has no member lists, not empty ones: {v}"
+            );
+            assert_eq!(v["class_name"], "Ens.Director", "{v}");
+            assert_eq!(v["namespace"], "APP", "{v}");
         });
     }
 

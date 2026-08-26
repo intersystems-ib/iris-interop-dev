@@ -8,7 +8,7 @@ use std::fmt;
 /// Before this, every consumer re-guessed what "PUT doc failed: HTTP 401 Unauthorized" meant
 /// and they disagreed — `iris_production` said INTEROP_ERROR, `iris_table_info` said
 /// IRIS_EXECUTE_ERROR, `iris_test` said TEST_EXECUTION_ERROR. Three tools, three codes, one
-/// cause. `query_once` was worse: it never looked at the status at all, so a 401 (whose body
+/// cause. The query path was worse: it never looked at the status at all, so a 401 (whose body
 /// is not JSON) and a 404 (whose body is ZERO bytes) both surfaced as "error decoding
 /// response body" with the status destroyed.
 ///
@@ -59,6 +59,71 @@ pub fn atelier_status(err: &anyhow::Error) -> Option<&AtelierHttpError> {
 /// sequence would panic).
 pub(crate) fn truncate_body(body: &str, max: usize) -> String {
     body.trim().chars().take(max).collect()
+}
+
+/// What an Atelier `/action/query` response actually says.
+///
+/// #105: this used to be TWO readers. `IrisConnection::query` had the careful one; the `iris_query`
+/// tool had its own copy, and the copy drifted — it checked the HTTP status before the
+/// body (throwing away the `ERROR #16002` text Atelier puts in a 400) and parsed with
+/// `unwrap_or_default()`, so a 200 carrying HTML answered `success:true` with zero rows.
+/// The two tools gave different answers to the same malformed response. One reader means
+/// they cannot, while each caller still renders the outcome in its own envelope.
+#[derive(Debug)]
+pub(crate) enum QueryOutcome {
+    /// Parsed body with no `status.errors` and a successful status.
+    Rows(serde_json::Value),
+    /// Atelier reported its own error in `status.errors` — a deterministic SQL/Atelier
+    /// failure. Wins over the HTTP status whatever that status is (see below).
+    IrisError(String),
+    /// Non-2xx with nothing in `status.errors` to explain it.
+    HttpError {
+        status: reqwest::StatusCode,
+        snippet: String,
+    },
+    /// 2xx whose body is not JSON — a proxy error page, an HTML login redirect. NOT an
+    /// empty result set, which is what `unwrap_or_default()` silently turned it into.
+    /// The status rides along so a caller can report WHICH success code lied.
+    NonJson {
+        status: reqwest::StatusCode,
+        snippet: String,
+    },
+}
+
+/// BODY FIRST, then the status. Reading `resp.json()` alone destroyed the status — a 401
+/// body is not JSON and a missing-namespace 404 body is ZERO bytes, so every caller saw
+/// "error decoding response body" and IRIS's actual answer was gone.
+///
+/// The ordering is mandatory, not stylistic. Atelier puts REAL diagnostics in the body of
+/// some non-2xx responses: a malformed query POST returns HTTP 400 carrying
+/// `{"status":{"errors":[{"error":"ERROR #16002: Invalid JSON Content",...}]}}`. A
+/// status-first `if !status.is_success()` would swap one uninformative error for another.
+/// `status.errors` therefore wins over the HTTP status whatever that status is, so
+/// SQL_ERROR and the #16002 text keep coming through byte-for-byte. (A bad SELECT is not
+/// even this case — it returns 200 with status.errors.)
+pub(crate) fn interpret_query_response(status: reqwest::StatusCode, text: &str) -> QueryOutcome {
+    let parsed = serde_json::from_str::<serde_json::Value>(text).ok();
+    if let Some(body) = &parsed {
+        if let Some(errs) = body["status"]["errors"].as_array() {
+            if !errs.is_empty() {
+                let msg = errs[0]["error"].as_str().unwrap_or("Atelier query error");
+                return QueryOutcome::IrisError(msg.to_string());
+            }
+        }
+    }
+    if !status.is_success() {
+        return QueryOutcome::HttpError {
+            status,
+            snippet: truncate_body(text, 500),
+        };
+    }
+    match parsed {
+        Some(body) => QueryOutcome::Rows(body),
+        None => QueryOutcome::NonJson {
+            status,
+            snippet: truncate_body(text, 200),
+        },
+    }
 }
 
 /// Whether the connected IRIS instance is a production (Live) system.
@@ -715,110 +780,89 @@ impl IrisConnection {
         namespace: &str,
         client: &reqwest::Client,
     ) -> anyhow::Result<serde_json::Value> {
-        let delays = [
-            std::time::Duration::from_millis(150),
-            std::time::Duration::from_millis(350),
-            std::time::Duration::from_millis(700),
-        ];
-        let mut last_err = anyhow::anyhow!("no attempts made");
-        for (attempt, delay) in delays.iter().enumerate() {
-            match self
-                .query_once(sql, params.clone(), namespace, client)
-                .await
-            {
-                Ok(body) => return Ok(body),
-                Err(e) => {
-                    let msg = e.to_string();
-                    // Only transport-level failures are retryable; a SQL error is deterministic.
-                    // #102: the 5xx arm is STRUCTURAL now. Before the typed error below, a 500
-                    // made `resp.json()` fail with "error decoding response body", which matches
-                    // none of these substrings — so a 5xx was never actually retried, despite the
-                    // doc comment above promising it. Relying on the Display text happening to
-                    // contain "HTTP 5" would keep that accidental; asking the status makes it
-                    // deliberate.
-                    let is_retryable = match atelier_status(&e) {
-                        Some(http) => http.status >= 500,
-                        None => {
-                            msg.contains("error sending request")
-                                || msg.contains("connection refused")
-                                || msg.contains("connection reset")
-                                || msg.contains("timed out")
-                                || msg.contains("HTTP 5")
-                        }
-                    };
-                    if !is_retryable || attempt == delays.len() - 1 {
-                        return Err(e);
-                    }
-                    tracing::debug!(
-                        "query attempt {} failed ({}), retrying in {:?}",
-                        attempt + 1,
-                        msg,
-                        delay
-                    );
-                    last_err = e;
-                    tokio::time::sleep(*delay).await;
-                }
+        let url = self.versioned_ns_url(namespace, "/action/query");
+        match self.query_outcome(sql, params, namespace, client).await? {
+            QueryOutcome::Rows(body) => Ok(body),
+            QueryOutcome::IrisError(msg) => anyhow::bail!("{}", msg),
+            QueryOutcome::HttpError { status, snippet } => {
+                let message = if snippet.is_empty() {
+                    format!("HTTP {status} from {url}")
+                } else {
+                    format!("HTTP {status} from {url}: {snippet}")
+                };
+                Err(anyhow::Error::new(AtelierHttpError::new(
+                    status, &url, snippet, message,
+                )))
+            }
+            QueryOutcome::NonJson { snippet, .. } => {
+                anyhow::bail!("non-JSON response from {url}: {snippet}")
             }
         }
-        Err(last_err)
     }
 
-    /// Single attempt of `query` (no retry).
-    async fn query_once(
+    /// One `/action/query` request with transparent retry on transient failures, returning
+    /// the typed outcome so each caller can render its own envelope.
+    ///
+    /// SELECTs are idempotent, so retrying is safe. This is what makes long-running
+    /// iris_test result reads survive a dropped connection ("error sending request for url
+    /// .../action/query") instead of failing the whole run (issue #7). Atelier-level SQL
+    /// errors are NOT retried — those are deterministic and return on the first attempt.
+    ///
+    /// #105: the `iris_query` TOOL used to have its own copy of this request and therefore
+    /// none of this retry. The campaign logs show what that cost: one OpenCode run took
+    /// four consecutive `IRIS_UNREACHABLE`s from `iris_query` over ~190 s of a transient
+    /// sandbox blip, while `check_config` answered fine in between and every
+    /// `query`-backed tool rode it out. One request path, one retry policy, two renderers.
+    pub(crate) async fn query_outcome(
         &self,
         sql: &str,
         params: Vec<serde_json::Value>,
         namespace: &str,
         client: &reqwest::Client,
-    ) -> anyhow::Result<serde_json::Value> {
+    ) -> anyhow::Result<QueryOutcome> {
         let url = self.versioned_ns_url(namespace, "/action/query");
-        let resp = client
-            .post(&url)
-            .basic_auth(&self.username, Some(&self.password))
-            .json(&serde_json::json!({"query": sql, "parameters": params}))
-            .send()
-            .await?;
-        // #101/#102: BODY FIRST, then the status. `resp.json()` alone destroyed the status —
-        // a 401 body is not JSON and a missing-namespace 404 body is ZERO bytes, so every
-        // caller saw "error decoding response body" and IRIS's actual answer was gone.
-        //
-        // The ordering is mandatory, not stylistic. Atelier puts REAL diagnostics in the body
-        // of some non-2xx responses: a malformed query POST returns HTTP 400 carrying
-        // `{"status":{"errors":[{"error":"ERROR #16002: Invalid JSON Content",...}]}}`. A
-        // status-first `if !status.is_success() { bail!("HTTP {}") }` would swap one
-        // uninformative error for another. `status.errors` therefore wins over the HTTP status
-        // whatever that status is, so SQL_ERROR and the #16002 text keep coming through
-        // byte-for-byte. (A bad SELECT is not even this case — it returns 200 with
-        // status.errors.)
-        let status = resp.status();
-        let text = resp.text().await?;
-        let parsed = serde_json::from_str::<serde_json::Value>(&text).ok();
-        if let Some(body) = &parsed {
-            if let Some(errs) = body["status"]["errors"].as_array() {
-                if !errs.is_empty() {
-                    let msg = errs[0]["error"].as_str().unwrap_or("Atelier query error");
-                    anyhow::bail!("{}", msg);
-                }
+        let delays = [
+            std::time::Duration::from_millis(150),
+            std::time::Duration::from_millis(350),
+            std::time::Duration::from_millis(700),
+        ];
+        let last = delays.len() - 1;
+        let mut last_err: Option<anyhow::Error> = None;
+        for (attempt, delay) in delays.iter().enumerate() {
+            // A transport failure and a 5xx are the only retryable outcomes. #102: the 5xx
+            // arm is STRUCTURAL — it used to depend on the Display text happening to contain
+            // "HTTP 5", which a `resp.json()` decode error never did, so a 5xx was never
+            // actually retried despite the doc comment promising it.
+            let attempt_result = async {
+                let resp = client
+                    .post(&url)
+                    .basic_auth(&self.username, Some(&self.password))
+                    .json(&serde_json::json!({"query": sql, "parameters": params.clone()}))
+                    .send()
+                    .await?;
+                let status = resp.status();
+                let text = resp.text().await?;
+                Ok::<_, reqwest::Error>(interpret_query_response(status, &text))
             }
-        }
-        if !status.is_success() {
-            let snippet = truncate_body(&text, 500);
-            let message = if snippet.is_empty() {
-                format!("HTTP {status} from {url}")
-            } else {
-                format!("HTTP {status} from {url}: {snippet}")
+            .await;
+
+            let retryable = match &attempt_result {
+                Err(_) => true,
+                Ok(QueryOutcome::HttpError { status, .. }) => status.as_u16() >= 500,
+                Ok(_) => false,
             };
-            return Err(anyhow::Error::new(AtelierHttpError::new(
-                status, &url, snippet, message,
-            )));
+            if !retryable || attempt == last {
+                return attempt_result.map_err(anyhow::Error::from);
+            }
+            tracing::debug!(
+                "query attempt {} to {url} was retryable, retrying in {:?}",
+                attempt + 1,
+                delay
+            );
+            last_err = attempt_result.err().map(anyhow::Error::from);
+            tokio::time::sleep(*delay).await;
         }
-        match parsed {
-            Some(body) => Ok(body),
-            None => anyhow::bail!(
-                "non-JSON response from {url}: {}",
-                truncate_body(&text, 200)
-            ),
-        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no attempts made")))
     }
 
     /// Compile a document via POST /action/compile. Returns structured errors and console output.
@@ -1189,7 +1233,7 @@ mod system_mode_tests {
     }
 }
 
-// ── Issues #101 / #102: `query_once` must not destroy what IRIS said ──────────
+// ── Issues #101 / #102: the query path must not destroy what IRIS said ───────
 #[cfg(test)]
 mod atelier_http_error_tests {
     use super::*;
@@ -1221,7 +1265,7 @@ mod atelier_http_error_tests {
     async fn ask(tpl: ResponseTemplate) -> anyhow::Result<serde_json::Value> {
         let server = MockServer::start().await;
         let iris = mount(&server, tpl).await;
-        iris.query_once("SELECT 1", vec![], "APP", &reqwest::Client::new())
+        iris.query("SELECT 1", vec![], "APP", &reqwest::Client::new())
             .await
     }
 
@@ -1282,7 +1326,7 @@ mod atelier_http_error_tests {
             let server = MockServer::start().await;
             let iris = mount(&server, ResponseTemplate::new(404)).await;
             let e = iris
-                .query_once("SELECT 1", vec![], "ZZNOSUCHNS", &reqwest::Client::new())
+                .query("SELECT 1", vec![], "ZZNOSUCHNS", &reqwest::Client::new())
                 .await
                 .expect_err("a 404 is a failure");
             let http = atelier_status(&e).expect("the status must survive as a typed error");

@@ -156,6 +156,12 @@ pub async fn handle_iris_search(
         .send()
         .await;
 
+    // #106: what the sync leg answered, when it answered with a refusal rather than a
+    // timeout. Both used to land in the same `_` arm and vanish. The fallback POST below
+    // is kept for BOTH cases (a server that 404s the GET form is speculative, and
+    // preserving the fallback costs one request), but a refusal is now carried forward so
+    // the failure can be reported instead of becoming zero hits.
+    let mut sync_refusal: Option<reqwest::StatusCode> = None;
     match sync_result {
         Ok(resp) if resp.status().is_success() => {
             let body: serde_json::Value = resp.json().await.unwrap_or_default();
@@ -170,6 +176,9 @@ pub async fn handle_iris_search(
             .await
         }
         _ => {
+            if let Ok(resp) = &sync_result {
+                sync_refusal = Some(resp.status());
+            }
             // Timeout or error — fall back to async POST
             let post_url = iris.versioned_ns_url(&namespace, "/action/search");
             let post_body = serde_json::json!({
@@ -191,7 +200,45 @@ pub async fn handle_iris_search(
                     rmcp::ErrorData::internal_error(format!("Search request failed: {e}"), None)
                 })?;
 
-            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            // #106, the filed repro: this never looked at the status and parsed with
+            // `unwrap_or_default()`, so `IRIS_PASSWORD=WRONGPW` answered
+            // `{"success":true,"total_found":0}` — a caller reads "that string is not in
+            // that document" from a search IRIS refused to run. A search that did not run
+            // has no result, empty or otherwise.
+            if !resp.status().is_success() {
+                return search_request_failed(
+                    iris,
+                    client,
+                    &namespace,
+                    resp.status(),
+                    &post_url,
+                    sync_refusal,
+                )
+                .await;
+            }
+            let text = resp.text().await.map_err(|e| {
+                rmcp::ErrorData::internal_error(format!("Search request failed: {e}"), None)
+            })?;
+            let body: serde_json::Value = match serde_json::from_str(&text) {
+                Ok(v) => v,
+                Err(_) => {
+                    return crate::tools::envelope::fail_with(
+                        "IRIS_REQUEST_FAILED",
+                        &format!(
+                            "non-JSON response from {post_url}: {}",
+                            text.trim().chars().take(200).collect::<String>()
+                        ),
+                        serde_json::json!({
+                            "attempted_url": post_url,
+                            "query": p.query,
+                            "hint": "IRIS answered, but not with JSON — typically a proxy \
+                                     error page or an HTML login redirect in front of the \
+                                     Atelier API. The search did not run; this is not a \
+                                     zero-hit result.",
+                        }),
+                    );
+                }
+            };
             if let Some(work_id) = body["result"]["workId"].as_str() {
                 poll_async_search(
                     iris, client, work_id, &namespace, &p.query, p.inline, &log_store,
@@ -202,6 +249,41 @@ pub async fn handle_iris_search(
             }
         }
     }
+}
+
+/// Render a refused `/action/search` request. A 404 goes through the shared classifier so
+/// a bad IRIS_WEB_PREFIX and a nonexistent namespace stay distinguishable; anything else
+/// keeps its status and lets `builtin_hint` supply the advice that fits it.
+async fn search_request_failed(
+    iris: &IrisConnection,
+    client: &reqwest::Client,
+    namespace: &str,
+    status: reqwest::StatusCode,
+    url: &str,
+    sync_status: Option<reqwest::StatusCode>,
+) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+    if status.as_u16() == 404 {
+        if let crate::tools::interop::FourOhFour::Explained(e) =
+            crate::tools::interop::classify_404(
+                iris,
+                client,
+                namespace,
+                url,
+                "The search did not run — no documents were searched.",
+            )
+            .await
+        {
+            return e;
+        }
+    }
+    if let Some(sync) = sync_status {
+        tracing::debug!(
+            sync_status = sync.as_u16(),
+            post_status = status.as_u16(),
+            "iris_search: both the sync and async legs were refused"
+        );
+    }
+    crate::tools::envelope::http_status_fail("iris_search", status, url)
 }
 
 async fn poll_async_search(
@@ -244,7 +326,14 @@ async fn poll_async_search(
                 }
                 // Still pending — keep polling
             }
-            _ => continue,
+            // #106: a refusal is not "still pending". Polling through a 401 for the full
+            // five minutes and then reporting SEARCH_TIMEOUT describes the wrong problem
+            // and costs five minutes to say it. A transport blip stays retryable.
+            Ok(r) => {
+                return search_request_failed(iris, client, namespace, r.status(), &poll_url, None)
+                    .await;
+            }
+            Err(_) => continue,
         }
     }
 }

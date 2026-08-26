@@ -96,6 +96,107 @@ fn mcp_server_starts_and_responds_to_initialize() {
     child.kill().ok();
 }
 
+/// #104: a tool pruned from the profile must not DISPATCH, not merely be unlisted.
+///
+/// This is the test the fork did not have. `mcp_server_tools_list_returns_interop_profile`
+/// asserts `iris_search` is absent from tools/list and passed for the entire life of the
+/// bug; the server was answering `tools/call {"name":"iris_search"}` with real IRIS data
+/// the whole time, because `#[tool_handler]`'s default router expression builds a fresh
+/// UNPRUNED router per call while only `list_tools` read the pruned instance field.
+/// Nothing below inspects the listing — it goes at the wire, which is where the exposure
+/// was. The same mechanism carries the write gate, so this covers that too.
+#[test]
+fn pruned_tool_is_rejected_at_dispatch_not_merely_unlisted() {
+    let bin = iris_dev_bin();
+    if !bin.exists() {
+        eprintln!("Skipping: iris-agentic-dev binary not found");
+        return;
+    }
+
+    let mut child = Command::new(&bin)
+        .arg("mcp")
+        .arg("--toolset")
+        .arg("interop")
+        .env("IRIS_WEB_PORT", "9") // no IRIS: the rejection must precede any connection use
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn iris-agentic-dev mcp");
+
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+
+    send_jsonrpc(
+        &mut stdin,
+        1,
+        "initialize",
+        r#"{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}"#,
+    );
+    let _init = read_jsonrpc(&mut reader);
+    stdin
+        .write_all(
+            b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\",\"params\":{}}\n",
+        )
+        .unwrap();
+    stdin.flush().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // iris_search is not in INTEROP_TOOLS. Ask for it by name anyway — a scripted client,
+    // a replayed transcript or a model that learned the name elsewhere can all do this.
+    send_jsonrpc(
+        &mut stdin,
+        2,
+        "tools/call",
+        r#"{"name":"iris_search","arguments":{"query":"Copyright","documents":["%Library.String.cls"]}}"#,
+    );
+    let response = read_jsonrpc(&mut reader);
+
+    assert!(
+        response.get("result").is_none(),
+        "a pruned tool RAN: tools/call returned a result for iris_search under the \
+         interop toolset. Pruning must be enforced at dispatch, not only in tools/list: {response}"
+    );
+    let err = response
+        .get("error")
+        .unwrap_or_else(|| panic!("expected a JSON-RPC error, got: {response}"));
+    assert_eq!(
+        err["data"]["error_code"], "TOOL_NOT_IN_TOOLSET",
+        "the rejection should say WHY the tool is unreachable (which toolset pruned it), \
+         not just that it was not found: {err}"
+    );
+
+    // A kept tool must still dispatch — otherwise this test would pass on a server that
+    // rejects everything.
+    send_jsonrpc(
+        &mut stdin,
+        3,
+        "tools/call",
+        r#"{"name":"check_config","arguments":{}}"#,
+    );
+    let ok = read_jsonrpc(&mut reader);
+    assert!(
+        ok.get("result").is_some(),
+        "check_config is in the interop keep-list and must still dispatch: {ok}"
+    );
+
+    // An unknown name is a different fact from a pruned one, and gets a different code.
+    send_jsonrpc(
+        &mut stdin,
+        4,
+        "tools/call",
+        r#"{"name":"no_such_tool_at_all","arguments":{}}"#,
+    );
+    let unknown = read_jsonrpc(&mut reader);
+    assert_eq!(
+        unknown["error"]["data"]["error_code"], "UNKNOWN_TOOL",
+        "a name that is not a tool at all must not be reported as toolset pruning: {unknown}"
+    );
+
+    child.kill().ok();
+}
+
 /// tools/list returns exactly the 20-tool interop profile (this fork's default toolset).
 #[test]
 fn mcp_server_tools_list_returns_interop_profile() {
