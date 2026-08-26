@@ -370,6 +370,23 @@ mod env_guard {
             !names.contains("iris_production_item"),
             "iris_production_item must be absent in Live mode"
         );
+        // #104: absent from the LISTING is not the guarantee this test is for. The gate
+        // is only a gate if the tool cannot be CALLED, and until the `#[tool_handler]`
+        // router binding was fixed those were two different routers — this file's
+        // assertions above passed unchanged against a server that ran both tools on
+        // demand. `is_tool_reachable` reads the map the dispatcher resolves against.
+        assert!(
+            !tools.is_tool_reachable("iris_credential_manage"),
+            "iris_credential_manage must not DISPATCH in Live mode, not merely be unlisted"
+        );
+        assert!(
+            !tools.is_tool_reachable("iris_production_item"),
+            "iris_production_item must not DISPATCH in Live mode, not merely be unlisted"
+        );
+        assert!(
+            tools.is_tool_reachable("iris_credential_list"),
+            "the read-only sibling must still dispatch"
+        );
         // Read tools must still be present
         assert!(
             names.contains("iris_credential_list"),

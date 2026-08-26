@@ -61,6 +61,66 @@ pub(crate) fn truncate_body(body: &str, max: usize) -> String {
     body.trim().chars().take(max).collect()
 }
 
+/// What an Atelier `/action/query` response actually says.
+///
+/// #105: this used to be TWO readers. `query_once` had the careful one; the `iris_query`
+/// tool had its own copy, and the copy drifted — it checked the HTTP status before the
+/// body (throwing away the `ERROR #16002` text Atelier puts in a 400) and parsed with
+/// `unwrap_or_default()`, so a 200 carrying HTML answered `success:true` with zero rows.
+/// The two tools gave different answers to the same malformed response. One reader means
+/// they cannot, while each caller still renders the outcome in its own envelope.
+#[derive(Debug)]
+pub(crate) enum QueryOutcome {
+    /// Parsed body with no `status.errors` and a successful status.
+    Rows(serde_json::Value),
+    /// Atelier reported its own error in `status.errors` — a deterministic SQL/Atelier
+    /// failure. Wins over the HTTP status whatever that status is (see below).
+    IrisError(String),
+    /// Non-2xx with nothing in `status.errors` to explain it.
+    HttpError {
+        status: reqwest::StatusCode,
+        snippet: String,
+    },
+    /// 2xx whose body is not JSON — a proxy error page, an HTML login redirect. NOT an
+    /// empty result set, which is what `unwrap_or_default()` silently turned it into.
+    NonJson { snippet: String },
+}
+
+/// BODY FIRST, then the status. Reading `resp.json()` alone destroyed the status — a 401
+/// body is not JSON and a missing-namespace 404 body is ZERO bytes, so every caller saw
+/// "error decoding response body" and IRIS's actual answer was gone.
+///
+/// The ordering is mandatory, not stylistic. Atelier puts REAL diagnostics in the body of
+/// some non-2xx responses: a malformed query POST returns HTTP 400 carrying
+/// `{"status":{"errors":[{"error":"ERROR #16002: Invalid JSON Content",...}]}}`. A
+/// status-first `if !status.is_success()` would swap one uninformative error for another.
+/// `status.errors` therefore wins over the HTTP status whatever that status is, so
+/// SQL_ERROR and the #16002 text keep coming through byte-for-byte. (A bad SELECT is not
+/// even this case — it returns 200 with status.errors.)
+pub(crate) fn interpret_query_response(status: reqwest::StatusCode, text: &str) -> QueryOutcome {
+    let parsed = serde_json::from_str::<serde_json::Value>(text).ok();
+    if let Some(body) = &parsed {
+        if let Some(errs) = body["status"]["errors"].as_array() {
+            if !errs.is_empty() {
+                let msg = errs[0]["error"].as_str().unwrap_or("Atelier query error");
+                return QueryOutcome::IrisError(msg.to_string());
+            }
+        }
+    }
+    if !status.is_success() {
+        return QueryOutcome::HttpError {
+            status,
+            snippet: truncate_body(text, 500),
+        };
+    }
+    match parsed {
+        Some(body) => QueryOutcome::Rows(body),
+        None => QueryOutcome::NonJson {
+            snippet: truncate_body(text, 200),
+        },
+    }
+}
+
 /// Whether the connected IRIS instance is a production (Live) system.
 /// Detected at probe time via `^%SYS("SystemMode")` SQL query.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -792,32 +852,22 @@ impl IrisConnection {
         // status.errors.)
         let status = resp.status();
         let text = resp.text().await?;
-        let parsed = serde_json::from_str::<serde_json::Value>(&text).ok();
-        if let Some(body) = &parsed {
-            if let Some(errs) = body["status"]["errors"].as_array() {
-                if !errs.is_empty() {
-                    let msg = errs[0]["error"].as_str().unwrap_or("Atelier query error");
-                    anyhow::bail!("{}", msg);
-                }
+        match interpret_query_response(status, &text) {
+            QueryOutcome::Rows(body) => Ok(body),
+            QueryOutcome::IrisError(msg) => anyhow::bail!("{}", msg),
+            QueryOutcome::HttpError { snippet, .. } => {
+                let message = if snippet.is_empty() {
+                    format!("HTTP {status} from {url}")
+                } else {
+                    format!("HTTP {status} from {url}: {snippet}")
+                };
+                Err(anyhow::Error::new(AtelierHttpError::new(
+                    status, &url, snippet, message,
+                )))
             }
-        }
-        if !status.is_success() {
-            let snippet = truncate_body(&text, 500);
-            let message = if snippet.is_empty() {
-                format!("HTTP {status} from {url}")
-            } else {
-                format!("HTTP {status} from {url}: {snippet}")
-            };
-            return Err(anyhow::Error::new(AtelierHttpError::new(
-                status, &url, snippet, message,
-            )));
-        }
-        match parsed {
-            Some(body) => Ok(body),
-            None => anyhow::bail!(
-                "non-JSON response from {url}: {}",
-                truncate_body(&text, 200)
-            ),
+            QueryOutcome::NonJson { snippet } => {
+                anyhow::bail!("non-JSON response from {url}: {snippet}")
+            }
         }
     }
 

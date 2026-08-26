@@ -129,6 +129,10 @@ impl McpCommand {
                 &self.namespace,
             );
 
+        // #110: the same description a LATER re-probe must target. `discover_iris` consumes
+        // its argument, and the CLI-flag / workspace-config connection is not reconstructible
+        // from env vars — without this, a retry would silently probe somewhere else.
+        let discovery_seed = explicit.clone();
         tokio::spawn(async move {
             let conn = match discover_iris(explicit).await {
                 IrisDiscovery::Found(c) => {
@@ -161,16 +165,44 @@ impl McpCommand {
         }
 
         // Wait briefly for discovery — env-var discovery (single HTTP probe) completes in <500ms.
-        // Cap at 2s so Claude Code / Copilot get the initialize response well within their timeout.
-        // Docker/localhost-scan discovery may still be running when tools are first called;
-        // those return IRIS_UNREACHABLE and the client can retry.
+        // The cap keeps the `initialize` response inside the client's own timeout; it is NOT
+        // a verdict on whether IRIS exists.
+        //
+        // #110: it used to behave like one. At 2 seconds, a machine under load (concurrent
+        // `cargo clippy --all-targets` was enough, twice) misses the window, and because
+        // nothing ever re-probed, `iris` stayed None for the entire session — every tool
+        // answering IRIS_UNREACHABLE while `curl localhost:43080/api/atelier/` returned 200
+        // the whole time. A room of laptops starting containers at once is exactly that load
+        // profile, and it presents as "the MCP tools are broken".
+        //
+        // The fix is NOT a bigger number. Raising the default would only make `initialize`
+        // block longer on a machine with no IRIS at all (measured: ~40 ms today, and the
+        // SC-001 p50 gate is 100 ms) while still losing any probe slower than whatever the
+        // new number is. The cap stays at 2s and becomes purely a client-timeout budget;
+        // what changed is that missing it is no longer fatal — the discovery result is
+        // adopted whenever it arrives, and `retry_discovery` in the core re-probes lazily
+        // for the case where startup discovery genuinely failed. The override exists for
+        // environments that would rather block than serve unconnected.
+        let discovery_timeout_ms = std::env::var("IRIS_DISCOVERY_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(2000);
         let mut iris_rx_wait = iris_rx.clone();
-        let _ = tokio::time::timeout(
-            tokio::time::Duration::from_secs(2),
+        let settled = tokio::time::timeout(
+            tokio::time::Duration::from_millis(discovery_timeout_ms),
             iris_rx_wait.wait_for(|v| v.is_some()),
         )
-        .await;
+        .await
+        .is_ok();
         let iris = iris_rx.borrow().clone();
+        if !settled {
+            tracing::warn!(
+                timeout_ms = discovery_timeout_ms,
+                "IRIS discovery did not finish within the startup window — serving now and \
+                 adopting the connection when it arrives (set IRIS_DISCOVERY_TIMEOUT_MS to wait longer)"
+            );
+        }
 
         // On Windows, stdout opens in text mode which translates \n → \r\n.
         // MCP clients expect bare \n-terminated JSON lines — set stdout/stdin to binary mode.
@@ -204,6 +236,37 @@ impl McpCommand {
             config_watcher,
             startup_config_path,
         )?;
+
+        // #110: tell the tools what a re-probe should target, and that startup discovery is
+        // still in flight when it is — so a tool called during the gap says "the probe has
+        // not answered yet" instead of "set IRIS_HOST", which is advice for a different
+        // problem and was the wrong advice in every reported case.
+        tools.set_discovery_state(discovery_seed, !settled);
+        if !settled {
+            let state_tools = tools.connection.clone();
+            let mut rx = iris_rx.clone();
+            tokio::spawn(async move {
+                let adopted = rx
+                    .wait_for(|v| v.is_some())
+                    .await
+                    .ok()
+                    .and_then(|v| v.clone());
+                let mut st = state_tools.lock().unwrap();
+                st.discovery_pending = false;
+                match adopted {
+                    Some(c) => {
+                        tracing::info!(base_url = %c.base_url, "IRIS discovery completed after startup — connection adopted");
+                        let seed = st.discovery_seed.clone();
+                        let source = st.source.clone();
+                        *st = iris_agentic_dev_core::tools::ConnectionState::from_iris(
+                            c, source, None,
+                        );
+                        st.discovery_seed = seed;
+                    }
+                    None => tracing::warn!("IRIS discovery finished without a connection"),
+                }
+            });
+        }
 
         // FR-007: periodically sweep expired elicitation entries.
         {
