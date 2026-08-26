@@ -16,6 +16,18 @@ fn iris_unreachable() -> McpError {
     McpError::invalid_request("IRIS_UNREACHABLE", None)
 }
 
+/// Issue #101: every failing admin call reported `IRIS_UNREACHABLE` and inherited the
+/// "check IRIS_HOST / IRIS_WEB_PORT" hint — including a wrong password, which IRIS had
+/// answered with a 401 from that very host and port. `IRIS_UNREACHABLE` now comes only from
+/// the network arm; a 401/403 names the credentials, and everything else says the request
+/// failed without claiming to know why.
+///
+/// `err_json("IRIS_UNREACHABLE", "No IRIS connection")` is deliberately NOT routed here:
+/// that guard fires before any request, and there genuinely is no connection.
+fn admin_error_code(msg: &str) -> &'static str {
+    crate::tools::interop::classify_iris_error_or(msg, "IRIS_REQUEST_FAILED")
+}
+
 /// Returns true if write operations are permitted (IRIS_ADMIN_TOOLS=1 or true).
 pub fn admin_write_allowed() -> bool {
     std::env::var("IRIS_ADMIN_TOOLS")
@@ -67,7 +79,7 @@ pub async fn admin_list_namespaces_impl(
             let count = namespaces.len();
             ok_json(serde_json::json!({"success":true,"namespaces":namespaces,"count":count}))
         }
-        Err(e) => err_json("IRIS_UNREACHABLE", &e.to_string()),
+        Err(e) => err_json(admin_error_code(&e.to_string()), &e.to_string()),
     }
 }
 
@@ -110,7 +122,7 @@ While tRS.Next() {
             let count = databases.len();
             ok_json(serde_json::json!({"success":true,"databases":databases,"count":count}))
         }
-        Err(e) => err_json("IRIS_UNREACHABLE", &e.to_string()),
+        Err(e) => err_json(admin_error_code(&e.to_string()), &e.to_string()),
     }
 }
 
@@ -162,7 +174,7 @@ pub async fn admin_list_users_impl(
                 "total_count": total,
             }))
         }
-        Err(e) => err_json("IRIS_UNREACHABLE", &e.to_string()),
+        Err(e) => err_json(admin_error_code(&e.to_string()), &e.to_string()),
     }
 }
 
@@ -206,7 +218,7 @@ pub async fn admin_list_roles_impl(
                 "total_count": total,
             }))
         }
-        Err(e) => err_json("IRIS_UNREACHABLE", &e.to_string()),
+        Err(e) => err_json(admin_error_code(&e.to_string()), &e.to_string()),
     }
 }
 
@@ -235,7 +247,7 @@ pub async fn admin_list_webapps_impl(
             .as_array()
             .cloned()
             .unwrap_or_default(),
-        Err(e) => return err_json("IRIS_UNREACHABLE", &e.to_string()),
+        Err(e) => return err_json(admin_error_code(&e.to_string()), &e.to_string()),
     };
 
     let mut webapps: Vec<serde_json::Value> = rows
@@ -316,7 +328,7 @@ Write $GET(props("Roles"))"#
             };
             ok_json(serde_json::json!({"success":true,"username":username,"roles":roles}))
         }
-        Err(e) => err_json("IRIS_UNREACHABLE", &e.to_string()),
+        Err(e) => err_json(admin_error_code(&e.to_string()), &e.to_string()),
     }
 }
 
@@ -360,7 +372,7 @@ Write ns_"|"_dc_"|"_en_"|"_tp"#
                 "type": parts[3],
             }))
         }
-        Err(e) => err_json("IRIS_UNREACHABLE", &e.to_string()),
+        Err(e) => err_json(admin_error_code(&e.to_string()), &e.to_string()),
     }
 }
 
@@ -406,7 +418,7 @@ pub async fn admin_check_permission_impl(
                 "user": current_user,
             }))
         }
-        Err(e) => err_json("IRIS_UNREACHABLE", &e.to_string()),
+        Err(e) => err_json(admin_error_code(&e.to_string()), &e.to_string()),
     }
 }
 
@@ -451,7 +463,7 @@ If $$$ISERR(tSC) {{ Write "ERROR:USER_EXISTS:"_$System.Status.GetErrorText(tSC) 
                 err_json("INTEROP_ERROR", out)
             }
         }
-        Err(e) => err_json("IRIS_UNREACHABLE", &e.to_string()),
+        Err(e) => err_json(admin_error_code(&e.to_string()), &e.to_string()),
     }
 }
 
@@ -505,7 +517,7 @@ If $$$ISERR(tSC2) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tS
                 err_json("INTEROP_ERROR", out)
             }
         }
-        Err(e) => err_json("IRIS_UNREACHABLE", &e.to_string()),
+        Err(e) => err_json(admin_error_code(&e.to_string()), &e.to_string()),
     }
 }
 
@@ -542,7 +554,7 @@ If $$$ISERR(tSC) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC
                 err_json("INTEROP_ERROR", out)
             }
         }
-        Err(e) => err_json("IRIS_UNREACHABLE", &e.to_string()),
+        Err(e) => err_json(admin_error_code(&e.to_string()), &e.to_string()),
     }
 }
 
@@ -583,7 +595,7 @@ If $$$ISERR(tSC) {{ Write "ERROR:NAMESPACE_EXISTS:"_$System.Status.GetErrorText(
                 err_json("INTEROP_ERROR", out)
             }
         }
-        Err(e) => err_json("IRIS_UNREACHABLE", &e.to_string()),
+        Err(e) => err_json(admin_error_code(&e.to_string()), &e.to_string()),
     }
 }
 
@@ -619,7 +631,7 @@ If $$$ISERR(tSC) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC
                 err_json("INTEROP_ERROR", out)
             }
         }
-        Err(e) => err_json("IRIS_UNREACHABLE", &e.to_string()),
+        Err(e) => err_json(admin_error_code(&e.to_string()), &e.to_string()),
     }
 }
 
@@ -663,7 +675,7 @@ If $$$ISERR(tSC) {{ Write "ERROR:WEBAPP_EXISTS:"_$System.Status.GetErrorText(tSC
                 err_json("INTEROP_ERROR", out)
             }
         }
-        Err(e) => err_json("IRIS_UNREACHABLE", &e.to_string()),
+        Err(e) => err_json(admin_error_code(&e.to_string()), &e.to_string()),
     }
 }
 
@@ -699,6 +711,6 @@ If $$$ISERR(tSC2) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tS
                 err_json("INTEROP_ERROR", out)
             }
         }
-        Err(e) => err_json("IRIS_UNREACHABLE", &e.to_string()),
+        Err(e) => err_json(admin_error_code(&e.to_string()), &e.to_string()),
     }
 }

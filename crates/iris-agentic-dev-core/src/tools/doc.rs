@@ -108,16 +108,13 @@ fn err_json(code: &str, msg: &str) -> Result<rmcp::model::CallToolResult, rmcp::
 /// Map a non-success Atelier HTTP status to an accurate error_code. `IRIS_UNREACHABLE` is reserved for
 /// real transport failures (reqwest `send()` errors) and the no-connection guard — an HTTP *response*
 /// means IRIS is reachable, so a 4xx/5xx must never be reported as "unreachable".
-fn http_error_code(status: reqwest::StatusCode) -> &'static str {
-    match status.as_u16() {
-        400 => "IRIS_BAD_REQUEST",
-        401 | 403 => "IRIS_AUTH",
-        404 => "NOT_FOUND",
-        409 => "IRIS_CONFLICT",
-        423 => "IRIS_LOCKED",
-        s if s >= 500 => "IRIS_SERVER_ERROR",
-        _ => "IRIS_HTTP_ERROR",
-    }
+/// #101: iris_doc was the ONLY site in the tree that got this approximately right, and even
+/// here `401 | 403 => "IRIS_AUTH"` collapsed two disjoint remedies into one code and attached
+/// no hint at all. The map now lives in `envelope::http_status_code` so the whole surface
+/// shares one scheme instead of each file re-deciding — and 401/403 split into
+/// IRIS_AUTH_FAILED / IRIS_FORBIDDEN, both of which carry a `builtin_hint`.
+pub(crate) fn http_error_code(status: reqwest::StatusCode) -> &'static str {
+    crate::tools::envelope::http_status_code(status.as_u16())
 }
 
 /// Build an error result from a non-success Atelier response: accurate `error_code`, the response body
@@ -298,24 +295,106 @@ async fn handle_get(
         // Collect results, preserving insertion order via a map then re-order.
         let mut map: std::collections::HashMap<String, serde_json::Value> =
             std::collections::HashMap::new();
+        // #102 P1: this arm was byte-identical to the baseline while the single-name path
+        // below it was fixed, so the BATCH form still answered
+        // {"documents":[{"error":"HTTP 404 Not Found"},…],"success":true} — isError:false —
+        // for a namespace that does not exist, never naming the namespace. The envelope
+        // claiming success made it worse than the single-name bug the issue described.
+        // Track the statuses so the summary below is a reading of what happened, not a
+        // constant.
+        let mut first_404_url: Option<String> = None;
+        let mut worst_status: Option<u16> = None;
+        let mut ok_count = 0usize;
         while let Some(res) = set.join_next().await {
             if let Ok((name, fetch_result)) = res {
                 let entry = match fetch_result {
                     Ok(resp) if resp.status().is_success() => {
+                        ok_count += 1;
                         let body: serde_json::Value = resp.json().await.unwrap_or_default();
                         let content = doc_content_to_string(&body);
                         serde_json::json!({"name": name, "content": content})
                     }
                     Ok(resp) => {
-                        serde_json::json!({"name": name, "error": format!("HTTP {}", resp.status())})
+                        let status = resp.status();
+                        if status.as_u16() == 404 && first_404_url.is_none() {
+                            first_404_url = Some(iris.versioned_ns_url(
+                                &namespace,
+                                &format!("/doc/{}", urlencoding::encode(&name)),
+                            ));
+                        }
+                        // A per-document `error_code` so a caller branches on the code here
+                        // exactly as it does on the envelope's — a 401 in this array used to
+                        // be indistinguishable from a missing document.
+                        //
+                        // The status that speaks for the whole batch is the most ACTIONABLE
+                        // one, not the numerically largest: in a mixed 401/404 batch the
+                        // credentials are the reason to act, and "some of these documents do
+                        // not exist" is a detail of a call that was never allowed to run.
+                        worst_status = Some(match (worst_status, status.as_u16()) {
+                            (Some(w), _)
+                                if crate::tools::envelope::auth_status_code(w).is_some() =>
+                            {
+                                w
+                            }
+                            (_, s) if crate::tools::envelope::auth_status_code(s).is_some() => s,
+                            (Some(w), s) => w.max(s),
+                            (None, s) => s,
+                        });
+                        serde_json::json!({
+                            "name": name,
+                            "error": format!("HTTP {status}"),
+                            "error_code": crate::tools::envelope::http_status_code(status.as_u16()),
+                        })
                     }
-                    Err(e) => serde_json::json!({"name": name, "error": e.to_string()}),
+                    Err(e) => serde_json::json!({
+                        "name": name,
+                        "error": e.to_string(),
+                        "error_code": crate::tools::envelope::transport_error_code(&e.to_string()),
+                    }),
                 };
                 map.insert(name, entry);
             }
         }
         let results: Vec<_> = p.names.iter().filter_map(|n| map.remove(n)).collect();
-        return ok_json(serde_json::json!({"success": true, "documents": results}));
+        // `!p.names.is_empty()`, not `!results.is_empty()`: a join that never produced an
+        // entry at all is still a document that was not read, and the empty-`documents`
+        // envelope must not come back claiming success either.
+        if ok_count == 0 && !p.names.is_empty() {
+            // Nothing was read. `success: true` here is the #102 shape verbatim — an envelope
+            // claiming the call worked while every document in it failed.
+            if let Some(url) = &first_404_url {
+                if let Some(explained) = crate::tools::interop::namespace_missing_error(
+                    iris,
+                    client,
+                    &namespace,
+                    url,
+                    "Nothing was read.",
+                )
+                .await
+                {
+                    return explained;
+                }
+            }
+            let code = worst_status.map_or("IRIS_REQUEST_FAILED", |s| {
+                crate::tools::envelope::http_status_code(s)
+            });
+            return crate::tools::envelope::fail_with(
+                code,
+                &format!(
+                    "None of the {} requested documents could be read from namespace \
+                     '{namespace}' — see `documents` for the per-document status.",
+                    p.names.len()
+                ),
+                serde_json::json!({"documents": results, "namespace": namespace}),
+            );
+        }
+        // A partial failure keeps success:true — some documents WERE read — but names the
+        // namespace it read them from, which the baseline never did either.
+        return ok_json(serde_json::json!({
+            "success": true,
+            "documents": results,
+            "namespace": namespace,
+        }));
     }
 
     let name = match require_name(&p, "get") {
@@ -335,6 +414,21 @@ async fn handle_get(
     };
 
     if resp.status().as_u16() == 404 {
+        // #102 P1: the 404 body is ZERO bytes, so "no such document" and "no such namespace"
+        // are the same wire response — and this named the DOCUMENT for both. `None` from the
+        // helper means the namespace is confirmed present (or cannot be checked), and then
+        // NOT_FOUND naming the document is right and survives.
+        if let Some(missing) = crate::tools::interop::namespace_missing_error(
+            iris,
+            client,
+            &namespace,
+            &url,
+            "Nothing was read.",
+        )
+        .await
+        {
+            return missing;
+        }
         return err_json("NOT_FOUND", &format!("Document not found: {name}"));
     }
     if !resp.status().is_success() {
@@ -856,6 +950,19 @@ async fn handle_delete(
     };
 
     if resp.status().as_u16() == 404 {
+        // #102 P1: same zero-byte 404 as handle_get — a missing namespace was reported as a
+        // missing document, and the caller had no way to tell.
+        if let Some(missing) = crate::tools::interop::namespace_missing_error(
+            iris,
+            client,
+            &namespace,
+            &url,
+            "Nothing was deleted.",
+        )
+        .await
+        {
+            return missing;
+        }
         return err_json("NOT_FOUND", &format!("Document not found: {name}"));
     }
     if !resp.status().is_success() {
@@ -899,7 +1006,52 @@ async fn handle_head(
         Err(e) => return crate::tools::envelope::transport_fail("handle_head", &e.to_string()),
     };
 
-    let exists = resp.status().is_success();
+    // #102 P0: this was `let exists = resp.status().is_success();` — so EVERY non-2xx became
+    // a confident `{"success":true,"exists":false}`. Verified live twice: a document that
+    // provably exists was reported absent both for a namespace that does not exist (404) and,
+    // separately, for a wrong password against a namespace that does (401). A failed call must
+    // become an ERROR, never a negative answer. Only a 404 is a legitimate "not there".
+    let status = resp.status();
+    if !status.is_success() && status.as_u16() != 404 {
+        return http_err(resp, Some(name)).await;
+    }
+    if status.as_u16() == 404 {
+        // ...and even a 404 has two meanings on a zero-byte body: no such document, or no
+        // such namespace. This asked `namespace_missing_error`, whose `None` merges "the
+        // namespace is confirmed present" with "nothing could be established" — and then fell
+        // through to `exists = status.is_success()` for BOTH. Under a wrong IRIS_WEB_PREFIX
+        // that produced `{"success":true,"exists":false}` for %Library.String.cls, a class
+        // that answers exists:true one call earlier on the right prefix (reproduced live, and
+        // again against an all-404 stub). `exists:false` is a FACT claim; it may only be
+        // emitted on the arm where the namespace was actually confirmed.
+        use crate::tools::interop::FourOhFour;
+        match crate::tools::interop::classify_404(
+            iris,
+            client,
+            &namespace,
+            &url,
+            "Nothing was read.",
+        )
+        .await
+        {
+            FourOhFour::Explained(e) => return e,
+            // The namespace is there, so the document really is not: the true negative, and
+            // the overwhelmingly common case, is preserved exactly.
+            FourOhFour::TargetMissing => {}
+            FourOhFour::Undetermined => {
+                return crate::tools::interop::indeterminate_404_error(
+                    iris,
+                    &namespace,
+                    &url,
+                    &format!(
+                        "Whether '{name}' exists is therefore unknown — reporting exists:false \
+                         here would be a guess dressed as a reading."
+                    ),
+                )
+            }
+        }
+    }
+    let exists = status.is_success();
     let ts = resp
         .headers()
         .get("ETag")
@@ -1047,8 +1199,20 @@ mod tests {
         assert_eq!(http_error_code(StatusCode::BAD_REQUEST), "IRIS_BAD_REQUEST");
         assert_eq!(http_error_code(StatusCode::LOCKED), "IRIS_LOCKED");
         assert_eq!(http_error_code(StatusCode::CONFLICT), "IRIS_CONFLICT");
-        assert_eq!(http_error_code(StatusCode::UNAUTHORIZED), "IRIS_AUTH");
-        assert_eq!(http_error_code(StatusCode::FORBIDDEN), "IRIS_AUTH");
+        // #101: 401 and 403 are two problems with two disjoint remedies — a 401 caller edits
+        // IRIS_PASSWORD, a 403 caller cannot (IRIS validated the password before it could
+        // evaluate %Development). One code would have left English prose in `hint` as the
+        // only thing separating them.
+        assert_eq!(
+            http_error_code(StatusCode::UNAUTHORIZED),
+            "IRIS_AUTH_FAILED"
+        );
+        assert_eq!(http_error_code(StatusCode::FORBIDDEN), "IRIS_FORBIDDEN");
+        assert_ne!(
+            http_error_code(StatusCode::UNAUTHORIZED),
+            http_error_code(StatusCode::FORBIDDEN),
+            "a 401 and a 403 must not share an error_code"
+        );
         assert_eq!(http_error_code(StatusCode::NOT_FOUND), "NOT_FOUND");
         assert_eq!(
             http_error_code(StatusCode::INTERNAL_SERVER_ERROR),
@@ -1174,5 +1338,477 @@ mod doc_name_suffix_tests {
         assert!(hint.contains("type suffix"), "{hint}");
         assert!(hint.contains("MyApp.Thing.cls"), "{hint}");
         assert!(doc_suffix_hint("MyApp.Thing.cls").is_none());
+    }
+}
+
+// ── Issue #102: a failed call may never become a negative ANSWER ─────────────
+//
+// The matrix is the same for every site, because the defect was NOT 404-blindness — it was
+// non-2xx blindness. Case (d) is the one the issue text missed and the one written first: a
+// wrong password against a namespace that EXISTS produced the identical lie.
+#[cfg(test)]
+mod head_get_delete_status_tests {
+    use super::*;
+    use crate::iris::connection::DiscoverySource;
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    fn root_descriptor(namespaces: &[&str]) -> serde_json::Value {
+        serde_json::json!({"result": {"content": {
+            "version": "IRIS for UNIX 2026.1", "api": 8, "namespaces": namespaces
+        }}})
+    }
+
+    fn params(mode: &str, namespace: &str) -> IrisDocParams {
+        serde_json::from_value(serde_json::json!({
+            "mode": mode, "name": "Ens.Director.cls", "namespace": namespace
+        }))
+        .unwrap()
+    }
+
+    fn payload(r: &rmcp::model::CallToolResult) -> serde_json::Value {
+        match &r.content[0].raw {
+            rmcp::model::RawContent::Text(t) => serde_json::from_str(&t.text).unwrap(),
+            _ => panic!("expected text content"),
+        }
+    }
+
+    /// Mount a `/doc/...` response for `verb` plus a root descriptor, then run the handler.
+    async fn run(
+        verb: &str,
+        doc: ResponseTemplate,
+        root: Option<ResponseTemplate>,
+        ns: &str,
+    ) -> (Option<bool>, serde_json::Value) {
+        let server = MockServer::start().await;
+        Mock::given(method(verb))
+            .and(path_regex(r".*/doc/.*"))
+            .respond_with(doc)
+            .mount(&server)
+            .await;
+        if let Some(root) = root {
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/api/atelier/$"))
+                .respond_with(root)
+                .mount(&server)
+                .await;
+        }
+        let iris = IrisConnection::new(
+            server.uri(),
+            "APP",
+            "_SYSTEM",
+            "SYS",
+            DiscoverySource::EnvVar,
+        );
+        let client = reqwest::Client::new();
+        let mode = match verb {
+            "HEAD" => "head",
+            "DELETE" => "delete",
+            _ => "get",
+        };
+        let p = params(mode, ns);
+        let r = match mode {
+            "head" => handle_head(&iris, &client, p).await,
+            "delete" => handle_delete(&iris, &client, p).await,
+            _ => handle_get(&iris, &client, p).await,
+        }
+        .expect("the tool must answer, not error out of the transport");
+        (r.is_error, payload(&r))
+    }
+
+    fn ok_root() -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(root_descriptor(&["APP", "USER"]))
+    }
+
+    /// (a) A document that is there is still reported as there.
+    #[test]
+    fn head_still_answers_exists_true_for_a_document_that_exists() {
+        rt().block_on(async {
+            let (is_err, v) = run("HEAD", ResponseTemplate::new(200), None, "APP").await;
+            assert_ne!(is_err, Some(true), "{v}");
+            assert_eq!(v["success"], true, "{v}");
+            assert_eq!(v["exists"], true, "{v}");
+        });
+    }
+
+    /// (b) The legitimate negative — the namespace IS there, the document is not. The guard
+    /// against over-firing: this must NOT become NAMESPACE_NOT_FOUND.
+    #[test]
+    fn head_keeps_exists_false_when_the_namespace_is_confirmed_present() {
+        rt().block_on(async {
+            let (is_err, v) = run("HEAD", ResponseTemplate::new(404), Some(ok_root()), "APP").await;
+            assert_ne!(is_err, Some(true), "{v}");
+            assert_eq!(v["success"], true, "{v}");
+            assert_eq!(v["exists"], false, "{v}");
+        });
+    }
+
+    /// (c) #93 applied to iris_doc: a 404 body is ZERO bytes, so only a second question can
+    /// tell "no such document" from "no such namespace".
+    #[test]
+    fn head_names_the_namespace_when_the_namespace_is_the_reason() {
+        rt().block_on(async {
+            let (is_err, v) = run(
+                "HEAD",
+                ResponseTemplate::new(404),
+                Some(ok_root()),
+                "ZZNOSUCHNS",
+            )
+            .await;
+            assert_eq!(is_err, Some(true), "{v}");
+            assert_eq!(v["error_code"], "NAMESPACE_NOT_FOUND", "{v}");
+            assert_eq!(
+                v["available_namespaces"],
+                serde_json::json!(["APP", "USER"]),
+                "{v}"
+            );
+            assert!(
+                v["attempted_url"].as_str().unwrap().contains("ZZNOSUCHNS"),
+                "{v}"
+            );
+            assert!(!v.to_string().contains("Check IRIS_HOST"), "{v}");
+            assert!(
+                v["hint"].as_str().unwrap().contains("Nothing was read"),
+                "{v}"
+            );
+        });
+    }
+
+    /// (d) THE ASSERTION THAT ENCODES THE ISSUE. Live, with a wrong password against APP — a
+    /// namespace that exists, on an instance that answers — `iris_doc(head)` said the document
+    /// did not exist. It provably did. A 401 is not an answer about a document.
+    #[test]
+    fn head_reports_a_401_instead_of_claiming_the_document_is_absent() {
+        rt().block_on(async {
+            let (is_err, v) = run(
+                "HEAD",
+                ResponseTemplate::new(401).set_body_string("Unauthorized"),
+                Some(ok_root()),
+                "APP",
+            )
+            .await;
+            assert_eq!(is_err, Some(true), "{v}");
+            assert_eq!(v["error_code"], "IRIS_AUTH_FAILED", "{v}");
+            assert_eq!(
+                v["exists"],
+                serde_json::Value::Null,
+                "no negative FACT: {v}"
+            );
+            assert_eq!(v["success"], false, "{v}");
+            assert!(v["hint"].as_str().unwrap().contains("IRIS_PASSWORD"), "{v}");
+        });
+    }
+
+    /// (d, continued) 403 and 5xx are failures too, and each says which kind.
+    #[test]
+    fn head_codes_a_403_and_a_500_from_the_status() {
+        rt().block_on(async {
+            for (status, code) in [(403u16, "IRIS_FORBIDDEN"), (500, "IRIS_SERVER_ERROR")] {
+                let (is_err, v) = run(
+                    "HEAD",
+                    ResponseTemplate::new(status),
+                    Some(ok_root()),
+                    "APP",
+                )
+                .await;
+                assert_eq!(is_err, Some(true), "{v}");
+                assert_eq!(v["error_code"], code, "{v}");
+                assert_eq!(v["exists"], serde_json::Value::Null, "{v}");
+            }
+        });
+    }
+
+    /// (e) The cannot-tell contract, corrected. It used to read "leave the caller's own
+    /// ANSWER alone" and was pinned as `..._leaves_exists_false_alone` — which made a test
+    /// out of the P0 itself. `exists:false` is not the caller's error being preserved; it is
+    /// a FACT claim, `success:true`, `isError:false`, indistinguishable from the true
+    /// negative, and it was emitted precisely when the server had established nothing.
+    ///
+    /// Reproduced live against IRIS 2026.1 with `IRIS_WEB_PREFIX=/zznoprefix`:
+    /// `head(%Library.String.cls)` answered `{"exists":false,"success":true}` for a class
+    /// that answered `exists:true` on the correct prefix seconds earlier.
+    ///
+    /// Cannot-tell means the tool says so. Nothing here may read as a reading.
+    #[test]
+    fn an_unreadable_root_descriptor_never_becomes_exists_false() {
+        rt().block_on(async {
+            for root in [
+                // A sick instance, and an older Atelier that does not list namespaces.
+                ResponseTemplate::new(500),
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"result": {"content": {"version": "IRIS 2019.1"}}}),
+                ),
+            ] {
+                let (is_err, v) =
+                    run("HEAD", ResponseTemplate::new(404), Some(root), "ZZNOSUCHNS").await;
+                assert_eq!(is_err, Some(true), "an absent answer is an error: {v}");
+                assert_eq!(v["error_code"], "INDETERMINATE", "{v}");
+                assert_eq!(
+                    v["exists"],
+                    serde_json::Value::Null,
+                    "no negative FACT may survive: {v}"
+                );
+                assert_eq!(v["success"], false, "{v}");
+            }
+        });
+    }
+
+    /// ...and the case that IS knowable is answered, not shrugged at. A 404 root descriptor
+    /// means the Atelier application is not at this URL at all — the wrong-IRIS_WEB_PREFIX
+    /// signature — so head names that instead of either guessing or giving up.
+    #[test]
+    fn a_404_root_descriptor_makes_head_name_the_prefix() {
+        rt().block_on(async {
+            let (is_err, v) = run(
+                "HEAD",
+                ResponseTemplate::new(404),
+                Some(ResponseTemplate::new(404)),
+                "APP",
+            )
+            .await;
+            assert_eq!(is_err, Some(true), "{v}");
+            assert_eq!(v["error_code"], "ATELIER_NOT_FOUND", "{v}");
+            assert_eq!(v["exists"], serde_json::Value::Null, "{v}");
+            assert!(
+                v["hint"].as_str().unwrap().contains("IRIS_WEB_PREFIX"),
+                "{v}"
+            );
+        });
+    }
+
+    // The guard that keeps (e) from swallowing the common case — a confirmed namespace still
+    // answers `exists:false` — is `head_keeps_exists_false_when_the_namespace_is_confirmed_present`
+    // above, unchanged by any of this. That is the point: only the arm with no evidence moved.
+
+    /// #102 P1 for get: a missing NAMESPACE was reported as a missing DOCUMENT.
+    #[test]
+    fn get_names_the_namespace_but_keeps_not_found_for_a_real_document_miss() {
+        rt().block_on(async {
+            let (_, v) = run("GET", ResponseTemplate::new(404), Some(ok_root()), "APP").await;
+            assert_eq!(v["error_code"], "NOT_FOUND", "the namespace is there: {v}");
+            assert!(
+                v["error"].as_str().unwrap().contains("Ens.Director.cls"),
+                "{v}"
+            );
+
+            let (_, v) = run(
+                "GET",
+                ResponseTemplate::new(404),
+                Some(ok_root()),
+                "ZZNOSUCHNS",
+            )
+            .await;
+            assert_eq!(v["error_code"], "NAMESPACE_NOT_FOUND", "{v}");
+            assert!(
+                v["hint"].as_str().unwrap().contains("Nothing was read"),
+                "{v}"
+            );
+        });
+    }
+
+    /// The same for delete — and its effect line says nothing was DELETED, not compiled.
+    #[test]
+    fn delete_names_the_namespace_but_keeps_not_found_for_a_real_document_miss() {
+        rt().block_on(async {
+            let (_, v) = run("DELETE", ResponseTemplate::new(404), Some(ok_root()), "APP").await;
+            assert_eq!(v["error_code"], "NOT_FOUND", "{v}");
+
+            let (_, v) = run(
+                "DELETE",
+                ResponseTemplate::new(404),
+                Some(ok_root()),
+                "ZZNOSUCHNS",
+            )
+            .await;
+            assert_eq!(v["error_code"], "NAMESPACE_NOT_FOUND", "{v}");
+            assert!(
+                v["hint"].as_str().unwrap().contains("Nothing was deleted"),
+                "the hint must not claim a compile that never happened: {v}"
+            );
+        });
+    }
+
+    // ── #102 P1, the BATCH arm of get ────────────────────────────────────────
+    //
+    // The single-name path above was fixed while `names: [...]`, twenty lines higher in the
+    // same function, stayed byte-identical to the baseline. It answered
+    // {"documents":[{"error":"HTTP 404 Not Found"},…],"success":true} — isError:false — for a
+    // namespace that does not exist, which is worse than the bug the issue described: the
+    // envelope claimed the call worked.
+
+    /// Run batch get for `names` against a `/doc/...` mock and the given root descriptor.
+    async fn run_batch(
+        doc: ResponseTemplate,
+        root: Option<ResponseTemplate>,
+        ns: &str,
+        names: &[&str],
+    ) -> (Option<bool>, serde_json::Value) {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r".*/doc/.*"))
+            .respond_with(doc)
+            .mount(&server)
+            .await;
+        if let Some(root) = root {
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/api/atelier/$"))
+                .respond_with(root)
+                .mount(&server)
+                .await;
+        }
+        let iris = IrisConnection::new(
+            server.uri(),
+            "APP",
+            "_SYSTEM",
+            "SYS",
+            DiscoverySource::EnvVar,
+        );
+        let p: IrisDocParams = serde_json::from_value(serde_json::json!({
+            "mode": "get", "names": names, "namespace": ns
+        }))
+        .unwrap();
+        let r = handle_get(&iris, &reqwest::Client::new(), p)
+            .await
+            .expect("the tool must answer, not error out of the transport");
+        (r.is_error, payload(&r))
+    }
+
+    /// The filed shape: every document 404s because the NAMESPACE is missing, and the
+    /// envelope said success while never mentioning the namespace.
+    #[test]
+    fn a_batch_get_in_a_missing_namespace_names_the_namespace_and_fails() {
+        rt().block_on(async {
+            let (is_err, v) = run_batch(
+                ResponseTemplate::new(404),
+                Some(ok_root()),
+                "ZZNOSUCHNS",
+                &["%Library.String.cls", "%Library.Integer.cls"],
+            )
+            .await;
+            assert_eq!(
+                is_err,
+                Some(true),
+                "nothing was read — that is a failure: {v}"
+            );
+            assert_eq!(v["error_code"], "NAMESPACE_NOT_FOUND", "{v}");
+            assert_eq!(v["success"], false, "{v}");
+            assert!(
+                v["available_namespaces"]
+                    .as_array()
+                    .is_some_and(|a| !a.is_empty()),
+                "#93 asks for the namespaces that DO exist: {v}"
+            );
+        });
+    }
+
+    /// A 401 across the batch is credentials, not a pile of missing documents — and it must
+    /// carry the same code and hint the single-name path gives (#101).
+    #[test]
+    fn a_batch_get_rejected_by_credentials_says_so() {
+        rt().block_on(async {
+            let (is_err, v) = run_batch(
+                ResponseTemplate::new(401),
+                Some(ok_root()),
+                "APP",
+                &["A.cls", "B.cls"],
+            )
+            .await;
+            assert_eq!(is_err, Some(true), "{v}");
+            assert_eq!(v["error_code"], "IRIS_AUTH_FAILED", "{v}");
+            assert!(v["hint"].as_str().unwrap().contains("IRIS_PASSWORD"), "{v}");
+            // The per-document detail survives, and each entry is coded too.
+            assert_eq!(v["documents"][0]["error_code"], "IRIS_AUTH_FAILED", "{v}");
+        });
+    }
+
+    /// A batch where nothing was read but the statuses disagree speaks with the most
+    /// ACTIONABLE one. A 401 mixed with a 404 is a call that was never allowed to run — a
+    /// numerically-largest rule would have summarised it as NOT_FOUND and sent the caller
+    /// looking for documents instead of at the password.
+    #[test]
+    fn a_mixed_status_batch_leads_with_the_credentials() {
+        rt().block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path_regex(r".*/doc/LOCKED\.cls$"))
+                .respond_with(ResponseTemplate::new(401))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path_regex(r".*/doc/.*"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/api/atelier/$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(root_descriptor(&["APP"])))
+                .mount(&server)
+                .await;
+            let iris = IrisConnection::new(
+                server.uri(),
+                "APP",
+                "_SYSTEM",
+                "SYS",
+                DiscoverySource::EnvVar,
+            );
+            let p: IrisDocParams = serde_json::from_value(serde_json::json!({
+                "mode": "get", "names": ["GONE.cls", "LOCKED.cls"], "namespace": "APP"
+            }))
+            .unwrap();
+            let r = handle_get(&iris, &reqwest::Client::new(), p).await.unwrap();
+            let v = payload(&r);
+            assert_eq!(r.is_error, Some(true), "{v}");
+            assert_eq!(v["error_code"], "IRIS_AUTH_FAILED", "{v}");
+            // Both per-document verdicts still survive intact.
+            assert_eq!(v["documents"][0]["error_code"], "NOT_FOUND", "{v}");
+            assert_eq!(v["documents"][1]["error_code"], "IRIS_AUTH_FAILED", "{v}");
+        });
+    }
+
+    /// The guard: a batch where SOMETHING was read is still a success, and the per-document
+    /// errors ride along exactly as before — only now they are coded and the namespace is
+    /// named.
+    #[test]
+    fn a_batch_get_that_read_something_is_still_a_success() {
+        rt().block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path_regex(r".*/doc/GOOD\.cls$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"result": {"content": ["Class GOOD {", "}"]}}),
+                ))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path_regex(r".*/doc/.*"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+            let iris = IrisConnection::new(
+                server.uri(),
+                "APP",
+                "_SYSTEM",
+                "SYS",
+                DiscoverySource::EnvVar,
+            );
+            let p: IrisDocParams = serde_json::from_value(serde_json::json!({
+                "mode": "get", "names": ["GOOD.cls", "MISSING.cls"], "namespace": "APP"
+            }))
+            .unwrap();
+            let r = handle_get(&iris, &reqwest::Client::new(), p).await.unwrap();
+            let v = payload(&r);
+            assert_ne!(r.is_error, Some(true), "{v}");
+            assert_eq!(v["success"], true, "{v}");
+            assert_eq!(v["namespace"], "APP", "{v}");
+            assert!(v["documents"][0]["content"].is_string(), "{v}");
+            assert_eq!(v["documents"][1]["error_code"], "NOT_FOUND", "{v}");
+        });
     }
 }

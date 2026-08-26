@@ -23,6 +23,30 @@ pub(crate) fn is_network_error(msg: &str) -> bool {
         || msg.contains("timed out")
 }
 
+/// Issue #101: ONE decision for "what kind of IRIS failure is this string", replacing 34
+/// hand-copied `if is_network_error(..) { "IRIS_UNREACHABLE" } else { "INTEROP_ERROR" }`
+/// ternaries that had no auth arm at all — so every credential failure landed in the
+/// INTEROP_ERROR bucket and no message ever contained the word "password".
+///
+/// Order matters: auth first (an HTTP 401 response is proof IRIS is REACHABLE, so it must
+/// never fall through to the network arm), then network, then the interop default.
+pub(crate) fn classify_iris_error(msg: &str) -> &'static str {
+    classify_iris_error_or(msg, "INTEROP_ERROR")
+}
+
+/// [`classify_iris_error`] for the two arms whose non-auth, non-network default is
+/// `IRIS_EXECUTE_ERROR` rather than `INTEROP_ERROR`. Same precedence, different tail.
+pub(crate) fn classify_iris_error_or(msg: &str, fallback: &'static str) -> &'static str {
+    if let Some(code) = crate::tools::envelope::auth_error_code(msg) {
+        return code;
+    }
+    if is_network_error(msg) {
+        "IRIS_UNREACHABLE"
+    } else {
+        fallback
+    }
+}
+
 fn default_ns() -> String {
     "USER".to_string()
 }
@@ -123,7 +147,15 @@ pub async fn ensure_interop_namespace(
         .await;
     let n = match &probe {
         Ok(resp) => resp["result"]["content"][0]["n"].as_i64()?,
-        Err(_) => return None,
+        // #102: ONE arm, NINE tools. This pre-flight already runs ahead of iris_production,
+        // iris_production_item, iris_message_body, iris_business_rule_info,
+        // iris_production_diff, iris_credential_list, iris_credential_manage,
+        // iris_lookup_manage and iris_lookup_transfer — so a mistyped namespace that used to
+        // surface as `INTEROP_ERROR: "PUT doc failed: HTTP 404 Not Found"` is named here for
+        // all of them. Any other failure still returns None so the tool's own error survives.
+        Err(e) => {
+            return namespace_missing_error_for(iris, &client, ns, "Nothing was run.", e).await
+        }
     };
     if n >= 1 {
         if let Ok(mut c) = cache.lock() {
@@ -183,15 +215,90 @@ pub async fn namespace_missing_error(
     client: &reqwest::Client,
     ns: &str,
     attempted_url: &str,
+    effect: &str,
 ) -> Option<Result<CallToolResult, McpError>> {
-    let available = iris.accessible_namespaces(client).await?;
+    match classify_404(iris, client, ns, attempted_url, effect).await {
+        FourOhFour::Explained(e) => Some(e),
+        FourOhFour::TargetMissing | FourOhFour::Undetermined => None,
+    }
+}
+
+/// Issue #102: what a 404 at a tool's own URL turned out to MEAN.
+///
+/// [`namespace_missing_error`]'s `Option` says "I have a better error" / "I don't", which is
+/// all a caller needs when its own fallback is already an *error*. It is NOT enough for a
+/// caller whose fallback is a **negative answer reported as success** — `iris_doc` mode=head's
+/// `exists:false`. That caller must distinguish "the namespace is confirmed present, so the
+/// document really is absent" from "nothing was established", and the `Option` cannot: both
+/// arrive as `None`.
+///
+/// Collapsing them is exactly how head came to answer `{"success":true,"exists":false}` for
+/// `%Library.String.cls` — a class that answers `exists:true` one call earlier — under a wrong
+/// `IRIS_WEB_PREFIX`. "Unknowable" is not licence to answer.
+pub enum FourOhFour {
+    /// The namespace is visible to these credentials, so the 404 is about the target itself.
+    /// A negative answer about the target is now backed by evidence.
+    TargetMissing,
+    /// A definitively better error: the namespace does not exist, or the Atelier application
+    /// is not published at this URL at all.
+    Explained(Result<CallToolResult, McpError>),
+    /// The root descriptor established nothing. Keep your own ERROR — but never emit a
+    /// negative FACT that depends on this having been knowable.
+    Undetermined,
+}
+
+/// The one place that turns a 404 + the Atelier root descriptor into a verdict.
+/// [`namespace_missing_error`] is the two-state view of this for callers that only need
+/// "better error or not".
+pub async fn classify_404(
+    iris: &IrisConnection,
+    client: &reqwest::Client,
+    ns: &str,
+    attempted_url: &str,
+    effect: &str,
+) -> FourOhFour {
+    use crate::iris::connection::RootProbe;
+    let available = match iris.root_probe(client).await {
+        RootProbe::Namespaces(list) => list,
+        // #101 regression + #102 P0, one arm. A 404 at the tool's URL AND a 404 at the API's
+        // own root descriptor is not "cannot tell": nothing that serves Atelier 404s its root.
+        // Before this, the pair produced a bare `NOT_FOUND` about a document that was never
+        // looked for, and `IRIS_WEB_PREFIX` — the thing that is actually wrong — was named
+        // nowhere in the response.
+        RootProbe::NoAtelierHere { url } => {
+            return FourOhFour::Explained(atelier_not_found_error(
+                iris,
+                &url,
+                attempted_url,
+                effect,
+            ))
+        }
+        RootProbe::Unknown => return FourOhFour::Undetermined,
+    };
     if available
         .iter()
         .any(|n| n.trim().eq_ignore_ascii_case(ns.trim()))
     {
-        return None;
+        return FourOhFour::TargetMissing;
     }
-    Some(crate::tools::envelope::fail_with(
+    FourOhFour::Explained(namespace_not_found_error(
+        iris,
+        ns,
+        &available,
+        attempted_url,
+        effect,
+    ))
+}
+
+/// The #93 answer, split out so [`classify_404`] reads as three verdicts and one shape.
+fn namespace_not_found_error(
+    iris: &IrisConnection,
+    ns: &str,
+    available: &[String],
+    attempted_url: &str,
+    effect: &str,
+) -> Result<CallToolResult, McpError> {
+    crate::tools::envelope::fail_with(
         crate::tools::ERR_NAMESPACE_NOT_FOUND,
         &format!(
             "Namespace '{ns}' does not exist on this IRIS instance, or is not accessible to \
@@ -207,13 +314,121 @@ pub async fn namespace_missing_error(
             "attempted_url": attempted_url,
             // Explicit, so the IRIS_UNREACHABLE host/port hint this replaces can never
             // reappear through `builtin_hint` (envelope.rs).
+            // #102: `effect` is the caller's own "and here is what did NOT happen" tail.
+            // It was hard-coded to "Nothing was compiled." when only iris_compile called
+            // this; reusing the helper unchanged at the iris_doc / iris_query / iris_test
+            // sites would have had them all report a compile that never happened.
             "hint": format!(
                 "Pass namespace= one of the listed namespaces (omitting it targets the \
-                 connection namespace '{}'). Nothing was compiled.",
+                 connection namespace '{}'). {effect}",
                 iris.namespace
             ),
         }),
-    ))
+    )
+}
+
+/// Issue #101 (the `IRIS_WEB_PREFIX` regression) + #102 P0: a 404 at the tool's URL whose
+/// cause is the URL itself, not anything in IRIS.
+///
+/// `IRIS_UNREACHABLE` — which the baseline used here, with "Check IRIS_HOST and
+/// IRIS_WEB_PORT" — is the one code this cannot be: IRIS answered, twice. But the code that
+/// replaced it, a bare `NOT_FOUND` about a document, was a confident negative about a
+/// document the request never went looking for. `ATELIER_NOT_FOUND` says the true thing: the
+/// host and port are fine, and the path is not.
+fn atelier_not_found_error(
+    iris: &IrisConnection,
+    root_url: &str,
+    attempted_url: &str,
+    effect: &str,
+) -> Result<CallToolResult, McpError> {
+    crate::tools::envelope::fail_with(
+        crate::tools::ERR_ATELIER_NOT_FOUND,
+        &format!(
+            "The Atelier REST API is not published at {base}/api/atelier — IRIS answered on \
+             {base}, but a GET of {root_url}, the API's own root descriptor that every IRIS \
+             with Atelier enabled serves, returned 404 as well. The request never reached a \
+             namespace or a document, so nothing here is evidence about either.",
+            base = iris.base_url.trim_end_matches('/'),
+        ),
+        serde_json::json!({
+            "attempted_url": attempted_url,
+            "root_url": root_url,
+            "base_url": iris.base_url,
+            // Explicit, so `builtin_hint` can never put the host/port advice back — the host
+            // and port are the two things this response has just PROVED are right.
+            "hint": format!(
+                "Check IRIS_WEB_PREFIX. This server is building every URL as \
+                 {base}/api/atelier/... — behind a web gateway the API is usually published \
+                 under a prefix, and a wrong or missing one 404s every request including the \
+                 root. Then confirm the /api/atelier web application is enabled (Management \
+                 Portal > System Administration > Security > Applications > Web \
+                 Applications). IRIS_HOST and IRIS_WEB_PORT are answering and are not the \
+                 problem. {effect}",
+                base = iris.base_url.trim_end_matches('/'),
+            ),
+        }),
+    )
+}
+
+/// Issue #102 P0: the answer when a 404 could not be attributed and the caller's own
+/// fallback would have been a negative FACT.
+///
+/// An Atelier 404 has a zero-byte body: "no such document" and "no such namespace" are the
+/// same bytes on the wire. When the root descriptor cannot settle which, the honest output is
+/// an error saying so — not `exists:false`, which reads as evidence and is indistinguishable
+/// from the true negative. `question` names what could not be settled.
+pub fn indeterminate_404_error(
+    iris: &IrisConnection,
+    ns: &str,
+    attempted_url: &str,
+    question: &str,
+) -> Result<CallToolResult, McpError> {
+    crate::tools::envelope::fail_with(
+        crate::tools::ERR_INDETERMINATE,
+        &format!(
+            "IRIS answered HTTP 404 for {attempted_url}, and this server could not establish \
+             what the 404 was about. An Atelier 404 carries a ZERO-byte body, so a missing \
+             document and a missing namespace are byte-for-byte identical; the follow-up read \
+             of {base}/api/atelier/ — the root descriptor, which lists the namespaces these \
+             credentials can reach — did not come back readable, so '{ns}' could be neither \
+             confirmed nor ruled out. {question}",
+            base = iris.base_url.trim_end_matches('/'),
+        ),
+        serde_json::json!({
+            "namespace": ns,
+            "attempted_url": attempted_url,
+            "base_url": iris.base_url,
+            "hint": format!(
+                "This is not a negative answer — it is the absence of one. Call check_config \
+                 to see the host, port and namespace in use, then confirm '{ns}' with \
+                 iris_query on it. If the root descriptor is unreadable because the instance \
+                 is unwell (5xx) the same call will show it; if IRIS is an older build that \
+                 does not list namespaces, name the namespace explicitly and retry."
+            ),
+        }),
+    )
+}
+
+/// Issue #102: the `anyhow` adapter for [`namespace_missing_error`]. It makes NO judgement of
+/// its own — it downcasts, checks the status is a 404, and delegates — so the
+/// `None`-means-cannot-tell contract still lives in exactly one place.
+///
+/// A 404 is the only status worth asking about: a 401/403 is credentials (#101 owns it) and a
+/// 5xx is a sick instance. This is what lets a `query()` / `execute_via_generator()` failure
+/// deep inside a tool be attributed to a mistyped namespace instead of being reported as
+/// Docker, or as an unreachable instance that is answering perfectly.
+pub async fn namespace_missing_error_for(
+    iris: &IrisConnection,
+    client: &reqwest::Client,
+    ns: &str,
+    effect: &str,
+    err: &anyhow::Error,
+) -> Option<Result<CallToolResult, McpError>> {
+    let http = crate::iris::connection::atelier_status(err)?;
+    if http.status != 404 {
+        return None;
+    }
+    namespace_missing_error(iris, client, ns, &http.url, effect).await
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -424,14 +639,7 @@ pub async fn interop_production_status_impl(
             }
         }
         Err(e) if e.to_string() == "DOCKER_REQUIRED" => docker_required_interop(),
-        Err(e) => err_json(
-            if is_network_error(&e.to_string()) {
-                "IRIS_UNREACHABLE"
-            } else {
-                "INTEROP_ERROR"
-            },
-            &e.to_string(),
-        ),
+        Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
     }
 }
 
@@ -478,14 +686,7 @@ pub async fn interop_production_start_impl(
             }
         }
         Err(e) if e.to_string() == "DOCKER_REQUIRED" => docker_required_interop(),
-        Err(e) => err_json(
-            if is_network_error(&e.to_string()) {
-                "IRIS_UNREACHABLE"
-            } else {
-                "INTEROP_ERROR"
-            },
-            &e.to_string(),
-        ),
+        Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
     }
 }
 
@@ -513,14 +714,7 @@ pub async fn interop_production_stop_impl(
             }
         }
         Err(e) if e.to_string() == "DOCKER_REQUIRED" => docker_required_interop(),
-        Err(e) => err_json(
-            if is_network_error(&e.to_string()) {
-                "IRIS_UNREACHABLE"
-            } else {
-                "INTEROP_ERROR"
-            },
-            &e.to_string(),
-        ),
+        Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
     }
 }
 
@@ -548,14 +742,7 @@ pub async fn interop_production_update_impl(
             }
         }
         Err(e) if e.to_string() == "DOCKER_REQUIRED" => docker_required_interop(),
-        Err(e) => err_json(
-            if is_network_error(&e.to_string()) {
-                "IRIS_UNREACHABLE"
-            } else {
-                "INTEROP_ERROR"
-            },
-            &e.to_string(),
-        ),
+        Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
     }
 }
 
@@ -574,14 +761,7 @@ pub async fn interop_production_needs_update_impl(
             ok_json(serde_json::json!({"success": true, "needs_update": output.trim() == "1"}))
         }
         Err(e) if e.to_string() == "DOCKER_REQUIRED" => docker_required_interop(),
-        Err(e) => err_json(
-            if is_network_error(&e.to_string()) {
-                "IRIS_UNREACHABLE"
-            } else {
-                "INTEROP_ERROR"
-            },
-            &e.to_string(),
-        ),
+        Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
     }
 }
 
@@ -605,14 +785,7 @@ pub async fn interop_production_recover_impl(
             }
         }
         Err(e) if e.to_string() == "DOCKER_REQUIRED" => docker_required_interop(),
-        Err(e) => err_json(
-            if is_network_error(&e.to_string()) {
-                "IRIS_UNREACHABLE"
-            } else {
-                "INTEROP_ERROR"
-            },
-            &e.to_string(),
-        ),
+        Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
     }
 }
 
@@ -664,14 +837,7 @@ pub async fn interop_logs_impl(
         Ok(resp) => ok_json(
             serde_json::json!({"success": true, "logs": resp["result"]["content"], "count": resp["result"]["content"].as_array().map(|a| a.len()).unwrap_or(0)}),
         ),
-        Err(e) => err_json(
-            if is_network_error(&e.to_string()) {
-                "IRIS_UNREACHABLE"
-            } else {
-                "INTEROP_ERROR"
-            },
-            &e.to_string(),
-        ),
+        Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
     }
 }
 
@@ -693,14 +859,7 @@ pub async fn interop_queues_impl(
         Ok(resp) => {
             ok_json(serde_json::json!({"success": true, "queues": resp["result"]["content"]}))
         }
-        Err(e) => err_json(
-            if is_network_error(&e.to_string()) {
-                "IRIS_UNREACHABLE"
-            } else {
-                "INTEROP_ERROR"
-            },
-            &e.to_string(),
-        ),
+        Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
     }
 }
 
@@ -874,13 +1033,9 @@ pub async fn interop_message_search_impl(
         .namespace
         .as_deref()
         .unwrap_or(iris.namespace.as_str());
-    let net_err = |e: &str| {
-        if is_network_error(e) {
-            "IRIS_UNREACHABLE"
-        } else {
-            "INTEROP_ERROR"
-        }
-    };
+    // #101: one shared classifier (auth, then network, then interop) — see
+    // `classify_iris_error`.
+    let net_err = classify_iris_error;
 
     let body_mode = params.body_class.is_some()
         || params.body_where.is_some()
@@ -1149,13 +1304,9 @@ pub async fn interop_trace_impl(
     };
     let client = IrisConnection::http_client().map_err(|_| iris_unreachable())?;
     let ns = namespace.as_deref().unwrap_or(iris.namespace.as_str());
-    let net_err = |e: &str| {
-        if is_network_error(e) {
-            "IRIS_UNREACHABLE"
-        } else {
-            "INTEROP_ERROR"
-        }
-    };
+    // #101: one shared classifier (auth, then network, then interop) — see
+    // `classify_iris_error`.
+    let net_err = classify_iris_error;
     // session_id is numeric (i64) — safe to inline.
     let msg_sql = format!("SELECT ID, TimeCreated, SourceConfigName, TargetConfigName, MessageBodyClassName, Status, IsError FROM Ens.MessageHeader WHERE SessionId = {} ORDER BY ID ASC", session_id);
     let log_sql = format!("SELECT ID, TimeLogged, Type, ConfigName, Text FROM Ens_Util.Log WHERE SessionId = {} ORDER BY ID ASC", session_id);
@@ -1213,14 +1364,7 @@ Write "OK""#,
             }
         }
         Err(e) if e.to_string() == "DOCKER_REQUIRED" => docker_required_interop(),
-        Err(e) => err_json(
-            if is_network_error(&e.to_string()) {
-                "IRIS_UNREACHABLE"
-            } else {
-                "INTEROP_ERROR"
-            },
-            &e.to_string(),
-        ),
+        Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
     }
 }
 
@@ -1252,14 +1396,7 @@ pub async fn interop_partners_impl(
             let count = rows.as_array().map(|a| a.len()).unwrap_or(0);
             ok_json(serde_json::json!({"success": true, "partners": rows, "count": count}))
         }
-        Err(e) => err_json(
-            if is_network_error(&e.to_string()) {
-                "IRIS_UNREACHABLE"
-            } else {
-                "INTEROP_ERROR"
-            },
-            &e.to_string(),
-        ),
+        Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
     }
 }
 
@@ -1426,11 +1563,7 @@ Write "OK""#
                     }
                 }
                 Err(e) => err_json(
-                    if is_network_error(&e.to_string()) {
-                        "IRIS_UNREACHABLE"
-                    } else {
-                        "INTEROP_ERROR"
-                    },
+                    classify_iris_error(&e.to_string()),
                     &e.to_string(),
                 ),
             }
@@ -1476,11 +1609,7 @@ Set tKey="" For {{ Set tSetting=tItem.Settings.GetNext(.tKey) Quit:tKey=""
                     )
                 }
                 Err(e) => err_json(
-                    if is_network_error(&e.to_string()) {
-                        "IRIS_UNREACHABLE"
-                    } else {
-                        "INTEROP_ERROR"
-                    },
+                    classify_iris_error(&e.to_string()),
                     &e.to_string(),
                 ),
             }
@@ -1549,11 +1678,7 @@ If $$$ISERR(tSC4) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tS
                     }
                 }
                 Err(e) => err_json(
-                    if is_network_error(&e.to_string()) {
-                        "IRIS_UNREACHABLE"
-                    } else {
-                        "INTEROP_ERROR"
-                    },
+                    classify_iris_error(&e.to_string()),
                     &e.to_string(),
                 ),
             }
@@ -1600,11 +1725,7 @@ If $$$ISERR(tSC4) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tS
                     }
                 }
                 Err(e) => err_json(
-                    if is_network_error(&e.to_string()) {
-                        "IRIS_UNREACHABLE"
-                    } else {
-                        "INTEROP_ERROR"
-                    },
+                    classify_iris_error(&e.to_string()),
                     &e.to_string(),
                 ),
             }
@@ -1632,11 +1753,7 @@ If $$$ISERR(tSC4) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tS
                     }
                 }
                 Err(e) => err_json(
-                    if is_network_error(&e.to_string()) {
-                        "IRIS_UNREACHABLE"
-                    } else {
-                        "INTEROP_ERROR"
-                    },
+                    classify_iris_error(&e.to_string()),
                     &e.to_string(),
                 ),
             }
@@ -1709,14 +1826,7 @@ pub async fn interop_credential_list_impl(
                 "total_count": total
             }))
         }
-        Err(e) => err_json(
-            if is_network_error(&e.to_string()) {
-                "IRIS_UNREACHABLE"
-            } else {
-                "INTEROP_ERROR"
-            },
-            &e.to_string(),
-        ),
+        Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
     }
 }
 
@@ -1760,14 +1870,7 @@ If $$$ISERR(tSC) {{ Write "ERROR:CREDENTIAL_EXISTS:"_$System.Status.GetErrorText
                         err_json("INTEROP_ERROR", out)
                     }
                 }
-                Err(e) => err_json(
-                    if is_network_error(&e.to_string()) {
-                        "IRIS_UNREACHABLE"
-                    } else {
-                        "INTEROP_ERROR"
-                    },
-                    &e.to_string(),
-                ),
+                Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
             }
         }
         "update" => {
@@ -1801,14 +1904,7 @@ If $$$ISERR(tSC) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC
                         err_json("INTEROP_ERROR", out)
                     }
                 }
-                Err(e) => err_json(
-                    if is_network_error(&e.to_string()) {
-                        "IRIS_UNREACHABLE"
-                    } else {
-                        "INTEROP_ERROR"
-                    },
-                    &e.to_string(),
-                ),
+                Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
             }
         }
         "delete" => {
@@ -1830,14 +1926,7 @@ If $$$ISERR(tSC) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC
                         err_json("INTEROP_ERROR", out)
                     }
                 }
-                Err(e) => err_json(
-                    if is_network_error(&e.to_string()) {
-                        "IRIS_UNREACHABLE"
-                    } else {
-                        "INTEROP_ERROR"
-                    },
-                    &e.to_string(),
-                ),
+                Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
             }
         }
         _ => err_json(
@@ -1899,14 +1988,7 @@ pub async fn interop_lookup_manage_impl(
                         serde_json::json!({"success":true,"tables":tables,"count":tables.len(),"truncated":truncated,"total_count":total}),
                     )
                 }
-                Err(e) => err_json(
-                    if is_network_error(&e.to_string()) {
-                        "IRIS_UNREACHABLE"
-                    } else {
-                        "INTEROP_ERROR"
-                    },
-                    &e.to_string(),
-                ),
+                Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
             }
         }
         "get" => {
@@ -1939,14 +2021,7 @@ Write tVal"#,
                         serde_json::json!({"success":true,"table":params.table,"key":params.key,"value":out}),
                     )
                 }
-                Err(e) => err_json(
-                    if is_network_error(&e.to_string()) {
-                        "IRIS_UNREACHABLE"
-                    } else {
-                        "INTEROP_ERROR"
-                    },
-                    &e.to_string(),
-                ),
+                Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
             }
         }
         "set" => {
@@ -1977,14 +2052,7 @@ If $$$ISERR(tSC) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC
                         err_json("INTEROP_ERROR", out)
                     }
                 }
-                Err(e) => err_json(
-                    if is_network_error(&e.to_string()) {
-                        "IRIS_UNREACHABLE"
-                    } else {
-                        "INTEROP_ERROR"
-                    },
-                    &e.to_string(),
-                ),
+                Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
             }
         }
         "delete" => {
@@ -2016,14 +2084,7 @@ If $$$ISERR(tSC) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC
                         err_json("INTEROP_ERROR", out)
                     }
                 }
-                Err(e) => err_json(
-                    if is_network_error(&e.to_string()) {
-                        "IRIS_UNREACHABLE"
-                    } else {
-                        "INTEROP_ERROR"
-                    },
-                    &e.to_string(),
-                ),
+                Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
             }
         }
         "list_keys" => {
@@ -2051,14 +2112,7 @@ Set tKey="" For {{ Set tKey=$ORDER(^Ens.LookupTable({t},tKey)) Quit:tKey=""  Wri
                         serde_json::json!({"success":true,"table":params.table,"keys":keys,"count":keys.len()}),
                     )
                 }
-                Err(e) => err_json(
-                    if is_network_error(&e.to_string()) {
-                        "IRIS_UNREACHABLE"
-                    } else {
-                        "INTEROP_ERROR"
-                    },
-                    &e.to_string(),
-                ),
+                Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
             }
         }
         _ => err_json(
@@ -2130,14 +2184,7 @@ Write tOut"#,
                         serde_json::json!({"success":true,"table":params.table,"xml":out,"entry_count":entry_count}),
                     )
                 }
-                Err(e) => err_json(
-                    if is_network_error(&e.to_string()) {
-                        "IRIS_UNREACHABLE"
-                    } else {
-                        "INTEROP_ERROR"
-                    },
-                    &e.to_string(),
-                ),
+                Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
             }
         }
         "import" => {
@@ -2157,14 +2204,7 @@ Write tOut"#,
                         err_json("INTEROP_ERROR", out)
                     }
                 }
-                Err(e) => err_json(
-                    if is_network_error(&e.to_string()) {
-                        "IRIS_UNREACHABLE"
-                    } else {
-                        "INTEROP_ERROR"
-                    },
-                    &e.to_string(),
-                ),
+                Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
             }
         }
         _ => err_json(
@@ -2213,14 +2253,7 @@ pub async fn interop_autostart_get_impl(
                 "production": if enabled { serde_json::Value::String(prod) } else { serde_json::Value::Null }
             }))
         }
-        Err(e) => err_json(
-            if is_network_error(&e.to_string()) {
-                "IRIS_UNREACHABLE"
-            } else {
-                "INTEROP_ERROR"
-            },
-            &e.to_string(),
-        ),
+        Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
     }
 }
 
@@ -2247,16 +2280,7 @@ If $$$ISERR(tSC) { Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC)
                 );
             }
             Ok(out) => return err_json("INTEROP_ERROR", out.trim()),
-            Err(e) => {
-                return err_json(
-                    if is_network_error(&e.to_string()) {
-                        "IRIS_UNREACHABLE"
-                    } else {
-                        "INTEROP_ERROR"
-                    },
-                    &e.to_string(),
-                )
-            }
+            Err(e) => return err_json(classify_iris_error(&e.to_string()), &e.to_string()),
         }
     }
 
@@ -2274,16 +2298,7 @@ If $$$ISERR(tSC) { Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC)
                 }
                 out
             }
-            Err(e) => {
-                return err_json(
-                    if is_network_error(&e.to_string()) {
-                        "IRIS_UNREACHABLE"
-                    } else {
-                        "INTEROP_ERROR"
-                    },
-                    &e.to_string(),
-                )
-            }
+            Err(e) => return err_json(classify_iris_error(&e.to_string()), &e.to_string()),
         }
     };
 
@@ -2297,14 +2312,7 @@ If $$$ISERR(tSC) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC
             serde_json::json!({"success":true,"namespace":ns,"autostart_enabled":true,"production":prod_name}),
         ),
         Ok(out) => err_json("INTEROP_ERROR", out.trim()),
-        Err(e) => err_json(
-            if is_network_error(&e.to_string()) {
-                "IRIS_UNREACHABLE"
-            } else {
-                "INTEROP_ERROR"
-            },
-            &e.to_string(),
-        ),
+        Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
     }
 }
 
@@ -2639,11 +2647,7 @@ pub async fn handle_iris_message_body(
             ok_json(resp)
         }
         Err(e) => err_json(
-            if is_network_error(&e.to_string()) {
-                "IRIS_UNREACHABLE"
-            } else {
-                "IRIS_EXECUTE_ERROR"
-            },
+            classify_iris_error_or(&e.to_string(), "IRIS_EXECUTE_ERROR"),
             &e.to_string(),
         ),
     }
@@ -2694,11 +2698,7 @@ pub async fn handle_iris_business_rule_info(
         Ok(_) => {}
         Err(e) => {
             return err_json(
-                if is_network_error(&e.to_string()) {
-                    "IRIS_UNREACHABLE"
-                } else {
-                    "IRIS_EXECUTE_ERROR"
-                },
+                classify_iris_error_or(&e.to_string(), "IRIS_EXECUTE_ERROR"),
                 &e.to_string(),
             )
         }
@@ -2751,7 +2751,7 @@ pub async fn handle_iris_business_rule_info(
                     "source": source,
                 }))
             }
-            Err(e) => err_json("IRIS_UNREACHABLE", &e.to_string()),
+            Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
         };
     }
 
@@ -2853,10 +2853,10 @@ For i=1:1:count {{
                         "actions": actions,
                     }))
                 }
-                Err(e) => err_json("IRIS_UNREACHABLE", &e.to_string()),
+                Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
             }
         }
-        Err(e) => err_json("IRIS_UNREACHABLE", &e.to_string()),
+        Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
     }
 }
 
@@ -2891,6 +2891,14 @@ async fn rule_classes_from_catalog(
 }
 
 /// Diff a running production's config items against the committed class source.
+///
+/// Issue #101, the filed repro after it was declared fixed: all four `execute_via_generator`
+/// arms below hard-coded `IRIS_UNREACHABLE`, so a wrong password came back as
+/// `{"error":"PUT doc failed: HTTP 401 Unauthorized","error_code":"IRIS_UNREACHABLE",
+/// "hint":"IRIS did not answer on the configured host/port …"}` — the exact response the
+/// issue was filed about, on an interop-profile tool, while `interop.rs`'s own header claimed
+/// the shared classifier had replaced 34 hand-copied ternaries. They now go through
+/// `classify_iris_error` like every other arm in this file.
 pub async fn handle_iris_production_diff(
     iris: Option<&IrisConnection>,
     params: &ProductionDiffParams,
@@ -2917,7 +2925,7 @@ pub async fn handle_iris_production_diff(
                 }
                 out
             }
-            Err(e) => return err_json("IRIS_UNREACHABLE", &e.to_string()),
+            Err(e) => return err_json(classify_iris_error(&e.to_string()), &e.to_string()),
         }
     };
 
@@ -2941,7 +2949,7 @@ If $System.Status.IsError(sc)||('isInSC) {{ Write "NO_SCM" }} Else {{ Write "IN_
             )
         }
         Ok(_) => {}
-        Err(e) => return err_json("IRIS_UNREACHABLE", &e.to_string()),
+        Err(e) => return err_json(classify_iris_error(&e.to_string()), &e.to_string()),
     }
 
     let exists_code = format!(
@@ -2956,7 +2964,7 @@ If $System.Status.IsError(sc)||('isInSC) {{ Write "NO_SCM" }} Else {{ Write "IN_
             )
         }
         Ok(_) => {}
-        Err(e) => return err_json("IRIS_UNREACHABLE", &e.to_string()),
+        Err(e) => return err_json(classify_iris_error(&e.to_string()), &e.to_string()),
     }
 
     // Current in-memory item set. Bound parameter, not interpolation.
@@ -2987,7 +2995,7 @@ If $System.Status.IsError(sc)||('isInSC) {{ Write "NO_SCM" }} Else {{ Write "IN_
                 )
             })
             .collect(),
-        Err(e) => return err_json("IRIS_UNREACHABLE", &e.to_string()),
+        Err(e) => return err_json(classify_iris_error(&e.to_string()), &e.to_string()),
     };
 
     // Committed source via Atelier REST GET /doc/<name>.
@@ -3072,6 +3080,8 @@ mod tests {
             source: crate::iris::connection::DiscoverySource::EnvVar,
             port_superserver: None,
             system_mode: crate::iris::connection::SystemMode::Development,
+            probe_status: None,
+            probe_reached: None,
         }
     }
 
@@ -3613,6 +3623,14 @@ mod namespace_missing_tests {
             .unwrap()
     }
 
+    fn payload(r: &CallToolResult) -> serde_json::Value {
+        let text = match &r.content[0].raw {
+            rmcp::model::RawContent::Text(t) => t.text.clone(),
+            _ => panic!("expected text content"),
+        };
+        serde_json::from_str(&text).unwrap()
+    }
+
     /// Mount an Atelier root descriptor answering with `namespaces`, then ask about `ns`.
     async fn ask(namespaces: &[&str], ns: &str) -> Option<serde_json::Value> {
         let server = MockServer::start().await;
@@ -3632,7 +3650,14 @@ mod namespace_missing_tests {
             DiscoverySource::EnvVar,
         );
         let client = reqwest::Client::new();
-        let out = namespace_missing_error(&iris, &client, ns, "http://x/attempted").await?;
+        let out = namespace_missing_error(
+            &iris,
+            &client,
+            ns,
+            "http://x/attempted",
+            "Nothing was compiled.",
+        )
+        .await?;
         let r = out.unwrap();
         assert_eq!(r.is_error, Some(true));
         let text = match &r.content[0].raw {
@@ -3690,14 +3715,18 @@ mod namespace_missing_tests {
         });
     }
 
-    /// `None` means CANNOT TELL and must never become a positive claim. A wrong
-    /// `IRIS_WEB_PREFIX` 404s the root GET as well — the case the host/port hint is
-    /// actually right for — and an old or foreign server answers without the array.
+    /// `None` means CANNOT TELL and must never become a positive claim about a NAMESPACE.
+    ///
+    /// #101/#102 narrowed what "cannot tell" covers, and this test with it. A 5xx root and a
+    /// 200 root without the array are genuinely unknowable — a sick instance, and an older or
+    /// foreign server — and still return `None`. A **404 root** is not: nothing that serves
+    /// Atelier 404s its own root descriptor, so that pair is a positive finding about the URL
+    /// and moved to `a_404_root_descriptor_names_the_prefix_instead_of_shrugging` below. The
+    /// rule is unchanged; the set of facts it applies to shrank by one.
     #[test]
     fn an_unreadable_root_descriptor_is_never_a_claim_about_a_namespace() {
         rt().block_on(async {
             for body in [
-                ResponseTemplate::new(404),
                 ResponseTemplate::new(500),
                 // 200, but no `namespaces` array (older Atelier).
                 ResponseTemplate::new(200).set_body_json(
@@ -3718,12 +3747,259 @@ mod namespace_missing_tests {
                     DiscoverySource::EnvVar,
                 );
                 assert!(
-                    namespace_missing_error(&iris, &reqwest::Client::new(), "ZZNOSUCHNS", "u")
-                        .await
-                        .is_none(),
+                    namespace_missing_error(
+                        &iris,
+                        &reqwest::Client::new(),
+                        "ZZNOSUCHNS",
+                        "u",
+                        "Nothing was compiled.",
+                    )
+                    .await
+                    .is_none(),
                     "a blind probe must leave the caller's error alone"
                 );
             }
+        });
+    }
+
+    /// #101 REGRESSION + #102 P0, one arm and one test.
+    ///
+    /// A wrong `IRIS_WEB_PREFIX` 404s the tool's URL *and* the Atelier root. Reading that
+    /// pair as "cannot tell" cost two answers at once: `iris_query` lost the
+    /// `IRIS_WEB_PREFIX` diagnosis it had at baseline and returned a bare `NOT_FOUND` about a
+    /// document it never looked for, and `iris_doc` mode=head fell through to
+    /// `{"success":true,"exists":false}` for `%Library.String.cls` — verified live against
+    /// IRIS 2026.1 with `IRIS_WEB_PREFIX=/zznoprefix`, and again against an all-404 stub.
+    ///
+    /// It is not "cannot tell". Every IRIS with Atelier enabled serves `/api/atelier/`.
+    #[test]
+    fn a_404_root_descriptor_names_the_prefix_instead_of_shrugging() {
+        rt().block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/api/atelier/$"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+            let iris = IrisConnection::new(
+                server.uri(),
+                "APP",
+                "_SYSTEM",
+                "SYS",
+                DiscoverySource::EnvVar,
+            );
+            let v = payload(
+                &namespace_missing_error(
+                    &iris,
+                    &reqwest::Client::new(),
+                    "APP",
+                    "http://x/attempted",
+                    "Nothing was read.",
+                )
+                .await
+                .expect("a 404 root descriptor is a finding, not an absence of one")
+                .unwrap(),
+            );
+            assert_eq!(v["error_code"], "ATELIER_NOT_FOUND", "{v}");
+            let hint = v["hint"].as_str().unwrap();
+            assert!(
+                hint.contains("IRIS_WEB_PREFIX"),
+                "the variable that is actually wrong must be named: {v}"
+            );
+            assert!(
+                hint.contains("Nothing was read"),
+                "the caller's own effect line still rides along: {v}"
+            );
+            // IRIS answered twice. Neither the host/port advice nor a claim about a document
+            // may appear.
+            assert!(!v.to_string().contains("Check IRIS_HOST"), "{v}");
+            assert_ne!(v["error_code"], "IRIS_UNREACHABLE", "{v}");
+            assert_ne!(v["error_code"], "NOT_FOUND", "{v}");
+            // ...and it must not be pinned on the namespace either: `APP` was never disproved.
+            assert_ne!(v["error_code"], "NAMESPACE_NOT_FOUND", "{v}");
+        });
+    }
+
+    /// The guard on the arm above: a 404 at the tool's URL with a HEALTHY root descriptor is
+    /// still a document/namespace question, never a prefix one.
+    #[test]
+    fn a_healthy_root_descriptor_never_blames_the_prefix() {
+        rt().block_on(async {
+            assert!(
+                ask(&["APP", "USER"], "APP").await.is_none(),
+                "the namespace is listed — this 404 is about the document"
+            );
+            let v = ask(&["APP", "USER"], "ZZNOSUCHNS").await.unwrap();
+            assert_eq!(v["error_code"], "NAMESPACE_NOT_FOUND", "{v}");
+            assert!(
+                !v.to_string().contains("IRIS_WEB_PREFIX"),
+                "the prefix is demonstrably fine — the root descriptor was just read: {v}"
+            );
+        });
+    }
+}
+
+// ── Issue #101: one classifier, with an auth arm it never had ────────────────
+#[cfg(test)]
+mod classify_iris_error_tests {
+    use super::*;
+
+    /// Pins the PRECEDENCE across all 32 collapsed call sites at once. Auth must come first:
+    /// an HTTP 401 response proves IRIS is REACHABLE, so it may never fall through to the
+    /// network arm.
+    #[test]
+    fn auth_wins_then_network_then_the_interop_default() {
+        assert_eq!(
+            classify_iris_error("PUT doc failed: HTTP 401 Unauthorized"),
+            "IRIS_AUTH_FAILED"
+        );
+        assert_eq!(
+            classify_iris_error("HTTP 403 from http://h/x"),
+            "IRIS_FORBIDDEN"
+        );
+        assert_eq!(
+            classify_iris_error("error sending request for url (http://h/x)"),
+            "IRIS_UNREACHABLE"
+        );
+        assert_eq!(
+            classify_iris_error("ERROR <Ens>ErrGeneral: something interop-shaped"),
+            "INTEROP_ERROR"
+        );
+        // Bug 18 stays fixed: this is not a network error and it is not an auth error.
+        assert_eq!(
+            classify_iris_error("No Interoperability connection configured"),
+            "INTEROP_ERROR"
+        );
+        // The two arms whose default is IRIS_EXECUTE_ERROR keep it.
+        assert_eq!(
+            classify_iris_error_or("ERROR <Ens>ErrGeneral", "IRIS_EXECUTE_ERROR"),
+            "IRIS_EXECUTE_ERROR"
+        );
+        assert_eq!(
+            classify_iris_error_or("HTTP 401 Unauthorized", "IRIS_EXECUTE_ERROR"),
+            "IRIS_AUTH_FAILED"
+        );
+    }
+}
+
+// ── Issue #102: ONE Err arm, NINE interop tools ──────────────────────────────
+#[cfg(test)]
+mod interop_preflight_tests {
+    use super::*;
+    use crate::iris::connection::DiscoverySource;
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    fn root(namespaces: &[&str]) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({"result": {"content": {
+            "version": "IRIS for UNIX 2026.1", "api": 8, "namespaces": namespaces
+        }}}))
+    }
+
+    async fn preflight(
+        probe: ResponseTemplate,
+        root_tpl: ResponseTemplate,
+        ns: &str,
+    ) -> Option<serde_json::Value> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r".*/action/query$"))
+            .respond_with(probe)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/api/atelier/$"))
+            .respond_with(root_tpl)
+            .mount(&server)
+            .await;
+        let iris = IrisConnection::new(
+            server.uri(),
+            "APP",
+            "_SYSTEM",
+            "SYS",
+            DiscoverySource::EnvVar,
+        );
+        let r = ensure_interop_namespace(&iris, ns).await?.unwrap();
+        match &r.content[0].raw {
+            rmcp::model::RawContent::Text(t) => Some(serde_json::from_str(&t.text).unwrap()),
+            _ => panic!("expected text content"),
+        }
+    }
+
+    /// The lever: the probe's own 404 now names the namespace, and this pre-flight runs ahead
+    /// of iris_production, iris_production_item, iris_message_body, iris_business_rule_info,
+    /// iris_production_diff, iris_credential_list, iris_credential_manage, iris_lookup_manage
+    /// and iris_lookup_transfer.
+    #[test]
+    fn a_404_on_the_probe_names_a_namespace_that_is_absent_from_the_root() {
+        rt().block_on(async {
+            let v = preflight(
+                ResponseTemplate::new(404),
+                root(&["APP", "USER"]),
+                "ZZNOSUCHNS",
+            )
+            .await
+            .expect("absent from the list is definitively missing");
+            assert_eq!(v["error_code"], "NAMESPACE_NOT_FOUND", "{v}");
+            assert!(
+                v["hint"].as_str().unwrap().contains("Nothing was run"),
+                "{v}"
+            );
+            assert!(!v.to_string().contains("Check IRIS_HOST"), "{v}");
+        });
+    }
+
+    /// Cannot-tell stays cannot-tell: a 404 for a namespace that IS listed, or an unreadable
+    /// root, leaves the tool's own error in place.
+    #[test]
+    fn a_probe_failure_it_cannot_attribute_returns_none() {
+        rt().block_on(async {
+            assert!(
+                preflight(ResponseTemplate::new(404), root(&["APP"]), "APP")
+                    .await
+                    .is_none(),
+                "the namespace is listed — not our error to claim"
+            );
+            assert!(
+                preflight(ResponseTemplate::new(404), ResponseTemplate::new(500), "ZZ")
+                    .await
+                    .is_none(),
+                "an unreadable root is never a claim about a namespace"
+            );
+            assert!(
+                preflight(ResponseTemplate::new(401), root(&["APP"]), "ZZNOSUCHNS")
+                    .await
+                    .is_none(),
+                "a 401 is credentials (#101), not a missing namespace"
+            );
+        });
+    }
+
+    /// The pre-flight's original job is untouched: interop present -> None, absent -> the
+    /// NAMESPACE_NOT_INTEROP answer.
+    #[test]
+    fn the_interop_probe_itself_still_works() {
+        rt().block_on(async {
+            let present = ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"result": {"content": [{"n": 1}]}}));
+            assert!(preflight(present, root(&["APP"]), "APP").await.is_none());
+
+            // A DIFFERENT namespace name on purpose: the positive above is cached per
+            // (base_url, namespace), and a dropped MockServer's ephemeral port can be handed
+            // straight back to the next one — same base_url, same cache key, silent None.
+            let absent = ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"result": {"content": [{"n": 0}]}}));
+            let v = preflight(absent, root(&["APP", "NOINTEROP"]), "NOINTEROP")
+                .await
+                .expect("no Ens.Director means no interop");
+            assert_eq!(v["error_code"], "NAMESPACE_NOT_INTEROP", "{v}");
         });
     }
 }

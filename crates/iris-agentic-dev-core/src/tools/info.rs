@@ -84,10 +84,9 @@ pub async fn handle_iris_info(
     };
 
     if !resp.status().is_success() {
-        return err_json(
-            "IRIS_UNREACHABLE",
-            &format!("HTTP {} for {}", resp.status(), url),
-        );
+        // #101: IRIS answered — it is reachable by definition. This said IRIS_UNREACHABLE for
+        // every status, so a wrong password sent the caller to debug networking.
+        return crate::tools::envelope::http_status_fail("iris_info", resp.status(), &url);
     }
 
     let body: serde_json::Value = resp.json().await.unwrap_or_default();
@@ -137,7 +136,13 @@ pub async fn handle_iris_macro(
     match p.action.as_str() {
         "list" => {
             // Bug 14: use versioned_ns_url instead of hardcoded /v1/.
-            let url = iris.versioned_ns_url(&namespace, "/docnames/INC");
+            // `INC` is not an Atelier document CATEGORY — the categories are CLS / RTN / CSP /
+            // OTH, and .inc files live under RTN. `/docnames/INC` answers HTTP 400 Bad Request
+            // on every instance (verified live on IRIS 2026.1 Build 235U), so this listing has
+            // never once worked. Nobody noticed because the non-2xx arm below swallowed it into
+            // `success:true, macros:[], "No include files found in this namespace"` — the very
+            // #102 P0 lie. Unmasking the status is what made the broken URL visible.
+            let url = iris.versioned_ns_url(&namespace, "/docnames/RTN");
             let resp = match client
                 .get(&url)
                 .basic_auth(&iris.username, Some(&iris.password))
@@ -152,19 +157,40 @@ pub async fn handle_iris_macro(
                     )
                 }
             };
+            // #102 P0: EVERY non-2xx used to become `success:true, macros:[], "No include
+            // files found in this namespace"` — a confident negative FACT produced by a call
+            // that never succeeded. Verified live with a wrong password against a namespace
+            // that exists and is reachable: HTTP 401, and the tool said there were no include
+            // files. A 2xx with an empty content array still answers macros:[]; that is the
+            // legitimate negative and it is unchanged.
             if !resp.status().is_success() {
-                return ok_json(serde_json::json!({
-                    "success": true,
-                    "macros": [],
-                    "note": "No include files found in this namespace"
-                }));
+                let status = resp.status();
+                if status.as_u16() == 404 {
+                    if let Some(missing) = crate::tools::interop::namespace_missing_error(
+                        iris,
+                        client,
+                        &namespace,
+                        &url,
+                        "No macros were listed.",
+                    )
+                    .await
+                    {
+                        return missing;
+                    }
+                }
+                return crate::tools::envelope::http_status_fail("iris_macro", status, &url);
             }
             let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            // RTN carries .mac / .int / .inc / .bas together, and each element is an object
+            // (`{"cat":"RTN","name":"%apiCBIND.inc",...}`), not a bare string — the old
+            // `as_str()` would have dropped every name even if the URL had been right.
             let inc_files: Vec<String> = body["result"]["content"]
                 .as_array()
                 .unwrap_or(&vec![])
                 .iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .filter_map(|v| v["name"].as_str().or_else(|| v.as_str()))
+                .filter(|n| n.to_ascii_lowercase().ends_with(".inc"))
+                .map(|n| n.to_string())
                 .collect();
             ok_json(serde_json::json!({
                 "success": true,
@@ -483,10 +509,26 @@ if rs.%Next() {{
     {
         Ok(v) => v,
         Err(e) => {
-            return crate::tools::envelope::fail(
-                "IRIS_EXECUTE_ERROR",
-                &format!("info::output: {e}"),
+            // #102: a mistyped namespace answered `info::output: PUT doc failed: HTTP 404 Not
+            // Found` — the generator's scaffolding, not the caller's mistake. #101: a wrong
+            // password answered the same shape under IRIS_EXECUTE_ERROR, which named neither
+            // credentials nor the 401.
+            if let Some(missing) = crate::tools::interop::namespace_missing_error_for(
+                iris,
+                client,
+                &namespace,
+                "No table info was read.",
+                &e,
             )
+            .await
+            {
+                return missing;
+            }
+            let msg = e.to_string();
+            return crate::tools::envelope::fail(
+                crate::tools::interop::classify_iris_error_or(&msg, "IRIS_EXECUTE_ERROR"),
+                &format!("info::output: {msg}"),
+            );
         }
     };
 

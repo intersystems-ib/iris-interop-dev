@@ -6,6 +6,19 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use std::collections::HashMap;
 
+/// Issue #101: `dict.rs` was the file the "one shared helper, so every tool inherits it at
+/// once" claim did not reach — it had zero lines of diff. Every failure here became
+/// `IRIS_EXECUTE_ERROR` with **no hint**, so `extract_message_map_routing` answered a wrong
+/// password with `"dict::output: PUT doc failed: HTTP 401 Unauthorized"` and never mentioned
+/// a credential. The message keeps its `dict::output:` provenance; only the classification
+/// (and therefore the hint) changes.
+fn dict_exec_fail(msg: &str) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+    crate::tools::envelope::fail(
+        crate::tools::interop::classify_iris_error_or(msg, "IRIS_EXECUTE_ERROR"),
+        &format!("dict::output: {msg}"),
+    )
+}
+
 pub const METADATA_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 pub type MetadataCache = std::sync::Mutex<HashMap<String, (serde_json::Value, std::time::Instant)>>;
 
@@ -118,12 +131,7 @@ pub async fn handle_resolve_dynamic_dispatch(
 
     let output = match iris.execute_via_generator(&code, &namespace, client).await {
         Ok(v) => v,
-        Err(e) => {
-            return crate::tools::envelope::fail(
-                "IRIS_EXECUTE_ERROR",
-                &format!("dict::output: {e}"),
-            )
-        }
+        Err(e) => return dict_exec_fail(&e.to_string()),
     };
     let trimmed = output.trim();
 
@@ -211,12 +219,7 @@ pub async fn handle_extract_message_map_routing(
     let code = build_message_map_code(&p.class_name);
     let output = match iris.execute_via_generator(&code, &namespace, client).await {
         Ok(v) => v,
-        Err(e) => {
-            return crate::tools::envelope::fail(
-                "IRIS_EXECUTE_ERROR",
-                &format!("dict::output: {e}"),
-            )
-        }
+        Err(e) => return dict_exec_fail(&e.to_string()),
     };
     let trimmed = output.trim();
 
@@ -224,9 +227,21 @@ pub async fn handle_extract_message_map_routing(
         return err_json("NOT_FOUND", &format!("Class '{}' not found", p.class_name));
     }
 
-    let inner: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| {
-        rmcp::ErrorData::internal_error(format!("parse failed: {e} raw={trimmed}"), None)
-    })?;
+    // Same #57 escape one layer on: an unparseable body left the envelope as a -32603 too.
+    let inner: serde_json::Value = match serde_json::from_str(trimmed) {
+        Ok(v) => v,
+        Err(e) => {
+            return crate::tools::envelope::fail_with(
+                "PARSE_ERROR",
+                &format!("extract_message_map_routing could not parse the IRIS response: {e}"),
+                serde_json::json!({
+                    "class_name": p.class_name,
+                    "namespace": namespace,
+                    "raw_excerpt": trimmed.chars().take(400).collect::<String>(),
+                }),
+            )
+        }
+    };
     if let Some(err) = inner.get("error") {
         return err_json("PARSE_ERROR", err.as_str().unwrap_or("xml parse failed"));
     }
@@ -305,12 +320,18 @@ pub async fn handle_find_subclass_implementations(
 
     let limit = p.limit.unwrap_or(100);
     let expand_code = build_expand_hierarchy_code(&p.base_classes);
-    let desc_raw = iris
+    // #101/#57: this `?`-ed an rmcp `internal_error` straight out of the handler, so a wrong
+    // password left the tool surface entirely — raw JSON-RPC -32603 "hierarchy expansion
+    // failed: PUT doc failed: HTTP 401 Unauthorized", with no `error_code`, no `hint` and no
+    // `isError` for anything downstream to branch on. A failure to reach or read IRIS is a
+    // TOOL failure and belongs in the envelope.
+    let desc_raw = match iris
         .execute_via_generator(&expand_code, &namespace, client)
         .await
-        .map_err(|e| {
-            rmcp::ErrorData::internal_error(format!("hierarchy expansion failed: {e}"), None)
-        })?;
+    {
+        Ok(v) => v,
+        Err(e) => return dict_exec_fail(&format!("hierarchy expansion failed: {e}")),
+    };
 
     let descendants: Vec<String> = desc_raw
         .trim()
@@ -347,12 +368,7 @@ pub async fn handle_find_subclass_implementations(
 
     let output = match iris.execute_via_generator(&code, &namespace, client).await {
         Ok(v) => v,
-        Err(e) => {
-            return crate::tools::envelope::fail(
-                "IRIS_EXECUTE_ERROR",
-                &format!("dict::output: {e}"),
-            )
-        }
+        Err(e) => return dict_exec_fail(&e.to_string()),
     };
     let trimmed = output.trim();
 
