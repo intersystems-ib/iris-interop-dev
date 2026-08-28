@@ -475,9 +475,11 @@ pub fn no_runnable_tests_cause(shape: &TestClassShape, namespace: &str) -> (&'st
         return (
             "NO_TEST_METHODS",
             format!(
-                "'{class}' is a compiled test class but declares no Test* instance methods of \
-                 its own — %UnitTest only runs instance methods whose name starts with `Test` \
-                 (a ClassMethod is skipped). Add e.g. `Method TestX()` and recompile."
+                "'{class}' is a compiled test class but declares no Test* method of its own. \
+                 %UnitTest discovers by NAME, not by method kind — `ClassMethod TestX()` is \
+                 run too — but only an instance method can use `$$$Assert*`, so declare tests \
+                 as `Method TestX()` and recompile. Watch the converse: a helper named Test* \
+                 IS discovered and run with no arguments, and passes if it does not throw."
             ),
         );
     }
@@ -501,8 +503,8 @@ pub fn no_runnable_tests_cause(shape: &TestClassShape, namespace: &str) -> (&'st
         format!(
             "'{class}' is compiled in '{namespace}' and looks runnable ({} Test* method(s){}), \
              yet the run produced no method results. The pattern is not the problem — check \
-             OnBeforeAllTests/%OnNew for an early Quit, confirm the Test* methods are instance \
-             methods, and read the run output with iris_get_log.",
+             OnBeforeAllTests/%OnNew for an early Quit, and read the run output with \
+             iris_get_log.",
             shape.own_test_methods,
             if shape.extends_test_production() {
                 format!(", PRODUCTION = '{}'", shape.production)
@@ -527,9 +529,14 @@ pub async fn probe_test_class_shape(
     // The class name is caller text: bound parameter, never interpolated.
     // `_Default` is the SQL field name of %Dictionary.CompiledParameter.Default
     // ("Default" is a reserved word). `Origin = c.Name` keeps inherited members out.
+    // #136: the Test* count deliberately does NOT filter on ClassMethod. %UnitTest
+    // discovers by NAME, not by method kind — verified live: a class whose only Test*
+    // member is a ClassMethod runs it (total 1, passed 1). Counting instance methods
+    // only made this probe disagree with the runner, so a class that really does have a
+    // runnable test could be reported as NO_TEST_METHODS.
     let sql = "SELECT TOP 1 c.Name AS ClassName, c.PrimarySuper AS Supers, \
                (SELECT COUNT(*) FROM %Dictionary.CompiledMethod m WHERE m.parent = c.Name \
-                AND m.Name %STARTSWITH 'Test' AND m.ClassMethod = 0 AND m.Origin = c.Name) AS OwnTestMethods, \
+                AND m.Name %STARTSWITH 'Test' AND m.Origin = c.Name) AS OwnTestMethods, \
                (SELECT TOP 1 p._Default FROM %Dictionary.CompiledParameter p WHERE p.parent = c.Name \
                 AND p.Name = 'PRODUCTION') AS ProductionParam \
                FROM %Dictionary.CompiledClass c WHERE c.Name = ?";
@@ -9309,6 +9316,46 @@ mod no_runnable_tests_tests {
         let (cause, hint) = no_runnable_tests_cause(&shape(TESTPROD, "", 5), "EVALNS");
         assert_eq!(cause, "PRODUCTION_PARAMETER_EMPTY");
         assert!(hint.contains("PRODUCTION"), "{hint}");
+    }
+
+    /// #136: the hint used to say "(a ClassMethod is skipped)". It is not — %UnitTest
+    /// discovers by name, and a `Test*` ClassMethod is run. Verified live on IRIS 2026.1:
+    /// a probe with an instance Test*, a ClassMethod Test* and a non-Test* helper set the
+    /// first two globals and not the third (total 2, passed 2). Believing the old text
+    /// hides a helper named Test* that %UnitTest runs with no arguments and reports green.
+    #[test]
+    fn no_hint_claims_a_test_classmethod_is_skipped() {
+        let hints = [
+            no_runnable_tests_cause(&shape(TESTPROD, "APP.Production", 0), "APP").1,
+            no_runnable_tests_cause(&shape(TESTCASE, "", 4), "EVALNS").1,
+        ];
+        for hint in hints {
+            let lower = hint.to_lowercase();
+            assert!(
+                !lower.contains("classmethod is skipped"),
+                "a Test* ClassMethod IS discovered and run: {hint}"
+            );
+            assert!(
+                !lower.contains("only runs instance methods"),
+                "discovery is by name, not by method kind: {hint}"
+            );
+            assert!(
+                !lower.contains("are instance methods"),
+                "an instance-method check cannot explain an empty run: {hint}"
+            );
+        }
+    }
+
+    /// The replacement must still push the caller to the form that can actually assert —
+    /// correcting the false clause is not licence to drop the working advice.
+    #[test]
+    fn the_no_test_methods_hint_still_asks_for_an_instance_method() {
+        let (_, hint) = no_runnable_tests_cause(&shape(TESTPROD, "APP.Production", 0), "APP");
+        assert!(hint.contains("Method TestX()"), "{hint}");
+        assert!(
+            hint.contains("$$$Assert"),
+            "the reason an instance method is wanted is the assertion macros: {hint}"
+        );
     }
 
     #[test]
