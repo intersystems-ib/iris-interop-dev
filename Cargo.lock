@@ -945,7 +945,7 @@ dependencies = [
 
 [[package]]
 name = "iris-agentic-dev"
-version = "0.8.5"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -963,7 +963,7 @@ dependencies = [
 
 [[package]]
 name = "iris-agentic-dev-core"
-version = "0.8.5"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "bollard",
