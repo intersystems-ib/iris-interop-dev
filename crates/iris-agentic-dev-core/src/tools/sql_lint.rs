@@ -89,6 +89,49 @@ pub const TABLE_NOT_FOUND_HINT: &str = "Table/view not found. Call iris_table_in
 list the real tables and columns before querying. IRIS SQL uses Schema.Table and maps package \
 dots to '_' (e.g. class Ens.Util.Log -> table Ens_Util.Log; Ens.MessageHeader stays Ens.MessageHeader).";
 
+/// The SQLCODE an IRIS SQL error reports, in any of the three spellings seen in the wild
+/// (`SQLCODE: -359`, `SQLCODE=-359`, `SQLCODE -359`).
+pub fn sqlcode(err: &str) -> Option<i32> {
+    let low = err.to_ascii_lowercase();
+    let at = low.find("sqlcode")? + "sqlcode".len();
+    let rest = low[at..].trim_start_matches([':', '=', ' ']);
+    let end = rest
+        .char_indices()
+        .find(|(i, c)| !(c.is_ascii_digit() || (*i == 0 && *c == '-')))
+        .map(|(i, _)| i)
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
+/// Hints for the SQLCODEs the table did not reach (#126).
+///
+/// The two most common codes (-30 table not found, -29 field not found) were already covered
+/// and are demonstrably effective; -359 was the third most common and the largest single
+/// unhinted group, and it is the one where a hint helps most. `STRING_AGG` is real in other
+/// dialects, so a model reaching for it learns only that THAT name is absent and tries the next
+/// synonym — nothing tells it IRIS spells this `LIST()`.
+///
+/// Both suggestions below were executed against IRIS 2026.1 before being written down.
+pub fn sqlcode_hint(err: &str) -> Option<&'static str> {
+    match sqlcode(err)? {
+        -359 => Some(
+            "No such SQL function in IRIS. IRIS does not carry the T-SQL/Postgres aggregate \
+             names: string aggregation is LIST(expr) (verified: SELECT LIST(Name) FROM \
+             Ens_Config.Production), and $LIST-valued columns use %DLIST. To see which class \
+             methods ARE callable from SQL: SELECT parent, Name FROM %Dictionary.CompiledMethod \
+             WHERE SqlProc = 1 AND parent %STARTSWITH '<Package>'.",
+        ),
+        -1 => Some(
+            "SQLCODE -1 is a parse error. Two things to check first in IRIS SQL: a package maps \
+             to a schema with underscores (class Ens.Config.Item -> table Ens_Config.Item), and \
+             string concatenation is || — `+` is NUMERIC addition here and silently yields 0 on \
+             text rather than erroring. Call iris_table_info to confirm the real schema, table \
+             and column names.",
+        ),
+        _ => None,
+    }
+}
+
 /// Targeted redirect for the specific nonexistent catalog tables the model repeatedly guessed
 /// in the retest (67% of system-table guesses failed: SQL-Gateway, namespace, production
 /// config/status/settings tables). Returns a hint naming the typed tool/approach to use
@@ -370,5 +413,62 @@ mod tests {
             "set rs=##class(%SQL.Statement).%ExecDirect(,\"INSERT INTO public.menus VALUES (?)\",1)"
         )
         .is_none());
+    }
+}
+
+/// #126 — the SQLCODEs the hint table did not reach. Messages are verbatim from the corpus.
+#[cfg(test)]
+mod sqlcode_hint_tests {
+    use super::{is_table_not_found, sqlcode, sqlcode_hint};
+
+    const F359: &str = "ERROR #5540: SQLCODE: -359 Message:  User defined SQL function 'SQLUSER.STRING_AGG' does not exist";
+    const F30: &str =
+        "ERROR #5540: SQLCODE: -30 Message: Table 'SQLUSER.LABCSV_DATA_LABRESULT' not found";
+    const F29: &str = "ERROR #5540: SQLCODE: -29 Message: Field 'VALUE' not found in the applicable tables^ SELECT Name , Value FROM";
+
+    #[test]
+    fn the_code_is_read_in_every_spelling() {
+        assert_eq!(sqlcode(F359), Some(-359));
+        assert_eq!(sqlcode("SQLCODE=-30 something"), Some(-30));
+        assert_eq!(sqlcode("sqlcode -1 near ')'"), Some(-1));
+        assert_eq!(sqlcode("no code here"), None);
+    }
+
+    /// The largest unhinted group: 16 occurrences, no hint at all.
+    #[test]
+    fn a_missing_sql_function_now_names_the_iris_equivalent() {
+        let h = sqlcode_hint(F359).expect("-359 must be hinted");
+        assert!(h.contains("LIST("), "must name the IRIS spelling: {h}");
+        assert!(h.contains("SqlProc"), "must point at the catalog: {h}");
+    }
+
+    #[test]
+    fn a_syntax_error_names_only_verified_iris_behaviour() {
+        let h = sqlcode_hint("ERROR #5540: SQLCODE: -1 Message: Syntax error").expect("-1 hinted");
+        // Only claims verified against IRIS 2026.1 belong here. An earlier draft said "there is
+        // no LIMIT/OFFSET"; the instance accepts both, so that sentence was removed rather than
+        // shipped. `||` concatenates and `+` coerces text to 0 — both executed before writing.
+        assert!(
+            h.contains("||"),
+            "must name the concatenation operator: {h}"
+        );
+        assert!(
+            !h.contains("LIMIT"),
+            "unverified LIMIT claim came back: {h}"
+        );
+    }
+
+    /// The two codes that already had coverage must keep reaching their own hint, not this one:
+    /// the new branch runs only after `is_table_not_found` declines.
+    #[test]
+    fn the_codes_that_were_already_covered_are_untouched() {
+        for msg in [F30, F29] {
+            assert!(is_table_not_found(msg), "existing coverage lost for: {msg}");
+        }
+    }
+
+    #[test]
+    fn an_unmapped_code_still_gets_no_invented_advice() {
+        assert!(sqlcode_hint("ERROR #5540: SQLCODE: -12 Message: whatever").is_none());
     }
 }
