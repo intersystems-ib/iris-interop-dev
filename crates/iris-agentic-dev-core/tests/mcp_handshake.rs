@@ -508,6 +508,30 @@ fn mcp_server_tools_list_returns_interop_profile() {
         );
     }
 
+    // The generated executor class has carried a test since the RunUser()/Execute() rewrite
+    // asserting it does NOT use `CodeMode = objectgenerator` — user code runs at CALL time,
+    // not compile time. The DESCRIPTION kept claiming the opposite for four minor versions,
+    // which is the half a model actually reads. Worse, it is the exact construct upstream is
+    // adding a security gate against, so the stale text made this server look like it does
+    // the risky thing it deliberately stopped doing. Pair the two claims here.
+    for tool in tools {
+        let name = tool["name"].as_str().unwrap_or("?");
+        let described = format!(
+            "{} {}",
+            tool["description"].as_str().unwrap_or(""),
+            tool["inputSchema"]
+        );
+        let claims_use = described.contains("via CodeMode=objectgenerator")
+            || described.contains("via CodeMode = objectgenerator")
+            || described.contains("using CodeMode=objectgenerator");
+        assert!(
+            !claims_use,
+            "tool '{name}' advertises execution via CodeMode=objectgenerator, which \
+             build_exec_class has a test forbidding — see connection.rs \
+             build_exec_class_no_objectgenerator_uses_runuser"
+        );
+    }
+
     // #82: the advertised inputSchema is shipped to every client on every tools/list, so
     // a Rust `///` on a params struct becomes wire traffic — schemars promotes it to the
     // schema's top-level `description`. The #82 rationale landed there as 761 characters

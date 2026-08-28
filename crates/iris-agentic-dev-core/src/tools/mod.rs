@@ -4030,8 +4030,11 @@ impl IrisTools {
         };
 
         // Run tests via execute_via_generator (HTTP path).
-        // After RunTest completes, ^UnitTest.Result global IS persisted (globals bypass
-        // the objectgenerator transaction boundary; SQL %Save() does not).
+        // After RunTest completes, the ^UnitTest.Result global IS persisted.
+        // This used to be explained by "globals bypass the objectgenerator transaction
+        // boundary". That explanation is dead: user code has not run at compile time since
+        // build_exec_class moved it into RunUser(), and `write $TLEVEL` through this path
+        // reports 0 on 2026.1 — there is no enclosing transaction to bypass.
         let run_code = if is_class_pattern {
             build_class_test_run_code(&p.pattern, flags, &correlation_token)
         } else {
@@ -4191,9 +4194,12 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
         //   "      TestFoo() begins ..."
         //   "      TestFoo() PASSED in 0.0001s"
         //   "      TestBar() FAILED in 0.0001s"
-        // ^UnitTest.Result only has suite-level data in the objectgenerator context
-        // (class/method %Save() calls are inside nested transactions that don't commit).
-        // Stdout parsing is reliable and provides timing data directly.
+        // Stdout is parsed rather than read back from ^UnitTest.Result because it carries the
+        // per-method timing directly. The original reason given — that the global holds only
+        // suite-level rows because class/method %Save() calls sit in nested transactions that
+        // never commit — no longer applies: execution moved out of the objectgenerator context
+        // (see build_exec_class) and `write $TLEVEL` reports 0 here. Whether the global is now
+        // populated per method has NOT been re-measured; parsing stdout is independent of it.
         let mut test_cases: Vec<serde_json::Value> = Vec::new();
         let mut current_class = String::new();
         let mut passed = 0u64;
@@ -4529,7 +4535,7 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
     }
 
     #[tool(
-        description = "Execute arbitrary ObjectScript code on IRIS and return stdout. Uses pure-HTTP execution via CodeMode=objectgenerator (write temp class, compile, query result, delete). Falls back to docker exec if IRIS_CONTAINER env var is set and HTTP fails. &sql(...) embedded SQL macros are automatically translated to %SQL.Statement calls (set translate_sql: false to disable). When translation fires, response includes sql_translated: true and translated_code. Example: code='write $ZVERSION,!' returns the IRIS version string. Use this for side-effecting ObjectScript only — for SELECTs use iris_query, for class/table introspection use docs_introspect/iris_symbols/iris_table_info, for production state use iris_production/iris_interop_query, and to create+compile a class use iris_doc(put,compile) over Atelier (never $SYSTEM.OBJ.Load from a file path — that needs IRIS to share this host's disk). When the code matches one of those, the response includes a `hint` naming the typed tool. namespace: optional — defaults to the connection namespace (IRIS_NAMESPACE), never a hardcoded USER; the response echoes the namespace it ran in."
+        description = "Execute arbitrary ObjectScript code on IRIS and return stdout. Uses pure-HTTP execution: your code is written into the RunUser() method of a temp class, compiled, run at CALL time by an Execute() SqlProc that captures the device output, then the class is deleted. Falls back to docker exec if IRIS_CONTAINER env var is set and HTTP fails. &sql(...) embedded SQL macros are automatically translated to %SQL.Statement calls (set translate_sql: false to disable). When translation fires, response includes sql_translated: true and translated_code. Example: code='write $ZVERSION,!' returns the IRIS version string. Use this for side-effecting ObjectScript only — for SELECTs use iris_query, for class/table introspection use docs_introspect/iris_symbols/iris_table_info, for production state use iris_production/iris_interop_query, and to create+compile a class use iris_doc(put,compile) over Atelier (never $SYSTEM.OBJ.Load from a file path — that needs IRIS to share this host's disk). When the code matches one of those, the response includes a `hint` naming the typed tool. namespace: optional — defaults to the connection namespace (IRIS_NAMESPACE), never a hardcoded USER; the response echoes the namespace it ran in."
     )]
     async fn iris_execute(
         &self,
@@ -4559,7 +4565,8 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
             .map(|r| r.translated_code.as_str())
             .unwrap_or(&p.code);
 
-        // Try pure-HTTP execution first (write-compile-query via CodeMode=objectgenerator).
+        // Try pure-HTTP execution first (write-compile-query; see build_exec_class — user code
+        // runs at CALL time in RunUser(), NOT at compile time via CodeMode=objectgenerator).
         let gen_result = tokio::time::timeout(
             timeout,
             iris.execute_via_generator(code_to_run, &namespace, client),
