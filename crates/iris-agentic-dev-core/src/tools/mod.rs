@@ -5189,6 +5189,9 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                 } else if sql_lint::is_table_not_found(msg) {
                     extra["hint"] =
                         serde_json::Value::String(sql_lint::TABLE_NOT_FOUND_HINT.into());
+                } else if let Some(h) = sql_lint::sqlcode_hint(msg) {
+                    // #126: the table covered the two most common codes and stopped.
+                    extra["hint"] = serde_json::Value::String(h.into());
                 }
                 if !sql_warnings.is_empty() {
                     extra["warnings"] = serde_json::Value::Array(
