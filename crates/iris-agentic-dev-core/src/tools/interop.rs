@@ -592,6 +592,123 @@ pub fn parse_status_response(raw: &str) -> Result<(String, i64, String), String>
     Ok((name, code, state))
 }
 
+/// One classified interop failure: the code a caller can branch on, the message with the
+/// server's own prefix noise removed, and whatever the message named (#125).
+pub struct InteropFailure {
+    pub code: &'static str,
+    pub message: String,
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Split `INTEROP_ERROR` into the states underneath it (#125).
+///
+/// Every failure from `iris_production`/`iris_production_item` used to return the single code
+/// `INTEROP_ERROR`, so a caller had to pattern-match English prose to decide what to do — and
+/// the five conditions hiding under it want opposite responses, one of them being "nothing, this
+/// is the goal state". The production name the caller supplied was dropped as well, so
+/// "that production does not exist" and "you named nothing" read identically.
+///
+/// The prefixes are also normalised here. `Write "ERROR:"_$System.Status.GetErrorText(sc)`
+/// produces `ERROR:ERROR <Ens>…` because GetErrorText adds its own `ERROR ` — two different
+/// shapes (`ERROR:ERROR <Ens>…` and `ERROR:INTEROP_ERROR:…`) reached callers from one tool.
+pub fn classify_interop_failure(raw: &str, production: Option<&str>) -> InteropFailure {
+    let msg = raw
+        .trim()
+        .strip_prefix("ERROR:INTEROP_ERROR:")
+        .or_else(|| raw.trim().strip_prefix("ERROR:ERROR "))
+        .or_else(|| raw.trim().strip_prefix("ERROR:"))
+        .unwrap_or(raw.trim())
+        .trim()
+        .to_string();
+
+    let mut extra = serde_json::Map::new();
+    if let Some(p) = production.map(str::trim).filter(|p| !p.is_empty()) {
+        extra.insert("production".into(), p.into());
+    }
+
+    let code = if msg.contains("ErrProductionAlreadyRunning") {
+        if let Some(name) = between(&msg, "Production '", "'") {
+            extra.insert("running_production".into(), name.into());
+        }
+        "PRODUCTION_ALREADY_RUNNING"
+    } else if msg.contains("ErrInvalidProduction") || msg.contains("Cannot open production") {
+        "PRODUCTION_NOT_FOUND"
+    } else if msg.contains("Config Item") && msg.contains("unknown BusinessType") {
+        if let Some(item) = between(&msg, "Config Item ", " cannot run") {
+            extra.insert("config_item".into(), item.into());
+        }
+        "CONFIG_ITEM_INVALID"
+    } else if msg.contains("<CLASS DOES NOT EXIST>") {
+        // "…<CLASS DOES NOT EXIST>getProductionItems+51^Ens.Director.1 *Ens.Rule.Routing -- …"
+        // The caller's next move is to compile that class, so it must be a field, not a
+        // substring of an ObjectScript stack frame.
+        if let Some(cls) = msg
+            .split('*')
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .filter(|c| c.contains('.'))
+        {
+            extra.insert("missing_class".into(), cls.into());
+        }
+        "MISSING_CLASS"
+    } else {
+        "INTEROP_ERROR"
+    };
+
+    if let Some(h) = interop_failure_hint(code, &extra) {
+        extra.insert("hint".into(), h.into());
+    }
+    InteropFailure {
+        code,
+        message: msg,
+        extra,
+    }
+}
+
+fn between<'a>(haystack: &'a str, open: &str, close: &str) -> Option<&'a str> {
+    let start = haystack.find(open)? + open.len();
+    let rest = &haystack[start..];
+    let end = rest.find(close)?;
+    Some(rest[..end].trim()).filter(|s| !s.is_empty())
+}
+
+fn interop_failure_hint(
+    code: &str,
+    extra: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    let named = extra.get("production").and_then(|v| v.as_str());
+    match code {
+        "PRODUCTION_NOT_FOUND" => Some(match named {
+            Some(p) => format!(
+                "'{p}' is not a production this namespace can open — it is not compiled here, or \
+                 the name is wrong. Check with iris_query \"SELECT ID FROM Ens_Config.Production\", \
+                 then iris_doc(put, compile) the class if it is missing."
+            ),
+            None => "No production was named and none is running. Pass \
+                     production=<Package.ProductionName>."
+                .to_string(),
+        }),
+        "CONFIG_ITEM_INVALID" => extra.get("config_item").and_then(|v| v.as_str()).map(|i| {
+            format!(
+                "Config item '{i}' names a class that is not a Business Service/Process/Operation \
+                 (or is not compiled), so the production cannot start. Fix that one item — the \
+                 production itself is fine."
+            )
+        }),
+        "MISSING_CLASS" => extra.get("missing_class").and_then(|v| v.as_str()).map(|c| {
+            format!("Compile '{c}' — a config item references it and it does not exist here.")
+        }),
+        _ => None,
+    }
+}
+
+/// Answer a failed interop call with the split code, the cleaned message and the fields the
+/// message named.
+fn interop_fail(raw: &str, production: Option<&str>) -> Result<CallToolResult, McpError> {
+    let f = classify_interop_failure(raw, production);
+    crate::tools::envelope::fail_with(f.code, &f.message, serde_json::Value::Object(f.extra))
+}
+
 fn docker_required_interop() -> Result<CallToolResult, McpError> {
     err_json(
         "DOCKER_REQUIRED",
@@ -682,7 +799,30 @@ pub async fn interop_production_start_impl(
             if raw.starts_with("OK") {
                 ok_json(serde_json::json!({"success": true, "state": "Running"}))
             } else {
-                err_json("INTEROP_ERROR", raw)
+                let f = classify_interop_failure(raw, Some(prod));
+                // #125: the caller asked for this production to be running and it is running.
+                // Reporting the goal state as a failure made `start` non-idempotent — a retry
+                // loop could never converge. Only when the SAME production is up: a different
+                // one running is a genuine conflict the caller has to resolve.
+                let already_this_one = f.code == "PRODUCTION_ALREADY_RUNNING"
+                    && f.extra
+                        .get("running_production")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|r| r.eq_ignore_ascii_case(prod));
+                if already_this_one {
+                    return ok_json(serde_json::json!({
+                        "success": true,
+                        "state": "Running",
+                        "production": prod,
+                        "already_running": true,
+                        "note": format!("'{prod}' was already running; nothing to do."),
+                    }));
+                }
+                crate::tools::envelope::fail_with(
+                    f.code,
+                    &f.message,
+                    serde_json::Value::Object(f.extra),
+                )
             }
         }
         Err(e) if e.to_string() == "DOCKER_REQUIRED" => docker_required_interop(),
@@ -710,7 +850,7 @@ pub async fn interop_production_stop_impl(
             if raw.starts_with("OK") {
                 ok_json(serde_json::json!({"success": true, "state": "Stopped"}))
             } else {
-                err_json("INTEROP_ERROR", raw)
+                interop_fail(raw, None)
             }
         }
         Err(e) if e.to_string() == "DOCKER_REQUIRED" => docker_required_interop(),
@@ -781,7 +921,7 @@ pub async fn interop_production_recover_impl(
             if raw.starts_with("OK") {
                 ok_json(serde_json::json!({"success": true, "state": "Running"}))
             } else {
-                err_json("INTEROP_ERROR", raw)
+                interop_fail(raw, None)
             }
         }
         Err(e) if e.to_string() == "DOCKER_REQUIRED" => docker_required_interop(),
@@ -1441,15 +1581,6 @@ pub struct ProductionItemParams {
     pub category: Option<String>,
 }
 
-/// Strip the `ERROR:INTEROP_ERROR:` sentinel the generated ObjectScript writes so the envelope
-/// does not carry its own error code twice inside the message text (#118/#119: now that these
-/// messages name the production they failed on, the duplication is the only noise left).
-fn interop_error_text(out: &str) -> &str {
-    out.strip_prefix("ERROR:INTEROP_ERROR:")
-        .unwrap_or(out)
-        .trim()
-}
-
 /// The ObjectScript prologue that resolves `tProd`, the production every
 /// `iris_production_item` action operates on (pure → unit-testable).
 ///
@@ -1591,7 +1722,7 @@ Write "OK""#
                     } else if let Some(msg) = out.strip_prefix("ERROR:UPDATE_FAILED:") {
                         err_json("UPDATE_FAILED", msg)
                     } else {
-                        err_json("INTEROP_ERROR", interop_error_text(out))
+                        interop_fail(out, params.production.as_deref())
                     }
                 }
                 Err(e) => err_json(
@@ -1618,7 +1749,7 @@ Set tKey="" For {{ Set tSetting=tItem.Settings.GetNext(.tKey) Quit:tKey=""
                         return err_json("NO_PRODUCTION", msg);
                     }
                     if out.starts_with("ERROR:") {
-                        return err_json("INTEROP_ERROR", interop_error_text(out));
+                        return interop_fail(out, params.production.as_deref());
                     }
                     let settings: std::collections::HashMap<String, String> = out
                         .lines()
@@ -1700,7 +1831,7 @@ If $$$ISERR(tSC4) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tS
                     } else if let Some(msg) = out.strip_prefix("ERROR:UPDATE_FAILED:") {
                         err_json("UPDATE_FAILED", msg)
                     } else {
-                        err_json("INTEROP_ERROR", interop_error_text(out))
+                        interop_fail(out, params.production.as_deref())
                     }
                 }
                 Err(e) => err_json(
@@ -1898,7 +2029,7 @@ If $$$ISERR(tSC) {{ Write "ERROR:CREDENTIAL_EXISTS:"_$System.Status.GetErrorText
                     } else if let Some(msg) = out.strip_prefix("ERROR:CREDENTIAL_EXISTS:") {
                         err_json("CREDENTIAL_EXISTS", msg)
                     } else {
-                        err_json("INTEROP_ERROR", interop_error_text(out))
+                        interop_fail(out, None)
                     }
                 }
                 Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
@@ -1932,7 +2063,7 @@ If $$$ISERR(tSC) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC
                             serde_json::json!({"success":true,"action":"update","id":params.id}),
                         )
                     } else {
-                        err_json("INTEROP_ERROR", interop_error_text(out))
+                        interop_fail(out, None)
                     }
                 }
                 Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
@@ -1954,7 +2085,7 @@ If $$$ISERR(tSC) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC
                     } else if let Some(msg) = out.strip_prefix("ERROR:CREDENTIAL_NOT_FOUND:") {
                         err_json("CREDENTIAL_NOT_FOUND", msg)
                     } else {
-                        err_json("INTEROP_ERROR", interop_error_text(out))
+                        interop_fail(out, None)
                     }
                 }
                 Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
@@ -2090,7 +2221,7 @@ If $$$ISERR(tSC) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC
                             serde_json::json!({"success":true,"table":params.table,"key":params.key,"value":params.value}),
                         )
                     } else {
-                        err_json("INTEROP_ERROR", interop_error_text(out))
+                        interop_fail(out, None)
                     }
                 }
                 Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
@@ -2122,7 +2253,7 @@ If $$$ISERR(tSC) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC
                     } else if let Some(msg) = out.strip_prefix("ERROR:TABLE_NOT_FOUND:") {
                         err_json("TABLE_NOT_FOUND", msg)
                     } else {
-                        err_json("INTEROP_ERROR", interop_error_text(out))
+                        interop_fail(out, None)
                     }
                 }
                 Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
@@ -2242,7 +2373,7 @@ Write tOut"#,
                     } else if let Some(msg) = out.strip_prefix("ERROR:INVALID_XML:") {
                         err_json("INVALID_XML", msg)
                     } else {
-                        err_json("INTEROP_ERROR", interop_error_text(out))
+                        interop_fail(out, None)
                     }
                 }
                 Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
@@ -4064,5 +4195,105 @@ mod interop_preflight_tests {
                 .expect("no Ens.Director means no interop");
             assert_eq!(v["error_code"], "NAMESPACE_NOT_INTEROP", "{v}");
         });
+    }
+}
+
+/// #125 — `INTEROP_ERROR` collapsed five states a caller must respond to differently.
+/// Every input below is verbatim from the eval corpus.
+#[cfg(test)]
+mod interop_failure_tests {
+    use super::classify_interop_failure;
+
+    fn field(raw: &str, prod: Option<&str>, key: &str) -> Option<String> {
+        classify_interop_failure(raw, prod)
+            .extra
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    }
+
+    /// 63 of 89 occurrences. The caller named the production and the answer did not.
+    #[test]
+    fn an_invalid_production_is_named_and_gets_its_own_code() {
+        let raw = "ERROR:ERROR <Ens>ErrInvalidProduction: Invalid Production";
+        let f = classify_interop_failure(raw, Some("ResultOut.Production"));
+        assert_eq!(f.code, "PRODUCTION_NOT_FOUND");
+        assert_eq!(
+            f.extra.get("production").and_then(|v| v.as_str()),
+            Some("ResultOut.Production")
+        );
+        assert!(
+            f.extra
+                .get("hint")
+                .and_then(|v| v.as_str())
+                .is_some_and(|h| h.contains("ResultOut.Production")),
+            "the hint must name the production: {:?}",
+            f.extra.get("hint")
+        );
+    }
+
+    /// The other prefix shape the same tool emitted, for the same caller action.
+    #[test]
+    fn cannot_open_production_lands_on_the_same_code() {
+        let f = classify_interop_failure("ERROR:INTEROP_ERROR:Cannot open production", None);
+        assert_eq!(f.code, "PRODUCTION_NOT_FOUND");
+    }
+
+    /// The sharpest case: the caller asked for it to be running, and it is.
+    #[test]
+    fn already_running_is_its_own_code_and_names_the_running_production() {
+        let raw = "ERROR:ERROR <Ens>ErrProductionAlreadyRunning: Production 'NightLab.Production' is already running";
+        let f = classify_interop_failure(raw, Some("NightLab.Production"));
+        assert_eq!(f.code, "PRODUCTION_ALREADY_RUNNING");
+        assert_eq!(
+            f.extra.get("running_production").and_then(|v| v.as_str()),
+            Some("NightLab.Production")
+        );
+    }
+
+    #[test]
+    fn a_bad_config_item_is_not_a_production_level_failure() {
+        let raw = "ERROR:ERROR <Ens>ErrGeneral: Config Item DT.ADT2Normalized cannot run because it has unknown BusinessType";
+        assert_eq!(
+            classify_interop_failure(raw, None).code,
+            "CONFIG_ITEM_INVALID"
+        );
+        assert_eq!(
+            field(raw, None, "config_item").as_deref(),
+            Some("DT.ADT2Normalized")
+        );
+    }
+
+    /// The caller's next move is to compile that class, so it must be a field — not a
+    /// substring of an ObjectScript stack frame with internal log formatting around it.
+    #[test]
+    fn a_missing_class_is_lifted_out_of_the_stack_frame() {
+        let raw = "ERROR:ERROR <Ens>ErrException: <CLASS DOES NOT EXIST>getProductionItems+51^Ens.Director.1 *Ens.Rule.Routing -- logged as '-' number - @''";
+        assert_eq!(classify_interop_failure(raw, None).code, "MISSING_CLASS");
+        assert_eq!(
+            field(raw, None, "missing_class").as_deref(),
+            Some("Ens.Rule.Routing")
+        );
+    }
+
+    /// Two shapes reached callers from one tool; neither survives into the envelope.
+    #[test]
+    fn the_doubled_error_prefixes_are_stripped() {
+        for raw in [
+            "ERROR:ERROR <Ens>ErrInvalidProduction: Invalid Production",
+            "ERROR:INTEROP_ERROR:Cannot open production My.Prod",
+            "ERROR:something unclassified",
+        ] {
+            let m = classify_interop_failure(raw, None).message;
+            assert!(!m.starts_with("ERROR:"), "prefix survived: {m}");
+            assert!(!m.starts_with("ERROR "), "prefix survived: {m}");
+        }
+    }
+
+    #[test]
+    fn anything_unrecognised_still_falls_back_to_interop_error() {
+        let f = classify_interop_failure("ERROR:something nobody has seen", None);
+        assert_eq!(f.code, "INTEROP_ERROR");
+        assert_eq!(f.message, "something nobody has seen");
     }
 }

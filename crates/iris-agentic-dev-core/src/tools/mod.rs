@@ -1250,6 +1250,11 @@ pub struct IntrospectParams {
     /// (IRIS_NAMESPACE) — only pass a value to deliberately target a different namespace.
     #[serde(default)]
     pub namespace: Option<String>,
+    /// Include members inherited from superclasses (default false — only what this class
+    /// declares). Inherited %Persistent plumbing dominates the answer: Ens.Config.Production
+    /// has 451 methods of which 70 are its own.
+    #[serde(default)]
+    pub include_inherited: bool,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DebugMapParams {
@@ -2847,6 +2852,282 @@ pub fn translate_symbols_query(limit: usize, query: &str) -> (String, Vec<serde_
     (
         format!("{} WHERE Name LIKE ? ORDER BY Name", base),
         vec![serde_json::Value::String(format!("%{}%", query))],
+    )
+}
+
+/// Turn the wrapper's opaque frame into something the caller can act on (#124).
+///
+/// Adds the caller's OWN failing line (an IRIS terminal would have echoed it with a caret) and,
+/// when the trap names a member on a class, that class's declared members. Both come from
+/// information the server already holds at the moment it builds the error.
+async fn enrich_abort(
+    iris: &crate::iris::connection::IrisConnection,
+    client: &reqwest::Client,
+    namespace: &str,
+    abort: &str,
+    submitted: &str,
+    resp: &mut serde_json::Value,
+) {
+    let Some(frame) = parse_abort_frame(abort) else {
+        return;
+    };
+    resp["signal"] = serde_json::Value::String(frame.signal.to_string());
+
+    if let Some(n) = frame.line {
+        if let Some(text) = submitted.lines().nth(n - 1) {
+            resp["source_line_number"] = serde_json::Value::from(n);
+            resp["source_line"] = serde_json::Value::String(text.trim_end().to_string());
+        }
+    }
+
+    let mut hint = match (resp.get("source_line").and_then(|v| v.as_str()), frame.line) {
+        (Some(line), Some(n)) => format!("Line {n} of the code you sent is what failed: {line}"),
+        _ => String::new(),
+    };
+
+    if abort_wants_member_list(frame.signal) {
+        if let (Some(member), Some(class)) = (frame.member, frame.class) {
+            let members = declared_members(iris, client, namespace, class, Some(member)).await;
+            if !members.is_empty() {
+                resp["did_you_mean"] = members
+                    .iter()
+                    .take(8)
+                    .map(|m| serde_json::Value::String(m.clone()))
+                    .collect();
+                if !hint.is_empty() {
+                    hint.push(' ');
+                }
+                hint.push_str(&format!(
+                    "'{class}' has no '{member}'. It declares: {}. \
+                     (docs_introspect(class_name='{class}') lists all of them.)",
+                    members
+                        .iter()
+                        .take(8)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
+    }
+
+    if !hint.is_empty() && resp.get("hint").is_none() {
+        resp["hint"] = serde_json::Value::String(hint);
+    }
+}
+
+/// The members a class DECLARES (not inherited, not `%`-prefixed), ranked against the name the
+/// caller got wrong (#124). Runs only on the error path, so a working call never pays for it.
+async fn declared_members(
+    iris: &crate::iris::connection::IrisConnection,
+    client: &reqwest::Client,
+    namespace: &str,
+    class: &str,
+    wanted: Option<&str>,
+) -> Vec<String> {
+    let sql = "SELECT Name FROM %Dictionary.CompiledMethod \
+               WHERE parent = ? AND Origin = parent AND SUBSTRING(Name,1,1) <> '%' \
+               UNION \
+               SELECT Name FROM %Dictionary.CompiledProperty \
+               WHERE parent = ? AND Origin = parent AND SUBSTRING(Name,1,1) <> '%'";
+    let rows = match iris
+        .query(
+            sql,
+            vec![
+                serde_json::Value::String(class.to_string()),
+                serde_json::Value::String(class.to_string()),
+            ],
+            namespace,
+            client,
+        )
+        .await
+    {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    // `iris.query` answers `{"result":{"content":[…]}}` — the same shape `row_count` reads.
+    let mut names: Vec<String> = rows["result"]["content"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|r| r.get("Name").and_then(|n| n.as_str()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Nearest first: the caller is looking for one name.
+    match wanted {
+        Some(w) => rank_members(&mut names, w),
+        None => names.sort(),
+    }
+    names.truncate(25);
+    names
+}
+
+/// Split a CamelCase identifier into lowercase words: `ValidateProduction` -> `[validate, production]`.
+fn camel_words(name: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for ch in name.chars() {
+        if ch.is_ascii_uppercase() && !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+        }
+        if ch.is_ascii_alphanumeric() {
+            cur.push(ch.to_ascii_lowercase());
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Rank a class's members against the name the caller got wrong (#124).
+///
+/// A leading-prefix score alone is useless here: nothing in `Ens.Director` starts with a `V`, so
+/// `ValidateProduction` scored zero against every member and the caller was offered `Console`.
+/// What the caller wants shares a WORD — `StartProduction`, `StopProduction`,
+/// `GetProductionStatus`. Words of three characters or fewer (`get`, `is`, `on`) are skipped:
+/// they match everything and therefore rank nothing.
+fn rank_members(names: &mut [String], wanted: &str) {
+    let words: Vec<String> = camel_words(wanted)
+        .into_iter()
+        .filter(|w| w.len() > 3)
+        .collect();
+    let want_lower = wanted.to_ascii_lowercase();
+    let want_words = camel_words(wanted).len();
+    names.sort_by_cached_key(|n| {
+        let lower = n.to_ascii_lowercase();
+        let shared_words = words.iter().filter(|w| lower.contains(w.as_str())).count();
+        let prefix = lower
+            .chars()
+            .zip(want_lower.chars())
+            .take_while(|(a, b)| a == b)
+            .count();
+        // Among members sharing the same word, the one SHAPED like what the caller wrote is
+        // the better guess: `ValidateProduction` wants `StartProduction`, not
+        // `actualizeProductionDifferences`. Word count first, then length.
+        let shape = camel_words(n).len().abs_diff(want_words);
+        let length = lower.len().abs_diff(want_lower.len());
+        (
+            std::cmp::Reverse(shared_words),
+            std::cmp::Reverse(prefix),
+            shape,
+            length,
+            lower,
+        )
+    });
+}
+
+/// What the wrapper's abort line actually names (#124).
+///
+/// `ERROR: <METHOD DOES NOT EXIST> 148 RunUser+3^IrisDevTmp.Run32b6783ae37d.1 ValidateProduction,Ens.Director`
+///
+/// `RunUser+3` is a location in a routine the caller never submitted, never sees and cannot
+/// fetch, and the hash changes every call — so two identical errors did not even look
+/// identical. But the server wrote that routine: `RunUser+N` is submitted line N (verified on
+/// 2026.1 against a script whose third line trapped), and the trailing `Member,Class` pair is
+/// already parsed out for us by IRIS.
+#[derive(Debug, PartialEq)]
+pub struct AbortFrame<'a> {
+    pub signal: &'a str,
+    pub line: Option<usize>,
+    pub member: Option<&'a str>,
+    pub class: Option<&'a str>,
+}
+
+pub fn parse_abort_frame(abort: &str) -> Option<AbortFrame<'_>> {
+    let open = abort.find('<')?;
+    let close = abort[open..].find('>')? + open;
+    let signal = abort[open + 1..close].trim();
+    let rest = &abort[close + 1..];
+
+    // `RunUser+N^Routine` — N is the submitted line, 1-based.
+    let line = rest.find("RunUser+").and_then(|i| {
+        rest[i + "RunUser+".len()..]
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .and_then(|d| d.parse::<usize>().ok())
+    });
+
+    // Trailing detail after the routine reference, e.g. "ValidateProduction,Ens.Director".
+    let tail = rest
+        .split('^')
+        .nth(1)
+        .and_then(|after| after.split_whitespace().nth(1))
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+    let (member, class) = match tail.and_then(|t| t.split_once(',')) {
+        Some((m, c)) => (Some(m.trim()), Some(c.trim())),
+        None => (tail, None),
+    };
+
+    Some(AbortFrame {
+        signal,
+        line,
+        member,
+        class,
+    })
+}
+
+/// The signals for which naming the class's declared members answers the question (#124).
+///
+/// Three quarters of the opaque frames in the eval corpus are a name the agent got wrong —
+/// a method, class or property that does not exist. 54% of affected runs never called an
+/// introspection tool afterwards and 70% of missing symbols were never retried: agents do not
+/// recover from these, they abandon the line of enquiry. So the error has to carry the answer.
+fn abort_wants_member_list(signal: &str) -> bool {
+    matches!(
+        signal,
+        "METHOD DOES NOT EXIST" | "PROPERTY DOES NOT EXIST" | "CLASS PROPERTY"
+    )
+}
+
+/// The wrapper's own abort rendering, wherever it lands in the captured output (#123).
+///
+/// `iris_execute` used to decide success with `trimmed.starts_with("ERROR: ")`, which made the
+/// flag a function of whether the script had written anything BEFORE the trap fired. The same
+/// `<SYNTAX>` abort came back `success:false` when it hit line 1 and `success:true` when a
+/// `Write` landed first — 352 of 720 abort-carrying envelopes in the eval corpus were reported
+/// as successes, every one of them with no `error_code` for a caller to branch on. On a client
+/// that raises on `success:false` (opencode does) that is the difference between the agent
+/// seeing a failure and seeing nothing.
+///
+/// The trap is written by the wrapper's Catch block and aborts execution, so it is the LAST
+/// non-empty line. Anchoring there rather than matching anywhere keeps a script that
+/// legitimately prints the word ERROR mid-run from being reported as an abort. The
+/// leading-prefix test is kept as well, so nothing detected before stops being detected.
+pub fn runtime_abort_line(output: &str) -> Option<&str> {
+    fn is_abort(line: &str) -> bool {
+        let t = line.trim();
+        matches!(
+            t.strip_prefix("ERROR: ").or_else(|| t.strip_prefix("ERROR($ZERROR): ")),
+            Some(rest) if rest.starts_with('<')
+        )
+    }
+    let last = output.lines().rev().find(|l| !l.trim().is_empty())?;
+    if is_abort(last) {
+        return Some(last.trim());
+    }
+    // The wrapper's one non-`<signal>` failure, emitted when the device redirect could not be
+    // established. Matched exactly rather than by the old blanket `starts_with("ERROR: ")`,
+    // which also caught a script whose own first line happened to print the word.
+    output
+        .lines()
+        .map(str::trim)
+        .find(|l| *l == "ERROR: output capture unavailable")
+}
+
+/// `<ENDOFFILE>` is a `READ` loop reaching the end of a file — an abort, but usually the
+/// intended terminator rather than a defect. It is still reported as a failure, because the
+/// script did stop early and the ask in #123 was consistency; the hint says so, so a caller
+/// can tell this apart from a real fault without the flag having to lie.
+fn abort_hint(abort: &str) -> Option<&'static str> {
+    abort.contains("<ENDOFFILE>").then_some(
+        "<ENDOFFILE> is usually a READ loop reaching the end of the file, not a defect — the \
+         output above is everything that was read. If that is what you intended, treat this as \
+         done; guard the loop with `Quit:$ZEOF` to end without the trap.",
     )
 }
 
@@ -4590,8 +4871,9 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
             Ok(Ok(output)) => {
                 let trimmed = output.trim();
                 // Catch ObjectScript runtime errors written by the Catch block or $ZERROR check.
-                let is_runtime_error =
-                    trimmed.starts_with("ERROR: ") || trimmed.starts_with("ERROR($ZERROR): ");
+                // #123: anywhere in the output, not only at the start — see runtime_abort_line.
+                let abort = runtime_abort_line(trimmed);
+                let is_runtime_error = abort.is_some();
                 self.record_call("iris_execute", !is_runtime_error);
                 let mut resp = serde_json::json!({
                     "success": !is_runtime_error,
@@ -4599,8 +4881,11 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                     "namespace": namespace,
                     "method": "http",
                 });
-                if is_runtime_error {
+                if let Some(abort) = abort {
                     resp["error_code"] = serde_json::Value::String("IRIS_RUNTIME_ERROR".into());
+                    if let Some(h) = abort_hint(abort) {
+                        resp["hint"] = serde_json::Value::String(h.into());
+                    }
                 } else if trimmed.is_empty() {
                     // Execution succeeded but produced no captured output. With the RunUser
                     // fix the code really ran (this is no longer the objectgenerator silent
@@ -4636,9 +4921,12 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                     }
                 }
                 // Issue #2: the runtime-error message must live in `error` (not only
-                // `output`) and the result must be flagged isError on the wire.
-                if is_runtime_error {
-                    return envelope::fail_with("IRIS_RUNTIME_ERROR", trimmed, resp);
+                // `output`) and the result must be flagged isError on the wire. #123: `error`
+                // carries the abort LINE — `output` still holds everything the script wrote
+                // before it, which the caller asked to keep.
+                if let Some(abort) = abort {
+                    enrich_abort(&iris, client, &namespace, abort, code_to_run, &mut resp).await;
+                    return envelope::fail_with("IRIS_RUNTIME_ERROR", abort, resp);
                 }
                 return ok_json(resp);
             }
@@ -4704,8 +4992,9 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
             }
             Ok(Ok(output)) => {
                 let trimmed = output.trim();
-                let is_runtime_error =
-                    trimmed.starts_with("ERROR: ") || trimmed.starts_with("ERROR($ZERROR): ");
+                // #123: same rule as the HTTP arm — the flag must not depend on prior output.
+                let abort = runtime_abort_line(trimmed);
+                let is_runtime_error = abort.is_some();
                 self.record_call("iris_execute", !is_runtime_error);
                 let mut resp = serde_json::json!({
                     "success": !is_runtime_error,
@@ -4713,8 +5002,11 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                     "namespace": namespace,
                     "method": "docker",
                 });
-                if is_runtime_error {
+                if let Some(abort) = abort {
                     resp["error_code"] = serde_json::Value::String("IRIS_RUNTIME_ERROR".into());
+                    if let Some(h) = abort_hint(abort) {
+                        resp["hint"] = serde_json::Value::String(h.into());
+                    }
                 }
                 if let Some(ref tr) = translation {
                     if tr.found {
@@ -4736,8 +5028,8 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                         resp["hint"] = serde_json::Value::String(h.into());
                     }
                 }
-                if is_runtime_error {
-                    return envelope::fail_with("IRIS_RUNTIME_ERROR", trimmed, resp);
+                if let Some(abort) = abort {
+                    return envelope::fail_with("IRIS_RUNTIME_ERROR", abort, resp);
                 }
                 ok_json(resp)
             }
@@ -5461,7 +5753,7 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
     }
 
     #[tool(
-        description = "Introspect an ObjectScript class — returns methods, properties, and type information."
+        description = "Introspect an ObjectScript class — returns methods, properties, and type information. Returns only what the class DECLARES by default; pass include_inherited=true to also get everything it inherits (that is usually an order of magnitude more — Ens.Config.Production declares 70 methods and inherits 381)."
     )]
     async fn docs_introspect(
         &self,
@@ -5477,8 +5769,18 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
         // methods answers `methods:[]`, so `null` vs `[]` was the ONLY thing separating
         // "unreachable" from "no methods" and no caller makes that distinction. A failed call
         // must never be answered with a negative FACT.
+        // #124: the documented way out of "which members does this class have?" returned every
+        // inherited member — a 16 KB median response on the current pin, 78% of them carrying
+        // %AddToSaveSet/%BindExport plumbing, and often a note that most of the answer was
+        // truncated away. `Origin = parent` is the declared-only filter; it is not interpolated
+        // caller input, only this flag.
+        let origin_filter = if p.include_inherited {
+            ""
+        } else {
+            " AND Origin = parent"
+        };
         let methods = match iris.query(
-            "SELECT Name,FormalSpec,ReturnType FROM %Dictionary.CompiledMethod WHERE parent=? ORDER BY Name",
+            &format!("SELECT Name,FormalSpec,ReturnType FROM %Dictionary.CompiledMethod WHERE parent=?{origin_filter} ORDER BY Name"),
             vec![serde_json::Value::String(p.class_name.clone())],
             &namespace,
             client,
@@ -5490,7 +5792,7 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
         };
         let props = match iris
             .query(
-                "SELECT Name,Type FROM %Dictionary.CompiledProperty WHERE parent=? ORDER BY Name",
+                &format!("SELECT Name,Type FROM %Dictionary.CompiledProperty WHERE parent=?{origin_filter} ORDER BY Name"),
                 vec![serde_json::Value::String(p.class_name.clone())],
                 &namespace,
                 client,
@@ -5543,9 +5845,17 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                 ClassPresence::Compiled | ClassPresence::Undetermined => {}
             }
         }
-        ok_json(
-            serde_json::json!({"success": true, "class_name": p.class_name, "methods": methods["result"]["content"], "properties": props["result"]["content"]}),
-        )
+        let mut payload = serde_json::json!({"success": true, "class_name": p.class_name, "methods": methods["result"]["content"], "properties": props["result"]["content"], "include_inherited": p.include_inherited});
+        if !p.include_inherited {
+            // Say what was left out, or "no methods" reads as a fact about the class rather
+            // than about the filter.
+            payload["note"] = serde_json::Value::String(
+                "Declared members only — inherited members are omitted. Pass \
+                 include_inherited=true for the full surface."
+                    .into(),
+            );
+        }
+        ok_json(payload)
     }
 
     #[tool(
@@ -12960,5 +13270,151 @@ mod agent_stats_wiring_tests {
                 "say WHICH registry was unreadable: {v}"
             );
         });
+    }
+}
+
+/// #123 / #124 — what `iris_execute` makes of the wrapper's abort line.
+#[cfg(test)]
+mod abort_tests {
+    use super::{parse_abort_frame, runtime_abort_line};
+
+    const AFTER_OUTPUT: &str =
+        "one\ntwo\nERROR: <METHOD DOES NOT EXIST> 148 RunUser+3^IrisDevTmp.Run32b6783ae37d.1 ValidateProduction,Ens.Director";
+    const IMMEDIATE: &str =
+        "ERROR: <METHOD DOES NOT EXIST> 148 RunUser+1^IrisDevTmp.Runc793621a6a7d.1 ValidateProduction,Ens.Director";
+
+    /// The defect: `success` was `!trimmed.starts_with("ERROR: ")`, so the identical trap was
+    /// a failure when it hit line 1 and a success when a Write landed first.
+    #[test]
+    fn the_same_abort_is_detected_with_and_without_prior_output() {
+        assert!(runtime_abort_line(IMMEDIATE).is_some());
+        assert!(
+            runtime_abort_line(AFTER_OUTPUT).is_some(),
+            "an abort after output is still an abort"
+        );
+    }
+
+    #[test]
+    fn the_reported_error_is_the_abort_line_not_the_whole_output() {
+        let abort = runtime_abort_line(AFTER_OUTPUT).unwrap();
+        assert!(
+            abort.starts_with("ERROR: <METHOD DOES NOT EXIST>"),
+            "{abort}"
+        );
+        assert!(
+            !abort.contains("one"),
+            "partial output leaked into error: {abort}"
+        );
+    }
+
+    #[test]
+    fn the_zerror_shape_is_detected_too() {
+        let out =
+            "partial\nERROR($ZERROR): <UNDEFINED>RunUser+1^IrisDevTmp.Runde1eee3e4ec3.1 *pName";
+        assert!(runtime_abort_line(out).is_some());
+    }
+
+    /// The wrapper's own non-`<signal>` failure must still be caught.
+    #[test]
+    fn the_capture_unavailable_sentinel_is_an_abort() {
+        assert!(runtime_abort_line("ERROR: output capture unavailable").is_some());
+    }
+
+    /// A script that prints the word ERROR mid-run and then completes is not an abort.
+    #[test]
+    fn ordinary_output_mentioning_error_is_not_an_abort() {
+        for out in [
+            "ERROR: something the script itself printed\nand then it carried on",
+            "checking...\nno problems found",
+            "",
+        ] {
+            assert!(
+                runtime_abort_line(out).is_none(),
+                "false positive on: {out}"
+            );
+        }
+    }
+
+    /// `RunUser+N` is submitted line N — verified on 2026.1 against a four-line script whose
+    /// third line trapped.
+    #[test]
+    fn the_frame_names_the_submitted_line_and_the_member() {
+        let f = parse_abort_frame(runtime_abort_line(AFTER_OUTPUT).unwrap()).unwrap();
+        assert_eq!(f.signal, "METHOD DOES NOT EXIST");
+        assert_eq!(f.line, Some(3));
+        assert_eq!(f.member, Some("ValidateProduction"));
+        assert_eq!(f.class, Some("Ens.Director"));
+
+        let submitted = "write \"one\",!\nwrite \"two\",!\nset x = ##class(Ens.Director).ValidateProduction()\nwrite \"four\",!";
+        assert_eq!(
+            submitted.lines().nth(f.line.unwrap() - 1),
+            Some("set x = ##class(Ens.Director).ValidateProduction()")
+        );
+    }
+
+    /// The suggestion list is only worth attaching if it is ranked. The first cut scored on
+    /// leading prefix alone, so `ValidateProduction` — nothing in `Ens.Director` starts with V —
+    /// scored zero everywhere and the caller was offered `Console` and
+    /// `actualizeProductionDifferences`. These are the real declared members of Ens.Director.
+    #[test]
+    fn members_are_ranked_by_shared_word_then_shape() {
+        let mut names: Vec<String> = [
+            "actualizeProductionDifferences",
+            "CleanProduction",
+            "Console",
+            "CreateBusinessService",
+            "DeleteProduction",
+            "GetProductionStatus",
+            "RestartProduction",
+            "StartProduction",
+            "StopProduction",
+            "SystemStart",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        super::rank_members(&mut names, "ValidateProduction");
+
+        let top: Vec<&str> = names.iter().take(6).map(String::as_str).collect();
+        for want in ["StartProduction", "StopProduction", "RestartProduction"] {
+            assert!(top.contains(&want), "{want} missing from top 6: {top:?}");
+        }
+        for noise in ["Console", "CreateBusinessService", "SystemStart"] {
+            assert!(
+                !top.contains(&noise),
+                "{noise} should not outrank a *Production: {top:?}"
+            );
+        }
+        // Two-word members beat the three-word one that merely shares the word.
+        assert!(
+            names.iter().position(|n| n == "StartProduction")
+                < names
+                    .iter()
+                    .position(|n| n == "actualizeProductionDifferences"),
+            "{names:?}"
+        );
+    }
+
+    #[test]
+    fn camel_words_splits_on_case() {
+        assert_eq!(
+            super::camel_words("ValidateProduction"),
+            ["validate", "production"]
+        );
+        assert_eq!(
+            super::camel_words("getProductionItems"),
+            ["get", "production", "items"]
+        );
+        assert_eq!(super::camel_words("Name"), ["name"]);
+    }
+
+    /// A `<SYNTAX>` abort carries no member pair; the line number is still the useful half.
+    #[test]
+    fn a_syntax_abort_still_yields_its_line() {
+        let f =
+            parse_abort_frame("ERROR: <SYNTAX> 3 RunUser+1^IrisDevTmp.Runc793621a6a7d.1").unwrap();
+        assert_eq!(f.signal, "SYNTAX");
+        assert_eq!(f.line, Some(1));
+        assert_eq!(f.class, None);
     }
 }
