@@ -1428,7 +1428,9 @@ pub struct ProductionItemParams {
     /// add: enable the item on creation (default true).
     #[serde(default)]
     pub enabled: Option<bool>,
-    /// add/remove: target production by name. Defaults to the currently running production.
+    /// Target production by name (e.g. "MyApp.Production"), for every action. Defaults to the
+    /// currently running production. A production does NOT have to be running to be read or
+    /// edited — pass its name and it is opened from disk.
     #[serde(default)]
     pub production: Option<String>,
     /// add: optional PoolSize for the item.
@@ -1437,6 +1439,40 @@ pub struct ProductionItemParams {
     /// add: optional Category for portal grouping.
     #[serde(default)]
     pub category: Option<String>,
+}
+
+/// Strip the `ERROR:INTEROP_ERROR:` sentinel the generated ObjectScript writes so the envelope
+/// does not carry its own error code twice inside the message text (#118/#119: now that these
+/// messages name the production they failed on, the duplication is the only noise left).
+fn interop_error_text(out: &str) -> &str {
+    out.strip_prefix("ERROR:INTEROP_ERROR:")
+        .unwrap_or(out)
+        .trim()
+}
+
+/// The ObjectScript prologue that resolves `tProd`, the production every
+/// `iris_production_item` action operates on (pure → unit-testable).
+///
+/// `production` empty ⇒ fall back to the running production. Emitted by all six actions:
+/// #119 found `get_settings`/`set_settings`/`enable`/`disable` inlining their own copy that
+/// never read `production=` at all, so a stopped production was unreachable and `set_settings`
+/// silently wrote to whatever happened to be running instead. One helper, one behaviour.
+///
+/// The "no production" test is deliberately TWO statements rather than
+/// `If $$$ISERR(tSC)||tProdName=""`. ObjectScript has no operator precedence — it evaluates
+/// strictly left to right — so that one-liner parses as `(($$$ISERR(tSC))||tProdName)=""`,
+/// and since `||` yields 0 or 1 while neither `0=""` nor `1=""` holds, it is ALWAYS FALSE.
+/// #118 shipped that dead guard at three sites; callers fell through to `%OpenId("")` and got
+/// `Cannot open production` where `NO_PRODUCTION` was meant.
+pub fn resolve_production_prologue(production: &str) -> String {
+    format!(
+        r#"Set tProdName={prod}
+If tProdName="" {{ Set tSCr=##class(Ens.Director).GetProductionStatus(.tProdName,.sr) }}
+If tProdName="" {{ Write "ERROR:NO_PRODUCTION:No production running and no production= given" Quit }}
+Set tProd=##class(Ens.Config.Production).%OpenId(tProdName,,.tSC2)
+If '$IsObject(tProd) {{ Write "ERROR:INTEROP_ERROR:Cannot open production "_tProdName Quit }}"#,
+        prod = os_str_expr(production)
+    )
 }
 
 /// Build the ObjectScript that adds a config item to a production (pure → unit-testable).
@@ -1453,7 +1489,6 @@ pub fn build_add_item_code(
 ) -> String {
     let item_e = os_str_expr(item);
     let class_e = os_str_expr(class_name);
-    let prod_e = os_str_expr(production);
     let mut extra = String::new();
     if let Some(ps) = pool_size {
         extra.push_str(&format!("Set tItem.PoolSize={}\n", ps));
@@ -1474,10 +1509,7 @@ pub fn build_add_item_code(
         ));
     }
     format!(
-        r#"Set tProdName={prod}
-If tProdName="" {{ Set tSC=##class(Ens.Director).GetProductionStatus(.tProdName,.s) If tProdName="" {{ Write "ERROR:NO_PRODUCTION:No production running and no production= given" Quit }} }}
-Set tProd=##class(Ens.Config.Production).%OpenId(tProdName,,.tSC2)
-If '$IsObject(tProd) {{ Write "ERROR:INTEROP_ERROR:Cannot open production "_tProdName Quit }}
+        r#"{prologue}
 If $IsObject(tProd.FindItemByConfigName({item})) {{ Write "ERROR:ITEM_EXISTS:Item already exists: "_{item} Quit }}
 Set tItem=##class(Ens.Config.Item).%New()
 Set tItem.Name={item}
@@ -1489,7 +1521,7 @@ If $$$ISERR(tSC4) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tS
 Set tRun="" Do ##class(Ens.Director).GetProductionStatus(.tRun,.s2)
 If tRun=tProdName {{ Set tSC5=##class(Ens.Director).UpdateProduction(10,0) If $$$ISERR(tSC5) {{ Write "ERROR:UPDATE_FAILED:"_$System.Status.GetErrorText(tSC5) Quit }} }}
 Write "OK:"_tProdName"#,
-        prod = prod_e,
+        prologue = resolve_production_prologue(production),
         item = item_e,
         class = class_e,
         enabled = if enabled { 1 } else { 0 },
@@ -1500,12 +1532,8 @@ Write "OK:"_tProdName"#,
 /// Build the ObjectScript that removes a config item from a production (pure → unit-testable).
 pub fn build_remove_item_code(production: &str, item: &str) -> String {
     let item_e = os_str_expr(item);
-    let prod_e = os_str_expr(production);
     format!(
-        r#"Set tProdName={prod}
-If tProdName="" {{ Set tSC=##class(Ens.Director).GetProductionStatus(.tProdName,.s) If tProdName="" {{ Write "ERROR:NO_PRODUCTION:No production running and no production= given" Quit }} }}
-Set tProd=##class(Ens.Config.Production).%OpenId(tProdName,,.tSC2)
-If '$IsObject(tProd) {{ Write "ERROR:INTEROP_ERROR:Cannot open production "_tProdName Quit }}
+        r#"{prologue}
 Set tIdx=0 For i=1:1:tProd.Items.Count() {{ If tProd.Items.GetAt(i).Name={item} {{ Set tIdx=i Quit }} }}
 If tIdx=0 {{ Write "ERROR:ITEM_NOT_FOUND:Item not found: "_{item} Quit }}
 Do tProd.Items.RemoveAt(tIdx)
@@ -1514,7 +1542,7 @@ If $$$ISERR(tSC4) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tS
 Set tRun="" Do ##class(Ens.Director).GetProductionStatus(.tRun,.s2)
 If tRun=tProdName {{ Set tSC5=##class(Ens.Director).UpdateProduction(10,0) If $$$ISERR(tSC5) {{ Write "ERROR:UPDATE_FAILED:"_$System.Status.GetErrorText(tSC5) Quit }} }}
 Write "OK:"_tProdName"#,
-        prod = prod_e,
+        prologue = resolve_production_prologue(production),
         item = item_e
     )
 }
@@ -1528,6 +1556,9 @@ pub async fn interop_production_item_impl(
         None => return err_json("IRIS_UNREACHABLE", "No IRIS connection"),
     };
     let item = os_str_expr(&params.item);
+    // #119: every action resolves its target the same way — `production=` when given, the
+    // running production otherwise. `add`/`remove` get theirs inside build_*_item_code.
+    let prologue = resolve_production_prologue(params.production.as_deref().unwrap_or(""));
     let ns = &params.namespace;
     let client = IrisConnection::http_client()
         .map_err(|_| McpError::invalid_request("IRIS_UNREACHABLE", None))?;
@@ -1536,11 +1567,7 @@ pub async fn interop_production_item_impl(
         "enable" | "disable" => {
             let enabled_val = if params.action == "enable" { "1" } else { "0" };
             let code = format!(
-                r#"Set tSC=##class(Ens.Director).GetProductionStatus(.n,.s)
-If $$$ISERR(tSC) {{ Write "ERROR:NO_PRODUCTION:"_$System.Status.GetErrorText(tSC) Quit }}
-If n="" {{ Write "ERROR:NO_PRODUCTION:No production running" Quit }}
-Set tProd=##class(Ens.Config.Production).%OpenId(n,,.tSC2)
-If '$IsObject(tProd) {{ Write "ERROR:INTEROP_ERROR:Cannot open production" Quit }}
+                r#"{prologue}
 Set tItem=tProd.FindItemByConfigName({item},,.tSC3)
 If '$IsObject(tItem) {{ Write "ERROR:ITEM_NOT_FOUND:Item not found: "_{item} Quit }}
 Set tItem.Enabled={enabled_val}
@@ -1564,7 +1591,7 @@ Write "OK""#
                     } else if let Some(msg) = out.strip_prefix("ERROR:UPDATE_FAILED:") {
                         err_json("UPDATE_FAILED", msg)
                     } else {
-                        err_json("INTEROP_ERROR", out)
+                        err_json("INTEROP_ERROR", interop_error_text(out))
                     }
                 }
                 Err(e) => err_json(
@@ -1575,10 +1602,7 @@ Write "OK""#
         }
         "get_settings" => {
             let code = format!(
-                r#"Set tSC=##class(Ens.Director).GetProductionStatus(.n,.s)
-If $$$ISERR(tSC)||n="" {{ Write "ERROR:NO_PRODUCTION:No production running" Quit }}
-Set tProd=##class(Ens.Config.Production).%OpenId(n,,.tSC2)
-If '$IsObject(tProd) {{ Write "ERROR:INTEROP_ERROR:Cannot open production" Quit }}
+                r#"{prologue}
 Set tItem=tProd.FindItemByConfigName({item},,.tSC3)
 If '$IsObject(tItem) {{ Write "ERROR:ITEM_NOT_FOUND:Item not found: "_{item} Quit }}
 Set tKey="" For {{ Set tSetting=tItem.Settings.GetNext(.tKey) Quit:tKey=""
@@ -1594,7 +1618,7 @@ Set tKey="" For {{ Set tSetting=tItem.Settings.GetNext(.tKey) Quit:tKey=""
                         return err_json("NO_PRODUCTION", msg);
                     }
                     if out.starts_with("ERROR:") {
-                        return err_json("INTEROP_ERROR", out);
+                        return err_json("INTEROP_ERROR", interop_error_text(out));
                     }
                     let settings: std::collections::HashMap<String, String> = out
                         .lines()
@@ -1648,10 +1672,7 @@ Set tS.Value={v}
                 ""
             };
             let code = format!(
-                r#"Set tSC=##class(Ens.Director).GetProductionStatus(.n,.s)
-If $$$ISERR(tSC)||n="" {{ Write "ERROR:NO_PRODUCTION:No production running" Quit }}
-Set tProd=##class(Ens.Config.Production).%OpenId(n,,.tSC2)
-If '$IsObject(tProd) {{ Write "ERROR:INTEROP_ERROR:Cannot open production" Quit }}
+                r#"{prologue}
 Set tItem=tProd.FindItemByConfigName({item},,.tSC3)
 If '$IsObject(tItem) {{ Write "ERROR:ITEM_NOT_FOUND:Item not found: "_{item} Quit }}
 {setting_lines}Set tSC4=tProd.%Save()
@@ -1679,7 +1700,7 @@ If $$$ISERR(tSC4) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tS
                     } else if let Some(msg) = out.strip_prefix("ERROR:UPDATE_FAILED:") {
                         err_json("UPDATE_FAILED", msg)
                     } else {
-                        err_json("INTEROP_ERROR", out)
+                        err_json("INTEROP_ERROR", interop_error_text(out))
                     }
                 }
                 Err(e) => err_json(
@@ -1877,7 +1898,7 @@ If $$$ISERR(tSC) {{ Write "ERROR:CREDENTIAL_EXISTS:"_$System.Status.GetErrorText
                     } else if let Some(msg) = out.strip_prefix("ERROR:CREDENTIAL_EXISTS:") {
                         err_json("CREDENTIAL_EXISTS", msg)
                     } else {
-                        err_json("INTEROP_ERROR", out)
+                        err_json("INTEROP_ERROR", interop_error_text(out))
                     }
                 }
                 Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
@@ -1911,7 +1932,7 @@ If $$$ISERR(tSC) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC
                             serde_json::json!({"success":true,"action":"update","id":params.id}),
                         )
                     } else {
-                        err_json("INTEROP_ERROR", out)
+                        err_json("INTEROP_ERROR", interop_error_text(out))
                     }
                 }
                 Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
@@ -1933,7 +1954,7 @@ If $$$ISERR(tSC) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC
                     } else if let Some(msg) = out.strip_prefix("ERROR:CREDENTIAL_NOT_FOUND:") {
                         err_json("CREDENTIAL_NOT_FOUND", msg)
                     } else {
-                        err_json("INTEROP_ERROR", out)
+                        err_json("INTEROP_ERROR", interop_error_text(out))
                     }
                 }
                 Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
@@ -2069,7 +2090,7 @@ If $$$ISERR(tSC) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC
                             serde_json::json!({"success":true,"table":params.table,"key":params.key,"value":params.value}),
                         )
                     } else {
-                        err_json("INTEROP_ERROR", out)
+                        err_json("INTEROP_ERROR", interop_error_text(out))
                     }
                 }
                 Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
@@ -2101,7 +2122,7 @@ If $$$ISERR(tSC) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC
                     } else if let Some(msg) = out.strip_prefix("ERROR:TABLE_NOT_FOUND:") {
                         err_json("TABLE_NOT_FOUND", msg)
                     } else {
-                        err_json("INTEROP_ERROR", out)
+                        err_json("INTEROP_ERROR", interop_error_text(out))
                     }
                 }
                 Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
@@ -2221,7 +2242,7 @@ Write tOut"#,
                     } else if let Some(msg) = out.strip_prefix("ERROR:INVALID_XML:") {
                         err_json("INVALID_XML", msg)
                     } else {
-                        err_json("INTEROP_ERROR", out)
+                        err_json("INTEROP_ERROR", interop_error_text(out))
                     }
                 }
                 Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
@@ -2309,7 +2330,14 @@ If $$$ISERR(tSC) { Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC)
         p.clone()
     } else {
         // Get currently running production
-        let status_code = r#"Set sc=##class(Ens.Director).GetProductionStatus(.n,.s) If $$$ISERR(sc)||n="" { Write "ERROR:NO_PRODUCTION:No production running" } Else { Write n }"#;
+        // #118: NOT `If $$$ISERR(sc)||n=""` — ObjectScript has no operator precedence, so that
+        // parses as `((ISERR)||n)=""` and never fires. The guard silently fell through, `out`
+        // came back empty, and set_autostart called SetAutoStart("") while reporting
+        // `autostart_enabled: true` for a production it never set. Two statements, no ambiguity.
+        let status_code = r#"Set sc=##class(Ens.Director).GetProductionStatus(.n,.s)
+If $$$ISERR(sc) { Write "ERROR:NO_PRODUCTION:"_$System.Status.GetErrorText(sc) Quit }
+If n="" { Write "ERROR:NO_PRODUCTION:No production is running and no production= was given" Quit }
+Write n"#;
         match iris.execute_via_generator(status_code, ns, &client).await {
             Ok(out) => {
                 let out = out.trim().to_string();
@@ -2321,6 +2349,16 @@ If $$$ISERR(tSC) { Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC)
             Err(e) => return err_json(classify_iris_error(&e.to_string()), &e.to_string()),
         }
     };
+
+    // #118: SetAutoStart("") clears the setting while this tool reports it enabled. Whatever
+    // shape a future probe failure takes, an empty name must never reach IRIS as a write.
+    if prod_name.trim().is_empty() {
+        return err_json(
+            "NO_PRODUCTION",
+            "No production is running and no production= was given, so there is no name to \
+             autostart. Pass production=<Package.ProductionName>.",
+        );
+    }
 
     let code = format!(
         r#"Set tSC=##class(Ens.Director).SetAutoStart({})

@@ -714,3 +714,119 @@ fn tool_payload(r: &Result<rmcp::model::CallToolResult, rmcp::ErrorData>) -> ser
         _ => panic!("expected text content"),
     }
 }
+
+/// #118 / #119 — the production every `iris_production_item` action opens.
+mod production_target_resolution {
+    use super::*;
+
+    /// ObjectScript has no operator precedence. `If $$$ISERR(sc)||n=""` parses as
+    /// `((ISERR)||n)=""`, and since `||` yields 0 or 1 while neither `0=""` nor `1=""` holds,
+    /// the branch is unreachable. Three sites shipped it; this is the guard that keeps a
+    /// fourth from being written.
+    #[test]
+    fn the_prologue_tests_for_no_production_in_a_statement_that_can_fire() {
+        let code = resolve_production_prologue("");
+        assert!(
+            !code.contains("||"),
+            "compound condition reintroduced in generated ObjectScript:\n{code}"
+        );
+        assert_eq!(
+            code.matches(r#"If tProdName="""#).count(),
+            2,
+            "expected the fallback and the still-empty test as two statements:\n{code}"
+        );
+        assert!(code.contains("ERROR:NO_PRODUCTION:"), "{code}");
+    }
+
+    #[test]
+    fn an_explicit_production_is_embedded_and_the_running_one_is_only_a_fallback() {
+        let code = resolve_production_prologue("My.Production");
+        assert!(code.contains(r#"Set tProdName="My.Production""#), "{code}");
+        // GetProductionStatus stays, but behind the `tProdName=""` test — so a named,
+        // STOPPED production is opened from disk instead of being unreachable.
+        assert!(code.contains("GetProductionStatus"), "{code}");
+        assert!(code.contains(r#"%OpenId(tProdName"#), "{code}");
+        assert!(
+            !code.contains("%OpenId(n,"),
+            "must not open the running production by the `n` the status call filled: {code}"
+        );
+    }
+
+    /// #119: `get_settings`/`set_settings`/`enable`/`disable` each inlined their own copy that
+    /// never read `production=`. `add`/`remove` did. One helper now, so they cannot disagree.
+    #[test]
+    fn add_and_remove_are_built_from_the_same_prologue() {
+        let settings = std::collections::HashMap::new();
+        let add = build_add_item_code(
+            "My.Production",
+            "BS.In",
+            "My.BS.In",
+            true,
+            None,
+            None,
+            &settings,
+        );
+        let remove = build_remove_item_code("My.Production", "BS.In");
+        let prologue = resolve_production_prologue("My.Production");
+        for (what, code) in [("add", &add), ("remove", &remove)] {
+            assert!(
+                code.starts_with(&prologue),
+                "{what} does not open the production the shared way:\n{code}"
+            );
+        }
+    }
+}
+
+/// #118, crate-wide: the same precedence trap must not reappear anywhere in generated
+/// ObjectScript. Scans the real source rather than one function's output.
+#[test]
+fn no_generated_objectscript_compares_after_an_unparenthesised_or() {
+    fn scan(dir: &std::path::Path, hits: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).expect("readable src dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                scan(&path, hits);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let text = std::fs::read_to_string(&path).expect("readable source");
+                for (n, line) in text.lines().enumerate() {
+                    // Prose that QUOTES the trap (this file, and the helper's own doc comment)
+                    // is not the trap. Generated ObjectScript comments start `//` as well.
+                    let t = line.trim_start();
+                    if t.starts_with("//") || t.starts_with('*') {
+                        continue;
+                    }
+                    // Only ObjectScript statements — Rust's own `||` obeys precedence.
+                    let is_os = line.contains("$$$ISERR(")
+                        || line.trim_start().starts_with("If ")
+                        || line.trim_start().starts_with("While ");
+                    if !is_os {
+                        continue;
+                    }
+                    for (idx, _) in line.match_indices("||") {
+                        let rest = line[idx + 2..].trim_start();
+                        // Parenthesising the right operand is the fix, so `|| (` is fine.
+                        if rest.starts_with('(') {
+                            continue;
+                        }
+                        let operand: String = rest
+                            .chars()
+                            .take_while(|c| !"()= <>'".contains(*c))
+                            .collect();
+                        let after = rest[operand.len()..].trim_start();
+                        if after.starts_with('=') || after.starts_with("'=") {
+                            hits.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut hits = Vec::new();
+    scan(&src, &mut hits);
+    assert!(
+        hits.is_empty(),
+        "ObjectScript has no operator precedence — parenthesise the right operand (#118):\n{}",
+        hits.join("\n")
+    );
+}
