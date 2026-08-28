@@ -2153,9 +2153,9 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter-objectscript-routine"
-version = "1.7.13"
+version = "1.9.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "27f9b96e5856cf143dc29f2cf5aab9b16188da9aa334b473a77833e60a485e7a"
+checksum = "ab9924a47bf00a3c07927ffdef96d40535d86322aabc7760c7ae7e99e3b56991"
 dependencies = [
  "cc",
  "tree-sitter",
