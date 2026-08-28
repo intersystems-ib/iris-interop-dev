@@ -6241,7 +6241,7 @@ Methods:
     }
 
     #[tool(
-        description = "Inspect a SQL table: returns whether it is a class-projected table or DDL-created, the backing data/index globals, and (optionally) an approximate row count. Works for both class-projected tables (with real storage globals from %Dictionary.CompiledStorage) and DDL tables (globals inferred by IRIS naming convention). Use include_row_count=true to add a COUNT(*) estimate. Call this (or docs_introspect) to discover the real schema/table/column names BEFORE iris_query, rather than guessing catalog tables."
+        description = "Inspect a SQL table: returns whether it is a class-projected table or DDL-created, the backing data/index globals, and (optionally) an approximate row count. Works for both class-projected tables (with real storage globals from %Dictionary.CompiledStorage) and DDL tables (globals inferred by IRIS naming convention). Use include_row_count=true to add a COUNT(*) estimate. Accepts either the SQL name (Ens_Config.Item) or the CLASS name (Ens.Config.Item) — the class→table projection is resolved for you, and a miss lists the tables that do exist in that package. Call this (or docs_introspect) to discover the real schema/table/column names BEFORE iris_query, rather than guessing catalog tables."
     )]
     async fn iris_table_info(
         &self,

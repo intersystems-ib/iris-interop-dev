@@ -550,7 +550,9 @@ pub async fn handle_iris_generate(
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct TableInfoParams {
-    /// SQL table name in Schema.Table format (e.g. "SQLUser.MyTable" or "MyApp.Orders").
+    /// SQL table in Schema.Table form ("SQLUser.MyTable", "Ens_Config.Item") — or the CLASS name
+    /// ("Ens.Config.Item"), which is resolved for you: IRIS projects class `A.B.C.Name` onto
+    /// schema `A_B_C`, table `Name`. A miss names the tables that do exist in that package.
     pub table: String,
     /// IRIS namespace to query. Defaults to the connection namespace (IRIS_NAMESPACE).
     #[serde(default)]
@@ -560,25 +562,135 @@ pub struct TableInfoParams {
     pub include_row_count: bool,
 }
 
+/// Every `(schema, table)` pair worth trying for one caller-supplied name, best first (#120).
+///
+/// `iris_table_info` used to accept the exact SQL table name and nothing else, so handing it the
+/// CLASS name — which is what a caller actually has, and what every other tool here takes —
+/// returned a bare `TABLE_NOT_FOUND`. Agents then brute-forced the separator, three and four
+/// calls at a time, while the success payload was already reporting `class` back to them.
+///
+/// IRIS projects class `A.B.C.Name` onto SQL schema `A_B_C`, table `Name`. That mapping is
+/// mechanical, so it is applied here rather than left to the caller:
+///
+/// * as given — split at the FIRST dot, `SQLUser` when there is none. Unchanged, so a name that
+///   resolved before still resolves first and no existing call changes meaning.
+/// * two dots or more — split at the LAST dot and underscore the schema
+///   (`EnsLib.HL7.Message` → `EnsLib_HL7` / `Message`).
+/// * no dot but underscores — split at the LAST underscore
+///   (`Admissions_MSG_AdmitNoticeReq` → `Admissions_MSG` / `AdmitNoticeReq`).
+pub fn sql_table_candidates(input: &str) -> Vec<(String, String)> {
+    let name = input.trim();
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut push = |schema: String, table: String| {
+        if !table.is_empty() && !out.iter().any(|(s, t)| *s == schema && *t == table) {
+            out.push((schema, table));
+        }
+    };
+
+    match name.find('.') {
+        Some(idx) => push(name[..idx].to_string(), name[idx + 1..].to_string()),
+        None => push("SQLUser".to_string(), name.to_string()),
+    }
+
+    if name.matches('.').count() >= 2 {
+        if let Some(idx) = name.rfind('.') {
+            push(name[..idx].replace('.', "_"), name[idx + 1..].to_string());
+        }
+    }
+
+    if !name.contains('.') {
+        if let Some(idx) = name.rfind('_') {
+            push(name[..idx].to_string(), name[idx + 1..].to_string());
+        }
+    }
+
+    out
+}
+
+/// Order and filter the tables offered back as `did_you_mean` (#120).
+///
+/// `pkg` are tables in the package the caller's name points at ("what does exist in `Ens_Rule`?");
+/// `near` are tables anywhere whose name starts the same way ("this table, in another schema?").
+/// Package hits rank first because they answer the more useful question.
+///
+/// A suggestion sharing nothing with the request is worse than no suggestion. The first cut of
+/// this offered `%DeepSee_Dashboard.Definition` for `Ens.Rule.Definition` and told the caller to
+/// pass it — so a candidate must share the request's leading segment, and a `%`-schema table is
+/// only ever offered to a caller who asked for one.
+pub fn rank_table_suggestions(requested: &str, pkg: Vec<String>, near: Vec<String>) -> Vec<String> {
+    let wants_system = requested.starts_with('%');
+    let lead = requested
+        .split(['.', '_'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let plausible = |cand: &String| {
+        if cand.starts_with('%') && !wants_system {
+            return false;
+        }
+        lead.is_empty() || cand.to_ascii_lowercase().starts_with(&lead)
+    };
+    let mut out: Vec<String> = Vec::new();
+    for cand in pkg.into_iter().chain(near) {
+        if plausible(&cand) && !out.contains(&cand) {
+            out.push(cand);
+        }
+    }
+    out.truncate(5);
+    out
+}
+
 pub async fn handle_iris_table_info(
     iris: &crate::iris::connection::IrisConnection,
     client: &reqwest::Client,
     p: TableInfoParams,
 ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
     let namespace = crate::tools::interop::resolve_namespace(p.namespace.as_deref(), Some(iris));
-    // Split "Schema.Table" → (schema, table). Tables with no dot use SQLUser schema.
-    let (sql_schema, sql_table) = match p.table.find('.') {
-        Some(idx) => (p.table[..idx].to_string(), p.table[idx + 1..].to_string()),
-        None => ("SQLUser".to_string(), p.table.clone()),
-    };
+    let candidates = sql_table_candidates(&p.table);
+    // Two needles for did_you_mean, because they answer different questions. The most-normalised
+    // candidate's TABLE half ("did you mean this table, in some other schema?") and its SCHEMA
+    // half ("what does exist in this package?"). The second is the more useful of the two:
+    // `Ens.Rule.Definition` has no table anywhere, but `Ens_Rule.*` has five.
+    let (needle_schema, needle_table) = candidates
+        .last()
+        .cloned()
+        .unwrap_or_else(|| (String::new(), p.table.clone()));
+    let (mut sql_schema, mut sql_table) = candidates
+        .first()
+        .cloned()
+        .unwrap_or_else(|| ("SQLUser".to_string(), p.table.clone()));
+
+    let cand_list = candidates
+        .iter()
+        .map(|(s, t)| os_str_expr(&format!("{s}^{t}")))
+        .collect::<Vec<_>>()
+        .join(",");
 
     // Look up class projection: find a compiled class whose SQL mapping matches.
+    // Every candidate is tried inside ONE round trip — resolution must not cost the caller the
+    // extra calls it was meant to save. The `while` condition is fully parenthesised on purpose:
+    // ObjectScript has no operator precedence (see #118).
     let lookup_code = format!(
         r#"
-set sqlSchema = {schema}, sqlTable = {table}
-// Check table exists at all via INFORMATION_SCHEMA
-set rsEx = ##class(%SQL.Statement).%ExecDirect(,"SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?", sqlSchema, sqlTable)
-if rsEx.%Next() && (rsEx.%GetData(1) = 0) {{ write "NOT_FOUND",! quit }}
+set cands = $LISTBUILD({cands})
+set found = "", ci = 0
+while (found = "") && (ci < $LISTLENGTH(cands)) {{
+    set ci = ci + 1
+    set one = $LIST(cands, ci)
+    set cs = $PIECE(one, "^", 1), ct = $PIECE(one, "^", 2)
+    set rsEx = ##class(%SQL.Statement).%ExecDirect(,"SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?", cs, ct)
+    if rsEx.%Next() {{ if (rsEx.%GetData(1) '= 0) {{ set found = one }} }}
+}}
+if found = "" {{
+    set rsP = ##class(%SQL.Statement).%ExecDirect(,"SELECT TOP 5 TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA %STARTSWITH ? ORDER BY TABLE_SCHEMA, TABLE_NAME", {needle_schema})
+    while rsP.%Next() {{ write "PKG:",rsP.%GetData(1),".",rsP.%GetData(2),! }}
+    set rsN = ##class(%SQL.Statement).%ExecDirect(,"SELECT TOP 8 TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME %STARTSWITH ? ORDER BY TABLE_SCHEMA", {needle_table})
+    while rsN.%Next() {{ write "NEAR:",rsN.%GetData(1),".",rsN.%GetData(2),! }}
+    write "NOT_FOUND",!
+    quit
+}}
+set sqlSchema = $PIECE(found, "^", 1), sqlTable = $PIECE(found, "^", 2)
+write "RESOLVED:",sqlSchema,".",sqlTable,!
 // Look for backing class
 set rs = ##class(%SQL.Statement).%ExecDirect(,"SELECT c.Name, c.ClassType, s.DataLocation, s.IndexLocation, s.IDLocation FROM %Dictionary.CompiledClass c LEFT JOIN %Dictionary.CompiledStorage s ON s.parent = c.Name WHERE c.SqlSchemaName = ? AND c.SqlTableName = ?", sqlSchema, sqlTable)
 if rs.%Next() {{
@@ -591,8 +703,9 @@ if rs.%Next() {{
     write "DDL_TABLE",!
 }}
 "#,
-        schema = os_str_expr(&sql_schema),
-        table = os_str_expr(&sql_table),
+        cands = cand_list,
+        needle_schema = os_str_expr(&needle_schema),
+        needle_table = os_str_expr(&needle_table),
     );
 
     let output = match iris
@@ -627,13 +740,63 @@ if rs.%Next() {{
     let lines: std::collections::HashMap<&str, &str> =
         output.lines().filter_map(|l| l.split_once(':')).collect();
 
-    if output.trim() == "NOT_FOUND" {
+    if output.lines().any(|l| l.trim() == "NOT_FOUND") {
+        // #120: a truthful "not found" that names no alternative is what made callers guess the
+        // separator. Same treatment #107 gave docs_introspect: say what was tried, and name what
+        // actually exists.
+        let collect = |prefix: &str| -> Vec<String> {
+            output
+                .lines()
+                .filter_map(|l| l.strip_prefix(prefix))
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect()
+        };
+        let did_you_mean = rank_table_suggestions(&p.table, collect("PKG:"), collect("NEAR:"));
+        let tried: Vec<String> = candidates
+            .iter()
+            .map(|(sc, tb)| format!("{sc}.{tb}"))
+            .collect();
+        let mut extra = serde_json::json!({
+            "table": p.table,
+            "namespace": namespace,
+            "tried": tried,
+        });
+        if !did_you_mean.is_empty() {
+            extra["did_you_mean"] = did_you_mean.clone().into();
+            extra["hint"] = format!(
+                "No such table. IRIS projects class 'A.B.C.Name' onto SQL schema 'A_B_C', table \
+                 'Name' — pass the SQL name, not the class name. These exist in this namespace: \
+                 {}.",
+                did_you_mean.join(", ")
+            )
+            .into();
+        } else {
+            extra["hint"] = format!(
+                "No such table in namespace '{namespace}'. IRIS projects class 'A.B.C.Name' onto \
+                 SQL schema 'A_B_C', table 'Name'. Check the namespace, or call \
+                 iris_symbols/docs_introspect to confirm the class exists and is %Persistent."
+            )
+            .into();
+        }
         return crate::tools::envelope::fail_with(
             "TABLE_NOT_FOUND",
             &format!("Table '{}' not found in namespace '{}'", p.table, namespace),
-            serde_json::json!({"table": p.table, "namespace": namespace}),
+            extra,
         );
     }
+
+    // Which candidate actually resolved. Everything downstream — the row count, the DDL global
+    // names — must use the resolved pair, not what the caller typed.
+    let requested = format!("{sql_schema}.{sql_table}");
+    if let Some(resolved) = lines.get("RESOLVED").map(|v| v.trim()) {
+        if let Some(idx) = resolved.rfind('.') {
+            sql_schema = resolved[..idx].to_string();
+            sql_table = resolved[idx + 1..].to_string();
+        }
+    }
+    let resolved_table = format!("{sql_schema}.{sql_table}");
+    let renamed = resolved_table != requested;
 
     let result = if lines.contains_key("CLASS") {
         // Class-projected table
@@ -642,7 +805,7 @@ if rs.%Next() {{
         let index_global = lines.get("INDEX").copied().unwrap_or("").trim();
 
         let mut obj = serde_json::json!({
-            "table": p.table,
+            "table": resolved_table,
             "type": "class_projection",
             "class": class_name,
             "namespace": namespace,
@@ -663,7 +826,7 @@ if rs.%Next() {{
         let id_counter_global = format!("^{}.{}C", sql_schema, sql_table);
 
         let mut obj = serde_json::json!({
-            "table": p.table,
+            "table": resolved_table,
             "type": "ddl_table",
             "namespace": namespace,
             "data_global": data_global,
@@ -679,10 +842,20 @@ if rs.%Next() {{
         obj
     };
 
-    crate::tools::ok_json(serde_json::json!({
+    let mut payload = serde_json::json!({
         "success": true,
         "result": result,
-    }))
+    });
+    if renamed {
+        // Say so rather than silently answering about a different name than the one asked for.
+        payload["requested"] = p.table.clone().into();
+        payload["note"] = format!(
+            "'{}' is a class name; it resolves to SQL table '{}'.",
+            p.table, resolved_table
+        )
+        .into();
+    }
+    crate::tools::ok_json(payload)
 }
 
 async fn get_row_count(
@@ -708,5 +881,114 @@ if rs.%Next() {{ write rs.%GetData(1),! }} else {{ write "error",! }}"#,
             .map(serde_json::Value::from)
             .unwrap_or(serde_json::Value::Null),
         Err(_) => serde_json::Value::Null,
+    }
+}
+
+#[cfg(test)]
+mod table_candidate_tests {
+    use super::sql_table_candidates;
+
+    fn tried(input: &str) -> Vec<String> {
+        sql_table_candidates(input)
+            .into_iter()
+            .map(|(s, t)| format!("{s}.{t}"))
+            .collect()
+    }
+
+    /// The exact corpus failure: 37 `TABLE_NOT_FOUND`s, agents guessing separators.
+    #[test]
+    fn a_class_name_yields_the_projected_table() {
+        assert!(tried("EnsLib.HL7.Message").contains(&"EnsLib_HL7.Message".to_string()));
+        assert!(tried("Admissions.MSG.AdmitNoticeReq")
+            .contains(&"Admissions_MSG.AdmitNoticeReq".to_string()));
+    }
+
+    /// `Admissions_MSG_AdmitNoticeReq` was the second guess in the corpus; one underscore short.
+    #[test]
+    fn an_all_underscore_name_splits_at_the_last_underscore() {
+        assert!(tried("Admissions_MSG_AdmitNoticeReq")
+            .contains(&"Admissions_MSG.AdmitNoticeReq".to_string()));
+    }
+
+    /// No regression: whatever resolved before still resolves, and still resolves FIRST.
+    #[test]
+    fn the_exact_sql_name_is_always_tried_first() {
+        assert_eq!(tried("EnsLib_HL7.Message")[0], "EnsLib_HL7.Message");
+        assert_eq!(tried("SQLUser.MyTable")[0], "SQLUser.MyTable");
+        assert_eq!(tried("MyTable")[0], "SQLUser.MyTable");
+        assert_eq!(tried("Billing.LabCharge")[0], "Billing.LabCharge");
+    }
+
+    #[test]
+    fn candidates_are_deduped_and_never_empty_tabled() {
+        for input in ["A.B", "A_B", "A", "A.B.C", "A_B_C", "  Padded.Name  "] {
+            let c = sql_table_candidates(input);
+            assert!(!c.is_empty(), "{input} produced no candidate");
+            assert!(c.iter().all(|(_, t)| !t.is_empty()), "{input} empty table");
+            let mut seen = c.clone();
+            seen.sort();
+            seen.dedup();
+            assert_eq!(seen.len(), c.len(), "{input} produced duplicates");
+        }
+    }
+}
+
+#[cfg(test)]
+mod table_suggestion_tests {
+    use super::rank_table_suggestions;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The regression this ranker exists for: the first cut answered `Ens.Rule.Definition` with
+    /// `%DeepSee_Dashboard.Definition` and told the caller to pass it.
+    #[test]
+    fn an_unrelated_system_table_is_never_offered() {
+        let out = rank_table_suggestions(
+            "Ens.Rule.Definition",
+            v(&["Ens_Rule.Assign", "Ens_Rule.Rule"]),
+            v(&["%DeepSee_Dashboard.Definition", "%IPM_Repo.Definition"]),
+        );
+        assert_eq!(out, v(&["Ens_Rule.Assign", "Ens_Rule.Rule"]));
+    }
+
+    #[test]
+    fn nothing_plausible_yields_nothing_rather_than_noise() {
+        let out = rank_table_suggestions(
+            "Totally.Bogus.Name",
+            vec![],
+            v(&["%Dictionary.ClassDefinition", "Ens_Rule.Rule"]),
+        );
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    /// A caller who asks for a `%` schema is asking for system tables.
+    #[test]
+    fn a_system_request_still_gets_system_answers() {
+        let out = rank_table_suggestions(
+            "%Dictionary.Nope",
+            v(&["%Dictionary.CompiledClass"]),
+            vec![],
+        );
+        assert_eq!(out, v(&["%Dictionary.CompiledClass"]));
+    }
+
+    #[test]
+    fn package_hits_rank_ahead_of_name_hits_and_duplicates_collapse() {
+        let out = rank_table_suggestions(
+            "Ens.Config.Nope",
+            v(&["Ens_Config.Item"]),
+            v(&["Ens_Config.Item", "Ens_Util.Nope"]),
+        );
+        assert_eq!(out, v(&["Ens_Config.Item", "Ens_Util.Nope"]));
+    }
+
+    #[test]
+    fn at_most_five_are_offered() {
+        let many = v(&[
+            "Ens_A.1", "Ens_A.2", "Ens_A.3", "Ens_A.4", "Ens_A.5", "Ens_A.6",
+        ]);
+        assert_eq!(rank_table_suggestions("Ens.A.X", many, vec![]).len(), 5);
     }
 }
