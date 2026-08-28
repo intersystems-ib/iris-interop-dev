@@ -1,11 +1,11 @@
 {
   "name": "iris-interop-dev",
-  "description": "Streamlined, interop-focused fork of iris-agentic-dev — 20 IRIS Interoperability tools (fixed iris_execute/iris_query/iris_production), distinct MCP server name so it coexists with the original. Single binary, no Python required.",
+  "description": "Streamlined, interop-focused fork of iris-agentic-dev — 23 IRIS Interoperability tools (fixed iris_execute/iris_query/iris_production), distinct MCP server name so it coexists with the original. Single binary, no Python required.",
   "version": "0.2.0",
   "author": {
     "name": "InterSystems Corporation"
   },
-  "homepage": "https://github.com/PYDuquesnoy/iris-agentic-dev",
+  "homepage": "https://github.com/intersystems-ib/iris-interop-dev",
   "license": "MIT",
   "keywords": [
     "intersystems",
