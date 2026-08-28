@@ -730,6 +730,33 @@ async fn do_write(
              allow_storage_regeneration: true.",
         );
     }
+
+    // Name the methods that will run ObjectScript at COMPILE time. This is reported on
+    // every write and refused only when the caller asked for that (IRIS_BLOCK_CODEGEN=1)
+    // — see `compile_time_methods` for why the default is to inform rather than block.
+    let generators = compile_time_methods(&content_for_write);
+    if !generators.is_empty() && block_compile_time_code() {
+        return crate::tools::envelope::fail_with(
+            "COMPILE_TIME_CODE_BLOCKED",
+            &format!(
+                "'{name}' declares CodeMode = objectgenerator on {} ({}). A generator body \
+                 runs at compile time under the identity of whoever compiles the class, not \
+                 only this connection. IRIS_BLOCK_CODEGEN is set, so the write was refused. \
+                 Unset it to allow generator methods.",
+                if generators.len() == 1 {
+                    "one method"
+                } else {
+                    "these methods"
+                },
+                generators.join(", ")
+            ),
+            serde_json::json!({
+                "name": name,
+                "compile_time_methods": generators,
+                "blocked_by": "IRIS_BLOCK_CODEGEN=1",
+            }),
+        );
+    }
     let lines: Vec<&str> = content_for_write.lines().collect();
 
     // I-4: use ?ignoreConflict=1 — IRIS accepts the write unconditionally, never returns 409.
@@ -860,20 +887,18 @@ async fn do_write(
                 .first()
                 .cloned()
                 .unwrap_or_else(|| "compile failed — see compile_console".to_string());
-            return crate::tools::envelope::fail_with(
-                "COMPILE_ERROR",
-                &first,
-                serde_json::json!({
-                    "name": name,
-                    "open_uri": open_uri,
-                    "storage_stripped": storage_stripped,
-                    "compiled": false,
-                    "compile_errors": compile_errors,
-                    "compile_console": compile_console,
-                }),
-            );
+            let mut payload = serde_json::json!({
+                "name": name,
+                "open_uri": open_uri,
+                "storage_stripped": storage_stripped,
+                "compiled": false,
+                "compile_errors": compile_errors,
+                "compile_console": compile_console,
+            });
+            note_compile_time_methods(&mut payload, &generators);
+            return crate::tools::envelope::fail_with("COMPILE_ERROR", &first, payload);
         }
-        return ok_json(serde_json::json!({
+        let mut payload = serde_json::json!({
             "success": true,
             "name": name,
             "open_uri": open_uri,
@@ -881,12 +906,14 @@ async fn do_write(
             "compiled": true,
             "compile_errors": compile_errors,
             "compile_console": compile_console,
-        }));
+        });
+        note_compile_time_methods(&mut payload, &generators);
+        return ok_json(payload);
     }
 
-    ok_json(
-        serde_json::json!({"success": true, "name": name, "open_uri": open_uri, "storage_stripped": storage_stripped}),
-    )
+    let mut payload = serde_json::json!({"success": true, "name": name, "open_uri": open_uri, "storage_stripped": storage_stripped});
+    note_compile_time_methods(&mut payload, &generators);
+    ok_json(payload)
 }
 
 async fn handle_delete(
@@ -1124,6 +1151,151 @@ pub fn strip_storage_blocks(content: &str) -> (String, bool) {
     }
 }
 
+/// Strip double-quoted ObjectScript literals from `line`, so brace counting and
+/// keyword scanning never see syntax that lives inside a string. ObjectScript escapes
+/// a quote by doubling it, so a `""` inside a literal does not end it.
+fn without_literals(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    let mut in_str = false;
+    while let Some(c) = chars.next() {
+        match (in_str, c) {
+            (false, '"') => in_str = true,
+            (false, _) => out.push(c),
+            (true, '"') => {
+                // A doubled quote is an escaped quote, not the end of the literal.
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                } else {
+                    in_str = false;
+                }
+            }
+            (true, _) => {}
+        }
+    }
+    out
+}
+
+/// The method name and keyword block of a member signature line, if it starts one.
+/// `Method`/`ClassMethod`/`ClientMethod` only — a `Property` or `Parameter` carries no
+/// CodeMode, and matching them would only widen the surface for no gain.
+fn member_signature_name(sig: &str) -> Option<&str> {
+    let rest = ["ClassMethod", "ClientMethod", "Method"]
+        .iter()
+        .find_map(|kw| sig.strip_prefix(*kw))?;
+    // Require real whitespace after the keyword: `Methodical(` is not a method named
+    // `ical`, and `ClassMethodFoo` is not a ClassMethod.
+    let rest = rest.strip_prefix(char::is_whitespace)?.trim_start();
+    let name = rest
+        .split(|c: char| c == '(' || c.is_whitespace())
+        .next()
+        .unwrap_or("");
+    (!name.is_empty()).then_some(name)
+}
+
+/// `CodeMode` as declared in a member's `[ ... ]` keyword block, lowercased.
+fn declared_code_mode(sig: &str) -> Option<String> {
+    // The keyword block is the last bracketed run on the signature. Searching from the
+    // end skips any `[` that appeared in a default value or a type parameter.
+    let open = sig.rfind('[')?;
+    let block = &sig[open + 1..];
+    let block = block.split(']').next().unwrap_or(block);
+    block.split(',').find_map(|kv| {
+        let (k, v) = kv.split_once('=')?;
+        (k.trim().eq_ignore_ascii_case("CodeMode")).then(|| v.trim().to_lowercase())
+    })
+}
+
+/// Names of the methods in `content` that declare `CodeMode = objectgenerator`,
+/// in source order.
+///
+/// Why this one keyword is worth naming: a generator method's body is ObjectScript
+/// that runs at COMPILE time, under the identity of whoever triggers the compile —
+/// which need not be the agent that wrote the class. `iris_execute` also runs
+/// arbitrary ObjectScript, so on a write-allowed connection a generator grants no new
+/// capability *now*; what it adds is code that fires LATER and as SOMEONE ELSE.
+///
+/// `CodeMode = expression` and `CodeMode = call` are deliberately not reported. They
+/// inline the body at the call site; they do not execute a generator at compile time.
+/// Upstream's gate refuses all three, which is why this one does not simply port it.
+///
+/// Only member SIGNATURES are scanned, never bodies. Braces are counted with string
+/// literals removed, so a method body that merely mentions `CodeMode = objectgenerator`
+/// in a comment, a string or a doc sample sits at depth >= 2 and is never considered.
+pub fn compile_time_methods(content: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut depth: i32 = 0;
+    // A signature may wrap across lines; accumulate until the body opens.
+    let mut pending: Option<(String, String)> = None;
+
+    for line in content.lines() {
+        let code = without_literals(line);
+        let trimmed = code.trim();
+        // `///` and `//` are documentation/comment lines; `;` is the ObjectScript
+        // comment form. None of them can carry a signature.
+        let is_comment = trimmed.starts_with("//") || trimmed.starts_with(';');
+
+        if pending.is_none() && depth <= 1 && !is_comment {
+            if let Some(name) = member_signature_name(trimmed) {
+                pending = Some((name.to_string(), String::new()));
+            }
+        }
+        if let Some((name, sig)) = pending.as_mut() {
+            sig.push(' ');
+            sig.push_str(trimmed);
+            // The signature ends where the body opens, or at a `;` for the bodyless
+            // forms. Either way the keyword block is complete by then.
+            if trimmed.contains('{') || trimmed.ends_with(';') {
+                if declared_code_mode(sig).as_deref() == Some("objectgenerator") {
+                    found.push(name.clone());
+                }
+                pending = None;
+            }
+        }
+
+        depth += code.matches('{').count() as i32;
+        depth -= code.matches('}').count() as i32;
+        if depth < 0 {
+            depth = 0;
+        }
+    }
+    found
+}
+
+/// Attach the generator finding to a write result. Absent when there is nothing to
+/// report, so an ordinary class keeps the payload it has always had.
+fn note_compile_time_methods(payload: &mut serde_json::Value, generators: &[String]) {
+    if generators.is_empty() {
+        return;
+    }
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert(
+            "compile_time_methods".to_string(),
+            serde_json::json!(generators),
+        );
+        obj.insert(
+            "compile_time_code_note".to_string(),
+            serde_json::json!(
+                "These methods declare CodeMode = objectgenerator: their bodies run at \
+                 compile time, under the identity of whoever compiles the class. The write \
+                 was allowed; set IRIS_BLOCK_CODEGEN=1 to refuse writes like this one."
+            ),
+        );
+    }
+}
+
+/// Whether the caller opted in to refusing generator writes outright.
+/// Off by default: this server targets development instances, where the write is
+/// already allowed and `iris_execute` runs arbitrary ObjectScript anyway. On a Live
+/// instance the #114 gate refuses the whole write before this is ever consulted, so
+/// blocking by default would buy nothing and would break writing back an
+/// IRIS-generated class that legitimately carries a generator.
+pub fn block_compile_time_code() -> bool {
+    std::env::var("IRIS_BLOCK_CODEGEN")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 pub(crate) fn doc_content_to_string(body: &serde_json::Value) -> String {
     // Atelier GET /doc/<name> returns result.content as a flat array of line strings.
     body["result"]["content"]
@@ -1135,6 +1307,164 @@ pub(crate) fn doc_content_to_string(body: &serde_json::Value) -> String {
                 .join("\n")
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod compile_time_code_tests {
+    use super::{block_compile_time_code, compile_time_methods, without_literals};
+
+    const GENERATOR: &str = r#"Class Demo.BS.Probe Extends %RegisteredObject
+{
+
+Parameter DOMAIN = "Demo";
+
+/// Builds the dispatch table at compile time.
+ClassMethod BuildTable() As %Status [ CodeMode = objectgenerator ]
+{
+    Do %code.WriteLine(" Quit 1")
+    Quit $$$OK
+}
+
+Method Plain() As %String
+{
+    Quit "CodeMode = objectgenerator"
+}
+
+}
+"#;
+
+    #[test]
+    fn finds_a_generator_method_by_name() {
+        assert_eq!(compile_time_methods(GENERATOR), vec!["BuildTable"]);
+    }
+
+    #[test]
+    fn a_body_that_merely_mentions_the_keyword_is_not_a_generator() {
+        // The `Plain` body contains the exact phrase in a string literal. Reporting it
+        // would be the false positive that makes an advisory worth ignoring.
+        let only_bodies = r#"Class Demo.BS.Probe Extends %RegisteredObject
+{
+
+Method Plain() As %String
+{
+    // CodeMode = objectgenerator
+    Quit "CodeMode = objectgenerator"
+}
+
+}
+"#;
+        assert!(compile_time_methods(only_bodies).is_empty());
+    }
+
+    #[test]
+    fn an_ordinary_class_reports_nothing() {
+        let plain = "Class Demo.MSG.Order Extends Ens.Request\n{\n\nProperty Id As %String;\n\n}\n";
+        assert!(compile_time_methods(plain).is_empty());
+    }
+
+    #[test]
+    fn expression_and_call_are_not_reported() {
+        // They inline at the call site; they do not execute a generator at compile time.
+        // Upstream's gate refuses them, which is the part this fork deliberately drops.
+        let inlined = r#"Class Demo.Util Extends %RegisteredObject
+{
+
+ClassMethod Version() As %String [ CodeMode = expression ]
+{
+"1.0"
+}
+
+ClassMethod Legacy() [ CodeMode = call ]
+{
+Legacy^DemoUtil
+}
+
+}
+"#;
+        assert!(compile_time_methods(inlined).is_empty());
+    }
+
+    #[test]
+    fn a_signature_wrapped_across_lines_still_matches() {
+        let wrapped = r#"Class Demo.Util Extends %RegisteredObject
+{
+
+ClassMethod Build(pName As %String = "x") As %Status [ CodeMode = objectgenerator,
+    Private ]
+{
+    Quit $$$OK
+}
+
+}
+"#;
+        assert_eq!(compile_time_methods(wrapped), vec!["Build"]);
+    }
+
+    #[test]
+    fn the_keyword_is_matched_case_insensitively() {
+        let odd = "Class D.U Extends %RegisteredObject\n{\n\nClassMethod G() [ codemode = ObjectGenerator ]\n{\n}\n\n}\n";
+        assert_eq!(compile_time_methods(odd), vec!["G"]);
+    }
+
+    #[test]
+    fn a_method_whose_name_merely_starts_with_the_keyword_is_not_a_member_start() {
+        // `ClassMethodical` must not parse as a ClassMethod named `ical`.
+        let odd =
+            "Class D.U Extends %RegisteredObject\n{\n\nProperty ClassMethodical As %String;\n\n}\n";
+        assert!(compile_time_methods(odd).is_empty());
+    }
+
+    #[test]
+    fn every_generator_in_a_class_is_listed_in_source_order() {
+        let two = r#"Class D.U Extends %RegisteredObject
+{
+
+ClassMethod First() [ CodeMode = objectgenerator ]
+{
+}
+
+ClassMethod Second() [ CodeMode = objectgenerator ]
+{
+}
+
+}
+"#;
+        assert_eq!(compile_time_methods(two), vec!["First", "Second"]);
+    }
+
+    #[test]
+    fn a_brace_inside_a_string_does_not_swallow_the_rest_of_the_class() {
+        // Unbalanced braces in a literal would leave the scanner stuck at depth >= 2
+        // and silently miss every later generator — a false negative, not a noisy one.
+        let tricky = r#"Class D.U Extends %RegisteredObject
+{
+
+Method Noisy() As %String
+{
+    Quit "{{{"
+}
+
+ClassMethod Gen() [ CodeMode = objectgenerator ]
+{
+}
+
+}
+"#;
+        assert_eq!(compile_time_methods(tricky), vec!["Gen"]);
+    }
+
+    #[test]
+    fn without_literals_keeps_doubled_quotes_inside_the_literal() {
+        assert_eq!(without_literals(r#"Set x = "a""b" _ y"#), "Set x =  _ y");
+    }
+
+    #[test]
+    fn blocking_is_off_unless_the_env_var_is_set() {
+        // The default must stay "inform, do not block": on a Live instance the #114 gate
+        // already refused the write, and on a dev instance friction is the thing this
+        // fork exists to avoid.
+        assert!(!block_compile_time_code());
+    }
 }
 
 #[cfg(test)]
