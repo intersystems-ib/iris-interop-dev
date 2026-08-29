@@ -975,6 +975,9 @@ fn translate_select_into(sql: &str, rs_var: &str, sc_var: &str, sqlcode_var: &st
     }
     out.push_str(&format!(" set {} = {}.%SQLCODE", sqlcode_var, rs_var));
     out.push_str(" }");
+    // #145: also on the FOUND branch — a successful SELECT INTO left SQLCODE
+    // undefined, so `If SQLCODE=0` threw exactly like the DML case.
+    out.push_str(&sqlcode_epilogue(rs_var));
 
     out
 }
@@ -996,10 +999,32 @@ fn translate_select_no_into(sql: &str, rs_var: &str, sc_var: &str, _sqlcode_var:
     ));
     let exec_args = where_params.join(", ");
     out.push_str(&format!(
-        "set {} = {}.%Execute({})\n",
-        rs_var, rs_var, exec_args
+        "set {} = {}.%Execute({}){}\n",
+        rs_var,
+        rs_var,
+        exec_args,
+        sqlcode_epilogue(rs_var)
     ));
     out
+}
+
+/// #145: the `&sql` contract is not just "the statement runs" — it is that
+/// `SQLCODE` and `%ROWCOUNT` are set afterwards. The translation ran the
+/// statement and left both UNDEFINED, so the idiomatic
+/// `&sql(INSERT ...) If SQLCODE<0 {...}` threw `<UNDEFINED>` *after the write
+/// had already committed*, and the caller reasonably read that as a failed
+/// write. Emitting the two variables under their real names means a read works
+/// wherever it appears — same line, next line, ten lines later — and makes the
+/// next-line rewrite below a belt-and-braces path rather than the only one.
+///
+/// Kept to ONE line: `execute_via_generator` maps submitted line N to
+/// `RunUser+N`, and a multi-line expansion here would break that 1:1 (#124).
+fn sqlcode_epilogue(rs_var: &str) -> String {
+    // -400 is IRIS's "fatal error" SQLCODE — the honest answer when %ExecDirect
+    // returned no result object at all, and never a value that reads as success.
+    format!(
+        " set SQLCODE=$Select($IsObject({rs}):{rs}.%SQLCODE,1:-400),%ROWCOUNT=$Select($IsObject({rs}):{rs}.%ROWCOUNT,1:0)"
+    , rs = rs_var)
 }
 
 fn translate_dml(sql: &str, rs_var: &str) -> String {
@@ -1011,10 +1036,11 @@ fn translate_dml(sql: &str, rs_var: &str) -> String {
         format!(", {}", params.join(", "))
     };
     format!(
-        "set {} = ##class(%SQL.Statement).%ExecDirect(, \"{}\"{})",
+        "set {} = ##class(%SQL.Statement).%ExecDirect(, \"{}\"{}){}",
         rs_var,
         prepared_sql.replace('"', "\"\""),
-        exec_args
+        exec_args,
+        sqlcode_epilogue(rs_var)
     )
 }
 
@@ -3251,6 +3277,68 @@ pub(crate) fn mutating_call(tool: &str, args: &serde_json::Value) -> Option<&'st
         | "iris_table_info" => None,
         _ => None,
     }
+}
+
+/// #143: a list argument, however the caller spelled it.
+///
+/// `body_select` was read with a bare `as_array()`, so ANY other shape fell
+/// through `unwrap_or_default()` to an empty vec — and an empty `body_select`
+/// is indistinguishable from "not asked for". The join was still built and
+/// still filtered on, so the call returned `success: true` with the body
+/// columns silently missing. A model emitting `"AccessionNumber,ExamCode"`
+/// instead of `["AccessionNumber","ExamCode"]` is the single most common way
+/// to reach that, and nothing told it.
+///
+/// Accepted: a JSON array of strings; a JSON-encoded array in a string; a
+/// comma-separated string; a single bare name. Anything else is an ERROR —
+/// the one thing it must never do again is quietly return `[]`.
+pub(crate) fn string_list_arg(
+    name: &str,
+    v: Option<&serde_json::Value>,
+) -> Result<Vec<String>, String> {
+    let Some(v) = v else { return Ok(vec![]) };
+    if v.is_null() {
+        return Ok(vec![]);
+    }
+    if let Some(arr) = v.as_array() {
+        let mut out = Vec::with_capacity(arr.len());
+        for item in arr {
+            match item.as_str() {
+                Some(s) if !s.trim().is_empty() => out.push(s.trim().to_string()),
+                _ => {
+                    return Err(format!(
+                        "{name} must be a list of column names; it contained {item}"
+                    ))
+                }
+            }
+        }
+        return Ok(out);
+    }
+    if let Some(s) = v.as_str() {
+        let s = s.trim();
+        if s.is_empty() {
+            return Ok(vec![]);
+        }
+        // A JSON array that arrived as a string — common when a client stringifies
+        // its own arguments.
+        if s.starts_with('[') {
+            return match serde_json::from_str::<serde_json::Value>(s) {
+                Ok(parsed) => string_list_arg(name, Some(&parsed)),
+                Err(e) => Err(format!(
+                    "{name} looks like a JSON array but did not parse: {e}"
+                )),
+            };
+        }
+        return Ok(s
+            .split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect());
+    }
+    Err(format!(
+        "{name} must be a list of column names (or a comma-separated string); got {v}"
+    ))
 }
 
 /// The call's arguments as a JSON object — `{}` when the client sent none.
@@ -6955,6 +7043,20 @@ Methods:
                 interop::interop_queues_impl(iris_opt, ns).await
             }
             "messages" => {
+                // #143: resolved BEFORE the struct is built so an unusable shape can
+                // be refused. Silently returning [] here is what made the dropped
+                // projection invisible.
+                let body_select = match string_list_arg("body_select", p.get("body_select")) {
+                    Ok(v) => v,
+                    Err(e) => return crate::tools::envelope::fail_with(
+                        "INVALID_PARAM",
+                        &e,
+                        serde_json::json!({
+                            "parameter": "body_select",
+                            "expected": "array of column names, e.g. [\"AccessionNumber\",\"ExamCode\"]",
+                        }),
+                    ),
+                };
                 interop::interop_message_search_impl(
                     iris_opt,
                     interop::MessageSearchParams {
@@ -6991,15 +7093,7 @@ Methods:
                             .get("body_where")
                             .and_then(|v| v.as_str())
                             .map(|s| s.to_string()),
-                        body_select: p
-                            .get("body_select")
-                            .and_then(|v| v.as_array())
-                            .map(|a| {
-                                a.iter()
-                                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
+                        body_select,
                         search_table: p
                             .get("search_table")
                             .cloned()
@@ -9247,6 +9341,66 @@ mod class_run_code_tests {
             1,
             "the compiled-class branch runs the class directly: {dispatch}"
         );
+    }
+}
+
+#[cfg(test)]
+mod string_list_arg_tests {
+    use super::string_list_arg;
+    use serde_json::json;
+
+    fn ok(v: serde_json::Value) -> Vec<String> {
+        string_list_arg("body_select", Some(&v)).expect("should parse")
+    }
+
+    #[test]
+    fn the_documented_array_form_works() {
+        assert_eq!(ok(json!(["A", "B"])), vec!["A", "B"]);
+    }
+
+    /// #143's actual cause: a model writing a comma string instead of an array.
+    /// It used to fall through as_array() to [] and the projection vanished with
+    /// success:true.
+    #[test]
+    fn a_comma_separated_string_is_accepted() {
+        assert_eq!(ok(json!("A,B , C")), vec!["A", "B", "C"]);
+    }
+
+    #[test]
+    fn a_single_bare_name_is_accepted() {
+        assert_eq!(ok(json!("AccessionNumber")), vec!["AccessionNumber"]);
+    }
+
+    #[test]
+    fn a_json_array_that_arrived_as_a_string_is_accepted() {
+        assert_eq!(ok(json!(r#"["A","B"]"#)), vec!["A", "B"]);
+    }
+
+    #[test]
+    fn absent_null_and_empty_all_mean_not_asked_for() {
+        assert!(string_list_arg("body_select", None).unwrap().is_empty());
+        assert!(ok(json!(null)).is_empty());
+        assert!(ok(json!("")).is_empty());
+        assert!(ok(json!([])).is_empty());
+    }
+
+    /// The one behaviour that must never come back: a shape it cannot read
+    /// turning into an empty list, which reads as "the caller wanted nothing".
+    #[test]
+    fn an_unusable_shape_is_an_error_not_an_empty_list() {
+        for bad in [json!(7), json!({"col": "A"}), json!(true), json!([1, 2])] {
+            let r = string_list_arg("body_select", Some(&bad));
+            assert!(r.is_err(), "{bad} must be refused, not silently dropped");
+            assert!(
+                r.unwrap_err().contains("body_select"),
+                "the error has to name the parameter"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_json_array_string_is_an_error() {
+        assert!(string_list_arg("body_select", Some(&json!("[\"A\","))).is_err());
     }
 }
 
