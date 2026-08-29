@@ -7279,8 +7279,12 @@ Methods:
             }
         }
         // Default block: a body can carry patient data, so reading one is opt-in.
+        // #151: read the DECLARED (snake_case) name first — the schema is generated from
+        // MessageBodyParams, so that is the only spelling a conformant client can send.
+        // The camelCase spelling stays as an alias so existing callers keep working.
         let data_policy = p
-            .get("dataPolicy")
+            .get("data_policy")
+            .or_else(|| p.get("dataPolicy"))
             .and_then(|v| v.as_str())
             .unwrap_or("block")
             .to_string();
@@ -7296,10 +7300,16 @@ Methods:
                     .unwrap_or_default(),
                 namespace,
                 max_bytes: p.get("max_bytes").and_then(|v| v.as_u64()).unwrap_or(65536) as u32,
+                // #151: declared as `acknowledge_phi`, previously read only as
+                // `acknowledgePhi` — so the one name a conformant client could discover
+                // was the one that did nothing, and the refusal blamed the caller for
+                // omitting what it had supplied.
                 acknowledge_phi: p
-                    .get("acknowledgePhi")
+                    .get("acknowledge_phi")
+                    .or_else(|| p.get("acknowledgePhi"))
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false),
+                data_policy: data_policy.clone(),
             },
             &data_policy,
         )

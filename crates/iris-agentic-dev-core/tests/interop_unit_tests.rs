@@ -587,6 +587,7 @@ mod interop_depth_guards {
                 namespace: "USER".into(),
                 max_bytes: 65536,
                 acknowledge_phi: false,
+                data_policy: "block".into(),
             },
             "block",
         ));
@@ -603,6 +604,7 @@ mod interop_depth_guards {
                 namespace: "USER".into(),
                 max_bytes: 65536,
                 acknowledge_phi: false,
+                data_policy: "allow".into(),
             },
             "allow",
         ));
@@ -619,11 +621,35 @@ mod interop_depth_guards {
                 namespace: "USER".into(),
                 max_bytes: 65536,
                 acknowledge_phi: true,
+                data_policy: "allow".into(),
             },
             "allow",
         ));
         let v = tool_payload(&r);
         assert_eq!(v["error_code"], "INVALID_MESSAGE_ID", "{v}");
+    }
+
+    /// #151: the three checks were `== "block"`, `== "allow"` and a final `== "redact"`,
+    /// so a value matching none of them — `Allow`, `none`, a typo — passed every gate and
+    /// reached the final branch, which returned the body UNREDACTED and unacknowledged.
+    /// Validation has to happen before the gates, not between them.
+    #[test]
+    fn an_unrecognised_policy_is_refused_rather_than_read_unredacted() {
+        for bogus in ["Allow", "ALLOW", "none", "redact ", ""] {
+            let r = rt().block_on(handle_iris_message_body(
+                None,
+                &MessageBodyParams {
+                    message_id: "1".into(),
+                    namespace: "USER".into(),
+                    max_bytes: 65536,
+                    acknowledge_phi: true,
+                    data_policy: bogus.into(),
+                },
+                bogus,
+            ));
+            let v = tool_payload(&r);
+            assert_eq!(v["error_code"], "INVALID_PARAM", "policy {bogus:?}: {v}");
+        }
     }
 
     #[test]

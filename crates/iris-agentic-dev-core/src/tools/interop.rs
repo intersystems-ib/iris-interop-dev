@@ -2556,9 +2556,24 @@ pub struct MessageBodyParams {
     pub max_bytes: u32,
     #[serde(default)]
     pub acknowledge_phi: bool,
+    // #151: the dispatcher READ this option but the schema never declared it, so a
+    // schema-validating client could not send it and the tool was pinned at `block` —
+    // i.e. unreachable for its whole purpose. The enum belongs in the SCHEMA, not only
+    // in the error text; same reasoning as #112 for `action`. Keep the doc comment below
+    // user-facing: schemars renders it as the field's title/description, which is what a
+    // model reads before choosing a value.
+    /// PHI gate. block (default) refuses to read the body at all; redact blanks known
+    /// HL7 v2 PHI fields (PID-3/5/7/8/11/18, MSH-3); allow returns the body unredacted
+    /// and additionally requires acknowledge_phi=true.
+    #[schemars(extend("enum" = ["block", "redact", "allow"]))]
+    #[serde(default = "default_data_policy")]
+    pub data_policy: String,
 }
 fn default_max_bytes() -> u32 {
     65536
+}
+fn default_data_policy() -> String {
+    "block".to_string()
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -2755,6 +2770,39 @@ If body.%Extends("Ens.StreamContainer") {{
   }} Catch ex {{
     Write "ERROR:BODY_READ_ERROR:"_ex.DisplayString()
   }}
+}} ElseIf body.%Extends("%Persistent") {{
+  Set cdef=##class(%Dictionary.CompiledClass).%OpenId(bodyClass)
+  If '$IsObject(cdef) {{ Write "ERROR:UNSUPPORTED_BODY_CLASS:"_bodyClass Quit }}
+  Set obj={{}}
+  For i=1:1:cdef.Properties.Count() {{
+    Set pd=cdef.Properties.GetAt(i)
+    If '$IsObject(pd) {{ Continue }}
+    Set nm=pd.Name
+    If $Extract(nm)="%" {{ Continue }}
+    If pd.Private {{ Continue }}
+    If pd.Calculated {{ Continue }}
+    If pd.MultiDimensional {{ Continue }}
+    If pd.Relationship {{ Continue }}
+    Set val=""
+    Try {{
+      Set val=$Property(body,nm)
+    }} Catch pex {{
+      Set val=""
+    }}
+    If $IsObject(val) {{
+      If val.%Extends("%Stream.Object") {{
+        Set val=val.Read({max_bytes})
+      }} Else {{
+        Set val="<"_val.%ClassName(1)_">"
+      }}
+    }}
+    Do obj.%Set(nm,val)
+  }}
+  Set content=obj.%ToJSON()
+  Set full=$Length(content)
+  If full>{max_bytes} {{ Set content=$Extract(content,1,{max_bytes}) }}
+  Write "OK:"_full_":"
+  Write content
 }} Else {{
   Write "ERROR:UNSUPPORTED_BODY_CLASS:"_bodyClass
 }}"#
@@ -2766,6 +2814,18 @@ pub async fn handle_iris_message_body(
     params: &MessageBodyParams,
     data_policy: &str,
 ) -> Result<CallToolResult, McpError> {
+    // #151: an unrecognised value used to fall straight through — not "block", not
+    // "allow", and not "redact" at the end, so a typo like `dataPolicy=Allow` returned
+    // the body UNREDACTED with no acknowledgement. Validate before any gate.
+    if !matches!(data_policy, "block" | "redact" | "allow") {
+        return err_json(
+            "INVALID_PARAM",
+            &format!(
+                "data_policy '{data_policy}' is not one of block, redact, allow — refusing \
+                 rather than falling through to an unredacted read"
+            ),
+        );
+    }
     if data_policy == "block" {
         return err_json(
             "PHI_POLICY_BLOCKED",
@@ -3243,18 +3303,17 @@ If $System.Status.IsError(sc)||('isInSC) {{ Write "NO_SCM" }} Else {{ Write "IN_
         pass_expr = os_str_expr(&iris.password),
         doc_expr = os_str_expr(&doc_name),
     );
-    match iris.execute_via_generator(&scm_code, ns, &client).await {
-        Ok(out) if out.trim() == "NO_SCM" => {
-            return err_json(
-                "NO_SCM",
-                &format!(
-                    "No source control is configured for '{doc_name}' in namespace '{ns}' — there is no committed source to diff against"
-                ),
-            )
-        }
-        Ok(_) => {}
+    // #153: this used to hard-refuse with NO_SCM. The baseline below is an Atelier
+    // `GET /doc/<name>`, which reads the class definition out of the namespace and needs
+    // no source control at all — verified in a namespace that answered NO_SCM while
+    // iris_doc(mode=get) returned the full ProductionDefinition XData. So the refusal
+    // named a cause that was not the reason and blocked a diff the code can compute, in
+    // every eval namespace and most dev namespaces. Report the baseline, do not enforce it.
+    let baseline = match iris.execute_via_generator(&scm_code, ns, &client).await {
+        Ok(out) if out.trim() == "IN_SCM" => "source_control",
+        Ok(_) => "class_definition",
         Err(e) => return err_json(classify_iris_error(&e.to_string()), &e.to_string()),
-    }
+    };
 
     let exists_code = format!(
         r#"Write ##class(%Dictionary.ClassDefinition).%ExistsId({prod_expr})"#,
@@ -3315,7 +3374,30 @@ If $System.Status.IsError(sc)||('isInSC) {{ Write "NO_SCM" }} Else {{ Write "IN_
             let source = crate::tools::doc::doc_content_to_string(&body);
             parse_production_items_from_source(&source)
         }
-        _ => Vec::new(),
+        // #153: this arm used to be `_ => Vec::new()`. An empty baseline is
+        // indistinguishable from "the committed production has no items", so a failed
+        // fetch reported EVERY running item as `added` under success:true — the
+        // silent-wrong shape of #123 and #143. Fail instead.
+        Ok(resp) => {
+            let status = resp.status();
+            return err_json(
+                "BASELINE_UNAVAILABLE",
+                &format!(
+                    "Could not read the class definition for '{doc_name}' in namespace \
+                     '{ns}' (Atelier GET returned HTTP {status}) — refusing rather than \
+                     diffing against an empty baseline, which would report every running \
+                     item as `added`"
+                ),
+            );
+        }
+        Err(e) => {
+            return err_json(
+                "BASELINE_UNAVAILABLE",
+                &format!(
+                    "Could not read the class definition for '{doc_name}' in namespace '{ns}': {e}"
+                ),
+            );
+        }
     };
 
     let mut changes = Vec::new();
@@ -3347,6 +3429,8 @@ If $System.Status.IsError(sc)||('isInSC) {{ Write "NO_SCM" }} Else {{ Write "IN_
         "namespace": ns,
         "in_sync": changes.is_empty(),
         "changes": changes,
+        // #153: name what the diff was taken against, so "in_sync" is interpretable.
+        "baseline": baseline,
     }))
 }
 
@@ -3870,6 +3954,75 @@ mod tests {
         assert!(edi.contains("Set full=$Length(content)"), "{edi}");
         assert!(edi.contains("If full>4096"), "{edi}");
         assert!(edi.contains("$Extract(content,1,4096)"), "{edi}");
+    }
+
+    // ─── #152: a custom Ens.Request / %Persistent body ───
+
+    /// The four original branches cover containers, streams and EDI documents; a custom
+    /// `Ens.Request` with typed properties — the shape the `messages` skill teaches — fell
+    /// straight through to UNSUPPORTED_BODY_CLASS.
+    #[test]
+    fn a_custom_persistent_body_has_its_own_branch() {
+        let code = build_message_body_code(16, 65536);
+        assert!(code.contains(r#"%Extends("%Persistent")"#), "{code}");
+        assert!(code.contains("%Dictionary.CompiledClass"), "{code}");
+        assert!(code.contains("obj.%ToJSON()"), "{code}");
+    }
+
+    /// Ordering is load-bearing: `Ens.StreamContainer` and `Ens.StringContainer` ARE
+    /// %Persistent, so a %Persistent branch placed before them would swallow both and
+    /// render a container as a property bag instead of reading its payload.
+    #[test]
+    fn the_persistent_branch_is_last_so_containers_are_not_swallowed() {
+        let code = build_message_body_code(16, 65536);
+        let persistent = code.find(r#"%Extends("%Persistent")"#).unwrap();
+        for cls in [
+            "Ens.StreamContainer",
+            "%Stream.Object",
+            "Ens.StringContainer",
+            "EnsLib.EDI.Document",
+        ] {
+            let at = code.find(&format!(r#"%Extends("{cls}")"#)).unwrap();
+            assert!(
+                at < persistent,
+                "{cls} must be tested before %Persistent, else it is swallowed: {code}"
+            );
+        }
+    }
+
+    /// A property bag is only useful if it holds readable values: private, calculated,
+    /// multidimensional and relationship properties cannot be rendered and `%`-prefixed
+    /// ones are system bookkeeping.
+    #[test]
+    fn the_persistent_branch_skips_properties_it_cannot_render() {
+        let code = build_message_body_code(16, 65536);
+        let branch = code.split(r#"%Extends("%Persistent")"#).nth(1).unwrap();
+        for guard in [
+            "pd.Private",
+            "pd.Calculated",
+            "pd.MultiDimensional",
+            "pd.Relationship",
+            r#"$Extract(nm)="%""#,
+        ] {
+            assert!(branch.contains(guard), "missing guard {guard}: {branch}");
+        }
+    }
+
+    /// Same #55 trap as the EDI branch: report the FULL length before cutting, or a
+    /// truncated body understates its own size.
+    #[test]
+    fn the_persistent_branch_reports_full_size_before_truncating() {
+        let code = build_message_body_code(16, 4096);
+        let branch = code.split(r#"%Extends("%Persistent")"#).nth(1).unwrap();
+        assert!(branch.contains("Set full=$Length(content)"), "{branch}");
+        assert!(branch.contains("If full>4096"), "{branch}");
+        assert!(branch.contains("$Extract(content,1,4096)"), "{branch}");
+    }
+
+    /// The generated branch must still be syntactically whole — the #6 <SYNTAX> guard.
+    #[test]
+    fn the_persistent_branch_generates_valid_objectscript() {
+        assert_valid_objectscript_lines(&build_message_body_code(16, 65536));
     }
 
     // ─── #63: one reader for the production-name argument ───
