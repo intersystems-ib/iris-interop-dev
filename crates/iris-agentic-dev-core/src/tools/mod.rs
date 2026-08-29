@@ -3155,16 +3155,34 @@ fn abort_wants_member_list(signal: &str) -> bool {
 /// legitimately prints the word ERROR mid-run from being reported as an abort. The
 /// leading-prefix test is kept as well, so nothing detected before stops being detected.
 pub fn runtime_abort_line(output: &str) -> Option<&str> {
-    fn is_abort(line: &str) -> bool {
-        let t = line.trim();
-        matches!(
-            t.strip_prefix("ERROR: ").or_else(|| t.strip_prefix("ERROR($ZERROR): ")),
-            Some(rest) if rest.starts_with('<')
-        )
+    /// #159: the abort is not always at the START of the last line. A script whose final
+    /// `Write` did not end in `,!` leaves the trap concatenated onto its own output —
+    /// `ROW=ERROR: <SYNTAX> …` — and a `strip_prefix` test misses it, so a hard abort came
+    /// back `success:true` or not depending on one character. Measured over the eval corpus
+    /// at 0.8.4: 209 aborts at line start, 189 mid-line.
+    ///
+    /// Still anchored to the last non-empty line, which is what keeps a script that
+    /// legitimately prints the word ERROR mid-run from being called an abort — a bare
+    /// substring test over the whole output would lose that. Taking the LAST marker on that
+    /// line to end-of-line also drops the script's own output out of the `error` field,
+    /// which returning the whole line would have carried into it.
+    fn abort_tail(line: &str) -> Option<&str> {
+        let mut best: Option<usize> = None;
+        for marker in ["ERROR: ", "ERROR($ZERROR): "] {
+            let mut from = 0;
+            while let Some(i) = line[from..].find(marker) {
+                let at = from + i;
+                if line[at + marker.len()..].starts_with('<') {
+                    best = Some(best.map_or(at, |b: usize| b.max(at)));
+                }
+                from = at + 1;
+            }
+        }
+        best.map(|i| line[i..].trim_end())
     }
     let last = output.lines().rev().find(|l| !l.trim().is_empty())?;
-    if is_abort(last) {
-        return Some(last.trim());
+    if let Some(tail) = abort_tail(last.trim()) {
+        return Some(tail);
     }
     // The wrapper's one non-`<signal>` failure, emitted when the device redirect could not be
     // established. Matched exactly rather than by the old blanket `starts_with("ERROR: ")`,
@@ -13633,6 +13651,56 @@ mod abort_tests {
         let out =
             "partial\nERROR($ZERROR): <UNDEFINED>RunUser+1^IrisDevTmp.Runde1eee3e4ec3.1 *pName";
         assert!(runtime_abort_line(out).is_some());
+    }
+
+    // ─── #159: the abort concatenated onto the script's own output ───
+
+    /// One character decided this. `Write "ROW=",!` reported the abort and `Write "ROW="`
+    /// did not, because the trap landed on the same line as the output and the old
+    /// `strip_prefix` test saw `ROW=`. Reproduced live on 0.11.0 before the fix.
+    #[test]
+    fn an_abort_concatenated_onto_the_output_line_is_still_an_abort() {
+        let out = "ROW=ERROR: <CLASS DOES NOT EXIST> 150 RunUser+1^IrisDevTmp.Runa8.1 No.Such";
+        assert!(runtime_abort_line(out).is_some(), "{out}");
+    }
+
+    /// The reported error must be the abort, not the script's output with the abort glued on.
+    #[test]
+    fn the_reported_abort_drops_the_scripts_own_output() {
+        let out = "PatientId=[ERROR: <OBJECT DISPATCH> 230 RunUser+9^IrisDevTmp.Runb2.1";
+        let abort = runtime_abort_line(out).unwrap();
+        assert!(abort.starts_with("ERROR: <OBJECT DISPATCH>"), "{abort}");
+        assert!(!abort.contains("PatientId="), "{abort}");
+    }
+
+    /// The `<` is what separates an IRIS signal from a script printing the word. A final
+    /// line mentioning `ERROR: ` with no signal after it must NOT become an abort.
+    #[test]
+    fn a_final_line_mentioning_error_without_a_signal_is_not_an_abort() {
+        for out in [
+            "done. ERROR: none",
+            "summary: 0 rows, ERROR: not applicable",
+            "ERROR: something broke",
+        ] {
+            assert!(runtime_abort_line(out).is_none(), "{out}");
+        }
+    }
+
+    /// When the line carries more than one marker the LAST one is the trap — anything
+    /// earlier is the script quoting a previous error.
+    #[test]
+    fn the_last_marker_on_the_line_wins() {
+        let out = "prev=ERROR: <UNDEFINED> x ERROR: <SYNTAX> 3 RunUser+1^IrisDevTmp.Runc3.1";
+        let abort = runtime_abort_line(out).unwrap();
+        assert!(abort.starts_with("ERROR: <SYNTAX>"), "{abort}");
+    }
+
+    /// The `$ZERROR` spelling must work mid-line too.
+    #[test]
+    fn the_zerror_spelling_is_found_mid_line() {
+        let out = "src=0 copy=ERROR($ZERROR): <METHOD DOES NOT EXIST> 148 RunUser+1^X.1 Copy";
+        let abort = runtime_abort_line(out).unwrap();
+        assert!(abort.starts_with("ERROR($ZERROR): <METHOD"), "{abort}");
     }
 
     /// The wrapper's own non-`<signal>` failure must still be caught.
