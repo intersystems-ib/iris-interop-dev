@@ -6739,7 +6739,7 @@ Methods:
     }
 
     #[tool(
-        description = "IRIS debug tools. action=map_int maps a runtime error offset to source line, action=error_logs fetches recent error log entries, action=capture captures current error state, action=source_map builds .INT to .CLS mapping."
+        description = "IRIS debug tools. action=map_int DECOMPOSES an ObjectScript error frame (<SIGNAL>label+offset^Pkg.Class.1) into signal/class/method/offset and verifies the class is compiled — it returns ROUTINE_NOT_FOUND for a class that does not exist and INVALID_PARAM for a string that is not a frame, and it does NOT return a source line: %Studio.Debugger.SourceLine answers identically for every input on IRIS 2026.1, so `mapped_to_source_line` is false and the note says what to read instead. For an error raised by code you ran through iris_execute, that tool already reports source_line and source_line_number directly — prefer it. action=error_logs fetches recent error log entries. action=capture captures current error state. action=source_map builds a .INT to .CLS mapping, and fails with UNSUPPORTED_IRIS_VERSION where %Studio.Debugger.MapToINT is absent (it is absent on 2026.1)."
     )]
     async fn iris_debug(
         &self,

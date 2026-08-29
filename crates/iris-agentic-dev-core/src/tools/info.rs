@@ -269,6 +269,89 @@ pub struct DebugParams {
     pub namespace: Option<String>,
 }
 
+/// One frame of an ObjectScript runtime error, decomposed.
+///
+/// `<ILLEGAL VALUE>SlotKey+1^Radio.BO.RisWorklistOut.1` is
+/// signal `<ILLEGAL VALUE>`, label `SlotKey`, offset `1`, INT routine
+/// `Radio.BO.RisWorklistOut.1`, whose class is `Radio.BO.RisWorklistOut`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntFrame {
+    pub signal: String,
+    pub label: String,
+    pub offset: i64,
+    pub routine: String,
+    pub class: String,
+}
+
+/// #142: the old parse was `$piece($piece(err,"^",2),".",1)` — the FIRST
+/// dot-piece — so `Radio.BO.RisWorklistOut.1` resolved to the routine `Radio`.
+/// The trailing `.1` is the INT-routine suffix and only IT should come off; a
+/// class name has dots all through it.
+pub fn parse_int_frame(err: &str) -> Option<IntFrame> {
+    let err = err.trim();
+    let (left, routine) = err.split_once('^')?;
+    let routine = routine.trim();
+    if routine.is_empty() {
+        return None;
+    }
+    // Strip a trailing numeric INT suffix, and only a numeric one.
+    let class = match routine.rsplit_once('.') {
+        Some((head, tail)) if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) => head,
+        _ => routine,
+    };
+    // The signal is the leading <...>, when present.
+    let (signal, rest) = match (left.find('<'), left.find('>')) {
+        (Some(a), Some(b)) if b > a => (left[a..=b].to_string(), left[b + 1..].trim()),
+        _ => (String::new(), left.trim()),
+    };
+    let (label, offset) = match rest.rsplit_once('+') {
+        Some((l, o)) => (l.trim().to_string(), o.trim().parse::<i64>().ok()?),
+        None => (rest.to_string(), 0),
+    };
+    if label.is_empty() {
+        return None;
+    }
+    Some(IntFrame {
+        signal,
+        // A generated method label carries a `z` prefix in the INT routine.
+        label: label.strip_prefix('z').unwrap_or(&label).to_string(),
+        offset,
+        routine: routine.to_string(),
+        class: class.to_string(),
+    })
+}
+
+/// Whether a `%Studio.Debugger` method is present on this instance. #142:
+/// `MapToINT` is GONE on IRIS 2026.1 (Build 235U) while `SourceLine` remains,
+/// and calling the absent one produced `<METHOD DOES NOT EXIST>` inside a data
+/// field of a `success: true` payload.
+async fn studio_debugger_has(
+    iris: &crate::iris::IrisConnection,
+    client: &reqwest::Client,
+    namespace: &str,
+    method: &str,
+) -> bool {
+    let sql = "SELECT COUNT(*) AS N FROM %Dictionary.CompiledMethod \
+               WHERE parent = '%Studio.Debugger' AND Name = ?";
+    match iris
+        .query(sql, vec![serde_json::json!(method)], namespace, client)
+        .await
+    {
+        Ok(resp) => {
+            resp["result"]["content"][0]["N"]
+                .as_i64()
+                .or_else(|| {
+                    resp["result"]["content"][0]["N"]
+                        .as_str()
+                        .and_then(|s| s.parse().ok())
+                })
+                .unwrap_or(0)
+                > 0
+        }
+        Err(_) => false,
+    }
+}
+
 pub async fn handle_iris_debug(
     iris: &IrisConnection,
     client: &reqwest::Client,
@@ -278,20 +361,75 @@ pub async fn handle_iris_debug(
 
     match p.action.as_str() {
         "map_int" => {
+            // #142: this used to hand `%Studio.Debugger.SourceLine` a routine name it
+            // had mis-parsed and report whatever came back as `source_location`. On
+            // IRIS 2026.1 SourceLine returns "1" for EVERY input — the correct routine
+            // name, the mis-parsed one, and a routine that has never existed — so the
+            // answer was indistinguishable from a real mapping and a caller could not
+            // tell it had learned nothing. It now decomposes the frame itself, checks
+            // the class is real, and never invents a line.
             let err = p.error_string.as_deref().unwrap_or("");
-            let code = format!(
-                "set err={} set routine=$piece($piece(err,\"^\",2),\".\",1) set offset=$piece(err,\"+\",2) set offset=$piece(offset,\"^\",1) write ##class(%Studio.Debugger).SourceLine(routine,+offset)",
-                os_str_expr(err)
-            );
-            // execute_via_generator works over plain Atelier HTTP — no docker exec
-            // needed (issue #20; the DOCKER_REQUIRED bail-out made iris_debug fail on
-            // every HTTP-only connection).
-            match iris.execute_via_generator(&code, &namespace, client).await {
-                Ok(output) => ok_json(
-                    serde_json::json!({"success": true, "error_string": err, "source_location": output.trim()}),
-                ),
-                Err(e) => err_json("EXECUTION_FAILED", &e.to_string()),
+            let Some(frame) = parse_int_frame(err) else {
+                return crate::tools::envelope::fail_with(
+                    "INVALID_PARAM",
+                    &format!(
+                        "'{err}' is not an ObjectScript error frame. Expected <SIGNAL>label+offset^Routine, e.g. <UNDEFINED>zMyMethod+3^My.Pkg.Class.1"
+                    ),
+                    serde_json::json!({"error_string": err}),
+                );
+            };
+            let exists = match iris
+                .query(
+                    "SELECT COUNT(*) AS N FROM %Dictionary.CompiledClass WHERE Name = ?",
+                    vec![serde_json::json!(frame.class)],
+                    &namespace,
+                    client,
+                )
+                .await
+            {
+                Ok(resp) => {
+                    resp["result"]["content"][0]["N"]
+                        .as_i64()
+                        .or_else(|| {
+                            resp["result"]["content"][0]["N"]
+                                .as_str()
+                                .and_then(|s| s.parse().ok())
+                        })
+                        .unwrap_or(0)
+                        > 0
+                }
+                Err(e) => {
+                    return crate::tools::envelope::transport_fail("iris_debug", &e.to_string())
+                }
+            };
+            if !exists {
+                return crate::tools::envelope::fail_with(
+                    "ROUTINE_NOT_FOUND",
+                    &format!(
+                        "'{}' is not a compiled class in namespace '{}', so the frame cannot be resolved. Previously this answered as if it had mapped.",
+                        frame.class, namespace
+                    ),
+                    serde_json::json!({
+                        "error_string": err,
+                        "class": frame.class,
+                        "namespace": namespace,
+                    }),
+                );
             }
+            ok_json(serde_json::json!({
+                "success": true,
+                "error_string": err,
+                "signal": frame.signal,
+                "class": frame.class,
+                "routine": frame.routine,
+                "method": frame.label,
+                "offset": frame.offset,
+                "mapped_to_source_line": false,
+                "note": format!(
+                    "The frame is decomposed and '{}' exists, but this IRIS cannot map an INT offset to a source line: %Studio.Debugger.SourceLine returns the same value for every input, including routines that do not exist. Read the method with iris_doc(mode=get, name='{}.cls') and count {} line(s) into {}. For an error raised by code YOU ran, iris_execute already reports source_line and source_line_number directly.",
+                    frame.class, frame.class, frame.offset, frame.label
+                ),
+            }))
         }
         "error_logs" => {
             // IRIS error log tables (%SYSTEM.Error, %SYS.ErrorLog) are not SQL-accessible
@@ -314,14 +452,39 @@ pub async fn handle_iris_debug(
         }
         "source_map" => {
             let cls = p.class_name.as_deref().unwrap_or("");
+            // #142: %Studio.Debugger.MapToINT does not exist on IRIS 2026.1 (Build
+            // 235U). Calling it put "<METHOD DOES NOT EXIST> ... MapToINT" inside the
+            // `mapping` field of a success:true payload — the same shape as #123.
+            // Probe first and fail closed.
+            if !studio_debugger_has(iris, client, &namespace, "MapToINT").await {
+                return crate::tools::envelope::fail_with(
+                    "UNSUPPORTED_IRIS_VERSION",
+                    "%Studio.Debugger.MapToINT is not present on this IRIS, so a .INT-to-.CLS map cannot be built.",
+                    serde_json::json!({
+                        "class": cls,
+                        "namespace": namespace,
+                        "missing_method": "%Studio.Debugger.MapToINT",
+                        "hint": "Use iris_debug(action=map_int) to decompose a single error frame, or iris_doc(mode=get) to read the class source. An error raised by code run through iris_execute already carries source_line and source_line_number.",
+                    }),
+                );
+            }
             let code = format!(
                 "set map=\"\" set line=1 do {{set int=##class(%Studio.Debugger).MapToINT({cls},line,.intline) if int=\"\" quit set map=map_line_\"->\"_intline_\",\" set line=line+1 }} while 1 write map",
                 cls = crate::objectscript::os_str_expr(cls)
             );
             match iris.execute_via_generator(&code, &namespace, client).await {
-                Ok(output) => ok_json(
-                    serde_json::json!({"success": true, "class": cls, "mapping": output.trim()}),
-                ),
+                Ok(output) => {
+                    let out = output.trim();
+                    // A wrapper abort is not a mapping, whatever field it lands in.
+                    if let Some(abort) = crate::tools::runtime_abort_line(out) {
+                        return crate::tools::envelope::fail_with(
+                            "EXECUTION_FAILED",
+                            abort,
+                            serde_json::json!({"class": cls, "namespace": namespace}),
+                        );
+                    }
+                    ok_json(serde_json::json!({"success": true, "class": cls, "mapping": out}))
+                }
                 Err(e) => err_json("EXECUTION_FAILED", &e.to_string()),
             }
         }
@@ -990,5 +1153,60 @@ mod table_suggestion_tests {
             "Ens_A.1", "Ens_A.2", "Ens_A.3", "Ens_A.4", "Ens_A.5", "Ens_A.6",
         ]);
         assert_eq!(rank_table_suggestions("Ens.A.X", many, vec![]).len(), 5);
+    }
+}
+
+#[cfg(test)]
+mod int_frame_tests {
+    use super::parse_int_frame;
+
+    /// #142's core defect: `$piece(routine,".",1)` took only the FIRST dot-piece,
+    /// so `Radio.BO.RisWorklistOut.1` was handed to SourceLine as `Radio`.
+    #[test]
+    fn the_class_keeps_every_dot_except_the_int_suffix() {
+        let f = parse_int_frame("<ILLEGAL VALUE>SlotKey+1^Radio.BO.RisWorklistOut.1").unwrap();
+        assert_eq!(f.class, "Radio.BO.RisWorklistOut");
+        assert_eq!(f.routine, "Radio.BO.RisWorklistOut.1");
+        assert_eq!(f.label, "SlotKey");
+        assert_eq!(f.offset, 1);
+        assert_eq!(f.signal, "<ILLEGAL VALUE>");
+    }
+
+    /// The z-prefixed label form from the same report.
+    #[test]
+    fn a_generated_label_loses_its_z_prefix() {
+        let f = parse_int_frame("<ILLEGAL VALUE>zSlotKey+1^Radio.BO.RisWorklistOut.1").unwrap();
+        assert_eq!(f.label, "SlotKey");
+    }
+
+    /// Only a NUMERIC trailing piece is an INT suffix. A class whose last segment
+    /// is a word must not be truncated.
+    #[test]
+    fn a_non_numeric_last_segment_is_part_of_the_class() {
+        let f = parse_int_frame("<UNDEFINED>zRun+3^My.Pkg.Helper").unwrap();
+        assert_eq!(f.class, "My.Pkg.Helper");
+    }
+
+    #[test]
+    fn a_frame_with_no_offset_reads_as_zero() {
+        let f = parse_int_frame("<UNDEFINED>zRun^My.Pkg.Helper.1").unwrap();
+        assert_eq!(f.offset, 0);
+        assert_eq!(f.label, "Run");
+    }
+
+    #[test]
+    fn a_multi_digit_offset_survives() {
+        let f = parse_int_frame("<UNDEFINED>zNoSuchLabel+99^Totally.Bogus.Class.1").unwrap();
+        assert_eq!(f.offset, 99);
+        assert_eq!(f.class, "Totally.Bogus.Class");
+    }
+
+    /// Refusing to parse is how the caller learns it sent something else — the old
+    /// code accepted anything and answered "1".
+    #[test]
+    fn a_string_that_is_not_a_frame_is_refused() {
+        for bad in ["", "just some text", "<UNDEFINED>", "^Only.A.Routine.1"] {
+            assert!(parse_int_frame(bad).is_none(), "{bad:?} must not parse");
+        }
     }
 }
