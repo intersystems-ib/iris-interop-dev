@@ -7405,7 +7405,7 @@ Methods:
     }
 
     #[tool(
-        description = "Export or import an Ensemble lookup table as XML. action: export|import. table: table name. xml: XML string (required for import). namespace: optional — defaults to the connection namespace (IRIS_NAMESPACE); must be an interop-enabled namespace. export always available; import write-gated."
+        description = "Export or import an Ensemble lookup table as XML. action: export|import. xml: XML string (required for import). namespace: optional — defaults to the connection namespace (IRIS_NAMESPACE); must be an interop-enabled namespace. export always available; import write-gated. IMPORT HAS TWO MODES AND `table` PICKS WHICH: passing table=<name> is a REPLACE — that table is CLEARED first and ends up holding ONLY the entries in the XML, so any row you did not include is DELETED; omitting table is a MERGE — entries are upserted into whatever table(s) the XML names and nothing is deleted. Exporting a table, deleting the bad rows and importing the file back WITHOUT table therefore keeps the rows you meant to remove. The response echoes `mode` (replace|merge) and `entries_applied`. For export, table names the table to export."
     )]
     async fn iris_lookup_transfer(
         &self,

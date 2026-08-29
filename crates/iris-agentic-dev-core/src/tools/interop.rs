@@ -2298,6 +2298,16 @@ Set tKey="" For {{ Set tKey=$ORDER(^Ens.LookupTable({t},tKey)) Quit:tKey=""  Wri
 /// `Ens.Util.LookupTable.%Import`. The XML is user-supplied free text (quotes,
 /// newlines, unicode), so it is embedded via `os_stream_write_stmts` — see
 /// issue #6, where quote-heavy XML made every import die with `<SYNTAX>`.
+///
+/// #144: the second argument is `pForceTableName`, and IT is what makes the
+/// import DESTRUCTIVE. Passing a name clears that table and leaves only the
+/// imported rows (REPLACE); passing "" upserts and deletes nothing (MERGE).
+/// Both used to return a bare `{"success": true}`, so someone who exported a
+/// drifted table, removed the bad rows and imported the corrected file WITHOUT
+/// `table` kept every row they meant to delete and was told it worked. The
+/// mode is now computed here and echoed, and `pCount` — declared `&pCount` and
+/// previously discarded by passing a literal `""` into the byref slot — is
+/// captured so the caller can see how many entries were actually applied.
 fn build_lookup_import_code(table: &str, xml: &str) -> String {
     let table_expr = os_str_expr(table);
     let write_block = os_stream_write_stmts("tStream", xml, 400).join("\n");
@@ -2309,10 +2319,10 @@ Set tStream.TranslateTable="UTF8"
 {write_block}
 Set tSC=tStream.%Save()
 If $$$ISERR(tSC) {{ Write "ERROR:INTEROP_ERROR:Cannot write temp file" Quit }}
-Set tSC2=##class(Ens.Util.LookupTable).%Import(tFile,{table_expr},"")
+Set tSC2=##class(Ens.Util.LookupTable).%Import(tFile,{table_expr},.tCount)
 Do ##class(%File).Delete(tFile)
 If $$$ISERR(tSC2) {{ Write "ERROR:INVALID_XML:"_$System.Status.GetErrorText(tSC2) Quit }}
-Write "OK""#
+Write "OK:"_+$Get(tCount)"#
     )
 }
 
@@ -2368,8 +2378,34 @@ Write tOut"#,
             match iris.execute_via_generator(&code, ns, &client).await {
                 Ok(out) => {
                     let out = out.trim();
-                    if out == "OK" {
-                        ok_json(serde_json::json!({"success":true,"table":params.table}))
+                    // The sentinel carries the applied count now ("OK:3"); the bare
+                    // "OK" form is still accepted so an older server cannot break here.
+                    if out == "OK" || out.starts_with("OK:") {
+                        {
+                            let mode = if params.table.is_empty() {
+                                "merge"
+                            } else {
+                                "replace"
+                            };
+                            let applied = out
+                                .trim()
+                                .strip_prefix("OK:")
+                                .and_then(|c| c.trim().parse::<i64>().ok());
+                            ok_json(serde_json::json!({
+                                "success": true,
+                                "table": params.table,
+                                "mode": mode,
+                                "entries_applied": applied,
+                                "note": if mode == "replace" {
+                                    format!(
+                                        "REPLACE: '{}' was cleared and now holds only the imported entries — any row not in the XML is gone. Omit `table` to MERGE instead (upsert, delete nothing).",
+                                        params.table
+                                    )
+                                } else {
+                                    "MERGE: entries were upserted into the table(s) named inside the XML and nothing was deleted. Pass `table` to REPLACE that table instead (clears it first).".to_string()
+                                },
+                            }))
+                        }
                     } else if let Some(msg) = out.strip_prefix("ERROR:INVALID_XML:") {
                         err_json("INVALID_XML", msg)
                     } else {
@@ -2850,6 +2886,61 @@ pub async fn handle_iris_message_body(
 /// List the namespace's business rule sets, or describe one.
 /// `Ens.Rule.RuleSet` is the rule-set persistent class (upstream's research
 /// confirmed `EnsLib.Rules.Definition` does not exist).
+/// #146: read a rule's `RuleDefinition` XData straight from the class source.
+///
+/// `Ens_Rule.RuleSet` is only written when a rule is saved from the portal Rule
+/// Editor, so a rule that arrived the way this server MANDATES —
+/// `iris_doc(put)` + `iris_compile`, because `$SYSTEM.OBJ.Load` is forbidden —
+/// has no row, and `action=get` could not reach it at all. Every rule under
+/// source control is in that state.
+///
+/// Deliberately a plain Atelier GET, not `execute_via_generator`: that path
+/// PUTs and compiles a temp class, which would turn a read-only tool into a
+/// mutating one and change its `mutating_call` write-gate classification.
+async fn fetch_class_source(
+    iris: &IrisConnection,
+    namespace: &str,
+    class: &str,
+    client: &reqwest::Client,
+) -> Option<String> {
+    let url = iris.versioned_ns_url(
+        namespace,
+        &format!("/doc/{}", urlencoding::encode(&format!("{class}.cls"))),
+    );
+    let resp = client
+        .get(&url)
+        .basic_auth(&iris.username, Some(&iris.password))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body: serde_json::Value = resp.json().await.ok()?;
+    Some(crate::tools::doc::doc_content_to_string(&body))
+}
+
+/// The body of `XData <name> { ... }` from UDL class source, braces balanced.
+pub fn extract_xdata(source: &str, name: &str) -> Option<String> {
+    let needle = format!("XData {name}");
+    let start = source.find(&needle)?;
+    let open = source[start..].find('{')? + start;
+    let mut depth = 0i32;
+    for (idx, ch) in source[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(source[open + 1..open + idx].trim().to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 pub async fn handle_iris_business_rule_info(
     iris: Option<&IrisConnection>,
     params: &BusinessRuleInfoParams,
@@ -2979,15 +3070,34 @@ pub async fn handle_iris_business_rule_info(
                         .filter_map(|r| r["name"].as_str().map(|s| s.to_string()))
                         .collect();
                 if known.iter().any(|k| k == rule_name) {
-                    return err_json(
+                    // #146: the projection's absence is not the answer. Read the
+                    // RuleDefinition XData out of the compiled class instead — that is
+                    // where a source-controlled rule actually lives.
+                    if let Some(src) =
+                        fetch_class_source(iris, &params.namespace, rule_name, &client).await
+                    {
+                        if let Some(xdata) = extract_xdata(&src, "RuleDefinition") {
+                            return ok_json(serde_json::json!({
+                                "success": true,
+                                "namespace": params.namespace,
+                                "rule_name": rule_name,
+                                "rule_definition": xdata,
+                                "source": "class_xdata",
+                                "note": "Read from the class's RuleDefinition XData: this rule has no Ens_Rule.RuleSet row, which is normal for any rule deployed as a compiled class rather than saved from the portal Rule Editor.",
+                            }));
+                        }
+                    }
+                    return crate::tools::envelope::fail_with(
                         "RULE_NOT_PROJECTED",
                         &format!(
-                            "'{rule_name}' is a compiled Ens.Rule.Definition class in '{}', but it has no \
-                             Ens_Rule.RuleSet row — the rule-set projection is written when the rule is saved \
-                             from the Rule Editor. Read the class source with iris_doc to inspect its \
-                             RuleDefinition XData.",
+                            "'{rule_name}' is a compiled Ens.Rule.Definition class in '{}', but it has no Ens_Rule.RuleSet row and its RuleDefinition XData could not be read either.",
                             params.namespace
                         ),
+                        serde_json::json!({
+                            "rule_name": rule_name,
+                            "namespace": params.namespace,
+                            "hint": format!("Read the class source directly: iris_doc(mode=get, name='{rule_name}.cls')."),
+                        }),
                     );
                 }
                 return err_json(
@@ -3399,7 +3509,7 @@ mod tests {
         assert_valid_objectscript_lines(&code);
         assert!(code.contains(r#"table=""GeneroSOAP"""#), "quotes doubled");
         assert!(code.contains("$CHAR(10)"), "newlines spliced via $CHAR");
-        assert!(code.contains(r#"%Import(tFile,"GeneroSOAP","")"#));
+        assert!(code.contains(r#"%Import(tFile,"GeneroSOAP",.tCount)"#));
     }
 
     #[test]
@@ -4295,5 +4405,71 @@ mod interop_failure_tests {
         let f = classify_interop_failure("ERROR:something nobody has seen", None);
         assert_eq!(f.code, "INTEROP_ERROR");
         assert_eq!(f.message, "something nobody has seen");
+    }
+}
+
+#[cfg(test)]
+mod xdata_tests {
+    use super::extract_xdata;
+
+    const RULE: &str = r#"Class Demo.RUL.Route Extends Ens.Rule.Definition
+{
+
+Parameter RuleAssistClass = "EnsLib.MsgRouter.RuleAssist";
+
+XData RuleDefinition [ XMLNamespace = "http://www.intersystems.com/rule" ]
+{
+<ruleDefinition alias="" context="EnsLib.MsgRouter.RoutingEngine">
+<ruleSet name="Main">
+<rule name="ToOut">
+<when condition="1">
+<send transform="" target="Demo.BO.Out"/>
+</when>
+</rule>
+</ruleSet>
+</ruleDefinition>
+}
+
+}
+"#;
+
+    #[test]
+    fn the_rule_definition_body_comes_back_without_its_braces() {
+        let x = extract_xdata(RULE, "RuleDefinition").expect("found");
+        assert!(x.starts_with("<ruleDefinition"), "{x}");
+        assert!(x.ends_with("</ruleDefinition>"), "{x}");
+        assert!(!x.contains("XData"), "the header must not be included: {x}");
+    }
+
+    /// The XData header carries its own brackets and an XMLNamespace with a URL;
+    /// the block still has to open at the real `{`.
+    #[test]
+    fn a_bracketed_xdata_header_does_not_confuse_the_scan() {
+        let x = extract_xdata(RULE, "RuleDefinition").unwrap();
+        assert!(!x.contains("XMLNamespace"), "{x}");
+    }
+
+    #[test]
+    fn a_missing_xdata_is_none_not_an_empty_string() {
+        assert!(extract_xdata(RULE, "MessageMap").is_none());
+        assert!(extract_xdata(
+            "Class A.B Extends %RegisteredObject\n{\n}\n",
+            "RuleDefinition"
+        )
+        .is_none());
+    }
+
+    /// Braces nest inside real rule XML (conditions, expressions). Stopping at the
+    /// first `}` would truncate the definition and silently return half a rule.
+    #[test]
+    fn nested_braces_do_not_end_the_block_early() {
+        let src = "XData RuleDefinition\n{\n<a expr=\"{x}\"/>\n<b/>\n}\n";
+        let x = extract_xdata(src, "RuleDefinition").unwrap();
+        assert!(x.contains("<b/>"), "truncated at the nested brace: {x}");
+    }
+
+    #[test]
+    fn an_unterminated_block_is_none_rather_than_the_rest_of_the_file() {
+        assert!(extract_xdata("XData RuleDefinition\n{\n<a/>\n", "RuleDefinition").is_none());
     }
 }
