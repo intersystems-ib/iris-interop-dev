@@ -394,3 +394,66 @@ fn test_sc001_representative_patterns() {
         }
     }
 }
+
+// ── #145: the &sql contract includes SQLCODE and %ROWCOUNT ──────────────────
+//
+// Reproduced live on IRIS 2026.1 before the fix: the INSERT below COMMITTED and
+// the caller still saw `<UNDEFINED> ... SQLCODE`, because the rewrite ran the
+// statement and set neither variable. A caller reading that concluded the write
+// had failed when the row was already there.
+
+#[test]
+fn a_translated_dml_sets_sqlcode_and_rowcount() {
+    let r = translate_sql_macros("&sql(INSERT INTO T (A) VALUES ('x'))");
+    assert!(r.found);
+    assert!(
+        r.translated_code.contains("set SQLCODE="),
+        "SQLCODE must be set under its REAL name, or a same-line read still throws: {}",
+        r.translated_code
+    );
+    assert!(
+        r.translated_code.contains("%ROWCOUNT="),
+        "%ROWCOUNT is part of the same contract: {}",
+        r.translated_code
+    );
+}
+
+/// The reported shape exactly: the read is on the SAME line as the &sql, which
+/// the next-line rewrite never covered.
+#[test]
+fn sqlcode_is_readable_on_the_same_line_as_the_statement() {
+    let r = translate_sql_macros(
+        "&sql(INSERT INTO Ens_Util.LookupTable (TableName) VALUES ('P')) Write \"sqlcode=\",SQLCODE,!",
+    );
+    let code = &r.translated_code;
+    let set_at = code.find("set SQLCODE=").expect("SQLCODE assigned");
+    let read_at = code.find("Write").expect("the original read survives");
+    assert!(
+        set_at < read_at,
+        "the assignment has to precede the read or it is useless: {code}"
+    );
+}
+
+/// execute_via_generator maps submitted line N to RunUser+N. A multi-line
+/// expansion of a one-line DML would silently break every frame number the
+/// #124 work made trustworthy.
+#[test]
+fn translating_a_one_line_dml_stays_one_line() {
+    let r = translate_sql_macros("&sql(DELETE FROM T WHERE A=1)");
+    assert_eq!(
+        r.translated_code.lines().count(),
+        1,
+        "line count must survive translation: {}",
+        r.translated_code
+    );
+}
+
+#[test]
+fn a_successful_select_into_also_sets_sqlcode() {
+    let r = translate_sql_macros("&sql(SELECT A INTO :a FROM T WHERE B=1)");
+    assert!(
+        r.translated_code.contains("set SQLCODE="),
+        "the found branch left SQLCODE undefined too: {}",
+        r.translated_code
+    );
+}
