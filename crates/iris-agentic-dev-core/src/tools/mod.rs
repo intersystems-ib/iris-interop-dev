@@ -2648,6 +2648,21 @@ fn rank_near_misses(class_name: &str, candidates: &[String]) -> Vec<String> {
     scored.into_iter().take(5).map(|(_, c)| c.clone()).collect()
 }
 
+/// `%Foo` is ObjectScript shorthand for `%Library.Foo` (#157).
+///
+/// `%Dictionary.CompiledClass` stores only the expanded name, so a lookup by the abbreviation
+/// misses and the class reads as absent — `docs_introspect("%File")` answered CLASS_NOT_FOUND
+/// while `%Library.File` introspected 74 methods. Expanding up front cannot lose a match:
+/// verified on 2026.1 that NO stored class name begins with `%` and contains no `.`
+/// (0 rows), while `%Library.*` holds 212, so the bare form can only ever be the shorthand.
+///
+/// Returns `None` for anything already qualified, so `%Library.File` and `Ens.Director` are
+/// untouched.
+pub fn expand_percent_class(name: &str) -> Option<String> {
+    let rest = name.strip_prefix('%')?;
+    (!rest.is_empty() && !rest.contains('.')).then(|| format!("%Library.{rest}"))
+}
+
 pub const ERR_CLASS_NOT_FOUND: &str = "CLASS_NOT_FOUND";
 
 /// The #107 envelope. Kept out of `docs_introspect` so the message is testable without a
@@ -2657,12 +2672,20 @@ fn class_not_found_error(
     namespace: &str,
     candidates: &[String],
     in_package: usize,
+    requested: Option<&str>,
 ) -> Result<CallToolResult, McpError> {
     let mut extra = serde_json::json!({
         "class_name": class_name,
         "namespace": namespace,
         "classes_in_package": in_package,
     });
+    // #157: when the name was expanded, the caller asked about `%Foo` and is being told
+    // `%Library.Foo` is absent. Name both, or the answer is about a string they never sent.
+    if let Some(r) = requested {
+        extra["requested_class_name"] = serde_json::Value::String(r.to_string());
+        extra["resolved"] =
+            serde_json::Value::String(format!("'{r}' is shorthand for '{class_name}'"));
+    }
     let absent = format!(
         "Class '{class_name}' does not exist in namespace '{namespace}' — it is in neither \
          %Dictionary.CompiledClass nor %Dictionary.ClassDefinition. Nothing was introspected. \
@@ -5861,6 +5884,13 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
         let client = self.http_client();
         // Bug 15: use parameterized queries instead of manual string escaping.
         let namespace = interop::resolve_namespace(p.namespace.as_deref(), Some(&iris));
+        // #157: `%Foo` is shorthand for `%Library.Foo` and only the expanded name is stored,
+        // so the abbreviation reported CLASS_NOT_FOUND for a class that exists and then
+        // suggested the wrong package (`%File` -> `%FileMan.*`). Resolve before querying;
+        // `expand_percent_class` returns None for anything already qualified.
+        let class_name =
+            expand_percent_class(&p.class_name).unwrap_or_else(|| p.class_name.clone());
+        let expanded_from = (class_name != p.class_name).then(|| p.class_name.clone());
         // #102 P0: both queries used to end in `.unwrap_or_default()`, so ANY failure —
         // a namespace that does not exist, a wrong password, a 500 — became
         // `{"success":true,"methods":null,"properties":null}`. A class that genuinely has no
@@ -5879,19 +5909,19 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
         };
         let methods = match iris.query(
             &format!("SELECT Name,FormalSpec,ReturnType FROM %Dictionary.CompiledMethod WHERE parent=?{origin_filter} ORDER BY Name"),
-            vec![serde_json::Value::String(p.class_name.clone())],
+            vec![serde_json::Value::String(class_name.clone())],
             &namespace,
             client,
         ).await {
             Ok(v) => v,
             Err(e) => {
-                return introspect_failure(&iris, client, &namespace, &p.class_name, &e).await
+                return introspect_failure(&iris, client, &namespace, &class_name, &e).await
             }
         };
         let props = match iris
             .query(
                 &format!("SELECT Name,Type FROM %Dictionary.CompiledProperty WHERE parent=?{origin_filter} ORDER BY Name"),
-                vec![serde_json::Value::String(p.class_name.clone())],
+                vec![serde_json::Value::String(class_name.clone())],
                 &namespace,
                 client,
             )
@@ -5899,7 +5929,7 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
         {
             Ok(v) => v,
             Err(e) => {
-                return introspect_failure(&iris, client, &namespace, &p.class_name, &e).await
+                return introspect_failure(&iris, client, &namespace, &class_name, &e).await
             }
         };
         // #107: "no members" and "no such class" arrived in the same shape —
@@ -5912,15 +5942,16 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
         // the empty answer rather than inventing a second wrong fact.
         let empty = row_count(&methods) == 0 && row_count(&props) == 0;
         if empty {
-            match class_presence(&iris, client, &namespace, &p.class_name).await {
+            match class_presence(&iris, client, &namespace, &class_name).await {
                 ClassPresence::Absent => {
                     let (candidates, in_package) =
-                        near_miss_classes(&iris, client, &namespace, &p.class_name).await;
+                        near_miss_classes(&iris, client, &namespace, &class_name).await;
                     return class_not_found_error(
-                        &p.class_name,
+                        &class_name,
                         &namespace,
                         &candidates,
                         in_package,
+                        expanded_from.as_deref(),
                     );
                 }
                 ClassPresence::DefinedNotCompiled => {
@@ -5929,10 +5960,10 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                         &format!(
                             "Class '{}' exists in namespace '{}' but is not compiled, so it has \
                              no compiled methods or properties to introspect. Nothing was read.",
-                            p.class_name, namespace
+                            class_name, namespace
                         ),
                         serde_json::json!({
-                            "class_name": p.class_name,
+                            "class_name": class_name,
                             "namespace": namespace,
                             "hint": "Compile it first: iris_compile(target='<class>.cls'). \
                                      docs_introspect reads %Dictionary.CompiledMethod / \
@@ -5943,15 +5974,57 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                 ClassPresence::Compiled | ClassPresence::Undetermined => {}
             }
         }
-        let mut payload = serde_json::json!({"success": true, "class_name": p.class_name, "methods": methods["result"]["content"], "properties": props["result"]["content"], "include_inherited": p.include_inherited});
+        let mut payload = serde_json::json!({"success": true, "class_name": class_name, "methods": methods["result"]["content"], "properties": props["result"]["content"], "include_inherited": p.include_inherited});
+        if let Some(requested) = &expanded_from {
+            // #157: say that the name was expanded, or the caller cannot learn the rule.
+            payload["requested_class_name"] = serde_json::Value::String(requested.clone());
+            payload["resolved"] =
+                serde_json::Value::String(format!("'{requested}' is shorthand for '{class_name}'"));
+        }
         if !p.include_inherited {
-            // Say what was left out, or "no methods" reads as a fact about the class rather
-            // than about the filter.
-            payload["note"] = serde_json::Value::String(
-                "Declared members only — inherited members are omitted. Pass \
-                 include_inherited=true for the full surface."
-                    .into(),
-            );
+            // #156: the prose note below was PRESENT on all 32 empty responses in the eval
+            // corpus and IGNORED by 29 of them — an empty list with a sentence beside it is
+            // still an empty list to a model that does not read the sentence, and these
+            // agents pass include_inherited=false explicitly, so prose confirming their own
+            // choice does not prompt them to revisit it. Give the omission as a NUMBER.
+            // Counted only when the declared answer is empty, so a class with members pays
+            // nothing — the same rule #107 uses for its existence probe.
+            let mut inherited_omitted: Option<i64> = None;
+            if empty {
+                if let Ok(v) = iris
+                    .query(
+                        "SELECT COUNT(*) AS N FROM %Dictionary.CompiledMethod WHERE parent=? \
+                         UNION ALL \
+                         SELECT COUNT(*) AS N FROM %Dictionary.CompiledProperty WHERE parent=?",
+                        vec![
+                            serde_json::Value::String(class_name.clone()),
+                            serde_json::Value::String(class_name.clone()),
+                        ],
+                        &namespace,
+                        client,
+                    )
+                    .await
+                {
+                    let total: i64 = v["result"]["content"]
+                        .as_array()
+                        .map(|rows| rows.iter().filter_map(|r| r["N"].as_i64()).sum())
+                        .unwrap_or(0);
+                    inherited_omitted = Some(total);
+                }
+            }
+            payload["note"] = serde_json::Value::String(match inherited_omitted {
+                Some(n) if n > 0 => format!(
+                    "This class declares no members of its own. {n} inherited member(s) were \
+                     omitted — pass include_inherited=true to see them."
+                ),
+                Some(_) => "This class has no members at all, declared or inherited.".to_string(),
+                None => "Declared members only — inherited members are omitted. Pass \
+                         include_inherited=true for the full surface."
+                    .to_string(),
+            });
+            if let Some(n) = inherited_omitted {
+                payload["inherited_omitted"] = serde_json::json!(n);
+            }
         }
         ok_json(payload)
     }
@@ -9969,11 +10042,45 @@ mod near_miss_tests {
         );
     }
 
+    // ─── #157: %Foo is shorthand for %Library.Foo ───
+
+    /// The bare form can only ever be the shorthand: verified on 2026.1 that NO stored class
+    /// name starts with `%` and contains no `.` (0 rows) while `%Library.*` holds 212, so
+    /// expanding up front cannot lose a match.
+    #[test]
+    fn a_bare_percent_name_expands_to_the_library_package() {
+        assert_eq!(
+            expand_percent_class("%File").as_deref(),
+            Some("%Library.File")
+        );
+        assert_eq!(
+            expand_percent_class("%String").as_deref(),
+            Some("%Library.String")
+        );
+    }
+
+    /// An already-qualified name must pass through untouched, or `%Library.File` would
+    /// become `%Library.Library.File` and `%SYSTEM.OBJ` would be rewritten.
+    #[test]
+    fn an_already_qualified_percent_name_is_left_alone() {
+        for n in ["%Library.File", "%SYSTEM.OBJ", "%Dictionary.CompiledClass"] {
+            assert_eq!(expand_percent_class(n), None, "{n} must not be rewritten");
+        }
+    }
+
+    /// Nothing without a leading `%` is shorthand, and a lone `%` is not a class.
+    #[test]
+    fn a_non_percent_name_is_never_expanded() {
+        for n in ["Ens.Director", "Demo.BS.FileIn", "File", "%", ""] {
+            assert_eq!(expand_percent_class(n), None, "{n} must not be rewritten");
+        }
+    }
+
     /// The envelope must never read as "exists and is empty", with or without candidates.
     #[test]
     fn the_envelope_says_absent_not_empty() {
         for (candidates, in_package) in [(v(&[]), 0usize), (v(&["A.Bar"]), 4usize)] {
-            let r = class_not_found_error("A.Baz", "APP", &candidates, in_package).unwrap();
+            let r = class_not_found_error("A.Baz", "APP", &candidates, in_package, None).unwrap();
             let text = match &r.content[0].raw {
                 rmcp::model::RawContent::Text(t) => t.text.clone(),
                 _ => panic!("expected text"),
