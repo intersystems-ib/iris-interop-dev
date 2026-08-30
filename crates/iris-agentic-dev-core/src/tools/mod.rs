@@ -13703,6 +13703,39 @@ mod abort_tests {
         assert!(abort.starts_with("ERROR($ZERROR): <METHOD"), "{abort}");
     }
 
+    // ─── #159: verbatim captures from the eval corpus (opencode/deepseek cell) ───
+
+    /// Real stored output, whitespace exact. The abort is glued to the last row of a
+    /// namespace listing (`USER:1:0:`) with no newline, and the signal is `<COMMAND>` —
+    /// a class none of the hand-written fixtures covered.
+    #[test]
+    fn a_captured_command_abort_after_a_namespace_listing_is_detected() {
+        let out = "Nsp:Status:Remote:\n%SYS:1:0:\nAPP:1:0:\nHSCUSTOM:1:0:\nHSLIB:1:0:\n\
+                   HSSYS:1:0:\nHSSYSLOCALTEMP:1:0:\nUSER:1:0:ERROR: <COMMAND> 101 \
+                   RunUser+1^IrisDevTmp.Run2a3eda04018b.1 Function must return a value at \
+                   RunQuery+9^%Library.AbstractResultSet.1";
+        let abort = runtime_abort_line(out).expect("captured abort must be detected");
+        assert!(abort.starts_with("ERROR: <COMMAND>"), "{abort}");
+        assert!(
+            !abort.contains("USER:1:0:"),
+            "must not carry the listing: {abort}"
+        );
+    }
+
+    /// Real stored output. `<INVALID OREF>`, glued to `global=`, with an earlier line that
+    /// must not be mistaken for the abort.
+    #[test]
+    fn a_captured_invalid_oref_abort_is_detected() {
+        let out =
+            "ns=HSCUSTOM\nglobal=ERROR: <INVALID OREF> 192 RunUser+3^IrisDevTmp.Run39336ac9f214.1";
+        let abort = runtime_abort_line(out).expect("captured abort must be detected");
+        assert!(abort.starts_with("ERROR: <INVALID OREF>"), "{abort}");
+        assert!(
+            !abort.contains("global="),
+            "must not carry the prefix: {abort}"
+        );
+    }
+
     /// The wrapper's own non-`<signal>` failure must still be caught.
     #[test]
     fn the_capture_unavailable_sentinel_is_an_abort() {
