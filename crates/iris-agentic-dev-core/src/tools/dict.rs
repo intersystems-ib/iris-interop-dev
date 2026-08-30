@@ -98,8 +98,7 @@ pub async fn handle_resolve_dynamic_dispatch(
     let method_esc = os_str_expr(&p.method_name);
     let prefix_esc = os_str_expr(prefix);
 
-    // Build ObjectScript — use q=$CHAR(34) for embedded JSON quotes
-    let mut lines: Vec<String> = vec!["Set q=$CHAR(34)".into()];
+    let mut lines: Vec<String> = Vec::new();
     let mut sql = "SELECT m.parent, m.Origin, m.FormalSpec FROM %Dictionary.CompiledMethod m WHERE m.Name = ? AND m.Origin = m.parent".to_string();
     if has_prefix {
         sql.push_str(" AND m.parent %STARTSWITH ?");
@@ -121,12 +120,14 @@ pub async fn handle_resolve_dynamic_dispatch(
         ));
     }
     lines.push(r#"If rs.%SQLCODE<0 { Write "ERROR:"_rs.%Message,! Quit }"#.into());
-    lines.push(r#"Set out="[",sep="""#.into());
+    // #164: built by hand with $CHAR(34) and no escaping, so a FormalSpec carrying a `"` —
+    // an ordinary defaulted parameter like `pInput:%RegisteredObject=""` — broke the whole
+    // array. %DynamicArray makes escaping IRIS's problem.
+    lines.push("Set arr=[]".into());
     lines.push("While rs.%Next() {".into());
-    lines.push(r#"  Set out=out_sep_"{"_q_"class"_q_":"_q_rs.parent_q_","_q_"origin"_q_":"_q_rs.Origin_q_","_q_"formal_spec"_q_":"_q_rs.FormalSpec_q_"}""#.into());
-    lines.push(r#"  Set sep=",""#.into());
+    lines.push(r#"  Do arr.%Push({"class":(rs.parent),"origin":(rs.Origin),"formal_spec":(rs.FormalSpec)})"#.into());
     lines.push("}".into());
-    lines.push(r#"Write out_"]",!"#.into());
+    lines.push(r#"Write arr.%ToJSON(),!"#.into());
     let code = lines.join("\n");
 
     let output = match iris.execute_via_generator(&code, &namespace, client).await {
@@ -144,7 +145,24 @@ pub async fn handle_resolve_dynamic_dispatch(
         return err_json("QUERY_ERROR", msg.trim());
     }
 
-    let raw: serde_json::Value = serde_json::from_str(trimmed).unwrap_or(serde_json::json!([]));
+    // #164: this was `unwrap_or(json!([]))`, so a payload that failed to parse came back as
+    // a successful EMPTY answer — the caller told there are no candidates when the truth is
+    // the result could not be read. Same silent-wrong shape as #123, #143 and #153: a
+    // failure must never be answered with a negative fact.
+    let raw: serde_json::Value = match serde_json::from_str(trimmed) {
+        Ok(v) => v,
+        Err(e) => {
+            return err_json(
+                "MALFORMED_RESULT",
+                &format!(
+                    "IRIS returned a result for '{}' that is not valid JSON ({e}) — refusing \
+                     rather than reporting zero candidates. First 200 bytes: {}",
+                    p.method_name,
+                    trimmed.chars().take(200).collect::<String>()
+                ),
+            )
+        }
+    };
     let candidates = raw.as_array().cloned().unwrap_or_default();
     let n = candidates.len();
     let confidence = confidence_for_count(n);
@@ -308,17 +326,19 @@ pub async fn handle_find_subclass_implementations(
 
     let mut sorted = p.base_classes.clone();
     sorted.sort();
+    let limit = p.limit.unwrap_or(100);
+    // #164: `limit` was not in the key, so raising it returned the previous smaller answer
+    // unchanged — the cache ignored the one parameter the caller had changed.
     let cache_key = format!(
-        "find_subclass:{}:{}:{}",
+        "find_subclass:{}:{}:{}:{}",
         p.method_name,
         sorted.join(","),
-        namespace
+        namespace,
+        limit
     );
     if let Some(cached) = metadata_cache_get(cache, &cache_key) {
         return ok_json(cached);
     }
-
-    let limit = p.limit.unwrap_or(100);
     let expand_code = build_expand_hierarchy_code(&p.base_classes);
     // #101/#57: this `?`-ed an rmcp `internal_error` straight out of the handler, so a wrong
     // password left the tool surface entirely — raw JSON-RPC -32603 "hierarchy expansion
@@ -352,18 +372,20 @@ pub async fn handle_find_subclass_implementations(
         .collect::<Vec<_>>()
         .join("_");
 
-    let mut lines: Vec<String> = vec!["Set q=$CHAR(34)".into()];
+    let mut lines: Vec<String> = Vec::new();
     lines.push(format!("Set descList={}", desc_list));
     lines.push(format!(r#"Set rs=##class(%SQL.Statement).%ExecDirect(,"SELECT m.parent, m.FormalSpec FROM %Dictionary.CompiledMethod m WHERE m.Name = ? AND m.Origin = m.parent ORDER BY m.parent FETCH FIRST {} ROWS ONLY",{})"#, limit, method_esc));
     lines.push(r#"If rs.%SQLCODE<0 { Write "ERROR:"_rs.%Message,! Quit }"#.into());
-    lines.push(r#"Set out="[",sep="""#.into());
+    // #164: ONE row among 96 good ones — HS.HC.Audit.ConsolidationService, whose FormalSpec
+    // is `pInput:%RegisteredObject="",…` — made the hand-built array unparseable and the
+    // tool answered `success:true, implementation_count:0`. Escaping is IRIS's job.
+    lines.push("Set arr=[]".into());
     lines.push("While rs.%Next() {".into());
     lines.push(r#"  If $LISTFIND(descList,rs.parent) {"#.into());
-    lines.push(r#"    Set out=out_sep_"{"_q_"class"_q_":"_q_rs.parent_q_","_q_"formal_spec"_q_":"_q_rs.FormalSpec_q_"}""#.into());
-    lines.push(r#"    Set sep=",""#.into());
+    lines.push(r#"    Do arr.%Push({"class":(rs.parent),"formal_spec":(rs.FormalSpec)})"#.into());
     lines.push("  }".into());
     lines.push("}".into());
-    lines.push(r#"Write out_"]",!"#.into());
+    lines.push(r#"Write arr.%ToJSON(),!"#.into());
     let code = lines.join("\n");
 
     let output = match iris.execute_via_generator(&code, &namespace, client).await {
@@ -375,7 +397,24 @@ pub async fn handle_find_subclass_implementations(
     if let Some(msg) = trimmed.strip_prefix("ERROR:") {
         return err_json("QUERY_ERROR", msg.trim());
     }
-    let raw: serde_json::Value = serde_json::from_str(trimmed).unwrap_or(serde_json::json!([]));
+    // #164: this was `unwrap_or(json!([]))`, so a payload that failed to parse came back as
+    // a successful EMPTY answer — the caller told there are no implementations when the truth is
+    // the result could not be read. Same silent-wrong shape as #123, #143 and #153: a
+    // failure must never be answered with a negative fact.
+    let raw: serde_json::Value = match serde_json::from_str(trimmed) {
+        Ok(v) => v,
+        Err(e) => {
+            return err_json(
+                "MALFORMED_RESULT",
+                &format!(
+                    "IRIS returned a result for '{}' that is not valid JSON ({e}) — refusing \
+                     rather than reporting zero implementations. First 200 bytes: {}",
+                    p.method_name,
+                    trimmed.chars().take(200).collect::<String>()
+                ),
+            )
+        }
+    };
     let impls = raw.as_array().cloned().unwrap_or_default();
     let n = impls.len();
     let confidence = confidence_for_count(n);
@@ -701,5 +740,47 @@ mod tests {
         let code = build_expand_hierarchy_code(&["Ens.BusinessProcess".to_string()]);
         assert!(code.contains("Ens.BusinessProcess"));
         assert!(code.contains("LIKE"));
+    }
+
+    // ─── #164: the payload must be built by IRIS, not concatenated by hand ───
+
+    /// One row whose FormalSpec carried a `"` — an ordinary defaulted parameter,
+    /// `pInput:%RegisteredObject=""` — made the hand-built array unparseable, and the tool
+    /// answered `success:true, implementation_count:0` for 96 real implementations.
+    /// Escaping is IRIS's job: %DynamicArray + %ToJSON.
+    #[test]
+    fn no_json_object_in_this_file_is_concatenated_by_hand() {
+        // Scope to the handlers: `include_str!` also reads this test's own literals below,
+        // which would make the guard match itself and fail for the wrong reason.
+        let src = include_str!("dict.rs")
+            .split("mod tests")
+            .next()
+            .expect("handlers precede the test module");
+        for frag in [
+            r#"_q_"class"_q_":"_q_"#,
+            r#"_q_"formal_spec"_q_":"_q_"#,
+            r#"_q_"origin"_q_":"_q_"#,
+        ] {
+            assert!(
+                !src.contains(frag),
+                "a JSON object is being concatenated by hand ({frag}); \
+                 use %DynamicArray/%ToJSON so IRIS escapes the values"
+            );
+        }
+    }
+
+    /// A payload that will not parse is a TOOL FAILURE. `unwrap_or(json!([]))` reported it
+    /// as a successful empty answer — the silent-wrong shape of #123, #143 and #153.
+    #[test]
+    fn a_result_that_cannot_be_parsed_is_never_reported_as_empty() {
+        let src = include_str!("dict.rs");
+        let handler_src = src
+            .split("mod tests")
+            .next()
+            .expect("handlers precede the test module");
+        assert!(
+            !handler_src.contains("from_str(trimmed).unwrap_or(serde_json::json!([]))"),
+            "a parse failure must return MALFORMED_RESULT, not an empty result set"
+        );
     }
 }
