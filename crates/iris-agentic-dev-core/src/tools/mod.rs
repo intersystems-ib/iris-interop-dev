@@ -13665,6 +13665,14 @@ mod abort_tests {
     }
 
     /// The reported error must be the abort, not the script's output with the abort glued on.
+    ///
+    /// PROVENANCE: this string is a REAL captured payload from the eval corpus, not a
+    /// constructed one, and `<OBJECT DISPATCH>` has no live reproduction here — the obvious
+    /// attempt (dispatching a missing method on a %DynamicObject) yields
+    /// `<METHOD DOES NOT EXIST>` on 2026.1 instead. So this test is the only record that the
+    /// `<OBJECT DISPATCH>` form occurs in the wild. Do not "simplify" it to a signal that is
+    /// easier to reproduce: the point is that the detector is signal-agnostic, and this is
+    /// the observed evidence for a class that a repro cannot currently produce.
     #[test]
     fn the_reported_abort_drops_the_scripts_own_output() {
         let out = "PatientId=[ERROR: <OBJECT DISPATCH> 230 RunUser+9^IrisDevTmp.Runb2.1";
