@@ -2162,11 +2162,9 @@ pub fn build_test_run_from_sql(suites: &[SuiteRow], methods: &[MethodRow]) -> se
             "tests_passed": false,
             "error_code": ERR_NO_TESTS_FOUND,
             "error": "Pattern matched no test classes",
-            "total": 0,
-            "passed": 0,
-            "failed": 0,
-            "errors": 0,
-            "skipped": 0,
+            // #166: no zeroed counters on a failure. `success:false` + `completed:false` +
+            // `outcome:"no_tests"` already say what happened; `failed: 0` beside them reads
+            // as a passing run to anything checking the count rather than the code.
         });
     }
 
@@ -4816,9 +4814,10 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                             "test_methods": shape.own_test_methods,
                             "pattern": p.pattern,
                             "namespace": namespace,
-                            "total": 0,
-                            "passed": 0,
-                            "failed": 0,
+                            // #166: no `total`/`passed`/`failed` here. A failure envelope must
+                            // not carry counters describing a run that did not happen — `failed: 0`
+                            // is exactly the field a naive green-check reaches for, and it reads
+                            // as a passing run. `success:false` + `error_code` is the contract.
                             "path": path_label,
                         }),
                     );
@@ -4876,9 +4875,8 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                     "more_candidates_than_listed": more_than_listed,
                     "pattern": p.pattern,
                     "namespace": namespace,
-                    "total": 0,
-                    "passed": 0,
-                    "failed": 0,
+                    // #166: see the NO_RUNNABLE_TESTS envelope above — a failure must not be
+                    // shaped like a zeroed scoreboard.
                     "path": path_label,
                     "source": "stdout_parse",
                 }),
@@ -13846,5 +13844,28 @@ mod abort_tests {
         assert_eq!(f.signal, "SYNTAX");
         assert_eq!(f.line, Some(1));
         assert_eq!(f.class, None);
+    }
+
+    // ─── #166: a failure envelope must not be shaped like a zeroed scoreboard ───
+
+    /// `failed: 0` beside `success: false` is exactly what a naive green-check reaches for.
+    /// The skills plugin's `tdd_first_green.py` was safe only by the accident of keying on
+    /// `success`/`outcome` instead. Same family as #123, #143, #153 and #164: a failure must
+    /// never be answered with a negative FACT.
+    #[test]
+    fn no_failure_envelope_carries_a_zeroed_counter() {
+        let src = include_str!("mod.rs");
+        // Scope to the handlers — `include_str!` also reads this test's own literals.
+        let handlers = src
+            .split("mod tests")
+            .next()
+            .expect("handlers precede the test module");
+        for frag in ["\"total\": 0,", "\"passed\": 0,", "\"failed\": 0,"] {
+            assert!(
+                !handlers.contains(frag),
+                "a zeroed counter ({frag}) is being emitted; a failure envelope must carry \
+                 the cause, not a scoreboard describing a run that did not happen"
+            );
+        }
     }
 }

@@ -120,8 +120,16 @@ fn test_build_test_run_one_failure() {
 #[test]
 fn test_build_test_run_empty_no_tests_found() {
     let result = build_test_run_from_sql(&[], &[]);
-    assert_eq!(result["total"], 0);
     assert_eq!(result["error_code"], "NO_TESTS_FOUND");
+    assert_eq!(result["success"], false);
+    // #166: the counters must be ABSENT, not zero. `failed: 0` on a failure envelope reads
+    // as a passing run to anything that checks the count instead of the code.
+    for k in ["total", "passed", "failed", "errors", "skipped"] {
+        assert!(
+            result.get(k).is_none(),
+            "failure envelope must not carry `{k}`: {result}"
+        );
+    }
 }
 
 // ── T032: US3 — error vs failed distinction ──────────────────────────────────
