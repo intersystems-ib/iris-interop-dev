@@ -3226,6 +3226,15 @@ pub struct IrisTools {
     pub metadata_cache: Arc<dict::MetadataCache>,
     /// Active toolset — controls which tools are registered.
     pub toolset: Toolset,
+    /// #169: monotonic write-gate latch. Once the gate has been observed CLOSED it stays
+    /// closed for the life of the process. A hot-reload may still NARROW the gate — that is
+    /// exactly what #114 built it for — but it can never widen one that has shut, because the
+    /// value the gate is inferred from (the namespace, via `is_write_allowed`) is read from a
+    /// config file that lives inside the caller's own workspace. Without the latch a caller
+    /// refused a write can rewrite `namespace` to something that does not look like production
+    /// and retry, which was reproducible on 0.13.0. Reopening now needs a restart, where an
+    /// operator is present.
+    write_gate_latched: Arc<std::sync::atomic::AtomicBool>,
     /// The PRUNED router. Both `list_tools` and `call_tool` read this one — see the
     /// `#[tool_handler(router = ...)]` note on the ServerHandler impl.
     tool_router: ToolRouter<IrisTools>,
@@ -3617,6 +3626,7 @@ impl IrisTools {
             ))),
             metadata_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             toolset,
+            write_gate_latched: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tool_router: router,
         })
     }
@@ -3711,7 +3721,15 @@ impl IrisTools {
     /// Public so a test can assert the CONNECTION is read-only without inferring it from
     /// which tools are listed — #114 stopped the gate expressing itself in the listing.
     pub fn write_tools_enabled(&self) -> bool {
-        self.connection.lock().unwrap().write_tools_enabled
+        let (stored, iris) = {
+            let c = self.connection.lock().unwrap();
+            (c.write_tools_enabled, c.iris.clone())
+        };
+        // #169: report what is ENFORCED, latch included, not the value cached at swap time.
+        match iris.as_deref() {
+            Some(c) => self.write_gate_open(c),
+            None => stored,
+        }
     }
 
     /// Returns the active connection as Option<Arc>, for interop helpers that take Option<&IrisConnection>.
@@ -5533,7 +5551,6 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
         }
 
         let version = new_conn.version.clone();
-        let write_tools_enabled = new_conn.is_write_allowed();
 
         // Atomically swap the active connection (fixes issue #11).
         let new_state =
@@ -5542,6 +5559,9 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
             let mut conn = self.connection.lock().unwrap();
             *conn = new_state;
         }
+        // #169: read the gate AFTER the swap and through the latch, so switching containers
+        // cannot report a gate that a later write would not actually get.
+        let write_tools_enabled = self.write_tools_enabled();
 
         tracing::info!(container = %p.name, "iris-agentic-dev: switched connection via iris_select_container");
 
@@ -5558,7 +5578,7 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
     }
 
     #[tool(
-        description = "Return the active IRIS connection state + this MCP server's own version. It only reports the cached connection snapshot (no IRIS network call), so it ALWAYS succeeds — when IRIS is down it returns connected:false / connection_source:disconnected instead of erroring with IRIS_UNREACHABLE. That is the point: it's the one tool you can call to DIAGNOSE an unreachable IRIS (read the `connected` field) without the call itself failing — unlike iris_query/iris_execute/etc., which do return IRIS_UNREACHABLE. If those tools instead return IRIS_AUTH_FAILED (HTTP 401) or IRIS_FORBIDDEN (HTTP 403), IRIS is REACHABLE and the credentials are the problem: read `auth_ok` and `probe_status` here — auth_ok:false means IRIS rejected IRIS_USERNAME/IRIS_PASSWORD (401) or refused this user the %Development privilege (403), and `connected` is false for that reason, not a network one. Also use to: verify hot-reload completed; confirm which container/host is active; validate the loaded MCP build (mcp_version). To switch connection mid-session without restart: call check_config first to get config_watch_path, then write a .iris-agentic-dev.toml to that exact path, then call any tool — the reload fires automatically. Fields: mcp_version, toolset, connected, auth_ok, probe_status, connection_source (http|docker|disconnected), host, port, namespace, container, config_file, config_watch_path, config_loaded_at, iris_version, write_tools_enabled."
+        description = "Return the active IRIS connection state + this MCP server's own version. It only reports the cached connection snapshot (no IRIS network call), so it ALWAYS succeeds — when IRIS is down it returns connected:false / connection_source:disconnected instead of erroring with IRIS_UNREACHABLE. That is the point: it's the one tool you can call to DIAGNOSE an unreachable IRIS (read the `connected` field) without the call itself failing — unlike iris_query/iris_execute/etc., which do return IRIS_UNREACHABLE. If those tools instead return IRIS_AUTH_FAILED (HTTP 401) or IRIS_FORBIDDEN (HTTP 403), IRIS is REACHABLE and the credentials are the problem: read `auth_ok` and `probe_status` here — auth_ok:false means IRIS rejected IRIS_USERNAME/IRIS_PASSWORD (401) or refused this user the %Development privilege (403), and `connected` is false for that reason, not a network one. Also use to: verify hot-reload completed; confirm which container/host is active; validate the loaded MCP build (mcp_version). Hot-reload is operator-driven: an edit to the .iris-agentic-dev.toml at config_watch_path is picked up on the next tool call, and config_loaded_at moves when it happens. A reload can only NARROW the write gate — once write_tools_enabled has gone false it stays false until the server restarts (write_gate_latched reports that), so a reload cannot reopen writes. Fields: mcp_version, toolset, connected, auth_ok, probe_status, connection_source (http|docker|disconnected), host, port, namespace, container, config_file, config_watch_path, config_loaded_at, iris_version, write_tools_enabled, write_gate_latched."
     )]
     async fn check_config(
         &self,
@@ -5677,7 +5697,12 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
             "config_file": config_file,
             "config_loaded_at": config_loaded_at,
             "iris_version": iris_version,
-            "write_tools_enabled": conn.write_tools_enabled,
+            "write_tools_enabled": conn
+                .iris
+                .as_deref()
+                .map(|c| self.write_gate_open(c))
+                .unwrap_or(conn.write_tools_enabled),
+            "write_gate_latched": self.write_gate_is_latched(),
             "config_watch_path": config_watcher_path,
             // The MCP server's OWN version + active toolset, so the loaded build can be validated
             // from a tool call (the serverInfo version shown by Claude Code's /mcp is the same value).
@@ -7855,10 +7880,17 @@ impl ServerHandler for IrisTools {
 
 impl IrisTools {
     /// #114: a mutation refused because the connection is not write-allowed. Says what it
-    /// would have changed and how to allow it — the escape hatch is deliberately named,
-    /// because a false positive on a development instance must be a five-second fix and not
-    /// a mystery. Reads are never refused, so reaching this means a write was attempted.
+    /// would have changed. Reads are never refused, so reaching this means a write was
+    /// attempted.
+    ///
+    /// #169: the escape hatch used to be named here, on the reasoning that a false positive
+    /// on a development instance must be a five-second fix and not a mystery. That reasoning
+    /// holds for an operator and fails for the reader this envelope actually has: the model,
+    /// which is the party the gate exists to constrain. A denial that names the setting that
+    /// lifts it is an instruction to lift it. The remediation now goes to stderr, where the
+    /// operator reads it and the caller does not.
     fn write_gated_error(&self, tool: &str, action: &str) -> McpError {
+        let latched = self.write_gate_is_latched();
         let (mode, namespace) = {
             let c = self.connection.lock().unwrap();
             match c.iris.as_ref() {
@@ -7866,12 +7898,21 @@ impl IrisTools {
                 None => ("Unknown".to_string(), String::new()),
             }
         };
+        // Operator-facing remediation, deliberately NOT in the envelope (#169).
+        tracing::warn!(
+            tool = %tool,
+            mode = %mode,
+            namespace = %namespace,
+            latched = latched,
+            "iris-agentic-dev: write refused by the gate. If writing to this instance is \
+             intended, set IRIS_ALLOW_PROD=1 and restart the server. A gate that has closed \
+             once stays closed until restart."
+        );
         McpError::invalid_params(
             format!(
                 "'{tool}' would {action} on a connection that is not write-allowed \
                  (system mode {mode}, namespace '{namespace}'), so it was not called. \
-                 Reads are never blocked — the read actions of this tool still work. \
-                 Set IRIS_ALLOW_PROD=1 if writing to this instance is intended."
+                 Reads are never blocked — the read actions of this tool still work."
             ),
             Some(serde_json::json!({
                 "error_code": "WRITE_GATED",
@@ -7879,22 +7920,38 @@ impl IrisTools {
                 "would": action,
                 "system_mode": mode,
                 "namespace": namespace,
-                "allow_with": "IRIS_ALLOW_PROD=1",
             })),
         )
     }
 
-    /// There IS a connection and it is not write-allowed — a Live system mode, or a
-    /// production-looking namespace without IRIS_ALLOW_PROD. Disconnected is deliberately
-    /// NOT this: those calls fail with IRIS_UNREACHABLE anyway, and reporting them as
-    /// write-gated would name the wrong problem.
+    /// The write gate as ENFORCED, after the #169 latch.
+    ///
+    /// Evaluating it is what arms the latch: any observation of a closed gate closes it for
+    /// good. Reporting has to go through here too — `check_config` promising a gate the
+    /// enforcement path does not honour is the failure mode upstream shipped as their #110,
+    /// where the flag read `false` while every write still landed.
+    fn write_gate_open(&self, c: &IrisConnection) -> bool {
+        use std::sync::atomic::Ordering;
+        if !c.is_write_allowed() {
+            self.write_gate_latched.store(true, Ordering::Relaxed);
+            return false;
+        }
+        !self.write_gate_latched.load(Ordering::Relaxed)
+    }
+
+    /// True once the gate has ever been observed closed in this process (#169).
+    fn write_gate_is_latched(&self) -> bool {
+        self.write_gate_latched
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// There IS a connection and it is not write-allowed — a Live system mode, a
+    /// production-looking namespace without IRIS_ALLOW_PROD, or the #169 latch. Disconnected
+    /// is deliberately NOT this: those calls fail with IRIS_UNREACHABLE anyway, and reporting
+    /// them as write-gated would name the wrong problem.
     fn connected_but_read_only(&self) -> bool {
-        self.connection
-            .lock()
-            .unwrap()
-            .iris
-            .as_ref()
-            .is_some_and(|c| !c.is_write_allowed())
+        let iris = { self.connection.lock().unwrap().iris.clone() };
+        iris.as_deref().is_some_and(|c| !self.write_gate_open(c))
     }
 
     /// Explain why `name` did not dispatch. See `call_tool` for why this exists.

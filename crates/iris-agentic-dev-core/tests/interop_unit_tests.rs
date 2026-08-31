@@ -1,6 +1,8 @@
 use iris_agentic_dev_core::iris::connection::{DiscoverySource, IrisConnection, SystemMode};
 use iris_agentic_dev_core::tools::interop::*;
-use iris_agentic_dev_core::tools::{IrisTools, Toolset};
+use iris_agentic_dev_core::tools::{
+    ConnectionSource, ConnectionState, IrisTools, Toolset,
+};
 
 fn rt() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
@@ -410,6 +412,112 @@ mod env_guard {
         let names = tools.registered_tool_names();
         assert!(names.contains("iris_credential_manage"));
         assert!(names.contains("iris_production_item"));
+    }
+
+    /// #169: a hot-reload must never REOPEN a write gate that has closed.
+    ///
+    /// The gate is inferred from `system_mode` and the namespace, and both arrive from a
+    /// `.iris-agentic-dev.toml` that sits inside the caller's own workspace. Before the latch,
+    /// a caller refused a write could rewrite `namespace` to something that does not look like
+    /// production and retry; the identical call then reached IRIS. Reproduced on 0.13.0, where
+    /// the refused `iris_doc put` went from `WRITE_GATED` to an IRIS `HTTP 404` — the request
+    /// left the process, which is what proves the gate was gone rather than merely reported
+    /// differently.
+    #[test]
+    fn a_reload_cannot_reopen_a_write_gate_that_has_closed() {
+        std::env::remove_var("IRIS_ALLOW_PROD");
+        let tools =
+            IrisTools::new_with_toolset(Some(conn_with_mode(SystemMode::Live)), Toolset::Merged)
+                .unwrap();
+        assert!(
+            !tools.write_tools_enabled(),
+            "precondition: a Live connection is not write-allowed"
+        );
+
+        // The escalation: swap in a connection the gate WOULD allow, exactly as a reload of a
+        // rewritten config does.
+        {
+            let mut conn = tools.connection.lock().unwrap();
+            *conn = ConnectionState::from_iris(
+                conn_with_mode(SystemMode::Development),
+                ConnectionSource::ConfigFile,
+                None,
+            );
+        }
+
+        assert!(
+            !tools.write_tools_enabled(),
+            "a gate that has closed once must stay closed until restart — a config the caller \
+             can write must not be able to reopen it"
+        );
+    }
+
+    /// The latch must not fire on its own: a gate that never closed stays open across reloads,
+    /// or every long session would drift shut for no reason.
+    #[test]
+    fn a_gate_that_never_closed_stays_open_across_a_reload() {
+        std::env::remove_var("IRIS_ALLOW_PROD");
+        let tools = IrisTools::new_with_toolset(
+            Some(conn_with_mode(SystemMode::Development)),
+            Toolset::Merged,
+        )
+        .unwrap();
+        assert!(tools.write_tools_enabled());
+
+        {
+            let mut conn = tools.connection.lock().unwrap();
+            *conn = ConnectionState::from_iris(
+                conn_with_mode(SystemMode::Test),
+                ConnectionSource::ConfigFile,
+                None,
+            );
+        }
+
+        assert!(
+            tools.write_tools_enabled(),
+            "the latch arms only on an observed CLOSED gate, never on a reload by itself"
+        );
+    }
+
+    /// NARROWING is what #114 built the per-call gate for, and #169 must not cost it.
+    #[test]
+    fn a_reload_onto_a_live_instance_still_closes_the_gate() {
+        std::env::remove_var("IRIS_ALLOW_PROD");
+        let tools = IrisTools::new_with_toolset(
+            Some(conn_with_mode(SystemMode::Development)),
+            Toolset::Merged,
+        )
+        .unwrap();
+        assert!(tools.write_tools_enabled());
+
+        {
+            let mut conn = tools.connection.lock().unwrap();
+            *conn = ConnectionState::from_iris(
+                conn_with_mode(SystemMode::Live),
+                ConnectionSource::ConfigFile,
+                None,
+            );
+        }
+
+        assert!(
+            !tools.write_tools_enabled(),
+            "a reload onto a Live instance must still close the gate"
+        );
+    }
+
+    /// #169: the denial must not hand the model the setting that lifts it.
+    ///
+    /// The remediation belongs on stderr, where the operator reads it. This guards the
+    /// structured field specifically — the prose is checked by reading, the field by CI.
+    #[test]
+    fn the_write_gate_denial_does_not_name_its_own_bypass() {
+        let src = include_str!("../src/tools/mod.rs");
+        assert!(
+            !src.contains("allow_with"),
+            "the WRITE_GATED envelope must not carry an `allow_with` field — a denial that \
+             names the setting that lifts it is an instruction to lift it, and the reader of \
+             this envelope is the party the gate exists to constrain"
+        );
     }
 }
 
