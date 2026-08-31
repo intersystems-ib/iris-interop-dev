@@ -6821,7 +6821,7 @@ Methods:
     }
 
     #[tool(
-        description = "Find all concrete subclass implementations of a method in the full inheritance hierarchy. Given base class names and a method name, expands to all descendants at any depth and returns classes where the method is defined (Origin = parent, not inherited). Use to resolve polymorphic dispatch: adapter.Execute() → find all EnsLib.*.Adapter subclasses that implement Execute. Results cached 60s per session."
+        description = "Find all concrete subclass implementations of a method in the full inheritance hierarchy. Given base class names and a method name, expands to all descendants at any depth and returns classes where the method is defined (Origin = parent, not inherited). Answers the structural question the other introspection tools cannot: WHICH CLASSES DEFINE a method rather than inherit it, across descendants you have not enumerated. docs_introspect takes one class you must already know the name of; iris_symbols will not walk a hierarchy; neither distinguishes a definition from an inherited copy. Example: adapter.Execute() → every EnsLib.*.Adapter subclass that implements Execute. Results cached 60s per session."
     )]
     async fn find_subclass_implementations(
         &self,
