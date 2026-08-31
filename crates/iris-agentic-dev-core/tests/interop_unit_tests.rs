@@ -1,8 +1,6 @@
 use iris_agentic_dev_core::iris::connection::{DiscoverySource, IrisConnection, SystemMode};
 use iris_agentic_dev_core::tools::interop::*;
-use iris_agentic_dev_core::tools::{
-    ConnectionSource, ConnectionState, IrisTools, Toolset,
-};
+use iris_agentic_dev_core::tools::{ConnectionSource, ConnectionState, IrisTools, Toolset};
 
 fn rt() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
