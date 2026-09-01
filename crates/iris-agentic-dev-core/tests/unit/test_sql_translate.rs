@@ -116,22 +116,93 @@ fn test_delete_dml() {
     assert!(r.translated_code.contains("DELETE FROM MyApp.Foo"));
 }
 
-// ── T012: SQLCODE on next line rewritten ──────────────────────────────────────
+// ── T012: SQLCODE on the next line survives verbatim (#177) ──────────────────
 
+/// This test used to assert the DEFECT: that `if SQLCODE` was rewritten to a generated
+/// `sqlSQLCODE{n}`. Once #145 moved the producer to the real `SQLCODE`, that rewrite
+/// renamed the caller's read to a variable nothing sets, and every `&sql(...)` followed
+/// by `If SQLCODE` threw `<UNDEFINED>`. The assertions passed through #145 untouched
+/// because #145 only ADDED assertions about the producer and never asked whether the
+/// existing ones still described a contract we wanted.
 #[test]
-fn test_sqlcode_next_line_rewritten() {
+fn test_sqlcode_next_line_is_not_renamed() {
     let code =
         "&sql(SELECT Name INTO :name FROM foo WHERE ID = :id)\nif SQLCODE { write \"err\",! }";
     let r = translate_sql_macros(code);
     assert!(r.found);
-    // The SQLCODE on the NEXT line should be rewritten
     assert!(
-        !r.translated_code.contains("\nif SQLCODE"),
-        "bare SQLCODE on next line should be rewritten"
+        r.translated_code.contains("\nif SQLCODE"),
+        "the caller's SQLCODE read must survive verbatim: {}",
+        r.translated_code
     );
     assert!(
-        r.translated_code.contains("sqlSQLCODE"),
-        "should contain generated SQLCODE var"
+        !r.translated_code.contains("sqlSQLCODE"),
+        "no generated SQLCODE variable may appear — nothing sets one: {}",
+        r.translated_code
+    );
+    assert!(
+        r.translated_code.contains("set SQLCODE="),
+        "the epilogue must still set SQLCODE under its real name: {}",
+        r.translated_code
+    );
+}
+
+/// The regression that would have caught #177: a SELECT INTO that FINDS a row and then
+/// reads SQLCODE. The old code set the generated variable in the `else` branch ONLY, so
+/// the failure was inverted — the statement threw precisely when the query SUCCEEDED.
+#[test]
+fn test_select_into_found_branch_leaves_sqlcode_readable() {
+    let r = translate_sql_macros(
+        "&sql(SELECT Name INTO :name FROM foo WHERE ID = 1)\nwrite SQLCODE, !",
+    );
+    let found_branch = r
+        .translated_code
+        .split(" } else {")
+        .next()
+        .expect("if/else emitted");
+    assert!(
+        !found_branch.contains("sqlSQLCODE"),
+        "the found branch must not depend on a generated name: {found_branch}"
+    );
+    assert!(
+        r.translated_code.contains("write SQLCODE, !"),
+        "the read must be left alone: {}",
+        r.translated_code
+    );
+}
+
+/// #177: `%msg` is set by the epilogue under its real name too, so it needs no rewrite.
+#[test]
+fn test_msg_is_set_under_its_real_name() {
+    let r = translate_sql_macros("&sql(SELECT Name INTO :n FROM foo)\nwrite %msg,!");
+    assert!(
+        r.translated_code.contains("%msg="),
+        "epilogue must set %msg: {}",
+        r.translated_code
+    );
+    assert!(
+        r.translated_code.contains("write %msg,!"),
+        "the caller's %msg read must survive verbatim: {}",
+        r.translated_code
+    );
+}
+
+/// #179: a SELECT with no INTO binds nothing, so every column read afterwards is
+/// <UNDEFINED>. Emitting that silently is worse than refusing.
+#[test]
+fn test_select_without_into_warns_that_nothing_is_bound() {
+    let r = translate_sql_macros("&sql(SELECT ID, Name FROM Ens_Config.Production)");
+    assert!(r.found);
+    assert!(
+        r.warnings.iter().any(|w| w.contains("no INTO clause")),
+        "expected an unbound-host-variable warning, got {:?}",
+        r.warnings
+    );
+    let with_into = translate_sql_macros("&sql(SELECT Name INTO :n FROM foo)");
+    assert!(
+        !with_into.warnings.iter().any(|w| w.contains("no INTO")),
+        "a SELECT INTO must not warn: {:?}",
+        with_into.warnings
     );
 }
 
@@ -150,20 +221,26 @@ fn test_sqlcode_elsewhere_not_rewritten() {
     );
 }
 
-// ── T013: %msg on next line rewritten ────────────────────────────────────────
+// ── T013: %msg is set, not rewritten (#177) ──────────────────────────────────
 
+/// The sibling of T012, and it had the same defect for the same reason: the rewrite
+/// pointed the caller's `%msg` at `{rs}.%Message`, which works only on the ONE line
+/// immediately after the macro. The epilogue now sets `%msg` itself, so a read works
+/// wherever it appears.
 #[test]
-fn test_msg_next_line_rewritten() {
+fn test_msg_next_line_is_not_rewritten() {
     let code = "&sql(SELECT Name INTO :name FROM foo WHERE ID = :id)\nwrite %msg,!";
     let r = translate_sql_macros(code);
     assert!(r.found);
     assert!(
-        !r.translated_code.contains("\nwrite %msg"),
-        "%msg on next line should be rewritten"
+        r.translated_code.contains("\nwrite %msg,!"),
+        "the caller's %msg read must survive verbatim: {}",
+        r.translated_code
     );
     assert!(
-        r.translated_code.contains(".%Message") || r.translated_code.contains("_sqlMsg"),
-        "should reference result set message"
+        r.translated_code.contains("%msg=$Select("),
+        "the epilogue must set %msg: {}",
+        r.translated_code
     );
 }
 
@@ -312,7 +389,7 @@ fn test_sc001_representative_patterns() {
         ("&sql(UPDATE foo SET Name = :n WHERE ID = :id)", "execDirect"),
         // DELETE
         ("&sql(DELETE FROM foo WHERE ID = :id)", "execDirect"),
-        // SQLCODE next line
+        // SQLCODE next line (#177: set under its real name, never renamed)
         ("&sql(SELECT Name INTO :n FROM foo WHERE 1=1)\nif SQLCODE { }", "rewrite_sqlcode"),
         // %msg next line
         ("&sql(SELECT Name INTO :n FROM foo WHERE 1=1)\nwrite %msg,!", "rewrite_msg"),
@@ -346,17 +423,18 @@ fn test_sc001_representative_patterns() {
             }
             "rewrite_sqlcode" => {
                 assert!(r.found);
+                // #177: the read is left alone and the epilogue defines the name.
                 assert!(
-                    r.translated_code.contains("sqlSQLCODE")
-                        || !r.translated_code.contains("\nif SQLCODE"),
-                    "SQLCODE should be rewritten for: {code}"
+                    !r.translated_code.contains("sqlSQLCODE")
+                        && r.translated_code.contains("set SQLCODE="),
+                    "SQLCODE must be set, not renamed, for: {code}"
                 );
             }
             "rewrite_msg" => {
                 assert!(r.found);
                 assert!(
-                    !r.translated_code.contains("\nwrite %msg"),
-                    "%msg should be rewritten for: {code}"
+                    r.translated_code.contains("%msg="),
+                    "%msg must be set by the epilogue for: {code}"
                 );
             }
             "no_rows" => {

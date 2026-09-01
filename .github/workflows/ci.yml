@@ -262,7 +262,14 @@ jobs:
           docker exec iris-e2e bash -c 'printf "Class IrisDevRunTest.UnitTestSuite Extends %%UnitTest.TestCase {\nMethod TestAlwaysPasses() { Do \$\$\$AssertEquals(1,1) }\nMethod TestAlwaysFails() { Do \$\$\$AssertEquals(1,2) }\n}" > /tmp/httest/IrisDevRunTest/UnitTestSuite.cls'
           echo "Created /tmp/httest/IrisDevRunTest/UnitTestSuite.cls in iris-e2e container"
       - name: Run E2E tests against live IRIS (Rust)
-        run: cargo test --test test_e2e -- --nocapture
+        # `--include-ignored` is not optional here. The four `#[ignore]` tests in
+        # test_sql_translate_e2e had never run in ANY job: the branch gate skips this
+        # job, and this job named only `--test test_e2e`. They reported as "ignored",
+        # which reads as coverage and is the absence of it — #177 shipped through four
+        # releases underneath them.
+        run: |
+          cargo test --test test_e2e -- --nocapture
+          cargo test --test test_sql_translate_e2e -- --include-ignored --nocapture
         env:
           IRIS_HOST: ${{ env.IRIS_HOST }}
           IRIS_WEB_PORT: "52773"
