@@ -2941,7 +2941,33 @@ async fn enrich_abort(
 
     if abort_wants_member_list(frame.signal) {
         if let (Some(member), Some(class)) = (frame.member, frame.class) {
-            let members = declared_members(iris, client, namespace, class, Some(member)).await;
+            let (members, member_kind) =
+                declared_members(iris, client, namespace, class, Some(member)).await;
+
+            // #178: the name the caller wrote DOES exist on the class — under the other
+            // kind. No list of other names helps here; the syntax is the bug.
+            if let Some(kind) = member_kind {
+                if let Some(mismatch) = member_kind_mismatch_hint(class, member, frame.signal, kind)
+                {
+                    if !hint.is_empty() {
+                        hint.push(' ');
+                    }
+                    hint.push_str(&mismatch);
+                    resp["hint"] = serde_json::Value::String(hint);
+                    return;
+                }
+            }
+
+            // #62, applied here at last: a suggestion identical to the input is not a
+            // correction — following it re-sends the same call. The guard has existed in
+            // `no_tests_found_guidance` since #62 and this second producer of the same
+            // field never came under it, so `did_you_mean[0]` was routinely the exact
+            // identifier that had just failed.
+            let members: Vec<String> = members
+                .into_iter()
+                .filter(|m| !m.eq_ignore_ascii_case(member))
+                .collect();
+
             if !members.is_empty() {
                 resp["did_you_mean"] = members
                     .iter()
@@ -2970,19 +2996,64 @@ async fn enrich_abort(
     }
 }
 
+/// Which kind of member a name is declared as. #178: the two are not interchangeable at the
+/// call site, and IRIS reports the mismatch as "does not exist", which is true of the syntax
+/// and false of the class.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MemberKind {
+    Method,
+    Property,
+}
+
+/// #178: the caller's name EXISTS on the class, under the other kind.
+///
+/// The verbatim report: `write $G(s.GetValueAt("1"))` answered
+/// `'EnsLib.HL7.Segment' has no 'GetValueAt'. It declares: GetValueAt, ...` — a sentence that
+/// denies a name and then lists it first — with `did_you_mean[0]` set to the identifier that
+/// had just failed, so an agent following the suggestion re-sent the identical call.
+///
+/// The cause is that `$GET()` forces PROPERTY syntax, so a method call inside it resolves as a
+/// property and IRIS reports `<PROPERTY DOES NOT EXIST>`. The class is fine; the wrapper is the
+/// bug, and no list of other member names can say that. Returns `None` when the kind matches
+/// the syntax the caller used — then the name genuinely is not there and the list is the answer.
+fn member_kind_mismatch_hint(
+    class: &str,
+    member: &str,
+    signal: &str,
+    declared_as: MemberKind,
+) -> Option<String> {
+    match (signal, declared_as) {
+        ("PROPERTY DOES NOT EXIST" | "CLASS PROPERTY", MemberKind::Method) => Some(format!(
+            "'{member}' exists on '{class}' as a METHOD, not a property. Property syntax cannot \
+             reach it — and $GET() forces property syntax, so `$GET(obj.{member}(...))` fails \
+             even where `obj.{member}(...)` works. Call it directly; if you were guarding \
+             against an undefined value, guard the OBJECT ($IsObject) rather than the call."
+        )),
+        ("METHOD DOES NOT EXIST", MemberKind::Property) => Some(format!(
+            "'{member}' exists on '{class}' as a PROPERTY, not a method. Read it as `obj.{member}` \
+             on an INSTANCE, with no parentheses — `##class({class}).{member}()` is a class-method \
+             call and cannot reach an instance property."
+        )),
+        _ => None,
+    }
+}
+
 /// The members a class DECLARES (not inherited, not `%`-prefixed), ranked against the name the
 /// caller got wrong (#124). Runs only on the error path, so a working call never pays for it.
+///
+/// #178: also reports which kind the caller's own `wanted` name is declared as, when it is
+/// declared at all — read from the same round-trip, never inferred.
 async fn declared_members(
     iris: &crate::iris::connection::IrisConnection,
     client: &reqwest::Client,
     namespace: &str,
     class: &str,
     wanted: Option<&str>,
-) -> Vec<String> {
-    let sql = "SELECT Name FROM %Dictionary.CompiledMethod \
+) -> (Vec<String>, Option<MemberKind>) {
+    let sql = "SELECT Name, 'M' AS Kind FROM %Dictionary.CompiledMethod \
                WHERE parent = ? AND Origin = parent AND SUBSTRING(Name,1,1) <> '%' \
                UNION \
-               SELECT Name FROM %Dictionary.CompiledProperty \
+               SELECT Name, 'P' AS Kind FROM %Dictionary.CompiledProperty \
                WHERE parent = ? AND Origin = parent AND SUBSTRING(Name,1,1) <> '%'";
     let rows = match iris
         .query(
@@ -2997,18 +3068,32 @@ async fn declared_members(
         .await
     {
         Ok(v) => v,
-        Err(_) => return Vec::new(),
+        Err(_) => return (Vec::new(), None),
     };
     // `iris.query` answers `{"result":{"content":[…]}}` — the same shape `row_count` reads.
-    let mut names: Vec<String> = rows["result"]["content"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|r| r.get("Name").and_then(|n| n.as_str()))
-                .map(str::to_string)
-                .collect()
+    let empty = Vec::new();
+    let rows = rows["result"]["content"].as_array().unwrap_or(&empty);
+
+    // #178: the kind of the caller's OWN name, if the class declares it at all.
+    let wanted_kind = wanted.and_then(|w| {
+        rows.iter().find_map(|r| {
+            let name = r.get("Name").and_then(|n| n.as_str())?;
+            if !name.eq_ignore_ascii_case(w) {
+                return None;
+            }
+            match r.get("Kind").and_then(|k| k.as_str()) {
+                Some("M") => Some(MemberKind::Method),
+                Some("P") => Some(MemberKind::Property),
+                _ => None,
+            }
         })
-        .unwrap_or_default();
+    });
+
+    let mut names: Vec<String> = rows
+        .iter()
+        .filter_map(|r| r.get("Name").and_then(|n| n.as_str()))
+        .map(str::to_string)
+        .collect();
 
     // Nearest first: the caller is looking for one name.
     match wanted {
@@ -3016,7 +3101,7 @@ async fn declared_members(
         None => names.sort(),
     }
     names.truncate(25);
-    names
+    (names, wanted_kind)
 }
 
 /// Split a CamelCase identifier into lowercase words: `ValidateProduction` -> `[validate, production]`.
@@ -9557,6 +9642,79 @@ mod string_list_arg_tests {
     #[test]
     fn a_malformed_json_array_string_is_an_error() {
         assert!(string_list_arg("body_select", Some(&json!("[\"A\","))).is_err());
+    }
+}
+
+#[cfg(test)]
+mod member_kind_tests {
+    use super::{member_kind_mismatch_hint, MemberKind};
+
+    /// The verbatim #178 report: `write $G(s.GetValueAt("1"))` on EnsLib.HL7.Segment.
+    /// The method exists and works when called directly — the `$GET()` wrapper is the bug.
+    #[test]
+    fn property_syntax_on_a_method_names_the_wrapper_not_the_class() {
+        let h = member_kind_mismatch_hint(
+            "EnsLib.HL7.Segment",
+            "GetValueAt",
+            "PROPERTY DOES NOT EXIST",
+            MemberKind::Method,
+        )
+        .expect("a declared method reached through property syntax must be explained");
+        assert!(h.contains("as a METHOD, not a property"), "{h}");
+        assert!(h.contains("$GET()"), "the cause has to be named: {h}");
+        // The sentence the old hint produced was "'C' has no 'X'. It declares: X, ..." —
+        // a denial and a listing of the same name, one clause apart.
+        assert!(
+            !h.contains("has no 'GetValueAt'"),
+            "must not deny a member it can see: {h}"
+        );
+    }
+
+    #[test]
+    fn method_syntax_on_a_property_is_the_same_bug_mirrored() {
+        let h = member_kind_mismatch_hint(
+            "My.Cls",
+            "Name",
+            "METHOD DOES NOT EXIST",
+            MemberKind::Property,
+        )
+        .expect("a declared property called with parentheses must be explained");
+        assert!(h.contains("as a PROPERTY, not a method"), "{h}");
+        assert!(h.contains("no parentheses"), "{h}");
+        // The shape that actually reaches this branch at the wire is `##class(C).Prop()`:
+        // `obj.Prop()` on an instance answers <OBJECT DISPATCH>, a different signal that
+        // `abort_wants_member_list` does not route (see #178 follow-up note).
+        assert!(h.contains("##class(My.Cls).Name()"), "{h}");
+    }
+
+    /// When the kind MATCHES the syntax the caller used, the name really is absent and the
+    /// list of declared members is the right answer — this branch must stay out of the way.
+    #[test]
+    fn a_matching_kind_is_not_a_mismatch() {
+        assert!(member_kind_mismatch_hint(
+            "My.Cls",
+            "Missing",
+            "METHOD DOES NOT EXIST",
+            MemberKind::Method
+        )
+        .is_none());
+        assert!(member_kind_mismatch_hint(
+            "My.Cls",
+            "Missing",
+            "PROPERTY DOES NOT EXIST",
+            MemberKind::Property
+        )
+        .is_none());
+    }
+
+    /// `CLASS PROPERTY` is routed to the same place by `abort_wants_member_list`, so it
+    /// needs the same treatment — a sibling signal is exactly how these get missed.
+    #[test]
+    fn the_class_property_signal_is_covered_too() {
+        assert!(
+            member_kind_mismatch_hint("My.Cls", "Thing", "CLASS PROPERTY", MemberKind::Method)
+                .is_some()
+        );
     }
 }
 
