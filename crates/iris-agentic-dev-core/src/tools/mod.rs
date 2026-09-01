@@ -2991,6 +2991,29 @@ async fn enrich_abort(
         }
     }
 
+    // #178 follow-up: `<SYNTAX>` carries no class or member, so the branch above cannot run —
+    // but the caller's own line names the cause. Gated on SYNTAX deliberately: the same
+    // wrapper over a non-object answers <INVALID OREF>, where the object is the bug and this
+    // sentence would point at the wrong thing.
+    if frame.signal == "SYNTAX" {
+        if let Some(member) = resp
+            .get("source_line")
+            .and_then(|v| v.as_str())
+            .and_then(get_wrapping_a_method_call)
+        {
+            if !hint.is_empty() {
+                hint.push(' ');
+            }
+            hint.push_str(&format!(
+                "$GET() forces PROPERTY syntax, and `{member}(...)` is a method call — with \
+                 arguments (a by-reference `.var` especially) that is not even parseable as a \
+                 property reference, which is the <SYNTAX>. Call `obj.{member}(...)` directly; \
+                 if you were guarding against an undefined value, guard the OBJECT ($IsObject) \
+                 rather than the call."
+            ));
+        }
+    }
+
     if !hint.is_empty() && resp.get("hint").is_none() {
         resp["hint"] = serde_json::Value::String(hint);
     }
@@ -3036,6 +3059,93 @@ fn member_kind_mismatch_hint(
         )),
         _ => None,
     }
+}
+
+/// #178 follow-up: `$GET(obj.Method(args))` where the argument list defeats the property
+/// rewrite outright.
+///
+/// The skills session measured the whole family: of every `iris_execute` whose code wraps a
+/// method call in `$G()`/`$GET()`, 3 of 3 failed and 0 succeeded. But they do not all fail the
+/// SAME way. `$G(s.GetValueAt("1"))` reaches `<PROPERTY DOES NOT EXIST>` and the member-kind
+/// branch above explains it; `$G(m.GetValueAt(p(i),m.Separators,.sc))` answers `<SYNTAX>`,
+/// because a by-reference argument cannot appear in a property reference at all. That shape
+/// never reaches the member branch, so the fix for the first shape would have left it dark —
+/// the same sibling-path miss the branch above exists to correct.
+///
+/// Works off the caller's OWN source line, which `enrich_abort` already holds, so there is no
+/// extra round-trip and nothing is inferred about a class.
+///
+/// Returns the member name when the line wraps a dot-method call in `$GET`. Deliberately does
+/// NOT match `$G(x(i))` or `$G(^Foo(1))` — a subscripted local or global is the ordinary,
+/// correct use of `$GET` and by far the commonest thing inside one.
+fn get_wrapping_a_method_call(line: &str) -> Option<String> {
+    let bytes = line.as_bytes();
+    let lower = line.to_ascii_lowercase();
+    let mut from = 0usize;
+    while let Some(rel) = lower[from..].find("$g") {
+        let open = {
+            let after = from + rel + 2;
+            if lower[after..].starts_with("et(") {
+                after + 3
+            } else if lower[after..].starts_with('(') {
+                after + 1
+            } else {
+                from += rel + 2;
+                continue;
+            }
+        };
+        // The argument text, to the paren that closes this $GET.
+        let mut depth = 1usize;
+        let mut j = open;
+        while j < bytes.len() && depth > 0 {
+            match bytes[j] {
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                _ => {}
+            }
+            if depth > 0 {
+                j += 1;
+            }
+        }
+        let arg = &line[open..j.min(line.len())];
+
+        // A global reference is a legitimate $GET argument even with dots in its name.
+        if !arg.trim_start().starts_with('^') {
+            if let Some(member) = dot_call_member(arg) {
+                return Some(member);
+            }
+        }
+        from = open;
+    }
+    None
+}
+
+/// `.Name(` preceded by something that can end an object expression — an identifier or a
+/// closing paren. `.sc` (a by-reference argument) has no `(` after it and is preceded by a
+/// comma, so it never matches; neither does the `1.5` in a number.
+fn dot_call_member(arg: &str) -> Option<String> {
+    let b = arg.as_bytes();
+    for (i, &c) in b.iter().enumerate() {
+        if c != b'.' || i == 0 {
+            continue;
+        }
+        let before = b[i - 1];
+        if !(before.is_ascii_alphanumeric() || before == b'%' || before == b')') {
+            continue;
+        }
+        if before.is_ascii_digit() && b[..i].iter().all(|c| c.is_ascii_digit()) {
+            continue; // a decimal literal
+        }
+        let rest = &arg[i + 1..];
+        let name_len = rest
+            .bytes()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == b'%')
+            .count();
+        if name_len > 0 && rest.as_bytes().get(name_len) == Some(&b'(') {
+            return Some(rest[..name_len].to_string());
+        }
+    }
+    None
 }
 
 /// The members a class DECLARES (not inherited, not `%`-prefixed), ranked against the name the
@@ -9715,6 +9825,65 @@ mod member_kind_tests {
             member_kind_mismatch_hint("My.Cls", "Thing", "CLASS PROPERTY", MemberKind::Method)
                 .is_some()
         );
+    }
+}
+
+#[cfg(test)]
+mod get_wrapper_tests {
+    use super::get_wrapping_a_method_call;
+
+    /// The three lines the skills session measured — every `iris_execute` in their corpus
+    /// that wraps a method call in `$G()`. 3 of 3 failed, 0 succeeded.
+    #[test]
+    fn the_measured_corpus_lines_are_all_recognised() {
+        for line in [
+            r#"Write i,":",s.Name," 1=",$G(s.GetValueAt("1"))," 2=",$G(s.GetValueAt("2")),!"#,
+            r#"Write p,"=",$G(m.GetValueAt(p,m.Separators,.sc))," sc=",$System.Status.GetErrorText(sc),!"#,
+            r#"For i=1:1:16 Write p(i),"=",$G(m.GetValueAt(p(i),m.Separators,.sc)),!"#,
+        ] {
+            assert_eq!(
+                get_wrapping_a_method_call(line).as_deref(),
+                Some("GetValueAt"),
+                "not recognised: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_long_spelling_and_class_methods_count_too() {
+        assert_eq!(
+            get_wrapping_a_method_call("write $GET(obj.Compute(1)),!").as_deref(),
+            Some("Compute")
+        );
+        assert_eq!(
+            get_wrapping_a_method_call("write $G(##class(My.Cls).Make()),!").as_deref(),
+            Some("Make")
+        );
+    }
+
+    /// The negative controls carry this test. A subscripted local or global is the ORDINARY
+    /// use of $GET and by far the commonest thing inside one — flagging those would put a
+    /// wrong explanation on the most common correct code in the corpus. Note the third line:
+    /// the very corpus line that SHOULD match also contains `p(i)`, so "has a paren inside"
+    /// was never a usable test.
+    #[test]
+    fn ordinary_get_arguments_are_not_flagged() {
+        for line in [
+            "write $G(x(i)),!",
+            "write $G(^Ens.Config.Item(1)),!",
+            "write $G(nope),!",
+            "write $G(obj.Property),!",
+            "set x=$G(arr(1,2),\"default\")",
+            "write $G(m.GetValue),!",
+            "do obj.Method(.sc)",
+            "write 1.5+$G(x),!",
+        ] {
+            assert_eq!(
+                get_wrapping_a_method_call(line),
+                None,
+                "false positive on: {line}"
+            );
+        }
     }
 }
 
