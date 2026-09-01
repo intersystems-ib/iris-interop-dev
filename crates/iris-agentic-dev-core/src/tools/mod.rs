@@ -793,7 +793,6 @@ pub fn translate_sql_macros(code: &str) -> TranslationResult {
             rs_counter += 1;
             let rs_var = format!("sqlrs{}", rs_counter);
             let sc_var = format!("sqlsc{}", rs_counter);
-            let sqlcode_var = format!("sqlSQLCODE{}", rs_counter);
 
             // Find matching closing paren using depth counting
             let start = i + 5; // after &sql(
@@ -823,21 +822,21 @@ pub fn translate_sql_macros(code: &str) -> TranslationResult {
                 output.push_str(&format!("&sql({})", sql_content));
             } else if sql_upper.starts_with("SELECT") {
                 // Translate SELECT INTO
-                output.push_str(&translate_select_into(
-                    &sql_content,
-                    &rs_var,
-                    &sc_var,
-                    &sqlcode_var,
-                ));
+                // #179: no INTO means no host variable is ever bound. The statement runs and
+                // the caller's `write ID` is `<UNDEFINED>` — say so rather than emit code that
+                // cannot work.
+                if find_keyword_pos(&sql_content, "INTO").is_none() {
+                    warnings.push(format!(
+                        "&sql(SELECT ...) at macro #{} has no INTO clause, so no host variable is \
+                         bound and any column you read afterwards will be <UNDEFINED>. Add \
+                         `INTO :var1, :var2`, or use ##class(%SQL.Statement) with a %Next() loop \
+                         directly if you need more than one row.",
+                        rs_counter
+                    ));
+                }
+                output.push_str(&translate_select_into(&sql_content, &rs_var, &sc_var));
                 // Check next line for SQLCODE / %msg and rewrite
-                i = rewrite_next_line_sqlcode(
-                    chars.as_slice(),
-                    i,
-                    n,
-                    &mut output,
-                    &sqlcode_var,
-                    &rs_var,
-                );
+                i = rewrite_next_line_sqlcode(chars.as_slice(), i, n, &mut output);
                 continue;
             } else if sql_upper.starts_with("INSERT")
                 || sql_upper.starts_with("UPDATE")
@@ -847,14 +846,7 @@ pub fn translate_sql_macros(code: &str) -> TranslationResult {
                 // Translate DML
                 output.push_str(&translate_dml(&sql_content, &rs_var));
                 // Check next line for SQLCODE / %msg
-                i = rewrite_next_line_sqlcode(
-                    chars.as_slice(),
-                    i,
-                    n,
-                    &mut output,
-                    &sqlcode_var,
-                    &rs_var,
-                );
+                i = rewrite_next_line_sqlcode(chars.as_slice(), i, n, &mut output);
                 continue;
             } else {
                 // Unknown — leave unchanged with warning
@@ -879,7 +871,7 @@ pub fn translate_sql_macros(code: &str) -> TranslationResult {
 }
 
 /// Translate a SELECT ... INTO :var1, :var2 ... statement.
-fn translate_select_into(sql: &str, rs_var: &str, sc_var: &str, sqlcode_var: &str) -> String {
+fn translate_select_into(sql: &str, rs_var: &str, sc_var: &str) -> String {
     // Parse: split on INTO to separate column list and host variables + WHERE clause
 
     // Find INTO keyword (not inside parens)
@@ -891,7 +883,7 @@ fn translate_select_into(sql: &str, rs_var: &str, sc_var: &str, sqlcode_var: &st
         (before, after.trim().to_string())
     } else {
         // SELECT without INTO — translate as result-set loop but no vars to set
-        return translate_select_no_into(sql, rs_var, sc_var, sqlcode_var);
+        return translate_select_no_into(sql, rs_var, sc_var);
     };
 
     // Extract SELECT column names (between SELECT and INTO)
@@ -973,7 +965,6 @@ fn translate_select_into(sql: &str, rs_var: &str, sc_var: &str, sqlcode_var: &st
     for var in &host_vars {
         out.push_str(&format!(" set {} = \"\"", var));
     }
-    out.push_str(&format!(" set {} = {}.%SQLCODE", sqlcode_var, rs_var));
     out.push_str(" }");
     // #145: also on the FOUND branch — a successful SELECT INTO left SQLCODE
     // undefined, so `If SQLCODE=0` threw exactly like the DML case.
@@ -982,7 +973,7 @@ fn translate_select_into(sql: &str, rs_var: &str, sc_var: &str, sqlcode_var: &st
     out
 }
 
-fn translate_select_no_into(sql: &str, rs_var: &str, sc_var: &str, _sqlcode_var: &str) -> String {
+fn translate_select_no_into(sql: &str, rs_var: &str, sc_var: &str) -> String {
     // SELECT without INTO — translate to prepare/execute but no host var assignment
     let where_params = extract_where_params(sql);
     let prepared_sql = replace_host_vars_with_positional(sql, &where_params);
@@ -1023,7 +1014,7 @@ fn sqlcode_epilogue(rs_var: &str) -> String {
     // -400 is IRIS's "fatal error" SQLCODE — the honest answer when %ExecDirect
     // returned no result object at all, and never a value that reads as success.
     format!(
-        " set SQLCODE=$Select($IsObject({rs}):{rs}.%SQLCODE,1:-400),%ROWCOUNT=$Select($IsObject({rs}):{rs}.%ROWCOUNT,1:0)"
+        " set SQLCODE=$Select($IsObject({rs}):{rs}.%SQLCODE,1:-400),%ROWCOUNT=$Select($IsObject({rs}):{rs}.%ROWCOUNT,1:0),%msg=$Select($IsObject({rs}):{rs}.%Message,1:\"\")"
     , rs = rs_var)
 }
 
@@ -1044,17 +1035,17 @@ fn translate_dml(sql: &str, rs_var: &str) -> String {
     )
 }
 
-/// After a translated &sql, check if the immediately following line contains
-/// a standalone SQLCODE or %msg reference and rewrite it.
-/// Returns the new position in chars after consuming any rewritten line.
-fn rewrite_next_line_sqlcode(
-    chars: &[char],
-    mut i: usize,
-    n: usize,
-    output: &mut String,
-    sqlcode_var: &str,
-    rs_var: &str,
-) -> usize {
+/// Copy the remainder of the `&sql` line and the line after it through to the output,
+/// stopping short of a following `&sql(` so the main loop can translate that one too.
+///
+/// #177: this used to REWRITE `SQLCODE` to a generated `sqlSQLCODE{n}` and `%msg` to
+/// `{rs}.%Message` on that next line. `sqlcode_epilogue` sets `SQLCODE`, `%ROWCOUNT` and
+/// `%msg` under their REAL names, so the rewrite renamed the caller's read to a variable
+/// nothing sets any more — `&sql(...)` followed by `If SQLCODE` threw `<UNDEFINED>` every
+/// time, including on the success path of a SELECT INTO. The names now resolve wherever
+/// they appear (same line, next line, ten lines later), which is what embedded SQL promises,
+/// so this function no longer edits anything.
+fn rewrite_next_line_sqlcode(chars: &[char], mut i: usize, n: usize, output: &mut String) -> usize {
     // Skip whitespace (but not newlines) to find the next line
     // First, collect the rest of the current line (should be empty or whitespace after &sql)
     while i < n && chars[i] != '\n' {
@@ -1086,12 +1077,7 @@ fn rewrite_next_line_sqlcode(
         return line_start;
     }
 
-    // Rewrite SQLCODE → sqlcode_var and %msg → rs_var.%Message on this specific line
-    let rewritten = next_line
-        .replace("SQLCODE", sqlcode_var)
-        .replace("%msg", &format!("{}.%Message", rs_var));
-
-    output.push_str(&rewritten);
+    output.push_str(&next_line);
     i
 }
 

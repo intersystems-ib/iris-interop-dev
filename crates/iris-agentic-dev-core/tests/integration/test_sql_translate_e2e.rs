@@ -145,6 +145,78 @@ fn test_e2e_select_into_translates_and_runs() {
     );
 }
 
+/// #177: a SELECT INTO that FINDS a row and then reads SQLCODE.
+///
+/// This is the shape that was broken in every shipped release up to 0.15.1 and that no
+/// test held: T025 above executes a SELECT INTO but never reads `SQLCODE`, and the unit
+/// suite asserted the rename that caused the failure. The failure was inverted — the
+/// generated variable was assigned in the `else` branch only, so the statement threw
+/// `<UNDEFINED>` precisely when the query SUCCEEDED.
+///
+/// It lives at the wire deliberately. The unit test and the translator share a frame; only
+/// running the generated ObjectScript through IRIS proves the names actually resolve.
+#[test]
+#[ignore]
+fn test_e2e_sqlcode_is_readable_after_a_successful_select_into() {
+    if iris_host().is_empty() {
+        eprintln!("Skipping: IRIS_HOST not set");
+        return;
+    }
+    let code = "&sql(SELECT Name INTO :name FROM %Dictionary.ClassDefinition WHERE Name = '%ASQ.AST')\nwrite \"sqlcode=\", SQLCODE, \" rows=\", %ROWCOUNT, \" name=\", name, !";
+    let result = execute(code, None);
+    eprintln!("#177: {}", serde_json::to_string_pretty(&result).unwrap());
+    let output = result["output"].as_str().unwrap_or("");
+    assert!(
+        !output.contains("sqlSQLCODE"),
+        "the caller's SQLCODE read was renamed to a variable nothing sets: {output}"
+    );
+    assert_eq!(result["success"], true, "output was: {output}");
+    assert!(
+        output.contains("sqlcode=0"),
+        "SQLCODE must be readable and 0 after a successful SELECT INTO, got: {output}"
+    );
+    assert!(
+        output.contains("name=%ASQ.AST"),
+        "the host variable must still be bound, got: {output}"
+    );
+}
+
+/// #179: a SELECT with no INTO binds nothing, so the caller's column read is
+/// `<UNDEFINED>`. The translation must say so rather than emit code that cannot work.
+#[test]
+#[ignore]
+fn test_e2e_select_without_into_warns_that_nothing_is_bound() {
+    if iris_host().is_empty() {
+        eprintln!("Skipping: IRIS_HOST not set");
+        return;
+    }
+    let result = execute(
+        "&sql(SELECT Name FROM %Dictionary.ClassDefinition WHERE Name = '%ASQ.AST')",
+        None,
+    );
+    eprintln!("#179: {}", serde_json::to_string_pretty(&result).unwrap());
+    assert_eq!(result["sql_translated"], true);
+    let warnings = result["translation_warning"].to_string();
+    assert!(
+        warnings.contains("no INTO clause"),
+        "expected an unbound-host-variable warning, got: {warnings}"
+    );
+
+    // Positive control for the warning itself: the INTO form must NOT carry it, or the
+    // assertion above would pass on a translator that warns unconditionally.
+    let with_into = execute(
+        "&sql(SELECT Name INTO :n FROM %Dictionary.ClassDefinition WHERE Name = '%ASQ.AST')",
+        None,
+    );
+    assert!(
+        !with_into["translation_warning"]
+            .to_string()
+            .contains("no INTO clause"),
+        "a SELECT INTO must not warn: {}",
+        with_into["translation_warning"]
+    );
+}
+
 /// T026: INSERT translation fires — sql_translated: true (don't actually execute insert against real table).
 /// Uses a read-only table to verify translation, then checks sql_translated even if INSERT fails.
 #[test]
