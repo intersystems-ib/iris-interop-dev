@@ -3000,9 +3000,76 @@ async fn enrich_abort(
         }
     }
 
+    // #182: <INVALID OREF> names a line and nothing else. The origin walk-back is pure; the
+    // Ens question is the only part that asks IRIS, and only when the origin IS a `%New()`.
+    if frame.signal == "INVALID OREF" {
+        if let Some(line) = resp.get("source_line").and_then(|v| v.as_str()) {
+            if let Some((var, at, expr)) = oref_origin(submitted, line) {
+                if !hint.is_empty() {
+                    hint.push(' ');
+                }
+                hint.push_str(&format!(
+                    "`{var}` is not an object. It was assigned on line {at} from `{expr}`."
+                ));
+                if let Some(class) = new_of_class(&expr) {
+                    hint.push_str(&format!(
+                        " That `%New()` returned an empty string rather than an object — \
+                         `$IsObject({var})` would have shown 0 there, one line before this one."
+                    ));
+                    if let Some(kind) = ens_host_kind(iris, client, namespace, &class).await {
+                        hint.push_str(&format!(
+                            " '{class}' is a {kind}, and an interoperability host does not \
+                             instantiate outside a running production. Test it with a \
+                             %UnitTest.TestProduction through iris_test, not by %New()-ing it."
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     if !hint.is_empty() && resp.get("hint").is_none() {
         resp["hint"] = serde_json::Value::String(hint);
     }
+}
+
+/// Is this class an interoperability host, and which kind (#182)?
+///
+/// Read from `%Dictionary.CompiledClass.PrimarySuper`, which carries the whole resolved
+/// ancestry as `~Pkg.Cls~...~` — so a concrete `ResultOut.BO.ArchiveWriter` is recognised, not
+/// just a literal `Ens.BusinessOperation`. Answers `None` on any error: a hint is never worth
+/// failing an error path for.
+async fn ens_host_kind(
+    iris: &crate::iris::connection::IrisConnection,
+    client: &reqwest::Client,
+    namespace: &str,
+    class: &str,
+) -> Option<&'static str> {
+    let rows = iris
+        .query(
+            "SELECT PrimarySuper FROM %Dictionary.CompiledClass WHERE Name = ?",
+            vec![serde_json::Value::String(class.to_string())],
+            namespace,
+            client,
+        )
+        .await
+        .ok()?;
+    let supers = rows["result"]["content"]
+        .as_array()?
+        .first()?
+        .get("PrimarySuper")?
+        .as_str()?
+        .to_string();
+    for (needle, label) in [
+        ("~Ens.BusinessService~", "Business Service"),
+        ("~Ens.BusinessOperation~", "Business Operation"),
+        ("~Ens.BusinessProcess~", "Business Process"),
+    ] {
+        if supers.contains(needle) {
+            return Some(label);
+        }
+    }
+    None
 }
 
 /// Which kind of member a name is declared as. #178: the two are not interchangeable at the
@@ -3045,6 +3112,150 @@ fn member_kind_mismatch_hint(
         )),
         _ => None,
     }
+}
+
+/// #182: where the OREF that was not an object came from.
+///
+/// `<INVALID OREF>` carries no class and no member, so `enrich_abort` has nothing to look up
+/// and used to fall through to a bare "line N is what failed" — correct, and saying nothing.
+/// But the failing line names a variable and the submitted code is in hand, so the assignment
+/// that produced it can be found by walking back. Nothing is inferred and no round-trip is
+/// needed for the general case.
+///
+/// The shape this exists for (skills#144): a Business Operation instantiated with `%New()`.
+/// `Ens.BusinessService`/`BusinessOperation` do not declare `%New` at all, and a concrete
+/// subclass returns `""` rather than erroring — so the failure surfaces a line later, on a
+/// statement that never mentions the class that failed to instantiate. Five of one peer's
+/// 26 `iris_execute` failures were this, scattered across two signals.
+///
+/// Returns `(variable, 1-based line number, the expression it was assigned)`.
+fn oref_origin(submitted: &str, failing_line: &str) -> Option<(String, usize, String)> {
+    let var = dereferenced_base(failing_line)?;
+    // Last assignment wins: the caller may have rebound the name.
+    submitted
+        .lines()
+        .enumerate()
+        .filter_map(|(idx, line)| assignment_rhs(line, &var).map(|rhs| (var.clone(), idx + 1, rhs)))
+        .last()
+}
+
+/// The variable on the left of a `.member` dereference — `bo` in `set bo.Adapter=a`.
+///
+/// Deliberately narrow. `##class(Pkg.Cls).%New()` also contains `ident.ident`, and `Pkg` is a
+/// package name, not a variable — matching it would report an origin for a thing that has
+/// none. Globals (`^Ens.Config`) and functions (`$System.Status`) are excluded for the same
+/// reason: they are not locals and have no assignment line to point at.
+fn dereferenced_base(line: &str) -> Option<String> {
+    let b = line.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        // Skip over ##class(...) wholesale — its dots are package separators.
+        if line[i..].starts_with("##class(") {
+            let mut depth = 0usize;
+            while i < b.len() {
+                match b[i] {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            i += 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if b[i] == b'"' {
+            i += 1;
+            while i < b.len() && b[i] != b'"' {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if b[i].is_ascii_alphabetic() || b[i] == b'%' {
+            let start = i;
+            // A local never starts with ^ or $; check what precedes it.
+            let prev = if start == 0 { b' ' } else { b[start - 1] };
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'%') {
+                i += 1;
+            }
+            if prev != b'^' && prev != b'$' && prev != b'.' && i < b.len() && b[i] == b'.' {
+                let after = &line[i + 1..];
+                let n = after
+                    .bytes()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == b'%')
+                    .count();
+                if n > 0 {
+                    return Some(line[start..i].to_string());
+                }
+            }
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The right-hand side if `line` assigns `var`, e.g. `set bo=##class(X).%New()` -> the
+/// `##class(X).%New()`. Handles the comma form (`set a=1,bo=##class(X).%New()`) by taking the
+/// text after the match up to a top-level comma.
+fn assignment_rhs(line: &str, var: &str) -> Option<String> {
+    let b = line.as_bytes();
+    let v = var.as_bytes();
+    let mut i = 0usize;
+    while i + v.len() <= b.len() {
+        if &b[i..i + v.len()] == v {
+            let prev = if i == 0 { b' ' } else { b[i - 1] };
+            let ok_before = !(prev.is_ascii_alphanumeric() || prev == b'%' || prev == b'.');
+            let mut j = i + v.len();
+            while j < b.len() && b[j] == b' ' {
+                j += 1;
+            }
+            // `==` is a comparison in some dialects and `=` inside a larger token is not an
+            // assignment; require a bare `=` and nothing dotted/subscripted before it.
+            if ok_before && j < b.len() && b[j] == b'=' {
+                let rhs = &line[j + 1..];
+                let mut depth = 0usize;
+                let mut end = rhs.len();
+                for (k, c) in rhs.char_indices() {
+                    match c {
+                        '(' => depth += 1,
+                        ')' => depth = depth.saturating_sub(1),
+                        ',' if depth == 0 => {
+                            end = k;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                let rhs = rhs[..end].trim();
+                if !rhs.is_empty() {
+                    return Some(rhs.to_string());
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The class in `##class(Pkg.Cls).%New()`, when that is the whole assigned expression (#182).
+fn new_of_class(expr: &str) -> Option<String> {
+    let rest = expr.strip_prefix("##class(")?;
+    let close = rest.find(')')?;
+    let class = &rest[..close];
+    let after = rest[close + 1..].trim_start();
+    if !after.starts_with(".%New(") {
+        return None;
+    }
+    if class.is_empty() || class.contains(' ') {
+        return None;
+    }
+    Some(class.to_string())
 }
 
 /// #178 follow-up: `$GET(obj.Method(args))` where the argument list defeats the property
@@ -9811,6 +10022,83 @@ mod member_kind_tests {
             member_kind_mismatch_hint("My.Cls", "Thing", "CLASS PROPERTY", MemberKind::Method)
                 .is_some()
         );
+    }
+}
+
+#[cfg(test)]
+mod oref_origin_tests {
+    use super::{dereferenced_base, new_of_class, oref_origin};
+
+    /// The shape from skills#144, verbatim: the BO is instantiated on one line and the
+    /// failure surfaces two lines later on a statement that never names it.
+    #[test]
+    fn the_business_operation_shape_is_traced_back() {
+        let code = "set bo=##class(ResultOut.BO.ArchiveWriter).%New()\n                    set ad=##class(EnsLib.File.OutboundAdapter).%New()\n                    set bo.Adapter=ad";
+        let (var, at, expr) = oref_origin(code, "set bo.Adapter=ad").expect("origin found");
+        assert_eq!(var, "bo");
+        assert_eq!(at, 1, "must point at the assignment, not the failing line");
+        assert_eq!(expr, "##class(ResultOut.BO.ArchiveWriter).%New()");
+        assert_eq!(
+            new_of_class(&expr).as_deref(),
+            Some("ResultOut.BO.ArchiveWriter")
+        );
+    }
+
+    /// The adapter on line 2 is the trap: it is a perfectly good object, assigned the same
+    /// way, one line closer. Reporting IT would be the "neighbour, not a control" error in
+    /// hint form — so the walk-back must key on the variable the failing line dereferences.
+    #[test]
+    fn the_neighbouring_good_object_is_not_reported() {
+        let code = "set bo=##class(My.BO).%New()\n                    set ad=##class(EnsLib.File.OutboundAdapter).%New()\n                    set bo.Adapter=ad";
+        let (var, _, expr) = oref_origin(code, "set bo.Adapter=ad").unwrap();
+        assert_eq!(var, "bo");
+        assert!(
+            !expr.contains("OutboundAdapter"),
+            "reported the neighbour: {expr}"
+        );
+    }
+
+    #[test]
+    fn the_last_binding_wins() {
+        let code = "set x=##class(A.B).%New()\nset x=##class(C.D).%New()\nset x.P=1";
+        let (_, at, expr) = oref_origin(code, "set x.P=1").unwrap();
+        assert_eq!(at, 2);
+        assert_eq!(expr, "##class(C.D).%New()");
+    }
+
+    #[test]
+    fn the_comma_form_is_handled() {
+        let code = "set a=1,bo=##class(My.BO).%New(),c=2\nset bo.Adapter=1";
+        let (_, _, expr) = oref_origin(code, "set bo.Adapter=1").unwrap();
+        assert_eq!(expr, "##class(My.BO).%New()");
+    }
+
+    /// The negative controls carry this test. `##class(Pkg.Cls)` contains `ident.ident` and
+    /// `Pkg` is a package name with no assignment anywhere — reporting an origin for it would
+    /// invent one. Globals and $-functions are excluded for the same reason.
+    #[test]
+    fn package_names_globals_and_functions_are_not_variables() {
+        for line in [
+            "set x=##class(Ens.Director).StartProduction(\"P\")",
+            "set ^Ens.Config=1",
+            "write $System.Status.GetErrorText(sc),!",
+            "write \"a.b\",!",
+            "set x=1",
+        ] {
+            assert_eq!(dereferenced_base(line), None, "false base on: {line}");
+        }
+    }
+
+    #[test]
+    fn a_variable_with_no_assignment_has_no_origin() {
+        assert!(oref_origin("do undefinedThing.Method()", "do undefinedThing.Method()").is_none());
+    }
+
+    #[test]
+    fn new_of_class_only_matches_a_bare_new() {
+        assert_eq!(new_of_class("##class(A.B).%New()").as_deref(), Some("A.B"));
+        assert_eq!(new_of_class("##class(A.B).Create()"), None);
+        assert_eq!(new_of_class("$G(x)"), None);
     }
 }
 
