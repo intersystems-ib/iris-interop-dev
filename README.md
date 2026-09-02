@@ -71,8 +71,11 @@ Restart Claude and **verify with the `check_config` tool** that it connects and 
 >   Claude Code and reads the same user-scope `~/.claude.json` registration shown above.
 > - **Connection settings from VS Code are read natively by this binary.** `iris-interop-dev` parses
 >   `.vscode/settings.json` — `objectscript.conn`, including named servers resolved through
->   `intersystems.servers` — as the last step of its discovery cascade. The order, and the known
->   limits of that step, are documented at the top of
+>   `intersystems.servers` — ahead of the blind localhost and Docker scans, so a workspace that
+>   names its server wins over whatever happens to answer on port 52773. The password is the one
+>   field it will not invent: Server Manager keeps it in the OS keychain, which this binary cannot
+>   read, so supply it with `IRIS_PASSWORD`. The full order, and the remaining limits, are at the
+>   top of
 >   [`discovery.rs`](crates/iris-agentic-dev-core/src/iris/discovery.rs) (issue #187).
 > - **What this fork does not carry is the Marketplace extension** that auto-registers the server,
 >   and `skill install --agent copilot`. That path belongs to the upstream community tool — see
