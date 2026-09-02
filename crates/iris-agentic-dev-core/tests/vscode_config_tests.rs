@@ -161,7 +161,9 @@ const KEYCHAIN_SERVER: &str = r#"{
 fn resolve(content: &str, env_password: Option<&str>) -> VsCodeResolution {
     let dir = tempfile::tempdir().unwrap();
     let path = write_settings(dir.path(), content);
-    parse_vscode_settings(&path).unwrap().resolve_with(env_password)
+    parse_vscode_settings(&path)
+        .unwrap()
+        .resolve_with(env_password)
 }
 
 /// The #187 defect itself: a named server whose password lives in the keychain

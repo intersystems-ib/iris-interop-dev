@@ -217,15 +217,15 @@ impl VsCodeSettings {
             // default everywhere else; the password is the field Server Manager
             // deliberately does not write here, so it is the one we refuse to invent.
             let username = server.username.as_deref().unwrap_or("_SYSTEM");
-            let password = match present(server.password.as_deref()).or_else(|| present(env_password))
-            {
-                Some(p) => p,
-                None => {
-                    return VsCodeResolution::MissingPassword {
-                        server: Some(server_name.clone()),
+            let password =
+                match present(server.password.as_deref()).or_else(|| present(env_password)) {
+                    Some(p) => p,
+                    None => {
+                        return VsCodeResolution::MissingPassword {
+                            server: Some(server_name.clone()),
+                        }
                     }
-                }
-            };
+                };
             return VsCodeResolution::Resolved(IrisConnection::new(
                 base_url,
                 ns,
