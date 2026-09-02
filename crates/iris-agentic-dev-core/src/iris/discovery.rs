@@ -3,11 +3,26 @@
 //! Order of priority (highest to lowest):
 //! 1. Explicit IrisConnection passed directly
 //! 2. Env vars (IRIS_HOST + IRIS_WEB_PORT)
-//! 3. Localhost port scan (100ms timeout, parallel)
-//! 4. Docker containers via bollard
-//! 5. VS Code settings.json objectscript.conn
+//! 3. IRIS_CONTAINER — named Docker container, web port resolved via bollard
+//! 4. Localhost port scan (100ms timeout, parallel), env-var credentials
+//! 5. Docker container scan via bollard
+//! 6. VS Code settings.json — `objectscript.conn`, resolving named servers through
+//!    `intersystems.servers` (see `vscode_config.rs`)
 //!
 //! Each step fails silently and falls through to the next.
+//!
+//! KNOWN LIMITS of step 6, tracked by issue #187. Recorded here because a reader
+//! concluded from a README sentence that no VS Code config path existed at all —
+//! the code is the only place that can answer that:
+//! - It runs LAST. Wherever IRIS answers on localhost or in Docker, steps 4-5 win
+//!   and settings.json is never opened. Step 3 already carries the equivalent
+//!   precedence fix for the named-container case; step 6 has no counterpart.
+//! - `discover_via_vscode_settings` searches exactly one path,
+//!   `current_dir()/.vscode/settings.json` — not user-scope settings, which is where
+//!   Server Manager normally keeps servers.
+//! - There is no OS-keychain reader. A server entry whose password lives in the
+//!   keychain arrives here with no password and defaults to _SYSTEM/SYS instead of
+//!   failing, producing a 401 that names no cause.
 
 use crate::iris::connection::{DiscoverySource, IrisConnection};
 use std::time::Duration;
