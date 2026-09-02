@@ -65,8 +65,20 @@ Or add it by hand to `~/.claude/settings.json`:
 
 Restart Claude and **verify with the `check_config` tool** that it connects and the tools appear.
 
-> **VS Code + GitHub Copilot?** The VS Code extension path is provided by the upstream community tool —
-> see [`intersystems-community/iris-agentic-dev`](https://github.com/intersystems-community/iris-agentic-dev).
+> **VS Code?** Three separate things get read as one here, so to be explicit about which is which:
+>
+> - **Claude Code's own VS Code extension works today, with no extra setup.** It is a front-end for
+>   Claude Code and reads the same user-scope `~/.claude.json` registration shown above.
+> - **Connection settings from VS Code are read natively by this binary.** `iris-interop-dev` parses
+>   `.vscode/settings.json` — `objectscript.conn`, including named servers resolved through
+>   `intersystems.servers` — as the last step of its discovery cascade. The order, and the known
+>   limits of that step, are documented at the top of
+>   [`discovery.rs`](crates/iris-agentic-dev-core/src/iris/discovery.rs) (issue #187).
+> - **What this fork does not carry is the Marketplace extension** that auto-registers the server,
+>   and `skill install --agent copilot`. That path belongs to the upstream community tool — see
+>   [`intersystems-community/iris-agentic-dev`](https://github.com/intersystems-community/iris-agentic-dev)
+>   — and it is bound to the `iris-agentic-dev` binary, so it will not register this one.
+>
 > This fork ships as the `iris-interop-dev` binary; the workshop VM registers it for Claude Code.
 
 ---
