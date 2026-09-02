@@ -147,18 +147,58 @@ pub fn parse_vscode_settings(path: impl AsRef<Path>) -> anyhow::Result<VsCodeSet
     Ok(settings)
 }
 
-impl VsCodeSettings {
-    /// Convert parsed settings to an IrisConnection, resolving named servers.
-    pub async fn to_iris_connection(&self) -> Option<IrisConnection> {
-        let conn = self.objectscript_conn.as_ref()?;
-        if conn.active == Some(false) {
-            return None;
-        }
+/// Outcome of resolving parsed settings into a connection.
+///
+/// #187: this used to be a bare `Option<IrisConnection>`, which collapsed "nothing is
+/// configured here" and "a connection IS configured but its password is missing" into
+/// the same `None` — and then avoided the second case entirely by defaulting the
+/// password to `SYS`. Those are different answers and the caller needs them apart.
+#[derive(Debug)]
+pub enum VsCodeResolution {
+    /// A complete connection was resolved.
+    Resolved(IrisConnection),
+    /// Nothing is configured here: no `objectscript.conn`, `active: false`, or a
+    /// `server:` name with no matching `intersystems.servers` entry.
+    NotConfigured,
+    /// A connection is configured but no password is available for it.
+    ///
+    /// This is the Server Manager case. The VS Code extension keeps the password in
+    /// the OS keychain, so it is absent from settings.json, and this binary has no
+    /// keychain reader. Fabricating `SYS` here produced a connection that looked
+    /// configured and was wrong — a 401 naming no cause.
+    MissingPassword { server: Option<String> },
+}
 
-        // Named server path
+impl VsCodeSettings {
+    /// Resolve to a connection, taking the fallback password from the caller.
+    ///
+    /// Pure — `resolve()` supplies `$IRIS_PASSWORD`. Split so tests can cover the
+    /// credential rules without mutating process environment.
+    pub fn resolve_with(&self, env_password: Option<&str>) -> VsCodeResolution {
+        // An empty string is an absent password, not a password of length zero.
+        let env_password = env_password.filter(|p| !p.is_empty());
+        let present = |v: Option<&str>| v.filter(|p| !p.is_empty()).map(str::to_owned);
+
+        let conn = match self.objectscript_conn.as_ref() {
+            Some(c) => c,
+            None => return VsCodeResolution::NotConfigured,
+        };
+        if conn.active == Some(false) {
+            return VsCodeResolution::NotConfigured;
+        }
+        let ns = conn.ns.as_deref().unwrap_or("USER");
+
+        // Named server path — resolve through `intersystems.servers`.
         if let Some(server_name) = &conn.server {
-            let servers = self.intersystems_servers.as_ref()?;
-            let server = servers.get(server_name)?;
+            let server = match self
+                .intersystems_servers
+                .as_ref()
+                .and_then(|servers| servers.get(server_name))
+            {
+                Some(s) => s,
+                // A name with no entry is a typo, not a licence to guess localhost.
+                None => return VsCodeResolution::NotConfigured,
+            };
             let host = server.web_server.host.as_deref().unwrap_or("localhost");
             let web_port = server.web_server.port.unwrap_or(52773);
             let scheme = server.web_server.scheme.as_deref().unwrap_or("http");
@@ -173,35 +213,48 @@ impl VsCodeSettings {
             } else {
                 format!("{}://{}:{}/{}", scheme, host, web_port, path_prefix)
             };
+            // Username is not a secret and `_SYSTEM` is this codebase's documented
+            // default everywhere else; the password is the field Server Manager
+            // deliberately does not write here, so it is the one we refuse to invent.
             let username = server.username.as_deref().unwrap_or("_SYSTEM");
-            let password = server.password.as_deref().unwrap_or("SYS");
-            let ns = conn.ns.as_deref().unwrap_or("USER");
-
-            let iris_conn = IrisConnection::new(
+            let password = match present(server.password.as_deref()).or_else(|| present(env_password))
+            {
+                Some(p) => p,
+                None => {
+                    return VsCodeResolution::MissingPassword {
+                        server: Some(server_name.clone()),
+                    }
+                }
+            };
+            return VsCodeResolution::Resolved(IrisConnection::new(
                 base_url,
                 ns,
                 username,
                 password,
                 DiscoverySource::VsCodeSettings,
-            );
-            // Note: super_server_port is available if needed for native connections
-            return Some(iris_conn);
+            ));
         }
 
-        // Direct host/port path
+        // Direct host/port path.
         let host = conn.host.as_deref().unwrap_or("localhost");
         let port = conn.port.unwrap_or(52773);
         let username = conn.username.as_deref().unwrap_or("_SYSTEM");
-        let password = conn.password.as_deref().unwrap_or("SYS");
-        let ns = conn.ns.as_deref().unwrap_or("USER");
-        let base_url = format!("http://{}:{}", host, port);
-
-        Some(IrisConnection::new(
-            base_url,
+        let password = match present(conn.password.as_deref()).or_else(|| present(env_password)) {
+            Some(p) => p,
+            None => return VsCodeResolution::MissingPassword { server: None },
+        };
+        VsCodeResolution::Resolved(IrisConnection::new(
+            format!("http://{}:{}", host, port),
             ns,
             username,
             password,
             DiscoverySource::VsCodeSettings,
         ))
+    }
+
+    /// Resolve to a connection, falling back to `$IRIS_PASSWORD` for the secret that
+    /// Server Manager keeps in the OS keychain.
+    pub fn resolve(&self) -> VsCodeResolution {
+        self.resolve_with(std::env::var("IRIS_PASSWORD").ok().as_deref())
     }
 }

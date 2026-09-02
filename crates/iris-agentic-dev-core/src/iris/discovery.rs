@@ -4,27 +4,27 @@
 //! 1. Explicit IrisConnection passed directly
 //! 2. Env vars (IRIS_HOST + IRIS_WEB_PORT)
 //! 3. IRIS_CONTAINER — named Docker container, web port resolved via bollard
-//! 4. Localhost port scan (100ms timeout, parallel), env-var credentials
-//! 5. Docker container scan via bollard
-//! 6. VS Code settings.json — `objectscript.conn`, resolving named servers through
+//! 4. VS Code settings.json — `objectscript.conn`, resolving named servers through
 //!    `intersystems.servers` (see `vscode_config.rs`)
+//! 5. Localhost port scan (100ms timeout, parallel), env-var credentials
+//! 6. Docker container scan via bollard
 //!
 //! Each step fails silently and falls through to the next.
 //!
-//! KNOWN LIMITS of step 6, tracked by issue #187. Recorded here because a reader
-//! concluded from a README sentence that no VS Code config path existed at all —
-//! the code is the only place that can answer that:
-//! - It runs LAST. Wherever IRIS answers on localhost or in Docker, steps 4-5 win
-//!   and settings.json is never opened. Step 3 already carries the equivalent
-//!   precedence fix for the named-container case; step 6 has no counterpart.
-//! - `discover_via_vscode_settings` searches exactly one path,
-//!   `current_dir()/.vscode/settings.json` — not user-scope settings, which is where
-//!   Server Manager normally keeps servers.
-//! - There is no OS-keychain reader. A server entry whose password lives in the
-//!   keychain arrives here with no password and defaults to _SYSTEM/SYS instead of
-//!   failing, producing a 401 that names no cause.
+//! Steps 3 and 4 are both EXPLICIT configuration and both sit ahead of the blind scans
+//! deliberately: they say which instance the user means, and a scan cannot tell one IRIS
+//! on 52773 from another. #187 moved step 4 up from last, where it could not run on any
+//! machine that had IRIS answering locally.
+//!
+//! REMAINING LIMIT of step 4, still tracked by #187: `discover_via_vscode_settings`
+//! searches exactly one path, `current_dir()/.vscode/settings.json` — not user-scope VS
+//! Code settings, which is where Server Manager normally keeps servers. A workspace that
+//! defines its own server is found; a server added through the Server Manager UI is not.
+//! There is still no OS-keychain reader either, but an absent password is now reported
+//! rather than replaced with `SYS`.
 
 use crate::iris::connection::{DiscoverySource, IrisConnection};
+use crate::iris::vscode_config::VsCodeResolution;
 use std::time::Duration;
 
 /// The ports we scan on localhost for IRIS web servers.
@@ -229,7 +229,17 @@ pub async fn discover_iris(explicit: Option<IrisConnection>) -> IrisDiscovery {
         }
     }
 
-    // 4. Localhost scan (parallel, 100ms each). Uses env var credentials.
+    // 4. VS Code settings.json — EXPLICIT configuration, so it runs before the blind
+    // scans for exactly the reason step 3 does: a settings.json naming a server states
+    // WHICH instance the user means, and a port scan cannot tell one IRIS on 52773 from
+    // another. #187: this used to be step 6, last, which made it unreachable on any
+    // machine where IRIS answered on localhost or in Docker — the code was present,
+    // tested, and never executed.
+    if let Some(conn) = discover_via_vscode_settings().await {
+        return IrisDiscovery::Found(conn);
+    }
+
+    // 5. Localhost scan (parallel, 100ms each). Uses env var credentials.
     let username = std::env::var("IRIS_USERNAME").unwrap_or_else(|_| "_SYSTEM".to_string());
     let password = std::env::var("IRIS_PASSWORD").unwrap_or_else(|_| "SYS".to_string());
     let namespace = std::env::var("IRIS_NAMESPACE").unwrap_or_else(|_| "USER".to_string());
@@ -262,13 +272,8 @@ pub async fn discover_iris(explicit: Option<IrisConnection>) -> IrisDiscovery {
         }
     }
 
-    // 5. Docker scan via bollard
+    // 6. Docker scan via bollard
     if let Some(conn) = discover_via_docker().await {
-        return IrisDiscovery::Found(conn);
-    }
-
-    // 6. VS Code settings.json
-    if let Some(conn) = discover_via_vscode_settings().await {
         return IrisDiscovery::Found(conn);
     }
 
@@ -608,7 +613,12 @@ async fn discover_via_docker() -> Option<IrisConnection> {
     None
 }
 
-/// Attempt to find IRIS connection from VS Code settings.json in common locations.
+/// Resolve a connection from VS Code settings.json, if one is configured here.
+///
+/// #187: a configured-but-passwordless entry returns `None` like an unconfigured one,
+/// but emits a warning naming the file and the server first. The two used to be
+/// indistinguishable because the missing password was filled in with `SYS`, so the
+/// cascade stopped on a connection that could only ever 401.
 async fn discover_via_vscode_settings() -> Option<IrisConnection> {
     let candidates = [std::env::current_dir().ok()?.join(".vscode/settings.json")];
 
@@ -616,9 +626,29 @@ async fn discover_via_vscode_settings() -> Option<IrisConnection> {
         if !path.exists() {
             continue;
         }
-        if let Ok(settings) = crate::iris::vscode_config::parse_vscode_settings(path) {
-            if let Some(conn) = settings.to_iris_connection().await {
-                return Some(conn);
+        let settings = match crate::iris::vscode_config::parse_vscode_settings(path) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("Could not parse {}: {}", path.display(), e);
+                continue;
+            }
+        };
+        match settings.resolve() {
+            VsCodeResolution::Resolved(conn) => return Some(conn),
+            VsCodeResolution::NotConfigured => continue,
+            VsCodeResolution::MissingPassword { server } => {
+                let what = match server.as_deref() {
+                    Some(name) => format!("server '{name}'"),
+                    None => "a connection".to_string(),
+                };
+                tracing::warn!(
+                    "{} configures {} but carries no password. VS Code Server Manager keeps it in \
+                     the OS keychain, which this binary cannot read — set IRIS_PASSWORD to supply \
+                     it. Continuing discovery without this entry. (issue #187)",
+                    path.display(),
+                    what
+                );
+                continue;
             }
         }
     }

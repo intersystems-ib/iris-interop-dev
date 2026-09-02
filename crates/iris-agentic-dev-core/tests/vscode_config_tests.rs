@@ -136,3 +136,143 @@ fn settings_without_objectscript_conn_is_ok() {
     let settings = parse_vscode_settings(&path).unwrap();
     assert!(settings.objectscript_conn.is_none());
 }
+
+// ── #187: resolution, not just parsing ───────────────────────────────────────
+//
+// Everything above tests that the FIELDS parse. These test what the parsed
+// settings resolve TO, which is where the defect lived: a Server Manager entry
+// keeps its password in the OS keychain, so it is absent from settings.json, and
+// `unwrap_or("SYS")` turned that absence into a confident wrong connection —
+// a 401 naming no cause. `resolve_with` takes the environment fallback as an
+// argument so these stay pure and cannot race on process env.
+
+use iris_agentic_dev_core::iris::vscode_config::VsCodeResolution;
+
+const KEYCHAIN_SERVER: &str = r#"{
+    "objectscript.conn": {"active": true, "server": "workshop-iris", "ns": "IRISAPP"},
+    "intersystems.servers": {
+        "workshop-iris": {
+            "webServer": {"scheme": "http", "host": "localhost", "port": 52773},
+            "username": "_SYSTEM"
+        }
+    }
+}"#;
+
+fn resolve(content: &str, env_password: Option<&str>) -> VsCodeResolution {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_settings(dir.path(), content);
+    parse_vscode_settings(&path).unwrap().resolve_with(env_password)
+}
+
+/// The #187 defect itself: a named server whose password lives in the keychain
+/// must NOT come back as a connection carrying "SYS".
+#[test]
+fn named_server_without_a_password_is_not_handed_sys() {
+    match resolve(KEYCHAIN_SERVER, None) {
+        VsCodeResolution::MissingPassword { server } => {
+            assert_eq!(server.as_deref(), Some("workshop-iris"));
+        }
+        VsCodeResolution::Resolved(conn) => panic!(
+            "resolved with a fabricated password {:?} — this is the 401 that names no cause",
+            conn.password
+        ),
+        VsCodeResolution::NotConfigured => panic!("a configured server read as NotConfigured"),
+    }
+}
+
+/// Same for the direct host/port form, which had its own copy of the default.
+#[test]
+fn direct_connection_without_a_password_is_not_handed_sys() {
+    let settings = r#"{"objectscript.conn": {"active": true, "host": "localhost", "port": 52773}}"#;
+    match resolve(settings, None) {
+        VsCodeResolution::MissingPassword { server } => assert!(server.is_none()),
+        VsCodeResolution::Resolved(conn) => {
+            panic!("resolved with a fabricated password {:?}", conn.password)
+        }
+        VsCodeResolution::NotConfigured => panic!("a configured connection read as NotConfigured"),
+    }
+}
+
+/// An empty string is an absent password, not a password of length zero.
+#[test]
+fn an_empty_password_counts_as_missing() {
+    let settings = r#"{"objectscript.conn": {"active": true, "host": "h", "password": ""}}"#;
+    assert!(matches!(
+        resolve(settings, None),
+        VsCodeResolution::MissingPassword { .. }
+    ));
+}
+
+/// The intended composition: VS Code supplies host/port/namespace, the
+/// environment supplies the secret that lives in the keychain.
+#[test]
+fn iris_password_from_the_environment_completes_a_keychain_server() {
+    match resolve(KEYCHAIN_SERVER, Some("from-the-env")) {
+        VsCodeResolution::Resolved(conn) => {
+            assert_eq!(conn.password, "from-the-env");
+            assert_eq!(conn.username, "_SYSTEM");
+            assert_eq!(conn.namespace, "IRISAPP");
+            assert_eq!(conn.base_url, "http://localhost:52773");
+        }
+        other => panic!("expected Resolved, got {other:?}"),
+    }
+}
+
+/// A password written in settings.json wins over the environment fallback.
+#[test]
+fn a_password_in_settings_beats_the_environment() {
+    let settings = r#"{
+        "objectscript.conn": {"active": true, "server": "s"},
+        "intersystems.servers": {
+            "s": {"webServer": {"host": "localhost", "port": 52773}, "password": "inline"}
+        }
+    }"#;
+    match resolve(settings, Some("from-the-env")) {
+        VsCodeResolution::Resolved(conn) => assert_eq!(conn.password, "inline"),
+        other => panic!("expected Resolved, got {other:?}"),
+    }
+}
+
+/// active:false means "do not use this", not "use it with defaults".
+#[test]
+fn inactive_connection_resolves_to_not_configured() {
+    let settings = r#"{"objectscript.conn": {"active": false, "host": "h", "password": "p"}}"#;
+    assert!(matches!(
+        resolve(settings, None),
+        VsCodeResolution::NotConfigured
+    ));
+}
+
+/// A server: name with no matching entry is a typo, not a connection to localhost.
+#[test]
+fn a_named_server_with_no_matching_entry_is_not_configured() {
+    let settings = r#"{
+        "objectscript.conn": {"active": true, "server": "ghost"},
+        "intersystems.servers": {"other": {"webServer": {"host": "h"}, "password": "p"}}
+    }"#;
+    assert!(matches!(
+        resolve(settings, None),
+        VsCodeResolution::NotConfigured
+    ));
+}
+
+/// pathPrefix still lands in the base URL (regression guard for the rewrite).
+#[test]
+fn path_prefix_survives_resolution() {
+    let settings = r#"{
+        "objectscript.conn": {"active": true, "server": "s"},
+        "intersystems.servers": {
+            "s": {
+                "webServer": {"scheme": "https", "host": "iris.example.com", "port": 443,
+                              "pathPrefix": "/gateway/"},
+                "password": "p"
+            }
+        }
+    }"#;
+    match resolve(settings, None) {
+        VsCodeResolution::Resolved(conn) => {
+            assert_eq!(conn.base_url, "https://iris.example.com:443/gateway");
+        }
+        other => panic!("expected Resolved, got {other:?}"),
+    }
+}
