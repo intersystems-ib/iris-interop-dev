@@ -754,6 +754,11 @@ pub struct TranslationResult {
     pub found: bool,
     /// Warnings for constructs that could not be safely translated (left unchanged).
     pub warnings: Vec<String>,
+    /// #179: for each line of `translated_code`, the 1-based line of the ORIGINAL code it
+    /// came from. Empty when nothing was translated. Without this the caller is shown a line
+    /// it never wrote — the translation expands one `&sql(...)` into three or four lines, so
+    /// after the first macro every number is off.
+    pub line_map: Vec<usize>,
 }
 
 /// Translate `&sql(...)` embedded SQL macros in ObjectScript code to
@@ -769,10 +774,14 @@ pub fn translate_sql_macros(code: &str) -> TranslationResult {
             translated_code: code.to_string(),
             found: false,
             warnings: vec![],
+            line_map: vec![],
         };
     }
 
     let mut output = String::with_capacity(code.len() * 2);
+    // (output byte offset, input char index) — where each stretch of output came from.
+    // Output only ever grows, so this stays sorted and a binary search is valid.
+    let mut marks: Vec<(usize, usize)> = vec![(0, 0)];
     let mut warnings = vec![];
     let mut rs_counter: u32 = 0;
     let chars: Vec<char> = code.chars().collect();
@@ -781,6 +790,7 @@ pub fn translate_sql_macros(code: &str) -> TranslationResult {
     let mut found = false;
 
     while i < n {
+        marks.push((output.len(), i));
         // Look for &sql(
         if i + 5 < n
             && chars[i] == '&'
@@ -836,7 +846,7 @@ pub fn translate_sql_macros(code: &str) -> TranslationResult {
                 }
                 output.push_str(&translate_select_into(&sql_content, &rs_var, &sc_var));
                 // Check next line for SQLCODE / %msg and rewrite
-                i = rewrite_next_line_sqlcode(chars.as_slice(), i, n, &mut output);
+                i = rewrite_next_line_sqlcode(chars.as_slice(), i, n, &mut output, &mut marks);
                 continue;
             } else if sql_upper.starts_with("INSERT")
                 || sql_upper.starts_with("UPDATE")
@@ -846,7 +856,7 @@ pub fn translate_sql_macros(code: &str) -> TranslationResult {
                 // Translate DML
                 output.push_str(&translate_dml(&sql_content, &rs_var));
                 // Check next line for SQLCODE / %msg
-                i = rewrite_next_line_sqlcode(chars.as_slice(), i, n, &mut output);
+                i = rewrite_next_line_sqlcode(chars.as_slice(), i, n, &mut output, &mut marks);
                 continue;
             } else {
                 // Unknown — leave unchanged with warning
@@ -863,11 +873,62 @@ pub fn translate_sql_macros(code: &str) -> TranslationResult {
         }
     }
 
+    let line_map = build_line_map(&chars, &output, &marks);
     TranslationResult {
         translated_code: output,
         found,
         warnings,
+        line_map,
     }
+}
+
+/// Attribute every OUTPUT line to the INPUT line it came from (#179).
+///
+/// `marks` records, at each step of the translation, how much output had been produced and
+/// where the reader was in the input. For an output line starting at byte `off`, the input
+/// position is whatever the most recent mark at or before `off` recorded — which is exactly
+/// the stretch of translation that produced it.
+fn build_line_map(chars: &[char], output: &str, marks: &[(usize, usize)]) -> Vec<usize> {
+    // Input char index -> 1-based input line.
+    let mut line_at = Vec::with_capacity(chars.len() + 1);
+    let mut line = 1usize;
+    for &c in chars {
+        line_at.push(line);
+        if c == '\n' {
+            line += 1;
+        }
+    }
+    line_at.push(line);
+
+    let mut map = Vec::new();
+    let mut off = 0usize;
+    for piece in output.split('\n') {
+        let idx = marks.partition_point(|m| m.0 <= off).saturating_sub(1);
+        let at = marks.get(idx).map(|m| m.1).unwrap_or(0);
+        map.push(*line_at.get(at).unwrap_or(&1));
+        off += piece.len() + 1;
+    }
+    map
+}
+
+/// The line an IRIS `RunUser+N` frame actually points at (#179).
+///
+/// MEASURED, not assumed: the class compiler drops blank and whitespace-only lines from the
+/// generated .INT, and keeps comment lines (`//`, `;`). So N counts lines with content. The
+/// old code did `submitted.lines().nth(n - 1)`, which is right only for code with no blank
+/// lines in it — and blank lines between steps are ordinary in anything an agent writes, so
+/// this was wrong for every `iris_execute` containing one, translated or not.
+///
+/// Returns the 0-based index into `code.lines()`.
+pub fn frame_line_index(code: &str, n: usize) -> Option<usize> {
+    if n == 0 {
+        return None;
+    }
+    code.lines()
+        .enumerate()
+        .filter(|(_, l)| !l.trim().is_empty())
+        .nth(n - 1)
+        .map(|(idx, _)| idx)
 }
 
 /// Translate a SELECT ... INTO :var1, :var2 ... statement.
@@ -1045,7 +1106,13 @@ fn translate_dml(sql: &str, rs_var: &str) -> String {
 /// time, including on the success path of a SELECT INTO. The names now resolve wherever
 /// they appear (same line, next line, ten lines later), which is what embedded SQL promises,
 /// so this function no longer edits anything.
-fn rewrite_next_line_sqlcode(chars: &[char], mut i: usize, n: usize, output: &mut String) -> usize {
+fn rewrite_next_line_sqlcode(
+    chars: &[char],
+    mut i: usize,
+    n: usize,
+    output: &mut String,
+    marks: &mut Vec<(usize, usize)>,
+) -> usize {
     // Skip whitespace (but not newlines) to find the next line
     // First, collect the rest of the current line (should be empty or whitespace after &sql)
     while i < n && chars[i] != '\n' {
@@ -1056,6 +1123,10 @@ fn rewrite_next_line_sqlcode(chars: &[char], mut i: usize, n: usize, output: &mu
         output.push('\n');
         i += 1;
     }
+
+    // #179: everything from here is the caller's NEXT line, copied verbatim — attribute it to
+    // that line and not to the `&sql(` above it.
+    marks.push((output.len(), i));
 
     // Collect the next line
     let mut next_line = String::new();
@@ -2895,6 +2966,18 @@ pub fn translate_symbols_query(limit: usize, query: &str) -> (String, Vec<serde_
     )
 }
 
+/// What the caller sent, what actually ran, and how to get from one to the other (#179).
+///
+/// `sent` is the text IRIS executed; `original` is set only when `&sql` translation rewrote
+/// it, in which case `line_map[i]` is the 1-based ORIGINAL line that produced line `i` of
+/// `sent`. Keeping both is the point: the caller needs their own line named, and the
+/// generated line is what the error is literally about.
+pub struct SourceMap<'a> {
+    pub sent: &'a str,
+    pub original: Option<&'a str>,
+    pub line_map: &'a [usize],
+}
+
 /// Turn the wrapper's opaque frame into something the caller can act on (#124).
 ///
 /// Adds the caller's OWN failing line (an IRIS terminal would have echoed it with a caret) and,
@@ -2905,23 +2988,58 @@ async fn enrich_abort(
     client: &reqwest::Client,
     namespace: &str,
     abort: &str,
-    submitted: &str,
+    src: SourceMap<'_>,
     resp: &mut serde_json::Value,
 ) {
+    let submitted = src.sent;
     let Some(frame) = parse_abort_frame(abort) else {
         return;
     };
     resp["signal"] = serde_json::Value::String(frame.signal.to_string());
 
+    // #179: `RunUser+N` counts lines with CONTENT — the class compiler drops blank ones. And
+    // when `translate_sql` rewrote the code, the line that ran is not a line the caller wrote,
+    // so the number has to be mapped back before it is quoted at them.
+    let mut generated: Option<(usize, String)> = None;
     if let Some(n) = frame.line {
-        if let Some(text) = submitted.lines().nth(n - 1) {
-            resp["source_line_number"] = serde_json::Value::from(n);
-            resp["source_line"] = serde_json::Value::String(text.trim_end().to_string());
+        if let Some(idx) = frame_line_index(submitted, n) {
+            let ran = submitted.lines().nth(idx).unwrap_or_default().trim_end();
+            match src.original {
+                Some(original) => {
+                    let own = src.line_map.get(idx).copied().unwrap_or(idx + 1);
+                    let own_text = original.lines().nth(own - 1).unwrap_or_default().trim_end();
+                    resp["source_line_number"] = serde_json::Value::from(own);
+                    resp["source_line"] = serde_json::Value::String(own_text.to_string());
+                    if ran != own_text {
+                        generated = Some((idx + 1, ran.to_string()));
+                    }
+                }
+                None => {
+                    resp["source_line_number"] = serde_json::Value::from(idx + 1);
+                    resp["source_line"] = serde_json::Value::String(ran.to_string());
+                }
+            }
         }
     }
 
-    let mut hint = match (resp.get("source_line").and_then(|v| v.as_str()), frame.line) {
-        (Some(line), Some(n)) => format!("Line {n} of the code you sent is what failed: {line}"),
+    let own_line = resp
+        .get("source_line")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let own_no = resp.get("source_line_number").and_then(|v| v.as_u64());
+    if let Some((gen_n, gen)) = &generated {
+        resp["generated_line_number"] = serde_json::Value::from(*gen_n);
+        resp["generated_line"] = serde_json::Value::String(gen.clone());
+    }
+    let mut hint = match (own_line, own_no) {
+        // Only claim "the code you sent" when that is what it is.
+        (Some(line), Some(n)) => match &generated {
+            Some((gen_n, gen)) => format!(
+                "Line {n} of the code you sent is what failed: {line} — after &sql \
+                 translation that ran as line {gen_n} of `translated_code`: {gen}"
+            ),
+            None => format!("Line {n} of the code you sent is what failed: {line}"),
+        },
         _ => String::new(),
     };
 
@@ -5469,7 +5587,19 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                 // carries the abort LINE — `output` still holds everything the script wrote
                 // before it, which the caller asked to keep.
                 if let Some(abort) = abort {
-                    enrich_abort(&iris, client, &namespace, abort, code_to_run, &mut resp).await;
+                    let src = match translation.as_ref().filter(|t| t.found) {
+                        Some(t) => SourceMap {
+                            sent: code_to_run,
+                            original: Some(&p.code),
+                            line_map: &t.line_map,
+                        },
+                        None => SourceMap {
+                            sent: code_to_run,
+                            original: None,
+                            line_map: &[],
+                        },
+                    };
+                    enrich_abort(&iris, client, &namespace, abort, src, &mut resp).await;
                     return envelope::fail_with("IRIS_RUNTIME_ERROR", abort, resp);
                 }
                 return ok_json(resp);
@@ -10022,6 +10152,93 @@ mod member_kind_tests {
             member_kind_mismatch_hint("My.Cls", "Thing", "CLASS PROPERTY", MemberKind::Method)
                 .is_some()
         );
+    }
+}
+
+#[cfg(test)]
+mod frame_line_tests {
+    use super::{frame_line_index, translate_sql_macros};
+
+    /// MEASURED against IRIS 2026.1, not assumed — see #179. The class compiler drops blank
+    /// and whitespace-only lines from the generated .INT and KEEPS comment lines, so
+    /// `RunUser+N` counts lines with content. Every row here was confirmed at the wire by
+    /// submitting code whose failing line writes a uniquely named undefined variable, so the
+    /// error itself names which line really failed.
+    #[test]
+    fn blank_lines_do_not_count_and_comments_do() {
+        // "write a" / blank / "write b" / "write vAT4"  -> RunUser+3 is the 4th line.
+        let code = "write \"a\",!\n\nwrite \"b\",!\nwrite vAT4";
+        assert_eq!(
+            frame_line_index(code, 3),
+            Some(3),
+            "blank line must not consume an index"
+        );
+
+        // whitespace-only counts as blank
+        let code = "write \"a\",!\n   \nwrite \"b\",!\nwrite vAT4";
+        assert_eq!(frame_line_index(code, 3), Some(3));
+
+        // comments are real lines in the .INT
+        let code = "write \"a\",!\n// note\nwrite \"b\",!\nwrite vAT4";
+        assert_eq!(frame_line_index(code, 4), Some(3));
+
+        // a leading blank shifts everything by one
+        assert_eq!(frame_line_index("\nwrite \"a\",!\nwrite vAT3", 2), Some(2));
+    }
+
+    #[test]
+    fn the_no_blank_case_is_unchanged() {
+        let code = "write \"a\",!\nwrite \"b\",!\nwrite vAT3";
+        for n in 1..=3 {
+            assert_eq!(frame_line_index(code, n), Some(n - 1));
+        }
+    }
+
+    #[test]
+    fn out_of_range_and_zero_are_none() {
+        assert_eq!(frame_line_index("write 1", 0), None);
+        assert_eq!(frame_line_index("write 1", 2), None);
+        assert_eq!(frame_line_index("", 1), None);
+    }
+
+    /// The #179 repro. Three lines in, seven out — without a map the caller is told about
+    /// "line 5" of a three-line script, quoting a line they never wrote.
+    #[test]
+    fn the_line_map_points_every_generated_line_at_its_source() {
+        let r = translate_sql_macros(
+            "&sql(SELECT ID, Name FROM Ens_Config.Production WHERE Name='X')\n             write \"found\",!\n             write ID",
+        );
+        assert!(r.found);
+        let out: Vec<&str> = r.translated_code.lines().collect();
+        assert!(
+            out.len() > 3,
+            "translation should have expanded the macro: {out:?}"
+        );
+        // Every generated line of the macro belongs to input line 1 ...
+        assert_eq!(r.line_map[0], 1);
+        // ... and the caller's own following lines keep their own numbers.
+        let write_id = out
+            .iter()
+            .position(|l| l.trim() == "write ID")
+            .expect("the caller's last line survives");
+        assert_eq!(
+            r.line_map[write_id],
+            3,
+            "`write ID` is the caller's line 3, not line {}",
+            write_id + 1
+        );
+        let found = out
+            .iter()
+            .position(|l| l.contains("\"found\""))
+            .expect("the caller's second line survives");
+        assert_eq!(r.line_map[found], 2);
+    }
+
+    #[test]
+    fn an_untranslated_body_has_no_map() {
+        let r = translate_sql_macros("write 1,!\nwrite 2,!");
+        assert!(!r.found);
+        assert!(r.line_map.is_empty());
     }
 }
 

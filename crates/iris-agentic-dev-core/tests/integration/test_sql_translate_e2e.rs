@@ -217,6 +217,72 @@ fn test_e2e_select_without_into_warns_that_nothing_is_bound() {
     );
 }
 
+/// #179: the caller is told about a line they actually wrote.
+///
+/// Before this, `iris_execute` indexed the RunUser+N frame straight into the TRANSLATED text
+/// while the hint said "the code you sent" — so this three-line script reported
+/// `Line 5 ... write "found",!`, a number the script does not have, quoting the wrong line.
+#[test]
+#[ignore]
+fn test_e2e_the_reported_line_is_one_the_caller_wrote() {
+    if iris_host().is_empty() {
+        eprintln!("Skipping: IRIS_HOST not set");
+        return;
+    }
+    // Deliberately no table: a `%Dictionary` reference triggers the typed-tool redirect hint,
+    // which is set BEFORE enrich_abort and takes the `hint` slot — that is a real precedence
+    // problem (filed separately) but it is not what this test is about.
+    let code = "&sql(SELECT 1 AS ID)\n\
+                write \"found\",!\n\
+                write ID";
+    let result = execute(code, None);
+    eprintln!("#179: {}", serde_json::to_string_pretty(&result).unwrap());
+    assert_eq!(
+        result["source_line_number"], 3,
+        "the failure is on the caller's line 3 (`write ID`, unbound because there is no INTO)"
+    );
+    assert_eq!(result["source_line"], "write ID");
+    let hint = result["hint"].as_str().unwrap_or("");
+    assert!(
+        hint.contains("Line 3"),
+        "the hint must name the caller's own line: {hint}"
+    );
+    assert!(
+        !hint.contains("sqlrs1"),
+        "the hint must not quote generated code as though the caller wrote it: {hint}"
+    );
+}
+
+/// #179, the other half: `RunUser+N` counts lines with CONTENT, because the class compiler
+/// drops blank ones from the .INT. This is not an `&sql` problem at all — it was wrong for
+/// EVERY iris_execute containing a blank line, which is most multi-step scripts.
+///
+/// The failing line writes a uniquely named undefined variable, so the error itself proves
+/// which line really failed rather than the test asserting its own assumption.
+#[test]
+#[ignore]
+fn test_e2e_a_blank_line_does_not_shift_the_reported_line() {
+    if iris_host().is_empty() {
+        eprintln!("Skipping: IRIS_HOST not set");
+        return;
+    }
+    let result = execute("write \"a\",!\n\nwrite \"b\",!\nwrite vAT4", Some(false));
+    eprintln!(
+        "#179 blank: {}",
+        serde_json::to_string_pretty(&result).unwrap()
+    );
+    assert!(
+        result["error"].as_str().unwrap_or("").contains("vAT4"),
+        "the abort must be the one we planted: {}",
+        result["error"]
+    );
+    assert_eq!(
+        result["source_line_number"], 4,
+        "the blank line 2 must not consume an index"
+    );
+    assert_eq!(result["source_line"], "write vAT4");
+}
+
 /// T026: INSERT translation fires — sql_translated: true (don't actually execute insert against real table).
 /// Uses a read-only table to verify translation, then checks sql_translated even if INSERT fails.
 #[test]
