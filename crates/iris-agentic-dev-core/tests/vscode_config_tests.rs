@@ -146,7 +146,9 @@ fn settings_without_objectscript_conn_is_ok() {
 // a 401 naming no cause. `resolve_with` takes the environment fallback as an
 // argument so these stay pure and cannot race on process env.
 
-use iris_agentic_dev_core::iris::vscode_config::VsCodeResolution;
+use iris_agentic_dev_core::iris::vscode_config::{
+    parse_code_workspace, VsCodeResolution, VsCodeSettings,
+};
 
 const KEYCHAIN_SERVER: &str = r#"{
     "objectscript.conn": {"active": true, "server": "workshop-iris", "ns": "IRISAPP"},
@@ -309,5 +311,240 @@ fn a_server_name_with_no_servers_map_at_all_is_not_configured() {
             "reported a missing password for a server that was never resolved — \
              the warning would name a cause that is not the real one"
         ),
+    }
+}
+
+// ── #187 (2): user-scope settings ────────────────────────────────────────────
+//
+// The workshop shape is split across TWO files by design. Server Manager writes
+// `intersystems.servers` into USER-scope settings; the workspace `.vscode/settings.json`
+// only references the server by name. Reading either file alone yields NotConfigured,
+// which is why adding the user path as another loop candidate would not have fixed
+// anything — the two scopes have to be MERGED before resolution.
+
+fn parse(content: &str) -> VsCodeSettings {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_settings(dir.path(), content);
+    parse_vscode_settings(&path).unwrap()
+}
+
+/// Exactly what a student has after the workshop VM is set up: the workspace names
+/// `workshop-iris`, Server Manager defines it in user scope, the password is in the
+/// keychain and supplied by the environment. Host and port come from user scope, the
+/// namespace from the workspace — which is the whole point of the merge.
+#[test]
+fn the_workshop_shape_resolves_once_user_scope_is_merged() {
+    let workspace = parse(
+        r#"{"objectscript.conn": {"active": true, "server": "workshop-iris", "ns": "HOSPITAL"}}"#,
+    );
+    let user = parse(
+        r#"{"intersystems.servers": {
+              "workshop-iris": {
+                "webServer": {"scheme": "http", "host": "iris.workshop.local", "port": 52773},
+                "username": "alumno"
+              }
+            }}"#,
+    );
+    match workspace
+        .overlay_on(user)
+        .resolve_with(Some("from-the-env"))
+    {
+        VsCodeResolution::Resolved(conn) => {
+            assert_eq!(conn.base_url, "http://iris.workshop.local:52773");
+            assert_eq!(conn.namespace, "HOSPITAL");
+            assert_eq!(conn.username, "alumno");
+            assert_eq!(conn.password, "from-the-env");
+        }
+        other => panic!("expected Resolved, got {other:?}"),
+    }
+}
+
+/// Without the env password it must name the server rather than fall silent — the
+/// student gets told which entry needs IRIS_PASSWORD instead of an unexplained 401.
+#[test]
+fn a_merged_server_with_no_password_names_itself() {
+    let workspace = parse(r#"{"objectscript.conn": {"active": true, "server": "workshop-iris"}}"#);
+    let user = parse(
+        r#"{"intersystems.servers": {"workshop-iris": {"webServer": {"host": "h", "port": 52773}}}}"#,
+    );
+    match workspace.overlay_on(user).resolve_with(None) {
+        VsCodeResolution::MissingPassword { server } => {
+            assert_eq!(server.as_deref(), Some("workshop-iris"))
+        }
+        other => panic!("expected MissingPassword, got {other:?}"),
+    }
+}
+
+/// Workspace wins key-by-key, the way VS Code resolves scopes.
+#[test]
+fn a_workspace_server_entry_overrides_the_user_one_of_the_same_name() {
+    let workspace = parse(
+        r#"{"objectscript.conn": {"active": true, "server": "iris"},
+            "intersystems.servers": {"iris": {"webServer": {"host": "workspace.example", "port": 443}, "password": "p"}}}"#,
+    );
+    let user = parse(
+        r#"{"intersystems.servers": {"iris": {"webServer": {"host": "user.example", "port": 52773}, "password": "p"}}}"#,
+    );
+    match workspace.overlay_on(user).resolve_with(None) {
+        VsCodeResolution::Resolved(conn) => {
+            assert_eq!(conn.base_url, "http://workspace.example:443")
+        }
+        other => panic!("expected Resolved, got {other:?}"),
+    }
+}
+
+/// A user-scope entry the workspace does not mention stays available.
+#[test]
+fn user_scope_entries_survive_the_overlay() {
+    let workspace = parse(
+        r#"{"objectscript.conn": {"active": true, "server": "other"},
+            "intersystems.servers": {"iris": {"webServer": {"host": "workspace.example"}, "password": "p"}}}"#,
+    );
+    let user = parse(
+        r#"{"intersystems.servers": {"other": {"webServer": {"host": "user.example", "port": 52773}, "password": "p"}}}"#,
+    );
+    match workspace.overlay_on(user).resolve_with(None) {
+        VsCodeResolution::Resolved(conn) => assert_eq!(conn.base_url, "http://user.example:52773"),
+        other => panic!("expected Resolved, got {other:?}"),
+    }
+}
+
+/// A workspace with no conn of its own falls back to the user-scope one.
+#[test]
+fn a_user_scope_conn_is_used_when_the_workspace_has_none() {
+    let workspace = parse(r#"{"editor.fontSize": 14}"#);
+    let user = parse(
+        r#"{"objectscript.conn": {"active": true, "host": "user.example", "port": 52773, "password": "p", "ns": "USER"}}"#,
+    );
+    match workspace.overlay_on(user).resolve_with(None) {
+        VsCodeResolution::Resolved(conn) => assert_eq!(conn.base_url, "http://user.example:52773"),
+        other => panic!("expected Resolved, got {other:?}"),
+    }
+}
+
+/// `active: false` in the workspace opts out even when user scope would connect —
+/// otherwise the opt-out documented in the README would be silently overridable.
+#[test]
+fn a_workspace_opt_out_is_not_undone_by_user_scope() {
+    let workspace =
+        parse(r#"{"objectscript.conn": {"active": false, "host": "h", "password": "p"}}"#);
+    let user = parse(
+        r#"{"objectscript.conn": {"active": true, "host": "user.example", "port": 52773, "password": "p"}}"#,
+    );
+    assert!(matches!(
+        workspace.overlay_on(user).resolve_with(None),
+        VsCodeResolution::NotConfigured
+    ));
+}
+
+/// Two empty scopes are still nothing — no accidental localhost default.
+#[test]
+fn merging_two_unconfigured_scopes_is_still_unconfigured() {
+    assert!(matches!(
+        parse(r#"{"editor.fontSize": 14}"#)
+            .overlay_on(parse(r#"{"telemetry.telemetryLevel": "off"}"#))
+            .resolve_with(None),
+        VsCodeResolution::NotConfigured
+    ));
+}
+
+// ── #187 (2b): the .code-workspace scope, and the namespace guardrail ────────
+//
+// Verbatim from the workshop's Alumno.code-workspace. The server is defined ONCE
+// here and referenced by name from each exercise folder — so neither user scope nor
+// .vscode/settings.json carries it, and a reader that does not walk up finds a name
+// it cannot resolve. Note port 80 + pathPrefix: a Web Gateway, which no port scan of
+// 52773 would ever have found.
+const WORKSHOP_CODE_WORKSPACE: &str = r#"{
+  "folders": [ { "name": "Hospital", "path": "./Ejercicios/Hospital" } ],
+  "settings": {
+    "intersystems.servers": {
+      "workshop-iris": {
+        "webServer": { "scheme": "http", "host": "localhost", "port": 80, "pathPrefix": "/irishealth" },
+        "username": "_SYSTEM",
+        "password": "SYS",
+        "description": "Workshop IRIS for Health instance (local)"
+      }
+    },
+    "files.associations": { "*.cls": "objectscript-class" }
+  },
+  "extensions": { "recommendations": [ "intersystems-community.servermanager" ] }
+}"#;
+
+fn parse_ws(content: &str) -> VsCodeSettings {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Alumno.code-workspace");
+    std::fs::write(&path, content).unwrap();
+    parse_code_workspace(&path).unwrap()
+}
+
+/// The settings live under a nested `settings` key; the surrounding `folders` and
+/// `extensions` must not derail the parse.
+#[test]
+fn a_code_workspace_yields_the_settings_nested_inside_it() {
+    let s = parse_ws(WORKSHOP_CODE_WORKSPACE);
+    let servers = s
+        .intersystems_servers
+        .expect("intersystems.servers from the .code-workspace settings block");
+    let ws = servers.get("workshop-iris").expect("workshop-iris defined");
+    assert_eq!(ws.web_server.port, Some(80));
+    assert_eq!(ws.web_server.path_prefix.as_deref(), Some("/irishealth"));
+}
+
+/// End to end for a student: folder names the server, .code-workspace defines it.
+/// The Web Gateway URL is the proof — no scan produces port 80 with a path prefix.
+#[test]
+fn the_student_layout_resolves_across_folder_and_code_workspace() {
+    let folder = parse(
+        r#"{"objectscript.conn": {"active": true, "server": "workshop-iris", "ns": "HOSPITAL"}}"#,
+    );
+    match folder
+        .overlay_on(parse_ws(WORKSHOP_CODE_WORKSPACE))
+        .resolve_with(None)
+    {
+        VsCodeResolution::Resolved(conn) => {
+            assert_eq!(conn.base_url, "http://localhost:80/irishealth");
+            assert_eq!(conn.username, "_SYSTEM");
+            assert_eq!(conn.namespace, "HOSPITAL");
+        }
+        other => panic!("expected Resolved, got {other:?}"),
+    }
+}
+
+/// THE GUARDRAIL. A workshop pins IRIS_NAMESPACE=DONOTUSE on purpose: a read-only
+/// namespace so a write that forgets to name its namespace fails at once instead of
+/// landing somewhere real. Taking `ns` from the editor would hand back a namespace
+/// that WORKS and delete that guardrail silently — 95% of namespace-omitted calls
+/// currently fail loudly, which is the point.
+#[test]
+fn the_operator_namespace_overrides_the_one_the_editor_configured() {
+    let folder = parse(
+        r#"{"objectscript.conn": {"active": true, "server": "workshop-iris", "ns": "HOSPITAL"}}"#,
+    );
+    match folder
+        .overlay_on(parse_ws(WORKSHOP_CODE_WORKSPACE))
+        .resolve_with_env(None, Some("DONOTUSE"))
+    {
+        VsCodeResolution::Resolved(conn) => {
+            assert_eq!(
+                conn.namespace, "DONOTUSE",
+                "the editor's ns silently replaced the operator's guardrail"
+            );
+            assert_eq!(conn.base_url, "http://localhost:80/irishealth");
+        }
+        other => panic!("expected Resolved, got {other:?}"),
+    }
+}
+
+/// An unset IRIS_NAMESPACE must not blank the namespace out.
+#[test]
+fn no_operator_namespace_leaves_the_editors_ns_alone() {
+    let folder =
+        parse(r#"{"objectscript.conn": {"active": true, "server": "s", "ns": "HOSPITAL"}}"#);
+    let ws =
+        parse(r#"{"intersystems.servers": {"s": {"webServer": {"host": "h"}, "password": "p"}}}"#);
+    match folder.overlay_on(ws).resolve_with_env(None, None) {
+        VsCodeResolution::Resolved(conn) => assert_eq!(conn.namespace, "HOSPITAL"),
+        other => panic!("expected Resolved, got {other:?}"),
     }
 }

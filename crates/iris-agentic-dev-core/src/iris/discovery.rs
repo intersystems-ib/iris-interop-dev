@@ -16,12 +16,30 @@
 //! on 52773 from another. #187 moved step 4 up from last, where it could not run on any
 //! machine that had IRIS answering locally.
 //!
-//! REMAINING LIMIT of step 4, still tracked by #187: `discover_via_vscode_settings`
-//! searches exactly one path, `current_dir()/.vscode/settings.json` — not user-scope VS
-//! Code settings, which is where Server Manager normally keeps servers. A workspace that
-//! defines its own server is found; a server added through the Server Manager UI is not.
-//! There is still no OS-keychain reader either, but an absent password is now reported
-//! rather than replaced with `SYS`.
+//! Step 4 reads all THREE VS Code scopes and merges them, narrower winning, as VS Code
+//! itself resolves a setting:
+//!   user      `dirs::config_dir()/{Code, Code - Insiders, VSCodium}/User/settings.json`
+//!   workspace the nearest `*.code-workspace` at or above the cwd (its `settings` block)
+//!   folder    `./.vscode/settings.json`
+//!
+//! #187: merging is the whole point, not an optimisation. The real shape is SPLIT — a
+//! multi-root workspace defines `intersystems.servers` once in the `.code-workspace`, and
+//! each folder's `.vscode/settings.json` only references it by name. Every file alone
+//! resolves to NotConfigured, so a reader that checks paths one at a time finds nothing no
+//! matter how many paths it checks.
+//!
+//! OPERATOR SCOPE OVERRIDES EDITOR SCOPE. `$IRIS_PASSWORD` supplies a password VS Code does
+//! not carry; `$IRIS_NAMESPACE` overrides the `ns` it does. The second is a guardrail, not a
+//! convenience: a workshop pins `IRIS_NAMESPACE=DONOTUSE` to a read-only namespace so a write
+//! that forgets to name its namespace fails AT ONCE rather than landing somewhere real.
+//! Taking `ns` from the editor would hand back a namespace that WORKS and delete that
+//! guardrail silently — measured at 95% of namespace-omitted calls failing loudly today,
+//! which is the intended behaviour.
+//!
+//! REMAINING LIMIT, still #187: no OS-keychain reader, and unlikely to gain one — VS Code
+//! keeps secrets in an encrypted store, not as per-server items an outside process can read.
+//! `$IRIS_PASSWORD` is the supported way in; an absent password is reported by name rather
+//! than replaced with `SYS`.
 
 use crate::iris::connection::{DiscoverySource, IrisConnection};
 use crate::iris::vscode_config::VsCodeResolution;
@@ -613,46 +631,124 @@ async fn discover_via_docker() -> Option<IrisConnection> {
     None
 }
 
-/// Resolve a connection from VS Code settings.json, if one is configured here.
+/// VS Code USER-scope settings paths — where Server Manager actually writes
+/// `intersystems.servers`.
 ///
-/// #187: a configured-but-passwordless entry returns `None` like an unconfigured one,
-/// but emits a warning naming the file and the server first. The two used to be
-/// indistinguishable because the missing password was filled in with `SYS`, so the
-/// cascade stopped on a connection that could only ever 401.
-async fn discover_via_vscode_settings() -> Option<IrisConnection> {
-    let candidates = [std::env::current_dir().ok()?.join(".vscode/settings.json")];
+/// `dirs::config_dir()` is the correct root on all three platforms:
+/// macOS `~/Library/Application Support`, Linux `~/.config`, Windows `%APPDATA%`.
+fn vscode_user_settings_paths() -> Vec<std::path::PathBuf> {
+    let Some(base) = dirs::config_dir() else {
+        return Vec::new();
+    };
+    ["Code", "Code - Insiders", "VSCodium"]
+        .iter()
+        .map(|app| base.join(app).join("User").join("settings.json"))
+        .collect()
+}
 
-    for path in &candidates {
-        if !path.exists() {
-            continue;
+/// Nearest `*.code-workspace` at or above `start`, which is where a multi-root workspace
+/// defines its servers. #187: the workshop keeps `intersystems.servers` here and references
+/// it by name from each folder's `.vscode/settings.json`, so a reader that never walks up
+/// finds a name it cannot resolve. `workspace_config` already walks up for
+/// `.iris-agentic-dev.toml`; this is the same move.
+fn find_code_workspace(start: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut dir = Some(start);
+    for _ in 0..12 {
+        let d = dir?;
+        let mut hits: Vec<_> = std::fs::read_dir(d)
+            .ok()?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "code-workspace"))
+            .collect();
+        if !hits.is_empty() {
+            hits.sort(); // deterministic when a folder holds more than one
+            return hits.into_iter().next();
         }
-        let settings = match crate::iris::vscode_config::parse_vscode_settings(path) {
-            Ok(s) => s,
+        dir = d.parent();
+    }
+    None
+}
+
+/// Resolve a connection from VS Code settings, merging user scope with the workspace.
+///
+/// #187: the real-world shape is SPLIT across two files. Server Manager writes the server
+/// definition into user-scope settings; the workspace `.vscode/settings.json` only names it
+/// (`"server": "workshop-iris"`). Each file alone resolves to `NotConfigured`, so this reads
+/// both and overlays the workspace on user scope before resolving once. Adding the user path
+/// as another candidate in a loop would have found nothing — that is the trap this shape sets.
+///
+/// A configured-but-passwordless entry returns `None` like an unconfigured one, but emits a
+/// warning naming the file and the server first.
+async fn discover_via_vscode_settings() -> Option<IrisConnection> {
+    fn load(path: &std::path::Path) -> Option<crate::iris::vscode_config::VsCodeSettings> {
+        if !path.exists() {
+            return None;
+        }
+        match crate::iris::vscode_config::parse_vscode_settings(path) {
+            Ok(s) => Some(s),
             Err(e) => {
                 tracing::warn!("Could not parse {}: {}", path.display(), e);
-                continue;
-            }
-        };
-        match settings.resolve() {
-            VsCodeResolution::Resolved(conn) => return Some(conn),
-            VsCodeResolution::NotConfigured => continue,
-            VsCodeResolution::MissingPassword { server } => {
-                let what = match server.as_deref() {
-                    Some(name) => format!("server '{name}'"),
-                    None => "a connection".to_string(),
-                };
-                tracing::warn!(
-                    "{} configures {} but carries no password. VS Code Server Manager keeps it in \
-                     the OS keychain, which this binary cannot read — set IRIS_PASSWORD to supply \
-                     it. Continuing discovery without this entry. (issue #187)",
-                    path.display(),
-                    what
-                );
-                continue;
+                None
             }
         }
     }
-    None
+
+    // User scope is the BASE: the first VS Code flavour that has a settings file wins.
+    let mut user = crate::iris::vscode_config::VsCodeSettings::default();
+    let mut user_path = None;
+    for path in vscode_user_settings_paths() {
+        if let Some(s) = load(&path) {
+            user = s;
+            user_path = Some(path);
+            break;
+        }
+    }
+
+    // Middle scope: the nearest .code-workspace at or above the cwd, where a multi-root
+    // workspace defines its servers.
+    let cwd = std::env::current_dir().ok();
+    let ws_file = cwd.as_deref().and_then(find_code_workspace);
+    let multi_root = ws_file
+        .as_deref()
+        .and_then(
+            |p| match crate::iris::vscode_config::parse_code_workspace(p) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    tracing::warn!("Could not parse {}: {}", p.display(), e);
+                    None
+                }
+            },
+        )
+        .unwrap_or_default();
+
+    // Narrowest scope: this folder's .vscode/settings.json.
+    let folder_path = cwd.map(|d| d.join(".vscode/settings.json"));
+    let folder = folder_path.as_deref().and_then(load).unwrap_or_default();
+
+    let named_in = folder_path.filter(|p| p.exists()).or(ws_file).or(user_path);
+
+    match folder.overlay_on(multi_root.overlay_on(user)).resolve() {
+        VsCodeResolution::Resolved(conn) => Some(conn),
+        VsCodeResolution::NotConfigured => None,
+        VsCodeResolution::MissingPassword { server } => {
+            let what = match server.as_deref() {
+                Some(name) => format!("server '{name}'"),
+                None => "a connection".to_string(),
+            };
+            tracing::warn!(
+                "VS Code settings configure {} but no password is available for it{}. Server \
+                 Manager keeps the password in the OS keychain, which this binary cannot read — \
+                 set IRIS_PASSWORD to supply it. Continuing discovery without this entry. \
+                 (issue #187)",
+                what,
+                named_in
+                    .map(|p| format!(" ({})", p.display()))
+                    .unwrap_or_default()
+            );
+            None
+        }
+    }
 }
 
 #[cfg(test)]
