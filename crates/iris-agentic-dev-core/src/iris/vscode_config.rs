@@ -132,6 +132,25 @@ fn strip_jsonc(src: &str) -> String {
     out
 }
 
+/// A `.code-workspace` file: the same settings, nested under a `settings` key.
+#[derive(Debug, Deserialize, Default)]
+struct CodeWorkspaceFile {
+    settings: Option<VsCodeSettings>,
+}
+
+/// Parse the `settings` block of a `.code-workspace` file.
+///
+/// #187: this is where the workshop actually defines its server — not user-scope settings,
+/// and not `.vscode/settings.json`. A multi-root workspace names the server once here and
+/// each folder's `.vscode/settings.json` references it by name.
+pub fn parse_code_workspace(path: impl AsRef<Path>) -> anyhow::Result<VsCodeSettings> {
+    let content = std::fs::read_to_string(path.as_ref())?;
+    let parsed: CodeWorkspaceFile = serde_json::from_str(&content)
+        .or_else(|_| serde_json::from_str(&strip_jsonc(&content)))
+        .unwrap_or_default();
+    Ok(parsed.settings.unwrap_or_default())
+}
+
 /// Parse a VS Code settings.json file.
 /// Bug 10: the old parser only stripped full-line // comments.
 /// This version handles inline //, /* */ block comments, and trailing commas.
@@ -170,13 +189,58 @@ pub enum VsCodeResolution {
 }
 
 impl VsCodeSettings {
+    /// Overlay `self` (workspace scope) on top of `base` (user scope), the way VS Code
+    /// resolves a setting: the narrower scope wins, key by key.
+    ///
+    /// #187: this exists because the workshop shape is SPLIT across the two files and
+    /// neither half resolves alone. Server Manager writes `intersystems.servers` into
+    /// user-scope settings; the workspace `.vscode/settings.json` only references a
+    /// server by name. Reading either file on its own yields `NotConfigured`, so adding
+    /// the user path as one more candidate in the discovery loop would have changed
+    /// nothing — the scopes have to be merged BEFORE resolution.
+    ///
+    /// `objectscript.conn` is taken whole from the narrower scope that defines one, which
+    /// is what makes `"active": false` in a workspace a real opt-out rather than something
+    /// user scope can silently undo. `intersystems.servers` merges per key so a workspace
+    /// can override one server without having to restate the rest.
+    pub fn overlay_on(self, base: VsCodeSettings) -> VsCodeSettings {
+        let intersystems_servers = match (self.intersystems_servers, base.intersystems_servers) {
+            (Some(mine), Some(mut theirs)) => {
+                theirs.extend(mine); // workspace entries win per key
+                Some(theirs)
+            }
+            (mine, theirs) => mine.or(theirs),
+        };
+        VsCodeSettings {
+            objectscript_conn: self.objectscript_conn.or(base.objectscript_conn),
+            intersystems_servers,
+        }
+    }
+
     /// Resolve to a connection, taking the fallback password from the caller.
     ///
     /// Pure — `resolve()` supplies `$IRIS_PASSWORD`. Split so tests can cover the
     /// credential rules without mutating process environment.
     pub fn resolve_with(&self, env_password: Option<&str>) -> VsCodeResolution {
+        self.resolve_with_env(env_password, None)
+    }
+
+    /// Resolve, letting the OPERATOR environment override what the EDITOR configured.
+    ///
+    /// `$IRIS_PASSWORD` fills a password VS Code does not carry; `$IRIS_NAMESPACE` overrides
+    /// the `ns` it does. #187: the second exists because a workshop pins
+    /// `IRIS_NAMESPACE=DONOTUSE` deliberately — a read-only namespace so that a write which
+    /// forgets to name its namespace fails AT ONCE instead of quietly landing in the wrong
+    /// one. Taking `ns` from `.vscode/settings.json` would hand back a namespace that WORKS
+    /// and silently delete that guardrail. Operator scope is the wider promise, so it wins.
+    pub fn resolve_with_env(
+        &self,
+        env_password: Option<&str>,
+        env_namespace: Option<&str>,
+    ) -> VsCodeResolution {
         // An empty string is an absent password, not a password of length zero.
         let env_password = env_password.filter(|p| !p.is_empty());
+        let env_namespace = env_namespace.filter(|n| !n.is_empty());
         let present = |v: Option<&str>| v.filter(|p| !p.is_empty()).map(str::to_owned);
 
         let conn = match self.objectscript_conn.as_ref() {
@@ -186,7 +250,7 @@ impl VsCodeSettings {
         if conn.active == Some(false) {
             return VsCodeResolution::NotConfigured;
         }
-        let ns = conn.ns.as_deref().unwrap_or("USER");
+        let ns = env_namespace.or(conn.ns.as_deref()).unwrap_or("USER");
 
         // Named server path — resolve through `intersystems.servers`.
         if let Some(server_name) = &conn.server {
@@ -255,6 +319,9 @@ impl VsCodeSettings {
     /// Resolve to a connection, falling back to `$IRIS_PASSWORD` for the secret that
     /// Server Manager keeps in the OS keychain.
     pub fn resolve(&self) -> VsCodeResolution {
-        self.resolve_with(std::env::var("IRIS_PASSWORD").ok().as_deref())
+        self.resolve_with_env(
+            std::env::var("IRIS_PASSWORD").ok().as_deref(),
+            std::env::var("IRIS_NAMESPACE").ok().as_deref(),
+        )
     }
 }
