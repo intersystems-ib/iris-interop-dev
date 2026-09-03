@@ -637,9 +637,51 @@ pub const ERR_INDETERMINATE: &str = "INDETERMINATE";
 #[serde(rename_all = "snake_case")]
 pub enum ConnectionSource {
     ConfigFile,
+    /// Reached through the discovery cascade's env-var step. NOTE: the MCP server does not
+    /// normally produce this — clap resolves `--host` and `$IRIS_HOST` into one value, so an
+    /// env-configured server arrives as an explicit seed and is stamped `ExplicitFlag`. This
+    /// variant is for entry points that go through `discover_iris` without a seed.
     EnvVars,
+    VsCodeSettings,
+    /// The operator named the target directly: a CLI flag, OR its environment-variable
+    /// equivalent, which clap merges into the same value before the connection is built.
+    ExplicitFlag,
     IrisSelectContainer,
     AutoDiscovered,
+}
+
+impl ConnectionSource {
+    /// How a LIVE connection actually got here.
+    ///
+    /// #192: this used to be decided by `config_path.is_some()` alone, so every connection
+    /// without a `.iris-agentic-dev.toml` — including one pinned by `IRIS_HOST`/`IRIS_WEB_PORT`
+    /// — reported `auto_discovered`, and `EnvVars` was reachable ONLY on the disconnected
+    /// path. The connection already knows: `discovery.rs` stamps `DiscoverySource` on it. The
+    /// answer was being discarded here rather than missing.
+    pub fn for_connection(conn: &IrisConnection, has_config_file: bool) -> Self {
+        if has_config_file {
+            // A config file is the narrowest statement of intent, so it wins.
+            return Self::ConfigFile;
+        }
+        use crate::iris::connection::DiscoverySource;
+        match conn.source {
+            DiscoverySource::EnvVar => Self::EnvVars,
+            DiscoverySource::VsCodeSettings => Self::VsCodeSettings,
+            DiscoverySource::ExplicitFlag => Self::ExplicitFlag,
+            DiscoverySource::Docker { .. } | DiscoverySource::LocalhostScan { .. } => {
+                Self::AutoDiscovered
+            }
+        }
+    }
+
+    /// Did the operator NAME this target, or did we guess it?
+    ///
+    /// Only `AutoDiscovered` is a guess. #21's fallback warning exists to flag exactly that
+    /// case — a blind port or Docker scan can silently land on the wrong instance — so firing
+    /// it on anything else buries the one state it was built to catch.
+    pub fn is_explicit(&self) -> bool {
+        !matches!(self, Self::AutoDiscovered)
+    }
 }
 
 /// Snapshot of the active IRIS connection, including metadata for `check_config`.
@@ -4103,11 +4145,8 @@ impl IrisTools {
                     // Record ConfigFile source (and the path) when the connection came from
                     // a .iris-agentic-dev.toml — so check_config shows config_file at
                     // startup, not just after the first hot-reload (issue #21, upstream #82).
-                    let (source, file) = if config_path.is_some() {
-                        (ConnectionSource::ConfigFile, config_path)
-                    } else {
-                        (ConnectionSource::AutoDiscovered, None)
-                    };
+                    let source = ConnectionSource::for_connection(&c, config_path.is_some());
+                    let file = config_path.filter(|_| source == ConnectionSource::ConfigFile);
                     ConnectionState::from_iris(c, source, file)
                 }
             }
@@ -6100,7 +6139,7 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
     }
 
     #[tool(
-        description = "Return the active IRIS connection state + this MCP server's own version. It only reports the cached connection snapshot (no IRIS network call), so it ALWAYS succeeds — when IRIS is down it returns connected:false / connection_source:disconnected instead of erroring with IRIS_UNREACHABLE. That is the point: it's the one tool you can call to DIAGNOSE an unreachable IRIS (read the `connected` field) without the call itself failing — unlike iris_query/iris_execute/etc., which do return IRIS_UNREACHABLE. If those tools instead return IRIS_AUTH_FAILED (HTTP 401) or IRIS_FORBIDDEN (HTTP 403), IRIS is REACHABLE and the credentials are the problem: read `auth_ok` and `probe_status` here — auth_ok:false means IRIS rejected IRIS_USERNAME/IRIS_PASSWORD (401) or refused this user the %Development privilege (403), and `connected` is false for that reason, not a network one. Also use to: verify hot-reload completed; confirm which container/host is active; validate the loaded MCP build (mcp_version). Hot-reload is operator-driven: an edit to the .iris-agentic-dev.toml at config_watch_path is picked up on the next tool call, and config_loaded_at moves when it happens. A reload can only NARROW the write gate — once write_tools_enabled has gone false it stays false until the server restarts (write_gate_latched reports that), so a reload cannot reopen writes. Fields: mcp_version, toolset, connected, auth_ok, probe_status, connection_source (http|docker|disconnected), host, port, namespace, container, config_file, config_watch_path, config_loaded_at, iris_version, write_tools_enabled, write_gate_latched."
+        description = "Return the active IRIS connection state + this MCP server's own version. It only reports the cached connection snapshot (no IRIS network call), so it ALWAYS succeeds — when IRIS is down it returns connected:false / connection_source:disconnected instead of erroring with IRIS_UNREACHABLE. That is the point: it's the one tool you can call to DIAGNOSE an unreachable IRIS (read the `connected` field) without the call itself failing — unlike iris_query/iris_execute/etc., which do return IRIS_UNREACHABLE. If those tools instead return IRIS_AUTH_FAILED (HTTP 401) or IRIS_FORBIDDEN (HTTP 403), IRIS is REACHABLE and the credentials are the problem: read `auth_ok` and `probe_status` here — auth_ok:false means IRIS rejected IRIS_USERNAME/IRIS_PASSWORD (401) or refused this user the %Development privilege (403), and `connected` is false for that reason, not a network one. Also use to: verify hot-reload completed; confirm which container/host is active; validate the loaded MCP build (mcp_version). Hot-reload is operator-driven: an edit to the .iris-agentic-dev.toml at config_watch_path is picked up on the next tool call, and config_loaded_at moves when it happens. A reload can only NARROW the write gate — once write_tools_enabled has gone false it stays false until the server restarts (write_gate_latched reports that), so a reload cannot reopen writes. Fields: mcp_version, toolset, connected, auth_ok, probe_status, connection_source — where the connection came from: config_file, explicit_flag (a --host flag or the IRIS_HOST env var, which clap merges), vs_code_settings, env_vars, iris_select_container, or auto_discovered. Only auto_discovered is a GUESS (a blind localhost/Docker scan that can land on the wrong instance); every other value means the operator named this target, and the fallback_warning is emitted for auto_discovered alone, host, port, namespace, container, config_file, config_watch_path, config_loaded_at, iris_version, write_tools_enabled, write_gate_latched."
     )]
     async fn check_config(
         &self,
@@ -6239,10 +6278,7 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
         // Surface fallback discovery explicitly: a connection with no config file and a
         // non-explicit source came from Docker/port-scan discovery, which can silently
         // target the wrong instance (issue #21, upstream #82).
-        let is_explicit = matches!(
-            conn.source,
-            ConnectionSource::ConfigFile | ConnectionSource::EnvVars
-        );
+        let is_explicit = conn.source.is_explicit();
         if conn.config_file.is_none() && !is_explicit && conn.iris.is_some() {
             response["fallback_warning"] = serde_json::Value::String(
                 "No .iris-agentic-dev.toml config file found. Connection established via \
@@ -9672,6 +9708,108 @@ mod schema_normalization_tests {
     }
 
     // ── check_config field ordering ───────────────────────────────────────────
+    // ── #192: the reported source must be the mechanism, not a guess ─────────
+    //
+    // Measured before the fix, same binary and same instance: an env-pinned connection
+    // and a blind port scan both reported `auto_discovered` and BOTH got the fallback
+    // warning telling the operator to pin an instance that was already pinned.
+
+    fn conn_from(
+        src: crate::iris::connection::DiscoverySource,
+    ) -> crate::iris::connection::IrisConnection {
+        crate::iris::connection::IrisConnection::new(
+            "http://localhost:52773",
+            "USER",
+            "_SYSTEM",
+            "SYS",
+            src,
+        )
+    }
+
+    /// The defect itself: IRIS_HOST/IRIS_WEB_PORT is an operator naming a target.
+    #[test]
+    fn an_env_var_connection_reports_env_vars_not_auto_discovered() {
+        use crate::iris::connection::DiscoverySource;
+        let s = crate::tools::ConnectionSource::for_connection(
+            &conn_from(DiscoverySource::EnvVar),
+            false,
+        );
+        assert_eq!(s, crate::tools::ConnectionSource::EnvVars);
+        assert!(s.is_explicit(), "an env-pinned target is not a guess");
+    }
+
+    /// 0.18.0 made this reachable: VS Code settings are explicit configuration too.
+    #[test]
+    fn a_vscode_connection_is_explicit() {
+        use crate::iris::connection::DiscoverySource;
+        let s = crate::tools::ConnectionSource::for_connection(
+            &conn_from(DiscoverySource::VsCodeSettings),
+            false,
+        );
+        assert_eq!(s, crate::tools::ConnectionSource::VsCodeSettings);
+        assert!(s.is_explicit());
+    }
+
+    /// The ONLY state the #21 fallback warning is meant to fire on.
+    #[test]
+    fn only_a_blind_scan_is_inexplicit() {
+        use crate::iris::connection::DiscoverySource;
+        for src in [
+            DiscoverySource::LocalhostScan { port: 52773 },
+            DiscoverySource::Docker {
+                container_name: "iris".into(),
+            },
+        ] {
+            let s = crate::tools::ConnectionSource::for_connection(&conn_from(src), false);
+            assert_eq!(s, crate::tools::ConnectionSource::AutoDiscovered);
+            assert!(
+                !s.is_explicit(),
+                "a scan IS a guess and must keep the warning"
+            );
+        }
+        for src in [
+            DiscoverySource::EnvVar,
+            DiscoverySource::VsCodeSettings,
+            DiscoverySource::ExplicitFlag,
+        ] {
+            assert!(
+                crate::tools::ConnectionSource::for_connection(&conn_from(src), false)
+                    .is_explicit(),
+                "a named target must not get the fallback warning"
+            );
+        }
+    }
+
+    /// A config file is the narrowest statement of intent and still wins.
+    #[test]
+    fn a_config_file_outranks_the_connections_own_source() {
+        use crate::iris::connection::DiscoverySource;
+        assert_eq!(
+            crate::tools::ConnectionSource::for_connection(
+                &conn_from(DiscoverySource::EnvVar),
+                true
+            ),
+            crate::tools::ConnectionSource::ConfigFile
+        );
+    }
+
+    /// `EnvVars` used to be assigned in exactly ONE place — the disconnected path — so no
+    /// live connection could ever report it. It is now derived. (The MCP server itself
+    /// stamps `ExplicitFlag` for env config, because clap merges flag and env into one
+    /// value before the connection is built; this covers the seedless cascade path.)
+    #[test]
+    fn env_var_discovery_maps_to_env_vars() {
+        use crate::iris::connection::DiscoverySource;
+        assert_eq!(
+            serde_json::to_value(crate::tools::ConnectionSource::for_connection(
+                &conn_from(DiscoverySource::EnvVar),
+                false
+            ))
+            .unwrap(),
+            serde_json::json!("env_vars")
+        );
+    }
+
     #[test]
     fn check_config_connection_source_before_host() {
         // Verify connection_source appears before host in the JSON key order.
