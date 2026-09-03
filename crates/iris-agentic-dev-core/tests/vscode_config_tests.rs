@@ -278,3 +278,36 @@ fn path_prefix_survives_resolution() {
         other => panic!("expected Resolved, got {other:?}"),
     }
 }
+
+/// The shape that actually exists in the wild, found by the SKILLS session in three
+/// workshop directories: `active: true` and a `server:` name, with NO
+/// `intersystems.servers` map at all — because Server Manager keeps the server
+/// definition in USER-scope settings, which this binary does not read.
+///
+/// `a_named_server_with_no_matching_entry_is_not_configured` covers the neighbouring
+/// case (map present, key absent). This one takes a different branch —
+/// `intersystems_servers.as_ref()` yields `None` before `.get()` is ever reached — and
+/// the two must not be assumed to agree just because they should.
+///
+/// It must resolve to NotConfigured so discovery falls THROUGH to the scans. Anything
+/// else would make 0.17.0 break every workshop directory: under the new precedence this
+/// entry is reached at step 4, ahead of the port scan that currently serves it.
+#[test]
+fn a_server_name_with_no_servers_map_at_all_is_not_configured() {
+    let settings = r#"{
+        "objectscript.conn": { "active": true, "server": "workshop-iris", "ns": "HOSPITAL" },
+        "objectscript.export": { "folder": "src", "atelier": true }
+    }"#;
+    match resolve(settings, None) {
+        VsCodeResolution::NotConfigured => {}
+        VsCodeResolution::Resolved(conn) => panic!(
+            "guessed a connection to {} for a server this binary cannot resolve — \
+             discovery would stop here instead of falling through to the scans",
+            conn.base_url
+        ),
+        VsCodeResolution::MissingPassword { .. } => panic!(
+            "reported a missing password for a server that was never resolved — \
+             the warning would name a cause that is not the real one"
+        ),
+    }
+}
