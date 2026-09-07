@@ -244,6 +244,13 @@ impl CompileResult {
     pub fn success(&self) -> bool {
         self.errors.is_empty()
     }
+
+    /// IRIS's own `Detected N errors during compilation` count, when the console carried it.
+    /// Cross-check it against `errors.len()` before presenting this list as complete —
+    /// see [`crate::tools::detected_error_count`].
+    pub fn detected_error_count(&self) -> Option<usize> {
+        crate::tools::detected_error_count(self.console.iter().map(String::as_str))
+    }
 }
 
 impl IrisConnection {
@@ -902,25 +909,9 @@ impl IrisConnection {
                     .collect()
             })
             .unwrap_or_default();
-        let mut errors: Vec<String> = vec![];
-        if let Some(se) = body["status"]["errors"].as_array() {
-            for e in se {
-                if let Some(msg) = e["error"].as_str() {
-                    errors.push(msg.to_string());
-                }
-            }
-        }
-        // Issue #80: same colon-vs-space prefix defect as iris_compile's own console loop,
-        // a second consumer away (iris_doc{mode:put, compile:true}.compile_errors, and
-        // iris_compile's local-source upload path). Shares the one parser so the two cannot
-        // drift apart again.
-        for line in &console {
-            if let Some(d) = crate::tools::parse_console_diag(line, "ERROR:", "ERROR ") {
-                if errors.iter().all(|e| !e.contains(&d.text)) {
-                    errors.push(d.text);
-                }
-            }
-        }
+        // Issue #80: the console loop lived here, in iris_compile and in iris_doc, and the
+        // fix reached two of the three. One shared assembly now, so they cannot drift.
+        let errors = crate::tools::compile_error_list(&body, &console);
         Ok(CompileResult { errors, console })
     }
 
