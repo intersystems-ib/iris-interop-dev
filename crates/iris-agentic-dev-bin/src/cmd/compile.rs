@@ -185,13 +185,20 @@ fn compile_result_to_json(r: &CompileResult, target: &str, namespace: &str) -> s
         .iter()
         .map(|e| serde_json::json!({"severity":"error","text":e}))
         .collect();
-    serde_json::json!({
+    let mut out = serde_json::json!({
         "success": r.success(),
         "target": target,
         "namespace": namespace,
         "errors": errors,
         "console": r.console,
-    })
+    });
+    iris_agentic_dev_core::tools::note_error_undercount(
+        &mut out,
+        r.detected_error_count(),
+        r.errors.len(),
+        "console",
+    );
+    out
 }
 
 fn output_result(result: &serde_json::Value, format: &str) {

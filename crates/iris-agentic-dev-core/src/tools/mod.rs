@@ -4382,7 +4382,7 @@ impl IrisTools {
     }
 
     #[tool(
-        description = "Compile an ObjectScript class, routine, or wildcard package on IRIS via Atelier REST. Wildcards ('MyApp.*', 'MyApp.*.cls') expand CLASS documents only and are guarded: the pattern MUST begin with a literal package prefix before its first '*' (bare '*', '*.cls', '*Foo' are refused as SCOPE_REQUIRED — they would select the whole namespace), and a pattern matching more than 500 documents is refused as TOO_BROAD with the count, so narrow the package rather than retrying. Matching ignores the document suffix, so 'Pkg.Class.*' means the SUBPACKAGE of Pkg.Class, never Pkg.Class itself; a pattern that matches nothing is NOT_FOUND. Atelier's listing omits Hidden and generated classes, so a wildcard cannot expand them: any that match are named in `not_expanded` with a count, and are NOT compiled — compile those by exact name. Compile a .mac/.int/.inc routine by its exact name. Returns structured errors with line numbers, columns, and severity. No Python required."
+        description = "Compile an ObjectScript class, routine, or wildcard package on IRIS via Atelier REST. Wildcards ('MyApp.*', 'MyApp.*.cls') expand CLASS documents only and are guarded: the pattern MUST begin with a literal package prefix before its first '*' (bare '*', '*.cls', '*Foo' are refused as SCOPE_REQUIRED — they would select the whole namespace), and a pattern matching more than 500 documents is refused as TOO_BROAD with the count, so narrow the package rather than retrying. Matching ignores the document suffix, so 'Pkg.Class.*' means the SUBPACKAGE of Pkg.Class, never Pkg.Class itself; a pattern that matches nothing is NOT_FOUND. Atelier's listing omits Hidden and generated classes, so a wildcard cannot expand them: any that match are named in `not_expanded` with a count, and are NOT compiled — compile those by exact name. Compile a .mac/.int/.inc routine by its exact name. Returns structured errors with line numbers, columns, and severity. The list is cross-checked against IRIS's own `Detected N errors` tally: if `errors_incomplete: true` appears (with `errors_detected_by_iris` / `errors_reported`), the errors array is a SUBSET and its first entry is NOT necessarily the root cause — read `console` in full before deciding what to fix. No Python required."
     )]
     async fn iris_compile(
         &self,
@@ -4495,7 +4495,7 @@ impl IrisTools {
                     .collect();
                 let success = cr.success();
                 self.record_call("iris_compile", success);
-                let payload = serde_json::json!({
+                let mut payload = serde_json::json!({
                     "success": success,
                     "target": doc_name,
                     "uploaded_from": local_src,
@@ -4505,6 +4505,12 @@ impl IrisTools {
                     "warnings": [],
                     "console": console,
                 });
+                note_error_undercount(
+                    &mut payload,
+                    cr.detected_error_count(),
+                    cr.errors.len(),
+                    "console",
+                );
                 if !success {
                     return compile_failure(&doc_name, payload);
                 }
@@ -4821,6 +4827,11 @@ impl IrisTools {
 
         let success = errors.is_empty();
         self.record_call("iris_compile", success);
+        // The list above is only as complete as the console parser. IRIS counts its own
+        // errors; compare, so a parser that has fallen behind cannot hand back a short list
+        // that reads like a complete one.
+        let detected = detected_error_count(console.iter().filter_map(|v| v.as_str()));
+        let reported = errors.len();
 
         // Write open hint for single non-wildcard successful compile
         let open_uri = if success && !p.target.contains('*') && targets.len() == 1 {
@@ -4839,6 +4850,7 @@ impl IrisTools {
             "warnings": warnings,
             "console": console,
         });
+        note_error_undercount(&mut resp, detected, reported, "console");
         if let Some(uri) = open_uri {
             resp["open_uri"] = serde_json::Value::String(uri);
         }
@@ -5750,7 +5762,7 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
     }
 
     #[tool(
-        description = "Read, write, delete, or check an IRIS document. mode='get' fetches source, mode='put' writes (with automatic SCM checkout if needed), mode='delete' removes, mode='head' checks existence. name needs the Atelier type suffix — 'MyApp.Patient.cls', not 'MyApp.Patient' (put adds it for you when the content starts with `Class <name>` or `ROUTINE <name>`). Supports batch ops via 'names' array and elicitation_id/elicitation_answer for SCM dialog resumption. For large source, paginate get with max_bytes + offset (response includes next_offset), or prefer docs_introspect for signatures/structure instead of full source. No Python required."
+        description = "Read, write, delete, or check an IRIS document. mode='get' fetches source, mode='put' writes (with automatic SCM checkout if needed), mode='delete' removes, mode='head' checks existence. name needs the Atelier type suffix — 'MyApp.Patient.cls', not 'MyApp.Patient' (put adds it for you when the content starts with `Class <name>` or `ROUTINE <name>`). Supports batch ops via 'names' array and elicitation_id/elicitation_answer for SCM dialog resumption. For large source, paginate get with max_bytes + offset (response includes next_offset), or prefer docs_introspect for signatures/structure instead of full source. With compile=true, compile_errors is cross-checked against IRIS's own `Detected N errors` tally — `errors_incomplete: true` means the list is a SUBSET and `compile_console` holds the rest. No Python required."
     )]
     async fn iris_doc(
         &self,
@@ -9297,9 +9309,19 @@ fn console_diag_already_reported(errors: &[serde_json::Value], text: &str) -> bo
     errors.iter().any(|e| {
         e["text"]
             .as_str()
-            .map(|t| !t.contains('\n') && t.contains(text))
-            .unwrap_or(false)
+            .is_some_and(|t| diag_stands_in_for(t, text))
     })
+}
+
+/// The rule behind [`console_diag_already_reported`], over a plain string list so the
+/// `Vec<String>` consumers (`compile_document`, `iris_doc{mode:put, compile:true}`) apply the
+/// SAME test instead of each copying `errors.iter().all(|e| !e.contains(text))`.
+///
+/// #80: a single-line `status.errors` entry that repeats a console line stands in for it. A
+/// MULTI-LINE wrapper does not — it embeds the first per-method message inside itself, so a
+/// plain `contains` swallows that one method's entry and N broken methods report N-1.
+pub fn diag_stands_in_for(existing: &str, text: &str) -> bool {
+    !existing.contains('\n') && existing.contains(text)
 }
 
 /// A console line that is only a document name. IRIS repeats `ERROR: Foo.Bar.cls` once per
@@ -9398,6 +9420,107 @@ pub(crate) fn parse_console_diag(
         location,
         text: rest.to_string(),
     })
+}
+
+/// Assemble a compile's error list from an Atelier response: the `status.errors` entries
+/// first, then every console diagnostic the shared parser recognises that no single-line
+/// status entry already stands in for.
+///
+/// Extracted because this loop existed THREE times — `iris_compile`, `compile_document` and
+/// `iris_doc{mode:put, compile:true}` — and #80 was fixed in two of them. The third kept
+/// matching `ERROR ` (space) and, measured live on IRIS 2026.1 (Build 235U), reported ONE of
+/// the thirteen errors IRIS counted. A copy cannot fall behind if there is no copy.
+///
+/// `iris_compile` keeps its own richer assembly (it emits code/line/location per entry and
+/// has a `status.summary` fallback); these two return plain strings.
+pub fn compile_error_list(body: &serde_json::Value, console: &[String]) -> Vec<String> {
+    let mut errors: Vec<String> = vec![];
+    if let Some(se) = body["status"]["errors"].as_array() {
+        for e in se {
+            if let Some(msg) = e["error"].as_str() {
+                errors.push(msg.to_string());
+            }
+        }
+    }
+    for line in console {
+        if let Some(d) = parse_console_diag(line, "ERROR:", "ERROR ") {
+            if !errors.iter().any(|e| diag_stands_in_for(e, &d.text)) {
+                errors.push(d.text);
+            }
+        }
+    }
+    errors
+}
+
+/// IRIS's own error arithmetic, read off the line it prints at the end of every compile:
+/// `Detected 13 errors during compilation in 0.048s.`
+///
+/// The compiler counts those itself — the number does not pass through our console parser —
+/// so it is the one value that can tell a caller our parsed list is SHORT. That matters
+/// because a short list reads exactly like a complete one. #80 fixed the parser on one path
+/// and left `iris_doc{mode:put, compile:true}` matching only `ERROR ` (space); measured live
+/// on IRIS 2026.1 (Build 235U), a 3-method class with 3 undefined macros made IRIS print
+/// `Detected 13 errors` while that path reported ONE — and the one it reported (`#5123
+/// Unable to find entry point for method 'M1'`) was a cascade, not the cause.
+///
+/// The invariant is `reported >= detected`, NOT equality: the `status.errors` wrapper is an
+/// extra entry IRIS does not count (the same class gave `iris_compile` 14 against 13).
+///
+/// With several such lines the LARGEST wins, not the sum. A multi-target compile is not
+/// measured here to emit only per-item lines; if IRIS also prints a grand total, summing
+/// would double-count and flag a complete list as short. A max can only understate the true
+/// total, so it never manufactures an undercount.
+pub fn detected_error_count<'a>(console: impl IntoIterator<Item = &'a str>) -> Option<usize> {
+    console
+        .into_iter()
+        .filter_map(|line| {
+            let rest = line.trim().strip_prefix("Detected ")?;
+            let (n, tail) = rest.split_once(' ')?;
+            // "errors" on the measured build; the singular is accepted in case one prints it.
+            if !tail.starts_with("error") {
+                return None;
+            }
+            n.parse::<usize>().ok()
+        })
+        .max()
+}
+
+/// Record on a compile response that our error list is shorter than IRIS's own count.
+///
+/// Also REPLACES the hint: "fix the first reported error, later ones are cascades of it" is
+/// actively wrong when the list is short — on the measured run the only surviving entry WAS
+/// a cascade and the root cause was absent. `merge_hint` and the envelope's built-in
+/// COMPILE_ERROR hint both yield to a hint the payload already carries, so this one wins on
+/// every path.
+///
+/// `console_field` names the field on THIS payload holding the raw compiler output:
+/// `console` for iris_compile, `compile_console` for iris_doc.
+pub fn note_error_undercount(
+    payload: &mut serde_json::Value,
+    detected: Option<usize>,
+    reported: usize,
+    console_field: &str,
+) {
+    let Some(detected) = detected.filter(|d| *d > reported) else {
+        return;
+    };
+    let Some(obj) = payload.as_object_mut() else {
+        return;
+    };
+    obj.insert("errors_incomplete".into(), serde_json::json!(true));
+    obj.insert(
+        "errors_detected_by_iris".into(),
+        serde_json::json!(detected),
+    );
+    obj.insert("errors_reported".into(), serde_json::json!(reported));
+    obj.insert(
+        "hint".into(),
+        serde_json::json!(format!(
+            "INCOMPLETE: IRIS counted {detected} errors and only {reported} were recovered \
+             from the compiler console. Do NOT treat the first entry as the root cause — read \
+             `{console_field}`, which holds every line IRIS printed."
+        )),
+    );
 }
 
 #[cfg(test)]
@@ -12992,6 +13115,219 @@ mod console_diag_tests {
         assert!(errors[1..]
             .iter()
             .all(|e| !e["location"].as_str().unwrap_or("").is_empty()));
+    }
+
+    // ── Detected-N cross-check ────────────────────────────────────────────────
+
+    /// The compiler console of the live measurement, verbatim: IRIS 2026.1 (Build 235U),
+    /// namespace APP, class `Zz.MSG.Undercount` — three methods, three undefined macros.
+    /// IRIS printed `Detected 13 errors`; `iris_compile` returned 14 entries (13 + the
+    /// status.errors wrapper) and `iris_doc{mode:put, compile:true}` returned ONE.
+    fn measured_console() -> Vec<&'static str> {
+        vec![
+            "",
+            "Compilation started on 09/07/2026 09:41:30 with qualifiers 'cuk'",
+            "Compiling class Zz.MSG.Undercount",
+            "Compiling table Zz_MSG.Undercount",
+            "Compiling routine Zz.MSG.Undercount.1",
+            "ERROR: Zz.MSG.Undercount.cls",
+            "ERROR:  Zz.MSG.Undercount.1(3) : MPP5610 : Referenced macro not defined: 'ZzUndefined0'",
+            " TEXT:     set x = $$$ZzUndefined0 }",
+            "ERROR: Zz.MSG.Undercount.cls",
+            "ERROR:  Zz.MSG.Undercount.1(3) : MPP5610 : Referenced macro not defined: 'ZzUndefined1'",
+            " TEXT:     set x = $$$ZzUndefined1 }",
+            "ERROR: Zz.MSG.Undercount.cls",
+            "ERROR:  Zz.MSG.Undercount.1(3) : MPP5610 : Referenced macro not defined: 'ZzUndefined2'",
+            " TEXT:     set x = $$$ZzUndefined2 }",
+            "ERROR: Zz.MSG.Undercount.cls(M0+2) #1002: Invalid character in tag : '$$$ZzUndefined0' : Offset:15 [M0+1^Zz.MSG.Undercount.1]",
+            " TEXT:     set x = $$$ZzUndefined0 }",
+            "ERROR: Zz.MSG.Undercount.cls(M1) #1026: Invalid command : 'methodimpl {' : Offset:16 [M1^Zz.MSG.Undercount.1]",
+            " TEXT: M1() methodimpl {",
+            "ERROR: Zz.MSG.Undercount.cls(M1+2) #1002: Invalid character in tag : '$$$ZzUndefined1' : Offset:15 [M1+1^Zz.MSG.Undercount.1]",
+            " TEXT:     set x = $$$ZzUndefined1 }",
+            "ERROR: Zz.MSG.Undercount.cls(M2) #1026: Invalid command : 'methodimpl {' : Offset:16 [M2^Zz.MSG.Undercount.1]",
+            " TEXT: M2() methodimpl {",
+            "ERROR: Zz.MSG.Undercount.cls(M2+2) #1002: Invalid character in tag : '$$$ZzUndefined2' : Offset:15 [M2+1^Zz.MSG.Undercount.1]",
+            " TEXT:     set x = $$$ZzUndefined2 }",
+            "ERROR: Zz.MSG.Undercount.cls(XMLExportInternal+2) #1038: Private variable not allowed : 'tag,summary,attrsVal,savelocal,aval,k,tmpPrefix,prefixDepth,hasNoContent,hasElement,topAttrs,beginprefix,endprefix,savexsiAttrs,initialxsiAttrs,initlist,initialCR,inlineFlag,popAtEnd,saveTopPrefix,saveTypesPrefix,saveAttrsPrefix,saveUsePrefix,initlist' : Offset:8 [zXMLExportInternal+1^Zz.MSG.Undercount.1]",
+            "ERROR: Zz.MSG.Undercount.cls(XMLImportInternal+3) #1038: Private variable not allowed : 'child,childlist,node,nodelist,inner,innerlist,data,encodedArray,key,nsIndex,savechild,savechildlist,saveinner,saveinnnerlist,exists' : Offset:10 [zXMLImportInternal+1^Zz.MSG.Undercount.1]",
+            "ERROR: Zz.MSG.Undercount.cls(XMLImportInternal+48) #1038: Private variable not allowed : 'msg,loc' : Offset:31 [XMLImportLocation^Zz.MSG.Undercount.1]",
+            " TEXT: XMLImportLocation(node) new msg,loc",
+            "ERROR: Zz.MSG.Undercount.1.int(614) #1026: Invalid command : 'ExtentExecute(%qHandle) [' : Offset:24 [ExtentExecute^Zz.MSG.Undercount.1]",
+            "ERROR #5123: Unable to find entry point for method 'M1' in routine 'Zz.MSG.Undercount.1'",
+            "Detected 13 errors during compilation in 0.048s.",
+        ]
+    }
+
+    #[test]
+    fn detected_error_count_reads_the_measured_line() {
+        assert_eq!(detected_error_count(measured_console()), Some(13));
+    }
+
+    #[test]
+    fn detected_error_count_is_none_when_iris_printed_no_tally() {
+        assert_eq!(
+            detected_error_count(vec![
+                "Compilation started on 09/07/2026 09:41:30 with qualifiers 'cuk'",
+                "Compiling class Zz.MSG.Undercount",
+                "Compilation finished successfully in 0.003s.",
+            ]),
+            None
+        );
+    }
+
+    /// Negative controls on each half of the match, so the parser cannot pass by being
+    /// permissive — a wrong count here would flag healthy compiles as incomplete.
+    #[test]
+    fn detected_error_count_ignores_lines_that_are_not_an_error_tally() {
+        for line in [
+            "Detected 4 warnings during compilation in 0.010s.",
+            "Detected changes in 2 classes",
+            "Detected errors during compilation",
+            "Compilation Detected 9 errors during compilation",
+        ] {
+            assert_eq!(detected_error_count(vec![line]), None, "{line}");
+        }
+    }
+
+    /// Several tallies take the LARGEST, never the sum: an IRIS that printed per-item lines
+    /// AND a grand total would make a sum double-count and condemn a complete list.
+    #[test]
+    fn detected_error_count_takes_the_largest_not_the_sum() {
+        assert_eq!(
+            detected_error_count(vec![
+                "Detected 3 errors during compilation in 0.001s.",
+                "Detected 5 errors during compilation in 0.002s.",
+            ]),
+            Some(5)
+        );
+    }
+
+    /// The distinguishing test. The same measured console goes through both console loops:
+    /// the shared parser recovers all 13 and is NOT flagged, the `ERROR ` (space) prefix
+    /// `iris_doc` used until now recovers 1 and IS. If doc.rs ever regresses to
+    /// `starts_with("ERROR ")`, the undercount half of this stops being hypothetical.
+    #[test]
+    fn the_cross_check_separates_a_complete_list_from_the_measured_undercount() {
+        let console = measured_console();
+        let detected = detected_error_count(console.iter().copied());
+        assert_eq!(detected, Some(13));
+
+        // What the space-only loop actually recovered, live: one entry — and #5123 is a
+        // CASCADE of the undefined macros, which never appear at all.
+        let old: Vec<String> = console
+            .iter()
+            .filter(|l| l.trim().starts_with("ERROR "))
+            .map(|l| l.trim().to_string())
+            .collect();
+        assert_eq!(old.len(), 1, "the measured undercount: {old:#?}");
+        assert!(old[0].contains("#5123"), "{old:#?}");
+
+        let mut short = serde_json::json!({"compiled": false, "compile_errors": old.clone()});
+        note_error_undercount(&mut short, detected, old.len(), "compile_console");
+        assert_eq!(short["errors_incomplete"], serde_json::json!(true));
+        assert_eq!(short["errors_detected_by_iris"], serde_json::json!(13));
+        assert_eq!(short["errors_reported"], serde_json::json!(1));
+        let hint = short["hint"].as_str().unwrap_or_default();
+        assert!(
+            hint.contains("INCOMPLETE") && hint.contains("compile_console"),
+            "the hint must name the field holding the rest: {hint}"
+        );
+
+        // The PRODUCTION assembly on the SAME lines — the function iris_doc and
+        // compile_document both call now, not a copy of it here: 13 recovered, none flagged.
+        let owned: Vec<String> = console.iter().map(|l| l.to_string()).collect();
+        let fixed = compile_error_list(&serde_json::json!({}), &owned);
+        assert_eq!(
+            fixed.len(),
+            13,
+            "every error IRIS counted must be recovered: {fixed:#?}"
+        );
+        for macro_name in ["ZzUndefined0", "ZzUndefined1", "ZzUndefined2"] {
+            assert!(
+                fixed.iter().any(|e| e.contains(macro_name)),
+                "{macro_name} caused the compile to fail and must be reachable: {fixed:#?}"
+            );
+        }
+        let mut ok = serde_json::json!({"compiled": false, "compile_errors": fixed});
+        note_error_undercount(&mut ok, detected, 13, "compile_console");
+        assert!(
+            ok.get("errors_incomplete").is_none(),
+            "a complete list must not be flagged: {ok:#?}"
+        );
+    }
+
+    /// The wrapper path through the SHARED assembly: `iris_compile`'s response carried a
+    /// multi-line `status.errors` entry that embeds the first per-method message. It must
+    /// add an entry, not swallow the method it quotes — 14, and all three macros still
+    /// individually reachable.
+    #[test]
+    fn a_multi_line_status_wrapper_adds_an_entry_without_swallowing_one() {
+        let console: Vec<String> = measured_console().iter().map(|l| l.to_string()).collect();
+        let body = serde_json::json!({"status": {"errors": [{"error":
+            "ERROR #5475: Error compiling routine: Zz.MSG.Undercount.  Errors:  \
+             Zz.MSG.Undercount.cls\r\nERROR:  Zz.MSG.Undercount.1(3) : MPP5610 : Referenced \
+             macro not defined: 'ZzUndefined0'"}]}});
+        let errors = compile_error_list(&body, &console);
+        assert_eq!(
+            errors.len(),
+            14,
+            "1 wrapper + 13 console errors: {errors:#?}"
+        );
+        for macro_name in ["ZzUndefined0", "ZzUndefined1", "ZzUndefined2"] {
+            assert!(
+                errors
+                    .iter()
+                    .filter(|e| !e.contains('\n'))
+                    .any(|e| e.contains(macro_name)),
+                "{macro_name} has no single-line entry of its own: {errors:#?}"
+            );
+        }
+        // 14 against IRIS's 13 — one MORE than detected, and still silent.
+        let mut payload = serde_json::json!({"success": false});
+        note_error_undercount(
+            &mut payload,
+            detected_error_count(console.iter().map(String::as_str)),
+            errors.len(),
+            "console",
+        );
+        assert!(payload.get("errors_incomplete").is_none(), "{payload:#?}");
+    }
+
+    /// The positive control for the "equality is the wrong invariant" claim: `iris_compile`
+    /// carries the status.errors wrapper IRIS does not count, so it reports 14 against 13 —
+    /// one MORE than detected — and that must stay silent.
+    #[test]
+    fn a_status_errors_wrapper_over_the_detected_count_is_not_an_undercount() {
+        let mut payload = serde_json::json!({"success": false});
+        note_error_undercount(&mut payload, Some(13), 14, "console");
+        assert!(payload.get("errors_incomplete").is_none(), "{payload:#?}");
+        // …and an unparseable console leaves the response exactly as it was.
+        note_error_undercount(&mut payload, None, 0, "console");
+        assert_eq!(payload, serde_json::json!({"success": false}));
+    }
+
+    /// The undercount hint must WIN over the generic COMPILE_ERROR hint, which tells the
+    /// caller to fix the first error — the one piece of advice that is wrong when the list
+    /// is short, since on the measured run the only entry left was a cascade.
+    #[test]
+    fn the_undercount_hint_survives_the_compile_error_envelope() {
+        let mut payload = serde_json::json!({"errors": []});
+        note_error_undercount(&mut payload, Some(13), 1, "console");
+        let result = crate::tools::envelope::fail_with("COMPILE_ERROR", "boom", payload);
+        let text = match &result.expect("envelope").content[0].raw {
+            rmcp::model::RawContent::Text(t) => t.text.clone(),
+            other => panic!("unexpected content: {other:?}"),
+        };
+        let v: serde_json::Value = serde_json::from_str(&text).expect("json");
+        assert_eq!(v["errors_incomplete"], serde_json::json!(true));
+        assert!(
+            v["hint"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("INCOMPLETE"),
+            "the built-in hint must not win: {v:#?}"
+        );
     }
 }
 

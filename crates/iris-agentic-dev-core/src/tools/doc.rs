@@ -859,22 +859,14 @@ async fn do_write(
                             .collect()
                     })
                     .unwrap_or_default();
-                let mut errs: Vec<String> = vec![];
-                if let Some(se) = body["status"]["errors"].as_array() {
-                    for e in se {
-                        if let Some(msg) = e["error"].as_str() {
-                            errs.push(msg.to_string());
-                        }
-                    }
-                }
-                for line in &console {
-                    if line.trim().starts_with("ERROR ") {
-                        let msg = line.trim().to_string();
-                        if errs.iter().all(|e| !e.contains(line.trim())) {
-                            errs.push(msg);
-                        }
-                    }
-                }
+                // #80 was fixed in iris_compile and in `compile_document` and never reached
+                // HERE, the third copy of the same loop. This build prefixes per-method
+                // diagnostics with `ERROR:` (colon); matching only `ERROR ` (space) missed
+                // every one of them. Measured live on IRIS 2026.1 (Build 235U): a 3-method
+                // class with 3 undefined macros printed `Detected 13 errors` and this path
+                // reported ONE — `#5123 Unable to find entry point`, a cascade, while the
+                // macros that caused it never appeared.
+                let errs = crate::tools::compile_error_list(&body, &console);
                 (errs.is_empty(), errs, console)
             }
         };
@@ -895,6 +887,12 @@ async fn do_write(
                 "compile_errors": compile_errors,
                 "compile_console": compile_console,
             });
+            crate::tools::note_error_undercount(
+                &mut payload,
+                crate::tools::detected_error_count(compile_console.iter().map(String::as_str)),
+                compile_errors.len(),
+                "compile_console",
+            );
             note_compile_time_methods(&mut payload, &generators);
             return crate::tools::envelope::fail_with("COMPILE_ERROR", &first, payload);
         }
@@ -907,6 +905,14 @@ async fn do_write(
             "compile_errors": compile_errors,
             "compile_console": compile_console,
         });
+        // Reached with compile_errors EMPTY. If IRIS still counted errors here, "compiled:
+        // true" is the undercount at its worst — a failed compile reported as a success.
+        crate::tools::note_error_undercount(
+            &mut payload,
+            crate::tools::detected_error_count(compile_console.iter().map(String::as_str)),
+            compile_errors.len(),
+            "compile_console",
+        );
         note_compile_time_methods(&mut payload, &generators);
         return ok_json(payload);
     }
