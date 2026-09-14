@@ -976,6 +976,81 @@ fn test_message_content_search() {
         "zero rows must explain config-time indexing: {r}"
     );
 
+    // ── #202: a filter that is DROPPED rather than applied ────────────────────
+    //
+    // Steps 4 and 5 both assert on an error or a zero, and a no-op filter produces
+    // neither — it returns the whole archive with success:true. What distinguishes the
+    // two is the row COUNT against a known corpus, so measure the unfiltered baseline
+    // first and require the filtered calls to differ from it. A zero is only evidence
+    // once the same call has been seen returning non-zero.
+    let unfiltered = call(
+        "iris_interop_query",
+        serde_json::json!({"what":"messages","namespace":ns}),
+    );
+    assert_eq!(unfiltered["success"], true, "{unfiltered}");
+    let baseline = unfiltered["count"].as_u64().unwrap_or(0);
+    assert!(
+        baseline > 0,
+        "positive control: the fixture header must be in the unfiltered archive, \
+         else `count == 0` below proves nothing: {unfiltered}"
+    );
+
+    // 6. The #202 trigger: the filter object arriving as a JSON *string*, which is what
+    //    a client with no shape to serialise against sends. It used to fail
+    //    from_value(), become None, and return all `baseline` rows as a success.
+    let r = call(
+        "iris_interop_query",
+        serde_json::json!({"what":"messages","namespace":ns,
+            "search_table": r#"{"prop":"MSHControlID","value":"e2e-no-such-value"}"#}),
+    );
+    assert_eq!(
+        r["success"], true,
+        "a stringified filter must be honoured: {r}"
+    );
+    assert_eq!(
+        r["count"], 0,
+        "the stringified filter must FILTER, not degrade into no filter \
+         (baseline is {baseline} rows): {r}"
+    );
+
+    // 7. A filter that cannot be honoured is an error — never an unfiltered search.
+    //    Each of these used to deserialise to None and return all `baseline` rows.
+    for bad in [
+        serde_json::json!({}),
+        serde_json::json!({"value": "x"}),
+        serde_json::json!({"prop": "MSHControlID", "value": 42}),
+        serde_json::json!("MSHControlID"),
+    ] {
+        let r = call(
+            "iris_interop_query",
+            serde_json::json!({"what":"messages","namespace":ns,"search_table":bad.clone()}),
+        );
+        assert_eq!(
+            r["success"], false,
+            "search_table={bad} must be refused, not answered with {baseline} unfiltered rows: {r}"
+        );
+        assert_eq!(r["error_code"], "INVALID_PARAM", "{r}");
+        assert!(
+            r["error"].as_str().unwrap_or("").contains("search_table"),
+            "the error has to name the parameter: {r}"
+        );
+    }
+
+    // 8. The no-value filter reaches the handler's own check instead of vanishing.
+    //    In the #202 repro this call returned rows, which is what proved the filter
+    //    never got there: this error is unreachable unless it did.
+    let r = call(
+        "iris_interop_query",
+        serde_json::json!({"what":"messages","namespace":ns,
+            "search_table":{"prop":"MSHControlID"}}),
+    );
+    assert_eq!(r["success"], false, "{r}");
+    assert_eq!(r["error_code"], "INVALID_PARAMS", "{r}");
+    assert!(
+        r["error"].as_str().unwrap_or("").contains("value_like"),
+        "the message must name the two alternatives: {r}"
+    );
+
     // Clean up the fixture.
     let cleanup = format!(
         "Do ##class(Ens.MessageHeader).%DeleteId({hdr_id})\n\

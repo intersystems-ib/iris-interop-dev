@@ -161,11 +161,15 @@ pub struct InteropQueryDispatchSchema {
     /// messages: body columns to return alongside the header.
     #[serde(default)]
     pub body_select: Option<Vec<String>>,
-    /// messages: search an indexed Search Table field instead of the body table —
-    /// {prop, value | value_like, class?, extent?}. extent defaults to
-    /// EnsLib.HL7.SearchTable; an error lists the searchable props.
+    // #202: this was `Option<serde_json::Value>`, so the advertised schema carried no
+    // `type` and no `properties` — a client had no shape to serialise against, and the one
+    // that sent the object as a JSON string had its filter silently dropped. Typed, clients
+    // get the shape; `#[schemars(inline)]` on the struct keeps it out of `$defs` so the
+    // inputSchema stays self-contained (the same constraint as `InteropQueryWhat`).
+    /// messages: search an indexed Search Table field instead of the body table.
+    /// extent defaults to EnsLib.HL7.SearchTable; an error lists the searchable props.
     #[serde(default)]
-    pub search_table: Option<serde_json::Value>,
+    pub search_table: Option<interop::SearchTableFilter>,
 }
 
 /// The `what` discriminator, as a schema `enum`. Hand-written for the same reason as
@@ -3939,6 +3943,56 @@ pub(crate) fn string_list_arg(
     Err(format!(
         "{name} must be a list of column names (or a comma-separated string); got {v}"
     ))
+}
+
+/// The `search_table` filter as the handler needs it, or an error saying why it cannot
+/// be honoured — never a silent `None`.
+///
+/// #202: this read used to be
+/// `p.get("search_table").cloned().and_then(|v| serde_json::from_value(v).ok())`, so any
+/// shape serde could not read became `None` and the call carried on as an ordinary
+/// unfiltered `what=messages` with `success: true`. Nothing in the response said the
+/// filter had not been applied. A filter that is dropped rather than refused cannot
+/// return zero rows, and a search that cannot return zero is not a search.
+///
+/// `None` is categorically different here than for the neighbouring `as_str()` reads:
+/// there it means "not asked for", here it would mean "asked to filter, and we did not".
+///
+/// The shape that actually triggered it is the one #143 found for `body_select` — a
+/// client stringifying its own arguments, which the untyped `Option<Value>` schema gave
+/// it no reason not to do. Accept that form for the same reason [`string_list_arg`]
+/// does, and refuse everything else out loud.
+pub(crate) fn search_table_arg(
+    name: &str,
+    v: Option<&serde_json::Value>,
+) -> Result<Option<interop::SearchTableFilter>, String> {
+    const SHAPE: &str = r#"{"prop": "PatientID", "value": "123"}"#;
+    let Some(v) = v else { return Ok(None) };
+    if v.is_null() {
+        return Ok(None);
+    }
+    if let Some(s) = v.as_str() {
+        let s = s.trim();
+        if s.is_empty() {
+            return Ok(None);
+        }
+        // An object that arrived as a string — the #202 repro's shape.
+        return match serde_json::from_str::<serde_json::Value>(s) {
+            Ok(parsed) if parsed.is_object() => search_table_arg(name, Some(&parsed)),
+            _ => Err(format!(
+                "{name} must be an object like {SHAPE}; got the string {v}"
+            )),
+        };
+    }
+    if !v.is_object() {
+        return Err(format!("{name} must be an object like {SHAPE}; got {v}"));
+    }
+    serde_json::from_value(v.clone()).map(Some).map_err(|e| {
+        format!(
+            "{name} is not a usable filter: {e}. Expected {SHAPE} \
+             — prop is required, plus exactly one of value / value_like."
+        )
+    })
 }
 
 /// The call's arguments as a JSON object — `{}` when the client sent none.
@@ -7741,6 +7795,20 @@ Methods:
                         }),
                     ),
                 };
+                // #202: same reason, one field over. A filter serde could not read used
+                // to become None and the call ran unfiltered, reporting success.
+                let search_table = match search_table_arg("search_table", p.get("search_table")) {
+                    Ok(v) => v,
+                    Err(e) => return crate::tools::envelope::fail_with(
+                        "INVALID_PARAM",
+                        &e,
+                        serde_json::json!({
+                            "parameter": "search_table",
+                            "expected": "{\"prop\": \"PatientID\", \"value\": \"123\"} \
+                                         — or value_like for a LIKE pattern; optional class / extent",
+                        }),
+                    ),
+                };
                 interop::interop_message_search_impl(
                     iris_opt,
                     interop::MessageSearchParams {
@@ -7778,10 +7846,7 @@ Methods:
                             .and_then(|v| v.as_str())
                             .map(|s| s.to_string()),
                         body_select,
-                        search_table: p
-                            .get("search_table")
-                            .cloned()
-                            .and_then(|v| serde_json::from_value(v).ok()),
+                        search_table,
                     },
                 )
                 .await
@@ -10340,6 +10405,131 @@ mod string_list_arg_tests {
     #[test]
     fn a_malformed_json_array_string_is_an_error() {
         assert!(string_list_arg("body_select", Some(&json!("[\"A\","))).is_err());
+    }
+}
+
+#[cfg(test)]
+mod search_table_arg_tests {
+    use super::{search_table_arg, InteropQueryDispatchSchema};
+    use serde_json::json;
+
+    fn ok(v: serde_json::Value) -> super::interop::SearchTableFilter {
+        search_table_arg("search_table", Some(&v))
+            .expect("should parse")
+            .expect("should be Some")
+    }
+
+    #[test]
+    fn the_documented_object_form_works() {
+        let f = ok(json!({"prop": "PatientID", "value": "16284718"}));
+        assert_eq!(f.prop, "PatientID");
+        assert_eq!(f.value.as_deref(), Some("16284718"));
+        assert!(f.value_like.is_none());
+    }
+
+    #[test]
+    fn class_and_extent_and_value_like_survive() {
+        let f = ok(json!({"prop": "PatientID", "value_like": "AMOX%",
+                          "class": "Hospital.Search.HL7", "extent": "EnsLib.HL7.SearchTable"}));
+        assert_eq!(f.value_like.as_deref(), Some("AMOX%"));
+        assert_eq!(f.class.as_deref(), Some("Hospital.Search.HL7"));
+        assert_eq!(f.extent.as_deref(), Some("EnsLib.HL7.SearchTable"));
+    }
+
+    /// #202's actual trigger, and #143's before it: a client stringifying its own
+    /// arguments. The untyped `Option<Value>` schema gave it no shape to serialise
+    /// against, and `from_value(Value::String(..))` is the one shape that fails for
+    /// EVERY call — which is why all five repro rows came back unfiltered, the
+    /// well-formed one included.
+    #[test]
+    fn an_object_that_arrived_as_a_string_is_accepted() {
+        let f = ok(json!(r#"{"prop":"PatientID","value":"16284718"}"#));
+        assert_eq!(f.prop, "PatientID");
+        assert_eq!(f.value.as_deref(), Some("16284718"));
+    }
+
+    #[test]
+    fn absent_null_and_empty_all_mean_not_asked_for() {
+        assert!(search_table_arg("search_table", None).unwrap().is_none());
+        for v in [json!(null), json!("")] {
+            assert!(
+                search_table_arg("search_table", Some(&v))
+                    .unwrap()
+                    .is_none(),
+                "{v} means the caller did not ask to filter"
+            );
+        }
+    }
+
+    /// The one behaviour that must never come back. Every shape here used to become
+    /// `None`, and `None` made the call an ordinary unfiltered `what=messages` that
+    /// answered `success: true` with every row in the archive. A filter that cannot be
+    /// honoured has to be refused — a search that cannot return zero is not a search.
+    #[test]
+    fn an_unusable_shape_is_an_error_not_an_unfiltered_search() {
+        for bad in [
+            json!({}),                                       // nothing to filter on
+            json!({"value": "x"}),                           // prop is required
+            json!({"prop": "PatientID", "value": 16284718}), // number, not string
+            json!({"prop": ["PatientID"]}),
+            json!("PatientID"),  // a bare string, not an object
+            json!("{\"prop\":"), // truncated JSON
+            json!(["PatientID"]),
+            json!(7),
+            json!(true),
+        ] {
+            let r = search_table_arg("search_table", Some(&bad));
+            assert!(r.is_err(), "{bad} must be refused, not silently dropped");
+            assert!(
+                r.unwrap_err().contains("search_table"),
+                "the error has to name the parameter: {bad}"
+            );
+        }
+    }
+
+    /// A filter missing BOTH value and value_like still deserialises — it is refused one
+    /// layer down, by the handler's own "exactly one of value / value_like" check, which
+    /// is where the message that names the two alternatives lives. What matters here is
+    /// that it REACHES that check instead of vanishing at the boundary: the #202 repro's
+    /// no-value row is the row that proved the filter never got there.
+    #[test]
+    fn a_filter_with_no_value_reaches_the_handlers_own_check() {
+        let f = ok(json!({"prop": "PatientID"}));
+        assert_eq!(f.prop, "PatientID");
+        assert!(f.value.is_none() && f.value_like.is_none());
+    }
+
+    /// #202 part two, and #112 one level down: an untyped `Option<Value>` published a
+    /// property with no `type` and no `properties`, so a client had nothing to serialise
+    /// against. The shape must be advertised, and advertised INLINE — a `$ref` into
+    /// `$defs` is not something every MCP client resolves.
+    #[test]
+    fn the_published_schema_carries_the_filter_shape_inline() {
+        let v = serde_json::to_value(schemars::schema_for!(InteropQueryDispatchSchema)).unwrap();
+        let st = &v["properties"]["search_table"];
+        assert!(st.get("$ref").is_none(), "must not be a $ref: {st}");
+        assert!(
+            v.get("$defs").is_none(),
+            "the inputSchema must stay self-contained: {v}"
+        );
+        let ty = &st["type"];
+        assert!(
+            ty.as_array()
+                .map(|a| a.iter().any(|t| t == "object"))
+                .unwrap_or(ty == "object"),
+            "search_table must advertise an object type: {st}"
+        );
+        for field in ["prop", "value", "value_like", "class", "extent"] {
+            assert!(
+                st["properties"].get(field).is_some(),
+                "{field} must be advertised: {st}"
+            );
+        }
+        assert_eq!(
+            st["required"],
+            json!(["prop"]),
+            "prop is the required one: {st}"
+        );
     }
 }
 

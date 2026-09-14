@@ -277,6 +277,24 @@ fn every_tool_advertises_the_parameters_it_reads() {
             "tool '{name}' advertises an EMPTY properties map: {schema}"
         );
 
+        // #202, which is #112 one level down: a PROPERTY with no type is the same defect
+        // as a TOOL with no properties. `search_table` was declared `Option<Value>`, so it
+        // shipped as `{"default": null, "description": "..."}` — a client had no shape to
+        // serialise against, sent the object as a JSON string, and the filter was dropped
+        // on the floor. Prose is not a schema at either level.
+        for (key, prop) in props {
+            let typed = ["type", "anyOf", "oneOf", "allOf", "enum", "const", "$ref"]
+                .iter()
+                .any(|k| prop.get(k).is_some());
+            assert!(
+                typed,
+                "tool '{name}' advertises '{key}' with no type — a caller has only the \
+                 prose to serialise against, and whatever it guesses cannot be validated \
+                 before it is sent. Give the field a concrete Rust type rather than \
+                 serde_json::Value: {prop}"
+            );
+        }
+
         // A dispatcher's discriminator must be required AND enumerated. Naming the field
         // without its values only moves the guess one level down — which is what the nine
         // INVALID_ACTION errors in the campaign were.
