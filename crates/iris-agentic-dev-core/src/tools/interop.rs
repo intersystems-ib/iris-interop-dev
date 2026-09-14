@@ -545,6 +545,7 @@ pub struct MessageSearchParams {
 /// `class` scopes props via Ens_Config.SearchTableProp.ClassDerivation — never
 /// via a table name of its own.
 #[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(inline)]
 pub struct SearchTableFilter {
     /// Search-table subclass (e.g. "Hospital.Search.HL7") — scopes props to
     /// the ones that subclass defines or inherits.
