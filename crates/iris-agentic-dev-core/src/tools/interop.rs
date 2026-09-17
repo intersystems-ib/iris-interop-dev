@@ -1546,9 +1546,8 @@ Write "OK""#,
 }
 
 /// B8: list configured interop Business Partners (Ens.Config.BusinessPartner) so the model gets real
-/// rows instead of guessing nonexistent config tables. (SQL-Gateway connections have no clean SQL
-/// table — that discovery path is the iris_query table-not-found hint + iris_table_info / the
-/// introspect-dont-guess agent.)
+/// rows instead of guessing nonexistent config tables. (SQL Gateway connections DO have a table —
+/// %Library.sys_SQLConnection — it is just not named after the class; #206.)
 pub async fn interop_partners_impl(
     iris: Option<&IrisConnection>,
     namespace: Option<String>,
