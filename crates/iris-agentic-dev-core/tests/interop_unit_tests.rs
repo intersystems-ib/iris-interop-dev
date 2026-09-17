@@ -1078,3 +1078,57 @@ mod production_item_name_arg {
         );
     }
 }
+
+/// #185: the ORDER of the two writes into `iris_execute`'s single `hint` slot. The unit
+/// tests next to `apply_redirect_hint` prove it YIELDS to an occupied slot; they cannot
+/// prove it is CALLED after the thing that occupies it, because that call sits in an async
+/// path needing a live IRIS. This guards the call-site ordering in the source instead.
+///
+/// WHAT THIS DOES NOT COVER, so a clean run is not read as more than it is: it checks the
+/// two call sites' relative position in the file, not that they run in that order at
+/// runtime, and not that some third writer cannot reach `resp["hint"]` first. A new
+/// producer of `hint` on this path would pass this test and still reintroduce #185.
+#[test]
+fn the_redirect_hint_is_written_after_enrich_abort_not_before() {
+    let mod_rs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("tools")
+        .join("mod.rs");
+    let text = std::fs::read_to_string(&mod_rs).expect("readable mod.rs");
+
+    // Scope the window to the http path's abort branch. An earlier version of this guard
+    // searched the whole file after enrich_abort and so matched the DOCKER path's call —
+    // it passed with the http call moved back before enrich_abort, i.e. with #185 fully
+    // reintroduced. Mutation is what exposed it; the window is the fix.
+    let decl = text
+        .find("let redirect_hint = sql_lint::execute_redirect_hint(&p.code);")
+        .expect("redirect_hint declaration moved — re-point this guard (#185)");
+    let enrich = text
+        .find("enrich_abort(&iris, client, &namespace, abort, src, &mut resp).await;")
+        .expect("the enrich_abort call site moved — re-point this guard (#185)");
+    let ret = text[enrich..]
+        .find(r#"return envelope::fail_with("IRIS_RUNTIME_ERROR", abort, resp);"#)
+        .map(|i| i + enrich)
+        .expect("the abort return moved — re-point this guard (#185)");
+
+    // AFTER: the redirect is applied between enrich_abort and the return it feeds.
+    assert!(
+        text[enrich..ret].contains("apply_redirect_hint(&mut resp, redirect_hint);"),
+        "the abort path no longer applies the redirect after enrich_abort (#185)"
+    );
+    // NOT BEFORE: nothing applies it between the declaration and enrich_abort. This is the
+    // assertion that fails when the call is moved back to where the bug was.
+    assert!(
+        !text[decl..enrich].contains("apply_redirect_hint(&mut resp, redirect_hint);"),
+        "the static redirect is claiming the hint slot before the abort explanation (#185)"
+    );
+
+    // The `hint` slot has several legitimate writers (abort_hint on both exec paths,
+    // enrich_abort). What must stay singular is the REDIRECT's writer — that is the one
+    // that was jumping the queue. Both exec paths route through the helper.
+    let redirect_writers = text.match_indices("if let Some(h) = redirect_hint").count();
+    assert_eq!(
+        redirect_writers, 1,
+        "redirect_hint must reach the envelope through apply_redirect_hint only (#185)"
+    );
+}
