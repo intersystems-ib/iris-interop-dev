@@ -92,6 +92,42 @@ pub fn production_name_arg(p: &serde_json::Value) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// #218: the same treatment #63 gave the production name, for the ITEM name.
+/// `iris_production_item` read `item` only; a caller that wrote `item_name` — the
+/// spelling this very file accepts for the PRODUCTION name — got "", which reached
+/// `FindItemByConfigName` and came back as a raw `<SUBSCRIPT>` on
+/// `^Ens.Runtime("DispatchName","")`. A parameter typo was indistinguishable from a
+/// broken production. Blank is treated as absent so it cannot reach ObjectScript.
+///
+/// `name` is LAST, and deliberately shared with `PRODUCTION_NAME_KEYS`: on
+/// `iris_production_item` the ITEM is the subject, so a bare `name=` belongs to it.
+/// The three explicit item spellings always win, and that dispatcher reads the
+/// production from `production`/`production_name` only — see `production_only_arg`.
+pub const ITEM_NAME_KEYS: [&str; 4] = ["item", "item_name", "config_name", "name"];
+
+pub fn item_name_arg(p: &serde_json::Value) -> Option<String> {
+    ITEM_NAME_KEYS
+        .iter()
+        .filter_map(|k| p.get(k).and_then(|v| v.as_str()))
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+/// The production name WITHOUT `name`, for tools where `name` addresses something
+/// else. On `iris_production_item` the item owns `name` (#218); leaving both readers
+/// reaching for one key is what makes a bare `name=` ambiguous.
+pub const PRODUCTION_ONLY_KEYS: [&str; 2] = ["production", "production_name"];
+
+pub fn production_only_arg(p: &serde_json::Value) -> Option<String> {
+    PRODUCTION_ONLY_KEYS
+        .iter()
+        .filter_map(|k| p.get(k).and_then(|v| v.as_str()))
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
 /// Positive probe results, keyed "base_url|namespace". Never invalidated: a
 /// namespace does not lose Interoperability within a server process lifetime.
 /// Negatives are NOT cached — a namespace can gain interop (or be created)
@@ -1683,6 +1719,25 @@ pub async fn interop_production_item_impl(
     iris: Option<&IrisConnection>,
     params: ProductionItemParams,
 ) -> Result<CallToolResult, McpError> {
+    // #218: every action of this tool addresses ONE config item — `add` included — so an
+    // empty name is refused here, before the branch. Three ObjectScript sites embed it
+    // (`enable`/`disable`, `get_settings`, `set_settings`) plus `add`, and each one's
+    // `If '$IsObject(tItem)` guard runs too late: `FindItemByConfigName("")` subscripts
+    // `^Ens.Runtime("DispatchName","")` and the <SUBSCRIPT> is raised inside the call.
+    if params.item.trim().is_empty() {
+        return crate::tools::envelope::fail_with(
+            "MISSING_PARAMETER",
+            "iris_production_item needs the config item name — nothing was sent to FindItemByConfigName.",
+            serde_json::json!({
+                "accepted_parameters": ITEM_NAME_KEYS,
+                "action": &params.action,
+                "namespace": &params.namespace,
+                "hint": "Pass item=<ConfigItemName> (item_name, config_name and name are also accepted). \
+                         To see what a production contains: iris_query \
+                         \"SELECT Name, ClassName FROM Ens_Config.Item WHERE Production = '<Package.Production>'\".",
+            }),
+        );
+    }
     let iris = match iris {
         Some(i) => i,
         None => return err_json("IRIS_UNREACHABLE", "No IRIS connection"),
