@@ -7946,11 +7946,10 @@ Methods:
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let item = p
-            .get("item")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+        // #218: `item` only meant a caller who wrote `item_name` — the spelling this
+        // tool accepts for the PRODUCTION name — sent "" into FindItemByConfigName and
+        // got a raw <SUBSCRIPT>. One reader, every spelling; the impl refuses blank.
+        let item = interop::item_name_arg(&p).unwrap_or_default();
         let _iris_arc_hold = self.iris_arc();
         let namespace = interop::resolve_namespace(
             p.get("namespace").and_then(|v| v.as_str()),
@@ -7979,10 +7978,10 @@ Methods:
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
         let enabled = p.get("enabled").and_then(|v| v.as_bool());
-        let production = p
-            .get("production")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+        // #218: `production_name` is read here too — the rest of the interop surface
+        // accepts it. NOT `name`: on this tool the ITEM owns that key, so the two
+        // readers cannot both reach for it.
+        let production = interop::production_only_arg(&p);
         let pool_size = p.get("pool_size").and_then(|v| v.as_i64());
         let category = p
             .get("category")

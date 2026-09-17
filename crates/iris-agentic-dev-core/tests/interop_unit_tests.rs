@@ -962,3 +962,119 @@ fn no_generated_objectscript_compares_after_an_unparenthesised_or() {
         hits.join("\n")
     );
 }
+
+/// #218: an empty config-item name reached `FindItemByConfigName`, which subscripts
+/// `^Ens.Runtime("DispatchName","")`, and IRIS answered with a raw `<SUBSCRIPT>` that
+/// the server classified as INTEROP_ERROR with no hint. The caller then diagnosed the
+/// production — which was fine. The parameter was empty, and `item_name` (the spelling
+/// this same tool accepts for the PRODUCTION name) was how callers got there.
+mod production_item_name_arg {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn params(action: &str, item: &str) -> ProductionItemParams {
+        ProductionItemParams {
+            action: action.into(),
+            item: item.into(),
+            namespace: "APP".into(),
+            settings: HashMap::new(),
+            apply: true,
+            class_name: None,
+            enabled: None,
+            production: None,
+            pool_size: None,
+            category: None,
+        }
+    }
+
+    /// Every action addresses one item, `add` included — so every action refuses.
+    /// `iris: None` is the point: a MISSING_PARAMETER here proves the check runs
+    /// BEFORE the connection check, so a parameter slip is never reported as an
+    /// unreachable server (and the refusal is knowable without an IRIS at all).
+    #[test]
+    fn empty_item_is_a_parameter_error_not_a_subscript() {
+        for action in [
+            "add",
+            "remove",
+            "enable",
+            "disable",
+            "get_settings",
+            "set_settings",
+        ] {
+            for blank in ["", "   "] {
+                let r = rt().block_on(interop_production_item_impl(None, params(action, blank)));
+                let result = r.unwrap();
+                assert_eq!(result.is_error, Some(true), "for {action}/{blank:?}");
+                let text = result.content[0].raw.as_text().unwrap().text.clone();
+                let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(
+                    v["error_code"], "MISSING_PARAMETER",
+                    "for {action}/{blank:?}"
+                );
+                let err = v["error"].as_str().unwrap();
+                assert!(
+                    !err.contains("SUBSCRIPT") && !err.contains("DispatchName"),
+                    "must not look like a broken production: {err}"
+                );
+                let accepted: Vec<&str> = v["accepted_parameters"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|x| x.as_str().unwrap())
+                    .collect();
+                for key in ["item", "item_name", "config_name", "name"] {
+                    assert!(accepted.contains(&key), "{key} missing from {accepted:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn item_name_arg_reads_every_spelling_and_treats_blank_as_absent() {
+        for key in ["item", "item_name", "config_name", "name"] {
+            let v = serde_json::json!({ key: "BO.WriteToSQL" });
+            assert_eq!(
+                item_name_arg(&v).as_deref(),
+                Some("BO.WriteToSQL"),
+                "spelling {key} not read"
+            );
+        }
+        // Blank is absent — it must not reach ObjectScript as "".
+        assert_eq!(item_name_arg(&serde_json::json!({"item": "   "})), None);
+        assert_eq!(item_name_arg(&serde_json::json!({})), None);
+        // Whitespace around a real value is trimmed, not rejected.
+        assert_eq!(
+            item_name_arg(&serde_json::json!({"item_name": "  BS.In  "})).as_deref(),
+            Some("BS.In")
+        );
+        // The explicit item spellings outrank the shared `name`.
+        assert_eq!(
+            item_name_arg(&serde_json::json!({"name": "Prod", "item": "BO.Out"})).as_deref(),
+            Some("BO.Out")
+        );
+    }
+
+    /// The trap named in #218: `name` is in PRODUCTION_NAME_KEYS too. On this tool the
+    /// item owns it, so the production reader must NOT reach for it — otherwise a bare
+    /// `name=` addresses two different things at once.
+    #[test]
+    fn production_only_arg_does_not_claim_name() {
+        assert_eq!(
+            production_only_arg(&serde_json::json!({"name": "P.Prod"})),
+            None
+        );
+        assert_eq!(
+            production_only_arg(&serde_json::json!({"production_name": "P.Prod"})).as_deref(),
+            Some("P.Prod")
+        );
+        assert_eq!(
+            production_only_arg(&serde_json::json!({"production": "P.Prod"})).as_deref(),
+            Some("P.Prod")
+        );
+        // ...while the full reader still does, for every other interop tool.
+        assert_eq!(
+            production_name_arg(&serde_json::json!({"name": "P.Prod"})).as_deref(),
+            Some("P.Prod")
+        );
+    }
+}
