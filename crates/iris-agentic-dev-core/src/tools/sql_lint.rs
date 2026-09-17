@@ -146,9 +146,16 @@ pub fn targeted_table_hint(sql: &str) -> Option<&'static str> {
         || u.contains("CONFIG.GATEWAYS")
         || u.contains("CONFIG.SQLCONNECTIONS")
     {
-        return Some("SQL-Gateway / external-gateway connections are NOT a queryable SQL table. \
-Use the introspect-dont-guess agent or iris_table_info to resolve real names; the active connection's \
-config is in check_config.");
+        return Some(
+            "SQL Gateway connections are not queried by the class name — but they ARE in a table. \
+It is %Library.sys_SQLConnection: iris_query(query=\"SELECT * FROM %Library.sys_SQLConnection\"). \
+To resolve one by logical name from ObjectScript: ##class(%SQLConnection).ConnExists(\"<name>\"), \
+or the class queries %SQLConnection:ByName / :ByConnection. To test one: \
+Do $SYSTEM.SQLGateway.TestConnection(\"<name>\"), which writes diagnostics to the current device. \
+check_config reports THIS server's connection to IRIS, not the namespace's gateway connections. \
+If the failure was <CLASS/METHOD/PROPERTY DOES NOT EXIST>, the next call is \
+docs_introspect(class_name=\"<Class>\"), never another guessed name.",
+        );
     }
     // Namespace enumeration — not a SQL table in the interop toolset.
     if u.contains("%SYS.NAMESPACE")
@@ -191,6 +198,21 @@ instead of guessing Ens_Config.SearchTableProp.",
 /// Priority: filesystem-load (worst, host-coupling) > production/catalog config > class
 /// dictionary introspection > bare SELECT. Returns None for legitimate side-effecting ObjectScript
 /// (object %New/%Save, production control, globals, etc.).
+/// #206: `targeted_table_hint` reads the text of a SQL QUERY. Handing it a block of
+/// ObjectScript makes a substring match ("SQLCONNECTION") claim the caller queried a table
+/// they never queried. A `##class(...)` reference must never receive a table hint.
+fn looks_like_sql(code: &str) -> bool {
+    let u = code.to_ascii_uppercase();
+    let t = u.trim_start();
+    t.starts_with("SELECT ")
+        || t.starts_with("INSERT ")
+        || t.starts_with("UPDATE ")
+        || t.starts_with("DELETE ")
+        || u.contains(" FROM ")
+        || u.contains("&SQL(")
+        || u.contains("%SQL.STATEMENT")
+}
+
 pub fn execute_redirect_hint(code: &str) -> Option<&'static str> {
     let u = code.to_ascii_uppercase();
 
@@ -212,8 +234,15 @@ Host-independent and the supported path.",
     }
 
     // 2. Production / interop config read as ad-hoc SQL — reuse the typed-tool redirects.
-    if let Some(h) = targeted_table_hint(code) {
-        return Some(h);
+    //    #206: ONLY when this really is SQL. targeted_table_hint reads the text of a SQL
+    //    QUERY; handing it a block of ObjectScript let a substring match ("SQLCONNECTION")
+    //    claim the caller queried a table they never queried — 49 of 81 firings landed on
+    //    calls that had already SUCCEEDED, and on failures the generic steer took the one
+    //    hint slot away from the abort's own explanation.
+    if looks_like_sql(code) {
+        if let Some(h) = targeted_table_hint(code) {
+            return Some(h);
+        }
     }
 
     // 3. Class/dictionary introspection via %Dictionary.* SQL — typed tools do this in one call.
@@ -302,6 +331,78 @@ fn strip_quoted(s: &str) -> String {
 mod tests {
     use super::*;
 
+    /// #206: the gateway redirect is written for SQL QUERY text. Delegating to it from
+    /// `iris_execute` let a bare substring match claim the caller had queried a table —
+    /// 49 of 81 firings landed on calls that had already SUCCEEDED.
+    #[test]
+    fn objectscript_mentioning_a_gateway_class_gets_no_table_hint() {
+        // The measured case: a call that succeeded, and still got the hint.
+        let succeeded =
+            r#"Write ##class(%Dictionary.CompiledClass).%ExistsId("Config.SQLConnections"),"|","#;
+        let h = execute_redirect_hint(succeeded);
+        assert!(
+            !h.unwrap_or("").contains("sys_SQLConnection"),
+            "a ##class() reference must never receive a TABLE hint: {h:?}"
+        );
+
+        // The #185 evidence call: the slot must be left free for the abort explanation.
+        assert_eq!(
+            execute_redirect_hint(
+                "Set rs = ##class(%Library.SQLGatewayConnection).ListConnections()"
+            ),
+            None,
+            "ObjectScript with no SQL in it must produce no redirect at all"
+        );
+        assert_eq!(
+            execute_redirect_hint("Do $SYSTEM.SQLGateway.TestConnection(\"MyConn\")"),
+            None
+        );
+    }
+
+    /// The other half: real SQL must STILL be redirected. Gating on "looks like SQL" is
+    /// only correct if it does not cost the case the hint was written for.
+    #[test]
+    fn real_sql_against_a_gateway_table_still_redirects() {
+        for sql in [
+            "SELECT * FROM Config.SQLConnections",
+            "select Name from Config.Gateways",
+            "  SELECT id FROM %Library.sys_SQLConnection",
+        ] {
+            let h = execute_redirect_hint(sql);
+            assert!(
+                h.unwrap_or("").contains("%Library.sys_SQLConnection"),
+                "real SQL lost its redirect: {sql}"
+            );
+        }
+        // iris_query calls targeted_table_hint directly — that path is unchanged.
+        assert!(targeted_table_hint("SELECT * FROM Config.SQLConnections").is_some());
+    }
+
+    /// #206(b): the old text said there was no table. There is one — saying otherwise is
+    /// the half-truth that sent the model looking for a non-SQL path that does not exist.
+    #[test]
+    fn the_gateway_hint_names_the_table_that_exists() {
+        let h = targeted_table_hint("SELECT * FROM Config.SQLConnections").unwrap();
+        assert!(h.contains("%Library.sys_SQLConnection"), "{h}");
+        assert!(
+            !h.contains("NOT a queryable SQL table"),
+            "the claim this issue corrects is back: {h}"
+        );
+        // A hint is read as contract: it must not name a plugin agent this server
+        // cannot assume is installed.
+        assert!(!h.contains("introspect-dont-guess"), "{h}");
+    }
+
+    #[test]
+    fn looks_like_sql_separates_query_text_from_objectscript() {
+        assert!(looks_like_sql("SELECT 1"));
+        assert!(looks_like_sql("  select x from t"));
+        assert!(looks_like_sql("&sql(select 1 into :x)"));
+        assert!(looks_like_sql("Set st=##class(%SQL.Statement).%New()"));
+        assert!(!looks_like_sql("Write ##class(Foo).Bar()"));
+        assert!(!looks_like_sql("Set x = 1"));
+    }
+
     #[test]
     fn objectscript_detected() {
         assert!(looks_like_objectscript("set x = 1").is_some());
@@ -344,12 +445,15 @@ mod tests {
 
     #[test]
     fn targeted_hints_redirect_known_guesses() {
+        // #206: assert the table the hint must NAME. The previous form asserted the
+        // string "SQL-Gateway", which the wrong text ("NOT a queryable SQL table") also
+        // satisfied — the assertion could not tell the two apart.
         assert!(targeted_table_hint("SELECT * FROM Config.Gateways")
             .unwrap()
-            .contains("SQL-Gateway"));
+            .contains("%Library.sys_SQLConnection"));
         assert!(targeted_table_hint("SELECT * FROM %Library.SQLConnection")
             .unwrap()
-            .contains("SQL-Gateway"));
+            .contains("%Library.sys_SQLConnection"));
         assert!(targeted_table_hint("SELECT NAME FROM %SYS.Namespace")
             .unwrap()
             .contains("namespace"));
