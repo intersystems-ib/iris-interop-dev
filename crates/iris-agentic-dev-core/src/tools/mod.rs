@@ -3197,6 +3197,24 @@ async fn enrich_abort(
     }
 }
 
+/// #185: apply the static code-text redirect, but only into a slot nobody more specific
+/// has claimed. `iris_execute` carries at most ONE `hint`, first-writer-wins, and the
+/// redirect used to be written before `enrich_abort` ran — so whenever the code happened
+/// to mention `%Dictionary` (or any other trigger), the runtime error's own explanation
+/// was dropped and the caller got a style steer they had not asked about.
+///
+/// Order was the whole bug: the redirect is a property of the code, knowable before
+/// execution, while the abort explanation can only be built afterwards. The caller is
+/// looking at a failure — "line 3, `write ID`, is what failed" acts on that failure; the
+/// redirect acts on a preference. So the redirect now goes last and yields.
+fn apply_redirect_hint(resp: &mut serde_json::Value, redirect_hint: Option<&'static str>) {
+    if resp.get("hint").is_none() {
+        if let Some(h) = redirect_hint {
+            resp["hint"] = serde_json::Value::String(h.into());
+        }
+    }
+}
+
 /// Is this class an interoperability host, and which kind (#182)?
 ///
 /// Read from `%Dictionary.CompiledClass.PrimarySuper`, which carries the whole resolved
@@ -5682,11 +5700,12 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                         }
                     }
                 }
-                if resp.get("hint").is_none() {
-                    if let Some(h) = redirect_hint {
-                        resp["hint"] = serde_json::Value::String(h.into());
-                    }
-                }
+                // #185: the redirect is NOT written here. It is a static steer derived
+                // from the code TEXT, so it is knowable before execution and used to reach
+                // the single `hint` slot first — while the abort's own explanation can only
+                // be built after the run. The more specific hint was losing to the more
+                // generic one purely because the generic one was cheaper to compute. The
+                // write now happens on both exits below, into an empty slot only.
                 // Issue #2: the runtime-error message must live in `error` (not only
                 // `output`) and the result must be flagged isError on the wire. #123: `error`
                 // carries the abort LINE — `output` still holds everything the script wrote
@@ -5704,9 +5723,13 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                             line_map: &[],
                         },
                     };
+                    // enrich_abort is async and needs `abort`, which is only known here —
+                    // so it does not move earlier; the redirect's WRITE moves later (#185).
                     enrich_abort(&iris, client, &namespace, abort, src, &mut resp).await;
+                    apply_redirect_hint(&mut resp, redirect_hint);
                     return envelope::fail_with("IRIS_RUNTIME_ERROR", abort, resp);
                 }
+                apply_redirect_hint(&mut resp, redirect_hint);
                 return ok_json(resp);
             }
             Ok(Err(e)) => {
@@ -5802,11 +5825,11 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                         }
                     }
                 }
-                if resp.get("hint").is_none() {
-                    if let Some(h) = redirect_hint {
-                        resp["hint"] = serde_json::Value::String(h.into());
-                    }
-                }
+                // #185: same helper as the http path. No enrich_abort runs here, so the
+                // ordering bug never existed on this path — routing it through the helper
+                // is behaviour-identical and makes the invariant uniform: `redirect_hint`
+                // reaches the envelope through ONE writer that yields to an occupied slot.
+                apply_redirect_hint(&mut resp, redirect_hint);
                 if let Some(abort) = abort {
                     return envelope::fail_with("IRIS_RUNTIME_ERROR", abort, resp);
                 }
@@ -10404,6 +10427,50 @@ mod string_list_arg_tests {
     #[test]
     fn a_malformed_json_array_string_is_an_error() {
         assert!(string_list_arg("body_select", Some(&json!("[\"A\","))).is_err());
+    }
+}
+
+#[cfg(test)]
+mod redirect_hint_precedence_tests {
+    use super::*;
+
+    /// #185: `iris_execute` carries at most ONE `hint`, first-writer-wins. The static
+    /// redirect used to be written BEFORE enrich_abort, so a code text that merely
+    /// mentioned %Dictionary took the slot and the runtime error's own explanation —
+    /// "line 3, `write ID`, is what failed" — was dropped.
+    #[test]
+    fn a_redirect_never_displaces_the_aborts_own_explanation() {
+        // What enrich_abort leaves behind on a real abort.
+        let mut resp = serde_json::json!({
+            "error": "ERROR: <UNDEFINED> 9 RunUser+5^IrisDevTmp.Run ID",
+            "source_line_number": 3,
+            "source_line": "write ID",
+            "hint": "Line 3 of the code you sent is what failed: 'ID' is undefined.",
+        });
+        apply_redirect_hint(
+            &mut resp,
+            Some("Introspect classes with typed tools, not %Dictionary SQL: docs_introspect(...)"),
+        );
+        let hint = resp["hint"].as_str().unwrap();
+        assert!(
+            hint.contains("is what failed"),
+            "the abort explanation lost its slot to a generic steer: {hint}"
+        );
+        assert!(!hint.contains("docs_introspect"), "{hint}");
+    }
+
+    /// The other direction: with no abort explanation there is nothing more specific to
+    /// yield to, and the redirect must still be delivered. Gating it must not silence it.
+    #[test]
+    fn a_redirect_still_lands_when_no_one_more_specific_claimed_the_slot() {
+        let mut resp = serde_json::json!({ "output": "ok" });
+        apply_redirect_hint(&mut resp, Some("use iris_query for a bare SELECT"));
+        assert_eq!(resp["hint"], "use iris_query for a bare SELECT");
+
+        // And None leaves the envelope untouched — no empty `hint` key invented.
+        let mut none_resp = serde_json::json!({ "output": "ok" });
+        apply_redirect_hint(&mut none_resp, None);
+        assert!(none_resp.get("hint").is_none());
     }
 }
 
