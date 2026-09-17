@@ -1132,3 +1132,112 @@ fn the_redirect_hint_is_written_after_enrich_abort_not_before() {
         "redirect_hint must reach the envelope through apply_redirect_hint only (#185)"
     );
 }
+
+/// #212: one tool, two contracts. `add` stripped `Adapter.` and set Target="Adapter";
+/// `set_settings` hard-coded Target="Host" for every key, so `Adapter.DSN` created a HOST
+/// setting literally named "Adapter.DSN" that the adapter never reads. The tool returned OK,
+/// the odd name appeared in the Portal with its value — so the caller verified it visually
+/// and concluded the write worked — and the BO terminated at startup. The <Ens>ErrGeneral it
+/// produced appeared 21 times across 8 students in one cohort.
+mod set_settings_target_resolution {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// The twin of `add_item_code_has_canonical_api_and_settings`'s target assertions,
+    /// which #212 notes could not be written while this codegen lived inline in the arm.
+    #[test]
+    fn an_adapter_prefixed_key_targets_the_adapter() {
+        let mut settings = HashMap::new();
+        settings.insert(
+            "Adapter.DSN".to_string(),
+            "jdbc:postgresql://h:5432/d".into(),
+        );
+        settings.insert("TargetConfigNames".to_string(), "Router.In".into());
+        let code = build_set_settings_code("My.Production", "BO.WriteToSQL", &settings, true);
+
+        // Looked up AND created against the resolved target, with the prefix stripped.
+        assert!(
+            code.contains(r#"Set tS=tItem.FindSettingByName("DSN","Adapter")"#),
+            "{code}"
+        );
+        assert!(
+            code.contains(r#"Set tS.Name="DSN" Set tS.Target="Adapter""#),
+            "{code}"
+        );
+        // A bare key is still the business host.
+        assert!(
+            code.contains(r#"Set tS=tItem.FindSettingByName("TargetConfigNames","Host")"#),
+            "{code}"
+        );
+        // The defect itself: no setting NAMED with its prefix, on any target.
+        assert!(
+            !code.contains(r#""Adapter.DSN""#),
+            "the prefix is still being written into the setting NAME: {code}"
+        );
+    }
+
+    /// The JDBC quintet from the field report — the combination that dies at startup.
+    #[test]
+    fn the_jdbc_settings_all_reach_the_adapter() {
+        let mut settings = HashMap::new();
+        for (k, v) in [
+            ("Adapter.DSN", "PGCONN"),
+            ("Adapter.JGService", "Util.JDBCGateway"),
+            ("Adapter.Credentials", "PGCRED"),
+        ] {
+            settings.insert(k.to_string(), v.to_string());
+        }
+        let code = build_set_settings_code("", "BO.WriteToSQL", &settings, true);
+        for name in ["DSN", "JGService", "Credentials"] {
+            assert!(
+                code.contains(&format!(r#"Set tS.Name="{name}" Set tS.Target="Adapter""#)),
+                "{name} did not reach the adapter:\n{code}"
+            );
+        }
+    }
+
+    /// `add` and `set_settings` must not drift apart again: one resolver, both callers.
+    #[test]
+    fn add_and_set_settings_resolve_a_key_identically() {
+        for (key, want_target, want_name) in [
+            ("Adapter.FilePath", "Adapter", "FilePath"),
+            ("Host.PoolSize", "Host", "PoolSize"),
+            ("TargetConfigNames", "Host", "TargetConfigNames"),
+        ] {
+            assert_eq!(resolve_setting_target(key), (want_target, want_name));
+
+            let mut one = HashMap::new();
+            one.insert(key.to_string(), "v".to_string());
+            let add = build_add_item_code("P", "I", "C", true, None, None, &one);
+            let set = build_set_settings_code("P", "I", &one, false);
+            let fragment = format!(r#"Set tS.Name="{want_name}" Set tS.Target="{want_target}""#);
+            assert!(add.contains(&fragment), "add disagreed for {key}:\n{add}");
+            assert!(
+                set.contains(&fragment),
+                "set_settings disagreed for {key}:\n{set}"
+            );
+        }
+    }
+
+    /// A dotted prefix this tool does not know resolved to Host, which is almost certainly
+    /// not what the caller meant. Say so rather than writing it silently.
+    #[test]
+    fn an_unknown_dotted_prefix_is_warned_about_not_swallowed() {
+        let mut settings = HashMap::new();
+        settings.insert("Adaptor.DSN".to_string(), "typo-for-Adapter".into());
+        let w = unknown_prefix_warnings(&settings);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("Adaptor.DSN"), "{w:?}");
+        assert!(
+            w[0].contains("Adapter.DSN"),
+            "must name the spelling meant: {w:?}"
+        );
+
+        // The three legitimate shapes stay silent.
+        let mut quiet = HashMap::new();
+        quiet.insert("Adapter.DSN".to_string(), "x".into());
+        quiet.insert("Host.PoolSize".to_string(), "1".into());
+        quiet.insert("TargetConfigNames".to_string(), "R".into());
+        assert!(unknown_prefix_warnings(&quiet).is_empty());
+    }
+}

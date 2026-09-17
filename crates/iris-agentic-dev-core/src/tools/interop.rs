@@ -1664,10 +1664,7 @@ pub fn build_add_item_code(
         extra.push_str(&format!("Set tItem.Category={}\n", os_str_expr(cat)));
     }
     for (k, v) in settings {
-        let (target, name) = match k.strip_prefix("Adapter.") {
-            Some(rest) => ("Adapter", rest),
-            None => ("Host", k.strip_prefix("Host.").unwrap_or(k)),
-        };
+        let (target, name) = resolve_setting_target(k);
         extra.push_str(&format!(
             "Set tS=##class(Ens.Config.Setting).%New() Set tS.Name={} Set tS.Target=\"{}\" Set tS.Value={} Do tItem.Settings.Insert(tS)\n",
             os_str_expr(name),
@@ -1712,6 +1709,94 @@ Write "OK:"_tProdName"#,
         prologue = resolve_production_prologue(production),
         item = item_e
     )
+}
+
+/// Build the ObjectScript that writes settings onto an existing config item (pure →
+/// unit-testable, which is why it is a named function: #212's twin of the `add` assertion in
+/// interop_unit_tests.rs could not be written while this lived inline in the match arm).
+///
+/// #212: settings keys resolve their TARGET exactly as `build_add_item_code` does —
+/// `Adapter.` → Target="Adapter", `Host.` or bare → Target="Host". The target used to be
+/// hard-coded "Host" for every key, so `Adapter.DSN` created a HOST setting literally named
+/// "Adapter.DSN", which the adapter never reads. The tool returned OK, the odd name showed up
+/// in the Management Portal, the caller verified it visually — and the BO died at startup with
+/// <Ens>ErrGeneral "The JGService setting must be configured...".
+pub fn build_set_settings_code(
+    production: &str,
+    item: &str,
+    settings: &std::collections::HashMap<String, String>,
+    apply: bool,
+) -> String {
+    let item_e = os_str_expr(item);
+    let mut setting_lines = String::new();
+    // Deterministic order: a HashMap iterates arbitrarily, and the generated code is asserted
+    // on in tests and read by humans in error output.
+    let mut keys: Vec<&String> = settings.keys().collect();
+    keys.sort();
+    for k in keys {
+        let v = &settings[k];
+        let (target, name) = resolve_setting_target(k);
+        setting_lines.push_str(&format!(
+            r#"Set tS=tItem.FindSettingByName({name},"{target}")
+If '$IsObject(tS) {{ Set tS=##class(Ens.Config.Setting).%New() Set tS.Name={name} Set tS.Target="{target}" Do tItem.Settings.Insert(tS) }}
+Set tS.Value={value}
+"#,
+            name = os_str_expr(name),
+            target = target,
+            value = os_str_expr(v)
+        ));
+    }
+    // C: apply live (Ens.Director.UpdateProduction) unless apply=false, so several
+    // set_settings calls can be batched and applied once (or via iris_production update).
+    let update_line = if apply {
+        "Set tSC5=##class(Ens.Director).UpdateProduction(10,0)\nIf $$$ISERR(tSC5) { Write \"ERROR:UPDATE_FAILED:\"_$System.Status.GetErrorText(tSC5) Quit }\n"
+    } else {
+        ""
+    };
+    format!(
+        r#"{prologue}
+Set tItem=tProd.FindItemByConfigName({item},,.tSC3)
+If '$IsObject(tItem) {{ Write "ERROR:ITEM_NOT_FOUND:Item not found: "_{item} Quit }}
+{setting_lines}Set tSC4=tProd.%Save()
+If $$$ISERR(tSC4) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC4) Quit }}
+{update_line}Write "OK""#,
+        prologue = resolve_production_prologue(production),
+        item = item_e,
+        setting_lines = setting_lines,
+        update_line = update_line
+    )
+}
+
+/// The one place a settings key is split into (Target, Name) — #212. `add` and `set_settings`
+/// both call it, so the two actions of one tool cannot drift apart again.
+pub fn resolve_setting_target(key: &str) -> (&'static str, &str) {
+    match key.strip_prefix("Adapter.") {
+        Some(rest) => ("Adapter", rest),
+        None => ("Host", key.strip_prefix("Host.").unwrap_or(key)),
+    }
+}
+
+/// Keys that carry a dotted prefix this tool does not know. They resolved to Host, which is
+/// almost certainly not what the caller meant — `Adapter.` and `Host.` are the only prefixes
+/// with meaning. Returned in the success envelope instead of being written silently (#212).
+pub fn unknown_prefix_warnings(
+    settings: &std::collections::HashMap<String, String>,
+) -> Vec<String> {
+    let mut out: Vec<String> = settings
+        .keys()
+        .filter(|k| !k.starts_with("Adapter.") && !k.starts_with("Host.") && k.contains('.'))
+        .map(|k| {
+            format!(
+                "\"{k}\" was written as a HOST setting named \"{k}\" — the only prefixes with \
+                 meaning are \"Adapter.\" (the adapter) and \"Host.\" (the business host). If you \
+                 meant the adapter, send \"Adapter.{rest}\".",
+                k = k,
+                rest = k.rsplit('.').next().unwrap_or(k)
+            )
+        })
+        .collect();
+    out.sort();
+    out
 }
 
 pub async fn interop_production_item_impl(
@@ -1836,40 +1921,19 @@ Set tKey="" For {{ Set tSetting=tItem.Settings.GetNext(.tKey) Quit:tKey=""
                     "set_settings requires at least one setting",
                 );
             }
-            // Build ObjectScript to set each setting then UpdateProduction
-            let mut setting_lines = String::new();
-            for (k, v) in &params.settings {
-                let k_expr = os_str_expr(k);
-                let v_expr = os_str_expr(v);
-                setting_lines.push_str(&format!(
-                    r#"Set tS=tItem.FindSettingByName({k},"Host")
-If '$IsObject(tS) {{ Set tS=##class(Ens.Config.Setting).%New() Set tS.Name={k} Set tS.Target="Host" Do tItem.Settings.Insert(tS) }}
-Set tS.Value={v}
-"#,
-                    k = k_expr,
-                    v = v_expr
-                ));
-            }
-            // C: apply live (Ens.Director.UpdateProduction) unless apply=false, so several
-            // set_settings calls can be batched and applied once (or via iris_production update).
-            let update_line = if params.apply {
-                "Set tSC5=##class(Ens.Director).UpdateProduction(10,0)\nIf $$$ISERR(tSC5) { Write \"ERROR:UPDATE_FAILED:\"_$System.Status.GetErrorText(tSC5) Quit }\n"
-            } else {
-                ""
-            };
-            let code = format!(
-                r#"{prologue}
-Set tItem=tProd.FindItemByConfigName({item},,.tSC3)
-If '$IsObject(tItem) {{ Write "ERROR:ITEM_NOT_FOUND:Item not found: "_{item} Quit }}
-{setting_lines}Set tSC4=tProd.%Save()
-If $$$ISERR(tSC4) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC4) Quit }}
-{update_line}Write "OK""#
+            // #212: one codegen, one target resolver, shared with `add`.
+            let code = build_set_settings_code(
+                params.production.as_deref().unwrap_or(""),
+                &params.item,
+                &params.settings,
+                params.apply,
             );
+            let warnings = unknown_prefix_warnings(&params.settings);
             match iris.execute_via_generator(&code, ns, &client).await {
                 Ok(out) => {
                     let out = out.trim();
                     if out == "OK" {
-                        ok_json(serde_json::json!({
+                        let mut env = serde_json::json!({
                             "success": true,
                             "item": params.item,
                             "applied": params.apply,
@@ -1878,7 +1942,14 @@ If $$$ISERR(tSC4) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tS
                             } else {
                                 "Settings saved; NOT applied (apply=false) — run iris_production action=update to apply"
                             }
-                        }))
+                        });
+                        // #212: a setting IRIS will never read must not be reported as a plain
+                        // success. The caller checks the Portal, sees the odd name with its
+                        // value, and concludes the write worked — the BO dies at startup.
+                        if !warnings.is_empty() {
+                            env["warnings"] = serde_json::json!(warnings);
+                        }
+                        ok_json(env)
                     } else if let Some(msg) = out.strip_prefix("ERROR:ITEM_NOT_FOUND:") {
                         err_json("ITEM_NOT_FOUND", msg)
                     } else if let Some(msg) = out.strip_prefix("ERROR:NO_PRODUCTION:") {
