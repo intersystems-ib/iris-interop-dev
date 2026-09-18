@@ -128,6 +128,47 @@ pub fn production_only_arg(p: &serde_json::Value) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// #204: the ObjectScript that enumerates a production's config items. ONE body serves both
+/// `iris_production action=status full=true` and `iris_production_item action=list`.
+///
+/// NOT `SELECT ... FROM Ens_Config.Item`: the item definitions live in the production class's
+/// `XData ProductionDefinition`, not in a queryable extent — the cohort's own attempts against
+/// ENS_CONFIG.SETTING came back SQLCODE -30. This is the single most likely wrong turn on this
+/// change, so it is stated here rather than left implicit.
+///
+/// Every property read here is one `build_add_item_code` already WRITES (Name, ClassName,
+/// Enabled, PoolSize, Category), so reading them back assumes nothing new about Ens.Config.Item.
+/// Tab-delimited out of ObjectScript and parsed in Rust is the house style, not a preference:
+/// the `get_settings` arm already writes `Name_"="_Value_$CHAR(10)` and rebuilds the map in
+/// Rust. Hand-writing JSON in ObjectScript would have to escape item names and categories.
+pub fn build_list_items_code(production: &str) -> String {
+    format!(
+        r#"{prologue}
+For i=1:1:tProd.Items.Count() {{
+    Set tItem=tProd.Items.GetAt(i)
+    Write tItem.Name_$C(9)_tItem.ClassName_$C(9)_(+tItem.Enabled)_$C(9)_(+tItem.PoolSize)_$C(9)_tItem.Category_$C(10)
+}}"#,
+        prologue = resolve_production_prologue(production)
+    )
+}
+
+/// Parse `build_list_items_code`'s tab-delimited output into the `items` array (#204).
+pub fn parse_list_items(out: &str) -> Vec<serde_json::Value> {
+    out.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            serde_json::json!({
+                "name":       f.first().copied().unwrap_or(""),
+                "class_name": f.get(1).copied().unwrap_or(""),
+                "enabled":    f.get(2).copied().unwrap_or("0") == "1",
+                "pool_size":  f.get(3).and_then(|v| v.parse::<i64>().ok()),
+                "category":   f.get(4).copied().unwrap_or(""),
+            })
+        })
+        .collect()
+}
+
 /// #215: an INVALID_ACTION message answers TWO questions, not one — what this tool accepts,
 /// and where the action that was ASKED FOR actually lives. The enum alone resolves the first.
 ///
@@ -141,7 +182,20 @@ pub fn production_only_arg(p: &serde_json::Value) -> Option<String> {
 /// the wordings cannot drift apart.
 /// The actions `iris_production_item` accepts. Named so the early guard and the match's
 /// catch-all answer from ONE list (#215).
-pub const PRODUCTION_ITEM_ACTIONS: [&str; 6] = [
+pub const PRODUCTION_ITEM_ACTIONS: [&str; 7] = [
+    "add",
+    "remove",
+    "enable",
+    "disable",
+    "get_settings",
+    "set_settings",
+    // #204: the enumeration the schema had been promising via iris_production full=true.
+    "list",
+];
+
+/// Actions that address ONE config item by name, and therefore require `item` (#218/#204).
+/// `list` is deliberately absent: it enumerates.
+pub const ACTIONS_NEEDING_AN_ITEM: [&str; 6] = [
     "add",
     "remove",
     "enable",
@@ -184,11 +238,15 @@ pub fn enumeration_redirect(tool: &str, requested: &str) -> Option<&'static str>
         // (its `full` parameter is declared, read, and then never used — #204), and
         // iris_interop_query has no `config_items`. Naming either would cost a second round
         // trip and teach a capability that does not exist.
+        // #204 made this real. The text #215 shipped said no listing action existed and
+        // pointed at iris_doc as the fallback; leaving that in place would have been a
+        // hint that was true when written and false now.
         "iris_production_item" => Some(
-            "This tool acts on ONE item, named by `item`; there is no listing action in the \
-             toolset yet. To see what a production contains, read the production class: \
-             iris_doc(mode=get, name=<Package.ProductionName>) — the items live in its \
-             XData ProductionDefinition, not in a queryable table.",
+            "To enumerate: action='list' returns every config item of the production \
+             (name, class_name, enabled, pool_size, category). \
+             iris_production(action='status', full=true) returns the same list alongside \
+             the production state. Pass production=<Package.Name> to either one to read a \
+             production that is not the running one.",
         ),
         "iris_lookup_manage" => Some(
             "To enumerate: action='list_keys' (the keys of one table=<name>) or \
@@ -847,9 +905,34 @@ pub async fn interop_production_status_impl(
         Ok(output) => {
             let raw = output.trim().to_string();
             match parse_status_response(&raw) {
-                Ok((name, code, state)) => ok_json(
-                    serde_json::json!({"success": true, "production": name, "state": state, "state_code": code}),
-                ),
+                Ok((name, code, state)) => {
+                    let mut v = serde_json::json!({"success": true, "production": name, "state": state, "state_code": code});
+                    // #204: `full` was parsed into full_status, advertised as "include
+                    // per-item detail", and never read — so a model reading the schema was
+                    // told the enumeration existed. 13 of 14 students, 55 full:true calls,
+                    // each answered byte-identically to the same call without it.
+                    if params.full_status {
+                        let items_code =
+                            build_list_items_code(v["production"].as_str().unwrap_or_default());
+                        match exec_http(iris, &items_code, &params.namespace).await {
+                            Ok(items_out) => {
+                                let t = items_out.trim();
+                                if let Some(msg) = t.strip_prefix("ERROR:NO_PRODUCTION:") {
+                                    v["items_note"] = serde_json::Value::String(msg.into());
+                                } else if let Some(msg) = t.strip_prefix("ERROR:INTEROP_ERROR:") {
+                                    v["items_note"] = serde_json::Value::String(msg.into());
+                                } else {
+                                    v["items"] =
+                                        serde_json::Value::Array(parse_list_items(&items_out));
+                                }
+                            }
+                            // The status answer is already correct; a failed enumeration
+                            // must not turn a working status call into an error.
+                            Err(e) => v["items_note"] = serde_json::Value::String(e.to_string()),
+                        }
+                    }
+                    ok_json(v)
+                }
                 Err(e) if e.starts_with("INTEROP_ERROR") => err_json("INTEROP_ERROR", &e[14..]),
                 // "No production running" answered to a STATUS question is a normal
                 // state, not a failure (issue #32) — fresh instances live here. Genuine
@@ -955,7 +1038,28 @@ pub async fn interop_production_stop_impl(
         Ok(output) => {
             let raw = output.trim();
             if raw.starts_with("OK") {
-                ok_json(serde_json::json!({"success": true, "state": "Stopped"}))
+                // #205, the sibling literal with lower blast radius: an OK from
+                // StopProduction was reported as the asserted state "Stopped" without
+                // reading it back. Same defect shape as recover; a timeout that stops short
+                // of a full shutdown would still have been reported as Stopped.
+                let status_code = r#"Set sc=##class(Ens.Director).GetProductionStatus(.n,.s) If $$$ISERR(sc) { Write "ERROR:"_$System.Status.GetErrorText(sc) } Else { Write n_":"_s }"#;
+                match exec_http(iris, status_code, &params.namespace).await {
+                    Ok(after) => match parse_status_response(after.trim()) {
+                        Ok((name, code, state)) => ok_json(serde_json::json!({
+                            "success": true,
+                            "production": name,
+                            "state": state,
+                            "state_code": code,
+                        })),
+                        // Nothing registered as running is the EXPECTED answer after a stop.
+                        Err(_) => ok_json(serde_json::json!({
+                            "success": true,
+                            "state": "Stopped",
+                            "production": serde_json::Value::Null,
+                        })),
+                    },
+                    Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
+                }
             } else {
                 interop_fail(raw, None)
             }
@@ -1026,7 +1130,43 @@ pub async fn interop_production_recover_impl(
         Ok(output) => {
             let raw = output.trim();
             if raw.starts_with("OK") {
-                ok_json(serde_json::json!({"success": true, "state": "Running"}))
+                // #205: RecoverProduction() cleans up a TROUBLED instance; it does not start
+                // one, and it returns without acting at all when the production is not
+                // Troubled (EGDV 12.3). A Suspended production is not Troubled — so the
+                // method did nothing, the wrapper wrote OK, and this arm translated that OK
+                // into the literal "Running". In every observed recover/status pair the next
+                // status said Suspended, and the model then issued a start that could only
+                // be refused. Read the state back rather than asserting it.
+                let status_code = r#"Set sc=##class(Ens.Director).GetProductionStatus(.n,.s) If $$$ISERR(sc) { Write "ERROR:"_$System.Status.GetErrorText(sc) } Else { Write n_":"_s }"#;
+                match exec_http(iris, status_code, &params.namespace).await {
+                    Ok(after) => match parse_status_response(after.trim()) {
+                        Ok((name, code, state)) => {
+                            let mut v = serde_json::json!({
+                                "success": true,
+                                "recovered": true,
+                                "production": name,
+                                "state": state,
+                                "state_code": code,
+                            });
+                            if state == "Suspended" || state == "Troubled" {
+                                v["hint"] = serde_json::Value::String(
+                                    crate::tools::envelope::SUSPENDED_MISMATCH_HINT.into(),
+                                );
+                            }
+                            ok_json(v)
+                        }
+                        // Same reading as interop_production_status_impl: nothing registered
+                        // as running is a normal post-recovery state, not a failure.
+                        Err(_) => ok_json(serde_json::json!({
+                            "success": true,
+                            "recovered": true,
+                            "state": "stopped",
+                            "production": serde_json::Value::Null,
+                            "note": "Recovery ran; no production is registered as running in this namespace.",
+                        })),
+                    },
+                    Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
+                }
             } else {
                 interop_fail(raw, None)
             }
@@ -1656,8 +1796,12 @@ pub struct ProductionItemParams {
     // Nine of the campaign's 31 parameter errors were a guessed action on one of these
     // tools; the runtime message names the valid set correctly, it just arrives a round
     // trip late. `extend` puts the same set where the model reads it first.
-    #[schemars(extend("enum" = ["add", "remove", "enable", "disable", "get_settings", "set_settings"]))]
+    #[schemars(extend("enum" = ["add", "remove", "enable", "disable", "get_settings", "set_settings", "list"]))]
     pub action: String,
+    // #204: `list` addresses no single item, so `item` is no longer schema-required. The
+    // type stays String — the dispatcher fills it through item_name_arg() (#218) — and the
+    // per-action refusal below is what enforces it where it IS required.
+    #[serde(default)]
     pub item: String,
     #[serde(default = "default_ns")]
     pub namespace: String,
@@ -1873,12 +2017,15 @@ pub async fn interop_production_item_impl(
     iris: Option<&IrisConnection>,
     params: ProductionItemParams,
 ) -> Result<CallToolResult, McpError> {
-    // #218: every action of this tool addresses ONE config item — `add` included — so an
-    // empty name is refused here, before the branch. Three ObjectScript sites embed it
-    // (`enable`/`disable`, `get_settings`, `set_settings`) plus `add`, and each one's
+    // #218: an empty name is refused before the branch, because four ObjectScript sites embed
+    // it (`enable`/`disable`, `get_settings`, `set_settings`, `add`) and each one's
     // `If '$IsObject(tItem)` guard runs too late: `FindItemByConfigName("")` subscripts
     // `^Ens.Runtime("DispatchName","")` and the <SUBSCRIPT> is raised inside the call.
-    if params.item.trim().is_empty() {
+    //
+    // #204 narrowed this from "every action" to "every action that names one item". `list`
+    // enumerates and takes no item, so it is exempt — the invariant #218 was written on
+    // stopped being true the moment an enumeration action existed.
+    if ACTIONS_NEEDING_AN_ITEM.contains(&params.action.as_str()) && params.item.trim().is_empty() {
         return crate::tools::envelope::fail_with(
             "MISSING_PARAMETER",
             "iris_production_item needs the config item name — nothing was sent to FindItemByConfigName.",
@@ -1984,6 +2131,29 @@ Set tKey="" For {{ Set tSetting=tItem.Settings.GetNext(.tKey) Quit:tKey=""
                     ok_json(
                         serde_json::json!({"success":true,"item":params.item,"settings":settings}),
                     )
+                }
+                Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
+            }
+        }
+        // #204: nothing in the toolset returned the config-item names, so the model guessed
+        // them and collected ITEM_NOT_FOUND. Same ObjectScript as status full=true.
+        "list" => {
+            let code = build_list_items_code(params.production.as_deref().unwrap_or(""));
+            match iris.execute_via_generator(&code, ns, &client).await {
+                Ok(out) => {
+                    let t = out.trim();
+                    if let Some(msg) = t.strip_prefix("ERROR:NO_PRODUCTION:") {
+                        err_json("NO_PRODUCTION", msg)
+                    } else if let Some(msg) = t.strip_prefix("ERROR:INTEROP_ERROR:") {
+                        err_json("INTEROP_ERROR", msg)
+                    } else {
+                        let items = parse_list_items(&out);
+                        ok_json(serde_json::json!({
+                            "success": true,
+                            "count": items.len(),
+                            "items": items,
+                        }))
+                    }
                 }
                 Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
             }
