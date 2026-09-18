@@ -120,8 +120,8 @@ fn tools_list_returns_interop_profile() {
     // gate removing two tools on a read-only connection — #114 stopped it doing that, so the
     // slack was vestigial and would have hidden a tool going missing.
     assert!(
-        names.len() == 26,
-        "expected the interop profile (26 tools), got {}: {:?}",
+        names.len() == 28,
+        "expected the interop profile (28 tools), got {}: {:?}",
         names.len(),
         names
     );
@@ -1135,4 +1135,99 @@ fn macro_includes_are_derived_from_the_document() {
             .contains("%occErrors.inc"),
         "GeneralError must resolve to %occErrors.inc: {result}"
     );
+}
+
+/// #246: the categories come from IRIS, not from a hardcoded list.
+#[test]
+fn hl7_schema_list_returns_this_instances_categories() {
+    let iris_host = std::env::var("IRIS_HOST").unwrap_or_default();
+    if iris_host.is_empty() {
+        return;
+    }
+    let responses = mcp_exchange(&[
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
+        serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"hl7_schema_list","arguments":{"namespace":interop_ns()}}}),
+    ]);
+    let result = parse_tool_text(&find_response(&responses, 2).expect("no tool response"));
+
+    // A plain IRIS has no HL7 schemas at all, and saying so is a correct answer — but it must
+    // arrive as HL7_NOT_AVAILABLE, never as an empty list of categories.
+    if result["error_code"] == "HL7_NOT_AVAILABLE" {
+        return;
+    }
+    let cats = result["categories"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no categories array: {result}"));
+    assert!(
+        !cats.is_empty(),
+        "an IRIS for Health instance has schema categories; an empty list means the read \
+         failed: {result}"
+    );
+    let names: Vec<&str> = cats.iter().filter_map(|c| c["category"].as_str()).collect();
+    assert!(
+        names.contains(&"2.5"),
+        "2.5 ships with every IRIS for Health: {names:?}"
+    );
+}
+
+/// #246's acceptance criterion, as a test.
+///
+/// `EnsLib.HL7.Schema.GetFieldNameFromNumber("2.5","PID","3")` returns `""` because it compares
+/// the stored `3()` against a bare `3`. This asserts the tool does NOT inherit that gap: PID:3
+/// and PID:5 must come back NAMED and flagged as repeating, and PID:7 — which does not repeat —
+/// must not be flagged. Both directions, so a hardcoded `repeating: true` would fail.
+#[test]
+fn hl7_schema_inspect_names_repeating_fields() {
+    let iris_host = std::env::var("IRIS_HOST").unwrap_or_default();
+    if iris_host.is_empty() {
+        return;
+    }
+    let responses = mcp_exchange(&[
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
+        serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"hl7_schema_inspect","arguments":{"version":"2.5","segment":"PID","namespace":interop_ns()}}}),
+    ]);
+    let result = parse_tool_text(&find_response(&responses, 2).expect("no tool response"));
+    if result["error_code"] == "HL7_NOT_AVAILABLE" {
+        return;
+    }
+
+    let fields = result["fields"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no fields array: {result}"));
+    assert!(
+        fields.len() > 30,
+        "PID in 2.5 has 39 fields; a short list means a partial read: {}",
+        fields.len()
+    );
+
+    let by_number = |n: &str| -> serde_json::Value {
+        fields
+            .iter()
+            .find(|f| f["number"] == n)
+            .unwrap_or_else(|| panic!("PID:{n} missing from {} fields", fields.len()))
+            .clone()
+    };
+
+    let f3 = by_number("3");
+    assert_eq!(
+        f3["name"], "PatientIdentifierList",
+        "PID:3 must be NAMED — GetFieldNameFromNumber returns \"\" here: {f3}"
+    );
+    assert_eq!(f3["repeating"], serde_json::json!(true), "{f3}");
+
+    let f5 = by_number("5");
+    assert_eq!(f5["name"], "PatientName", "{f5}");
+    assert_eq!(f5["repeating"], serde_json::json!(true), "{f5}");
+
+    // The other direction: a non-repeating field must not be flagged, or `repeating` carries
+    // no information.
+    let f7 = by_number("7");
+    assert_eq!(
+        f7["repeating"],
+        serde_json::json!(false),
+        "PID:7 does not repeat: {f7}"
+    );
+    assert_eq!(f7["data_type"], "TS", "{f7}");
 }
