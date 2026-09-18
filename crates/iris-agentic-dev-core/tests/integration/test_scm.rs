@@ -214,7 +214,12 @@ fn iris_compile_open_uri() {
     );
 
     // Verify sentinel file was written
-    let hint_path = dirs::home_dir().unwrap().join(".iris-dev/open-hint.json");
+    // #240: this asserted `.iris-dev/open-hint.json` while `write_open_hint` (tools/mod.rs)
+    // writes `.iris-agentic-dev/open-hint.json`. The directory was renamed and the assertion
+    // was not — and because this target ran in no job, nothing ever said so.
+    let hint_path = dirs::home_dir()
+        .unwrap()
+        .join(".iris-agentic-dev/open-hint.json");
     assert!(
         hint_path.exists(),
         "sentinel file should exist at {:?}",

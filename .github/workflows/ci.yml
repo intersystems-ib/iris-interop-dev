@@ -49,6 +49,11 @@ jobs:
       # fixed for fail-fast. New live-IRIS tests should use #[ignore] so the count stays
       # truthful; the master-only e2e-tests job is what actually exercises them.
       #
+      # #240: that last clause was only ever true of ONE target. The e2e job named two
+      # targets by hand and reached 9 of the 53 `#[ignore]` tests. It now derives the SAME
+      # list this gate uses and runs it with `--include-ignored`, so "`#[ignore]` means the
+      # e2e job runs it" is a fact rather than an intention.
+      #
       # Before this change the gate ran 11 hand-listed targets. Three targets that were in
       # no gate at all were found red or intermittently red (#90 test_search_unit,
       # #91 admin_unit_tests, test_workspace_config) — nobody saw them because nobody ran
@@ -267,9 +272,28 @@ jobs:
         # job, and this job named only `--test test_e2e`. They reported as "ignored",
         # which reads as coverage and is the absence of it — #177 shipped through four
         # releases underneath them.
+        #
+        # #240: that remedy reached ONE of the seven targets carrying `#[ignore]` tests.
+        # The other six — interop_e2e_tests, admin_e2e_tests,
+        # progressive_disclosure_integration, test_live_reload_e2e, test_sql_safety_e2e,
+        # test_iris_test_e2e — ran in NO job at all, 44 tests' worth, and reported as
+        # "ignored" beside a target that was genuinely covered, which made them look MORE
+        # trustworthy than they were.
+        #
+        # So this no longer names targets. It derives them from `cargo metadata`, exactly as
+        # the required gate does, and runs the same list with `--include-ignored`. A new test
+        # target, or a new `#[ignore]` test in an existing one, is therefore covered by
+        # default — nobody has to remember to add it here. That is the #95 argument applied
+        # to the job that had quietly become the hand-kept list #95 removed from the gate.
         run: |
-          cargo test --test test_e2e -- --nocapture
-          cargo test --test test_sql_translate_e2e -- --include-ignored --nocapture
+          TARGETS=$(bash scripts/ci-test-targets.sh)
+          # Same refusal as the required gate: never run a degraded list silently.
+          if [[ "$TARGETS" != *--test* ]]; then
+            echo "::error::scripts/ci-test-targets.sh emitted no test targets - refusing to run a degraded e2e job"
+            exit 1
+          fi
+          # Unquoted on purpose: $TARGETS must word-split into the --test flags.
+          cargo test --workspace --lib --bins $TARGETS --no-fail-fast -- --include-ignored --nocapture
         env:
           IRIS_HOST: ${{ env.IRIS_HOST }}
           IRIS_WEB_PORT: "52773"

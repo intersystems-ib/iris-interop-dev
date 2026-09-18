@@ -225,6 +225,29 @@ fn test_e2e_select_container_updates_check_config() {
         serde_json::to_string_pretty(&config_result).unwrap()
     );
 
+    // #240: this test needs a container whose Atelier REST is reachable on its own published
+    // port. Measured locally, `iris-dev-environment` publishes 1972->43972 only and its web
+    // server is fronted by a SEPARATE gateway container, so the tool correctly answers
+    // CONTAINER_UNREACHABLE and the assertion below fails for an environment reason. CI's
+    // `iris-e2e` publishes 52773 directly, so it must genuinely pass there.
+    //
+    // Hence: tolerate the unreachable case locally, and REFUSE to tolerate it on CI. A skip
+    // that can fire in the job is green-by-absence, which is the whole complaint of #240.
+    if select_result["error_code"] == "CONTAINER_UNREACHABLE" {
+        let on_ci = std::env::var("CI").is_ok_and(|v| !v.is_empty() && v != "false");
+        assert!(
+            !on_ci,
+            "on CI the selected container must be reachable — a skip here would be exactly the \
+             green-by-absence #240 is about: {select_result}"
+        );
+        eprintln!(
+            "SKIP test_e2e_select_container_updates_check_config: container '{}' has no \
+             directly reachable Atelier REST (it is probably fronted by a separate web gateway). \
+             Not a product failure: {select_result}",
+            target_container()
+        );
+        return;
+    }
     assert_eq!(
         select_result["switched"], true,
         "iris_select_container should return switched:true"
