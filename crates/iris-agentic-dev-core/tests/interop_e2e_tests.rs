@@ -1119,6 +1119,7 @@ fn test_message_content_search() {
     // properties, they must be listed. Where it has none, the interesting property is the one
     // this repo keeps having to fix: an empty list must arrive WITH the reason, not bare.
     let props = r["available_props"].as_array().cloned().unwrap_or_default();
+    let search_props_registered = !props.is_empty();
     if props.is_empty() {
         let hint = r["hint"].as_str().unwrap_or("");
         assert!(
@@ -1136,19 +1137,6 @@ fn test_message_content_search() {
             "available_props must list the extent's fields: {r}"
         );
     }
-
-    // 5. valid prop, zero rows → success with the config-time indexing hint.
-    let r = call(
-        "iris_interop_query",
-        serde_json::json!({"what":"messages","namespace":ns,
-            "search_table":{"prop":"MSHControlID","value":"e2e-no-such-value"}}),
-    );
-    assert_eq!(r["success"], true, "{r}");
-    assert_eq!(r["count"], 0, "{r}");
-    assert!(
-        r["hint"].as_str().unwrap_or("").contains("back-indexed"),
-        "zero rows must explain config-time indexing: {r}"
-    );
 
     // ── #202: a filter that is DROPPED rather than applied ────────────────────
     //
@@ -1169,23 +1157,62 @@ fn test_message_content_search() {
          else `count == 0` below proves nothing: {unfiltered}"
     );
 
-    // 6. The #202 trigger: the filter object arriving as a JSON *string*, which is what
-    //    a client with no shape to serialise against sends. It used to fail
-    //    from_value(), become None, and return all `baseline` rows as a success.
-    let r = call(
-        "iris_interop_query",
-        serde_json::json!({"what":"messages","namespace":ns,
-            "search_table": r#"{"prop":"MSHControlID","value":"e2e-no-such-value"}"#}),
-    );
-    assert_eq!(
-        r["success"], true,
-        "a stringified filter must be honoured: {r}"
-    );
-    assert_eq!(
-        r["count"], 0,
-        "the stringified filter must FILTER, not degrade into no filter \
-         (baseline is {baseline} rows): {r}"
-    );
+    // 5 and 6 need a prop that is actually REGISTERED on the extent, which requires a
+    // SearchTableClass configured on some production item. #240: CI's container has no
+    // production, so `EnsLib.HL7.SearchTable` has no registered properties there and no prop
+    // name is valid — step 4 above measured that.
+    //
+    // The #202 property survives either way, and it is the one that matters: a filter that
+    // cannot be honoured must NEVER degrade into an unfiltered search. So both environments
+    // assert it; only the shape of "honoured" differs.
+    let filters = [
+        serde_json::json!({"prop":"MSHControlID","value":"e2e-no-such-value"}),
+        // The #202 trigger: the filter arriving as a JSON *string*, which is what a client
+        // with no shape to serialise against sends. It used to fail from_value(), become
+        // None, and return all `baseline` rows as a success.
+        serde_json::json!(r#"{"prop":"MSHControlID","value":"e2e-no-such-value"}"#),
+    ];
+    for filter in &filters {
+        let r = call(
+            "iris_interop_query",
+            serde_json::json!({"what":"messages","namespace":ns,"search_table":filter.clone()}),
+        );
+        if search_props_registered {
+            // 5/6. valid prop, zero rows → success with the config-time indexing hint.
+            assert_eq!(
+                r["success"], true,
+                "a filter on a registered prop must be honoured: {r}"
+            );
+            assert_eq!(
+                r["count"], 0,
+                "the filter must FILTER, not degrade into no filter (baseline is \
+                 {baseline} rows): {r}"
+            );
+            assert!(
+                r["hint"].as_str().unwrap_or("").contains("back-indexed"),
+                "zero rows must explain config-time indexing: {r}"
+            );
+        } else {
+            // No prop can be valid here, so the filter cannot be honoured — and that is
+            // precisely when #202's regression would return the whole archive as a success.
+            assert_eq!(
+                r["success"], false,
+                "an unhonourable filter must be refused, not answered: {r}"
+            );
+            assert_eq!(r["error_code"], "SEARCH_PROP_NOT_FOUND", "{r}");
+            // `success == false` above is the real #202 guard. This one only bites when a
+            // count IS reported, so say that explicitly rather than let `unwrap_or(MAX)`
+            // turn an absent field into a silent pass — the defect being fixed all over
+            // this commit.
+            if let Some(n) = r["count"].as_u64() {
+                assert_ne!(
+                    n, baseline,
+                    "a filter that cannot be honoured must never return the {baseline} \
+                     unfiltered rows — that is #202: {r}"
+                );
+            }
+        }
+    }
 
     // 7. A filter that cannot be honoured is an error — never an unfiltered search.
     //    Each of these used to deserialise to None and return all `baseline` rows.
