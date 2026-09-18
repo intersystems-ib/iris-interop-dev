@@ -1877,8 +1877,11 @@ impl<'de> serde::Deserialize<'de> for GetLogParams {
 
 /// Issue #78: the keys iris_get_log tolerates without acting on them.
 ///
-/// Not leniency for its own sake. `namespace` is advertised by 13 of the 28 tools in
+/// Not leniency for its own sake. `namespace` is advertised by 26 of the 29 tools in
 /// this fork's default (interop) profile — the only key that spans tool families — and
+/// (this said "13 of the 28"; measured 2026-09-19 by counting tools whose advertised
+/// `inputSchema.properties` carries `namespace`, the figure is 26. The old number was
+/// wrong, not merely stale by one tool, so it is corrected rather than incremented.)
 /// the agent harness sends it on nearly every call, including the correct index call in
 /// the issue's own repro. It cannot mean anything here: the log store is a single
 /// process-global ring buffer (`log_store::LogStore`) with no namespace dimension, so
