@@ -134,11 +134,139 @@ pub async fn handle_iris_info(
 
 // ── iris_macro ───────────────────────────────────────────────────────────────
 
+/// Each macro action has its OWN Atelier endpoint. There is no `/action/getmacro`: posting
+/// there answers 404 for a real macro and a nonsense one alike, which is how four of this
+/// tool's five actions were broken without anyone seeing it. Verified 200 on IRIS for Health
+/// 2026.1 (API 8).
+pub fn macro_endpoint(action: &str) -> &'static str {
+    match action {
+        "signature" => "/action/getmacrosignature",
+        "location" => "/action/getmacrolocation",
+        "definition" => "/action/getmacrodefinition",
+        _ => "/action/getmacroexpansion",
+    }
+}
+
+/// True when the macro endpoint actually resolved something. Every field it can return is
+/// a string or a list, and IRIS answers with the field PRESENT but empty when it resolved
+/// nothing — `{"document":"","line":""}` or `{"definition":[]}` — so "has content" is the
+/// only reading that separates an answer from a non-answer.
+pub fn macro_answer_is_resolved(content: &serde_json::Value) -> bool {
+    match content {
+        serde_json::Value::Object(m) => m.values().any(macro_answer_is_resolved),
+        serde_json::Value::Array(a) => !a.is_empty(),
+        serde_json::Value::String(s) => !s.trim().is_empty(),
+        serde_json::Value::Null => false,
+        _ => true,
+    }
+}
+
+/// What to say when the endpoint answered but resolved nothing. It must not read as "no such
+/// macro": the commonest cause is that the needed Include was not named.
+/// Include names are BARE document stems — `Ensemble`, `%occStatus` — never `%occStatus.inc`.
+/// Measured on IRIS for Health 2026.1, the suffixed form fails two different ways and neither
+/// says so: at the resolver `%occStatus.inc` answers `ERROR #5001: Failure to compile include
+/// files`, and through the REST layer it never gets that far, because
+/// `%Atelier.v2.Utils.Macros:FormatMacroArgs` screens every include through
+/// `ExistsDoc(name_".INC")` and `%occStatus.inc.INC` does not exist — so the include is dropped
+/// in silence and the answer comes back empty, which reads exactly like "no such macro".
+/// Callers write the suffixed form by reflex, so normalise it rather than punish it.
+pub fn normalize_include(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    let t = match t.rsplit_once('.') {
+        Some((stem, ext)) if ext.eq_ignore_ascii_case("inc") => stem.trim(),
+        _ => t,
+    };
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+pub fn build_include_code_query() -> &'static str {
+    "SELECT IncludeCode FROM %Dictionary.CompiledClass WHERE Name = ?"
+}
+
+/// `%Dictionary.CompiledClass.IncludeCode` is a comma-separated list of bare include names.
+/// Measured shapes: `Ensemble`, `EnsAlertErrors`, `Ensemble,%ZEN.Utils`.
+pub fn parse_include_code(raw: &str) -> Vec<String> {
+    raw.split(',').filter_map(normalize_include).collect()
+}
+
+pub fn parse_include_code_row(body: &serde_json::Value) -> Vec<String> {
+    body["result"]["content"]
+        .as_array()
+        .and_then(|rows| rows.first())
+        .and_then(|row| row["IncludeCode"].as_str())
+        .map(parse_include_code)
+        .unwrap_or_default()
+}
+
+/// The class whose Include list we can look up, from the document the macro is resolved as seen
+/// from. `None` for a routine (`.mac`/`.int`/`.inc`), which carries its includes as `#include`
+/// lines in its text rather than in the class dictionary.
+pub fn docname_class_stem(docname: &str) -> Option<&str> {
+    let d = docname.trim();
+    match d.rsplit_once('.') {
+        Some((stem, ext)) if ext.eq_ignore_ascii_case("cls") && !stem.trim().is_empty() => {
+            Some(stem.trim())
+        }
+        _ => None,
+    }
+}
+
+/// Includes derived from the document, then those the caller named — normalised, de-duplicated
+/// case-insensitively, document order first. The caller can only ever ADD scope this way, which
+/// is the safe direction: a surplus include costs nothing, a missing one costs a wrong answer.
+pub fn merge_includes(derived: &[String], caller: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in derived.iter().chain(caller.iter()) {
+        if let Some(name) = normalize_include(raw) {
+            if !out.iter().any(|e| e.eq_ignore_ascii_case(&name)) {
+                out.push(name);
+            }
+        }
+    }
+    out
+}
+
+pub fn unresolved_macro_note(macro_name: &str, docname: &str, includes: &[String]) -> String {
+    let named = if includes.is_empty() {
+        "no includes in force".to_string()
+    } else {
+        format!("includes {}", includes.join(", "))
+    };
+    format!(
+        "IRIS resolved nothing for '{macro_name}' as seen from '{docname}' with {named}. This \
+         does NOT mean the macro does not exist. Macro visibility is decided by the include list \
+         alone, and this API does not read the document's own Include list — so a real macro \
+         whose include is not in force answers byte-for-byte like a macro that does not exist. \
+         iris_macro derives the includes from 'docname' when it names a compiled class; if that \
+         class is not compiled, or 'docname' names a routine, nothing is derived and the \
+         includes must be named here. Use BARE names — includes=[\"Ensemble\"], not \
+         [\"Ensemble.inc\"]. Ensemble macros such as GeneralError need [\"Ensemble\"]; \
+         %occStatus macros such as OK and ERROR resolve with no includes at all."
+    )
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct MacroParams {
     /// Action: list, signature, location, definition, expand
+    #[schemars(extend("enum" = ["list", "signature", "location", "definition", "expand"]))]
     pub action: String,
     pub name: Option<String>,
+    /// The document the macro is resolved AS SEEN FROM, e.g. My.Pkg.BO.Sender.cls. Pass the
+    /// class you are writing: when it names a compiled class, its Include list is looked up and
+    /// used automatically, which is what puts a macro in scope. The document need not exist —
+    /// naming one that does not simply derives nothing.
+    #[serde(default)]
+    pub docname: Option<String>,
+    /// EXTRA include files in force, beyond those derived from 'docname'. Bare names, no .inc
+    /// suffix: ["Ensemble"], not ["Ensemble.inc"]. Only needed when 'docname' is a routine, is
+    /// not compiled, or the macro lives outside that document's own Include list.
+    #[serde(default)]
+    pub includes: Vec<String>,
     #[serde(default)]
     pub args: Vec<String>,
     /// IRIS namespace. OMIT this field to use the connection's configured namespace
@@ -219,22 +347,100 @@ pub async fn handle_iris_macro(
             }))
         }
         action @ ("signature" | "location" | "definition" | "expand") => {
-            let name = p.name.as_deref().unwrap_or("");
-            let url = iris.versioned_ns_url(&namespace, "/action/getmacro");
-            let arg_count = p.args.len();
-            let resp= match client .post(&url) .basic_auth(&iris.username, Some(&iris.password)) .json(&serde_json::json!({ "macros": [{"name": name, "arguments": arg_count}], "action": action, "args": p.args, })) .send() .await {
-                Ok(v) => v,
-                Err(e) => return crate::tools::envelope::transport_fail("handle_iris_macro", &e.to_string()),
+            // These four posted to `/action/getmacro`, which is not an Atelier endpoint. Every
+            // call returned HTTP 404 — for a real macro and for a nonsense one alike, which is
+            // the signature of a missing endpoint rather than a missing macro. Four of this
+            // tool's five advertised actions had therefore never worked, and nothing noticed
+            // because the tool sits outside the interop profile. Measured against IRIS for
+            // Health 2026.1 (API 8): each action has its OWN endpoint, and all four answer 200.
+            let endpoint = macro_endpoint(action);
+            let name = p.name.as_deref().unwrap_or("").trim();
+            // `$$$Foo` is how the macro is written at the call site; the API wants the bare name.
+            let macro_name = name.trim_start_matches('$');
+            if macro_name.is_empty() {
+                return err_json(
+                    "MISSING_PARAMS",
+                    "'name' is required for this action — the macro to resolve, with or without \
+                     its $$$ prefix. Nothing was run.",
+                );
+            }
+            // `docname` does NOT decide resolution. Measured against the worker the REST layer
+            // calls, `$$GetMacroLocation^%qccServer`: with includes=["Ensemble"], `GeneralError`
+            // resolves to %occErrors.inc(1415) from a real class, from a made-up class, from a
+            // .mac name and from no docname at all — identically. IRIS says so itself, in
+            // `%Atelier.v2.Utils.Macros:ParseMacroRequest`: "The macro api does not require the
+            // document to exist". The include list is the only lever, and `FormatMacroArgs`
+            // builds it purely from what the CALLER posts — the document's own Include list is
+            // never read. So derive it here: that is the difference between an agent naming the
+            // class it is editing and an agent guessing an include name.
+            let docname = p.docname.as_deref().unwrap_or("%occStatus.inc");
+            let derived: Vec<String> = match docname_class_stem(docname) {
+                Some(class) => match iris
+                    .query(
+                        build_include_code_query(),
+                        vec![serde_json::Value::String(class.to_string())],
+                        &namespace,
+                        client,
+                    )
+                    .await
+                {
+                    Ok(body) => parse_include_code_row(&body),
+                    Err(e) => {
+                        tracing::debug!("IncludeCode lookup failed for {class}: {e}");
+                        Vec::new()
+                    }
+                },
+                None => Vec::new(),
             };
-            // Same #106 shape: a refused getmacro POST used to answer `success:true` with a
-            // null result, i.e. "that macro does not exist" for a call IRIS never ran.
+            let includes = merge_includes(&derived, &p.includes);
+            let url = iris.versioned_ns_url(&namespace, endpoint);
+            let resp = match client
+                .post(&url)
+                .basic_auth(&iris.username, Some(&iris.password))
+                .json(&serde_json::json!({
+                    "docname": docname,
+                    "macroname": macro_name,
+                    "includes": includes,
+                    "arguments": p.args,
+                }))
+                .send()
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    return crate::tools::envelope::transport_fail(
+                        "handle_iris_macro",
+                        &e.to_string(),
+                    )
+                }
+            };
             if !resp.status().is_success() {
                 return crate::tools::envelope::http_status_fail("iris_macro", resp.status(), &url);
             }
             let body: serde_json::Value = resp.json().await.unwrap_or_default();
-            ok_json(
-                serde_json::json!({"success": true, "name": name, "action": action, "result": body["result"]}),
-            )
+            let content = &body["result"]["content"];
+            let resolved = macro_answer_is_resolved(content);
+            // An empty answer is NOT "this macro does not exist". Measured: `GeneralError`
+            // resolves only with includes=["Ensemble"] (to %occErrors.inc line 1415) and comes
+            // back empty with %occStatus.inc, EnsUtil, EnsConstants or none — and empty again
+            // when asked from a real Business Operation with no includes, because the API does
+            // not read the document's own Include list. Reporting a bare empty success is how a
+            // caller concludes the macro is absent when the includes were simply not named.
+            ok_json(serde_json::json!({
+                "success": true,
+                "resolved": resolved,
+                "name": name,
+                "macro_name": macro_name,
+                "action": action,
+                "docname": docname,
+                "includes": includes,
+                "includes_from_document": derived,
+                "namespace": namespace,
+                "result": content,
+                "note": if resolved { serde_json::Value::Null } else {
+                    serde_json::Value::String(unresolved_macro_note(macro_name, docname, &includes))
+                },
+            }))
         }
         other => err_json(
             "INVALID_PARAM",
@@ -1208,5 +1414,229 @@ mod int_frame_tests {
         for bad in ["", "just some text", "<UNDEFINED>", "^Only.A.Routine.1"] {
             assert!(parse_int_frame(bad).is_none(), "{bad:?} must not parse");
         }
+    }
+}
+
+/// #247: the four macro actions that had never worked, and the empty answer that must not
+/// read as "no such macro".
+#[cfg(test)]
+mod macro_action_tests {
+
+    // A `.inc` suffix is the reflex spelling and it is wrong in BOTH layers: the resolver
+    // answers `ERROR #5001: Failure to compile include files`, and the REST layer screens the
+    // name out via `ExistsDoc("%occStatus.inc.INC")` = 0 and answers empty instead. Measured on
+    // IRIS for Health 2026.1.
+    #[test]
+    fn an_inc_suffix_is_stripped_because_it_resolves_nothing() {
+        assert_eq!(
+            normalize_include("%occStatus.inc").as_deref(),
+            Some("%occStatus")
+        );
+        assert_eq!(
+            normalize_include("Ensemble.INC").as_deref(),
+            Some("Ensemble")
+        );
+        assert_eq!(normalize_include(" Ensemble ").as_deref(), Some("Ensemble"));
+        // A dotted package name is NOT a suffix and must survive intact.
+        assert_eq!(
+            normalize_include("%ZEN.Utils").as_deref(),
+            Some("%ZEN.Utils")
+        );
+        assert_eq!(normalize_include("   "), None);
+        assert_eq!(normalize_include(".inc"), None);
+    }
+
+    #[test]
+    fn include_code_splits_into_bare_names() {
+        assert_eq!(parse_include_code("Ensemble"), vec!["Ensemble"]);
+        assert_eq!(
+            parse_include_code("Ensemble,%ZEN.Utils"),
+            vec!["Ensemble", "%ZEN.Utils"]
+        );
+        assert_eq!(parse_include_code(""), Vec::<String>::new());
+        assert_eq!(
+            parse_include_code("Ensemble, ,EnsAlertErrors"),
+            vec!["Ensemble", "EnsAlertErrors"]
+        );
+    }
+
+    #[test]
+    fn include_code_is_read_from_the_dictionary_row() {
+        let body =
+            serde_json::json!({"result": {"content": [{"IncludeCode": "Ensemble,%ZEN.Utils"}]}});
+        assert_eq!(
+            parse_include_code_row(&body),
+            vec!["Ensemble", "%ZEN.Utils"]
+        );
+        // Not compiled / no such class: derive nothing rather than guess.
+        let empty = serde_json::json!({"result": {"content": []}});
+        assert_eq!(parse_include_code_row(&empty), Vec::<String>::new());
+        let null_col = serde_json::json!({"result": {"content": [{"IncludeCode": null}]}});
+        assert_eq!(parse_include_code_row(&null_col), Vec::<String>::new());
+    }
+
+    #[test]
+    fn only_a_class_document_has_an_include_list_to_derive() {
+        assert_eq!(
+            docname_class_stem("Ens.AbstractDelegate.cls"),
+            Some("Ens.AbstractDelegate")
+        );
+        assert_eq!(
+            docname_class_stem("My.Pkg.BO.Sender.CLS"),
+            Some("My.Pkg.BO.Sender")
+        );
+        // A routine carries `#include` lines in its text, not in the class dictionary.
+        assert_eq!(docname_class_stem("ZZfoo.mac"), None);
+        assert_eq!(docname_class_stem("%occStatus.inc"), None);
+        assert_eq!(docname_class_stem(""), None);
+        assert_eq!(docname_class_stem(".cls"), None);
+    }
+
+    #[test]
+    fn derived_includes_come_first_and_the_caller_can_only_add() {
+        let derived = vec!["Ensemble".to_string()];
+        let caller = vec!["EnsAlertErrors".to_string()];
+        assert_eq!(
+            merge_includes(&derived, &caller),
+            vec!["Ensemble", "EnsAlertErrors"]
+        );
+        // The caller re-naming a derived include must not duplicate it, suffix or not.
+        assert_eq!(
+            merge_includes(&derived, &["Ensemble.inc".to_string()]),
+            vec!["Ensemble"]
+        );
+        assert_eq!(
+            merge_includes(&derived, &["ENSEMBLE".to_string()]),
+            vec!["Ensemble"]
+        );
+        // Nothing derived (routine, or class not compiled) leaves the caller in charge.
+        assert_eq!(merge_includes(&[], &caller), vec!["EnsAlertErrors"]);
+        assert_eq!(merge_includes(&[], &[]), Vec::<String>::new());
+    }
+
+    // The whole point of the note: an un-included macro and an absent macro are byte-identical
+    // at the API, so the note must never let an empty answer read as "no such macro" — and must
+    // not repeat the `.inc` advice that caused the problem.
+    #[test]
+    fn the_note_denies_absence_and_teaches_bare_include_names() {
+        let n = unresolved_macro_note(
+            "GeneralError",
+            "My.Pkg.BO.Sender.cls",
+            &["Ensemble".to_string()],
+        );
+        assert!(n.contains("does NOT mean the macro does not exist"), "{n}");
+        assert!(n.contains("Ensemble"), "{n}");
+        // The suffixed spelling may appear ONLY as the counter-example it is.
+        assert!(n.contains("BARE names"), "{n}");
+        assert!(
+            n.contains("not [\"Ensemble.inc\"]"),
+            "the .inc trap must be named as wrong, not merely omitted: {n}"
+        );
+        // The old text recommended ["%occStatus.inc"] for OK/ERROR. Both halves of that were
+        // wrong: the suffix is screened out, and OK/ERROR resolve with no includes at all.
+        assert!(
+            !n.contains("need [\"%occStatus"),
+            "note still prescribes an include for OK/ERROR: {n}"
+        );
+        let none = unresolved_macro_note("Foo", "ZZ.mac", &[]);
+        assert!(none.contains("no includes in force"), "{none}");
+    }
+
+    use super::{
+        docname_class_stem, macro_answer_is_resolved, macro_endpoint, merge_includes,
+        normalize_include, parse_include_code, parse_include_code_row, unresolved_macro_note,
+    };
+
+    /// The defect: every action posted to `/action/getmacro`, which does not exist. It
+    /// answered 404 for a real macro and for a nonsense one identically — a missing endpoint,
+    /// not a missing macro.
+    #[test]
+    fn no_action_posts_to_the_endpoint_that_does_not_exist() {
+        for a in ["signature", "location", "definition", "expand"] {
+            let ep = macro_endpoint(a);
+            assert_ne!(ep, "/action/getmacro", "{a} still uses the 404 endpoint");
+            assert!(ep.starts_with("/action/getmacro"), "{a}: {ep}");
+            assert!(ep.len() > "/action/getmacro".len(), "{a}: {ep}");
+        }
+    }
+
+    #[test]
+    fn each_action_has_its_own_endpoint() {
+        let eps: Vec<&str> = ["signature", "location", "definition", "expand"]
+            .iter()
+            .map(|a| macro_endpoint(a))
+            .collect();
+        let mut sorted = eps.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            eps.len(),
+            "two actions share an endpoint: {eps:?}"
+        );
+        assert_eq!(macro_endpoint("location"), "/action/getmacrolocation");
+        assert_eq!(macro_endpoint("definition"), "/action/getmacrodefinition");
+        assert_eq!(macro_endpoint("signature"), "/action/getmacrosignature");
+        assert_eq!(macro_endpoint("expand"), "/action/getmacroexpansion");
+    }
+
+    /// IRIS answers with the field PRESENT but empty when it resolved nothing. Measured
+    /// shapes, both directions.
+    #[test]
+    fn an_empty_answer_is_not_a_resolution() {
+        for empty in [
+            serde_json::json!({"document":"","line":""}),
+            serde_json::json!({"definition":[]}),
+            serde_json::json!({"signature":""}),
+            serde_json::json!(null),
+        ] {
+            assert!(
+                !macro_answer_is_resolved(&empty),
+                "must read as unresolved: {empty}"
+            );
+        }
+    }
+
+    /// The positive side, from real responses: without these the "unresolved" check could be
+    /// vacuously true for everything.
+    #[test]
+    fn a_real_answer_reads_as_resolved() {
+        for full in [
+            serde_json::json!({"document":"%occErrors.inc","line":1415}),
+            serde_json::json!({"document":"%sySystem.inc","line":114}),
+            serde_json::json!({"definition":["#def1arg ERROR(%ErrorArgList)"]}),
+        ] {
+            assert!(macro_answer_is_resolved(&full), "must resolve: {full}");
+        }
+    }
+
+    /// The note is the whole point of reporting `resolved: false` rather than an empty
+    /// success — a caller who reads "not found" concludes the macro does not exist, when the
+    /// real cause is almost always an Include that was not named.
+    #[test]
+    fn the_unresolved_note_refuses_to_say_the_macro_does_not_exist() {
+        let n = unresolved_macro_note("GeneralError", "My.Op.cls", &["%occStatus.inc".into()]);
+        assert!(n.contains("does NOT mean"), "{n}");
+        assert!(
+            n.contains("Ensemble"),
+            "must name the include that works: {n}"
+        );
+        assert!(
+            n.contains("%occStatus.inc"),
+            "must echo what was tried: {n}"
+        );
+        assert!(n.contains("My.Op.cls"), "must name the document: {n}");
+    }
+
+    /// An empty include list is the commonest call and the likeliest to resolve nothing,
+    /// because the API does not read the document's own Include list.
+    #[test]
+    fn the_note_handles_no_includes_without_pretending_some_were_named() {
+        let n = unresolved_macro_note("GeneralError", "My.Op.cls", &[]);
+        assert!(n.contains("no includes in force"), "{n}");
+        assert!(
+            !n.contains("with includes "),
+            "must not claim includes were sent: {n}"
+        );
     }
 }

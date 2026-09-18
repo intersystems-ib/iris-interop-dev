@@ -68,7 +68,7 @@ pub struct McpCommand {
     pub subscribe: Vec<String>,
     #[arg(long, default_value = ".")]
     pub workspace: String,
-    /// Tool set to register: interop (25 interop-focused tools — DEFAULT for this fork),
+    /// Tool set to register: interop (26 interop-focused tools — DEFAULT for this fork),
     /// merged (46: stubs removed + consolidated), nostub (50: stubs removed),
     /// or baseline (54: all tools). Also read from IRIS_TOOLSET env var.
     #[arg(long, env = "IRIS_TOOLSET", default_value = "interop")]
