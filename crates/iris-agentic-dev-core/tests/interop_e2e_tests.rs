@@ -1413,3 +1413,89 @@ fn hl7_schema_inspect_names_repeating_fields() {
     );
     assert_eq!(f7["data_type"], "TS", "{f7}");
 }
+
+/// #248: the stream global, which is where an HL7 message's content actually lives.
+///
+/// Filed as "port `resolve_storage`". Both of that issue's acceptance criteria —
+/// `DataLocation` and the index globals — were already met by `iris_table_info`, and upstream's
+/// `resolve_storage` selects neither `StreamLocation` nor anything else this tool lacked. So the
+/// gap was one column, not a tool.
+///
+/// `EnsLib.HL7.Message` is the case that matters: measured on IRIS for Health 2026.1 it stores
+/// to `^EnsLib.H.MessageD` / `^EnsLib.H.MessageS` — abbreviated globals that cannot be derived
+/// from the class name, which is exactly why a tool has to report them.
+#[test]
+#[ignore = "requires live IRIS"]
+fn table_info_reports_the_stream_global() {
+    let iris_host = std::env::var("IRIS_HOST").unwrap_or_default();
+    if iris_host.is_empty() {
+        return;
+    }
+    let ask = |table: &str| -> serde_json::Value {
+        let responses = mcp_exchange(&[
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
+            serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"iris_table_info","arguments":{"table":table,"namespace":interop_ns()}}}),
+        ]);
+        parse_tool_text(&find_response(&responses, 2).expect("no tool response"))
+    };
+
+    // Ens.MessageHeader exists in every interop-enabled namespace.
+    let r = ask("Ens.MessageHeader");
+    let res = &r["result"];
+    assert_eq!(res["type"], "class_projection", "{r}");
+    assert_eq!(res["data_global"], "^Ens.MessageHeaderD", "{r}");
+    assert_eq!(res["index_global"], "^Ens.MessageHeaderI", "{r}");
+    // Both of these were previously unreported: IDLocation was SELECTed and discarded, and
+    // StreamLocation was never asked for.
+    assert_eq!(
+        res["stream_global"], "^Ens.MessageHeaderS",
+        "the stream global is the #248 gap: {r}"
+    );
+    assert!(
+        res["id_global"].is_string(),
+        "id_global was already measured and thrown away: {r}"
+    );
+
+    // ExtentSize is deliberately absent — it is the optimizer's declared hint (measured: 1476
+    // of 3177 storage rows carry exactly "100000"), not a row count, and `include_row_count`
+    // gives the real figure.
+    assert!(
+        res["extent_size"].is_null(),
+        "extent_size must not be reported as if it were a row count: {r}"
+    );
+
+    // An HL7 message body: the global name is abbreviated and unguessable, which is the whole
+    // reason this has to come from IRIS rather than from a naming convention.
+    let r = ask("EnsLib.HL7.Message");
+    let res = &r["result"];
+    // Not `if type == "class_projection" { .. }`: that lets a resolution failure silently delete
+    // the assertion that carries the whole argument. Either the class resolved and the stream
+    // global is the abbreviated one, or the tool said plainly that it could not find the table.
+    match res["type"].as_str() {
+        Some("class_projection") => {
+            let stream = res["stream_global"]
+                .as_str()
+                .unwrap_or_else(|| panic!("class_projection with no stream_global: {r}"));
+            assert!(
+                stream.starts_with('^') && stream.ends_with('S'),
+                "stream global must be a global name: {r}"
+            );
+            assert_ne!(
+                stream, "^EnsLib.HL7.MessageS",
+                "the point of reporting it: IRIS abbreviates this one, so a name derived from the \
+                 class would be wrong: {r}"
+            );
+            assert_eq!(
+                stream, "^EnsLib.H.MessageS",
+                "measured on IRIS for Health 2026.1: {r}"
+            );
+        }
+        // HL7 is not installed in every namespace. That is allowed — but the tool has to SAY so,
+        // not return a success envelope with the globals missing.
+        _ => assert!(
+            r["success"] == false || res["error_code"].is_string() || r["error_code"].is_string(),
+            "EnsLib.HL7.Message neither resolved nor produced an explicit miss: {r}"
+        ),
+    }
+}
