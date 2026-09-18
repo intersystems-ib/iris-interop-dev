@@ -190,6 +190,26 @@ pub const SUSPENDED_MISMATCH_HINT: &str =
      CleanProduction removes all messages from queues and all current information about the \
      production (EGDV 13.1.3) — development only, never on a deployed production.";
 
+/// #216: a TIMEOUT envelope carried NO hint at all — `fail` passes Value::Null and
+/// `builtin_hint` had no TIMEOUT branch — so the caller got one line and no indication that the
+/// `timeout` parameter exists, that the job may still be alive on the server, or that anything
+/// the code had already done is not rolled back.
+///
+/// That is a correctness risk, not a DX nit. One student sent the same block three times,
+/// raising timeout 30 -> 70 -> 60; the block created a test Business Service and pushed a
+/// message into the running production with a different id each time. If the code reached IRIS
+/// before the client clock expired — which this error cannot rule out — three messages entered
+/// the circuit. 6 occurrences, hint empty in all 6.
+pub const TIMEOUT_HINT: &str =
+    "This is a CLIENT-side deadline: this server stopped waiting. It does NOT mean the code \
+     stopped running. IRIS may still be executing it, and anything already done — a %Save, a \
+     message sent into a production, a production started — has HAPPENED and is not rolled \
+     back. So do not simply resend side-effecting code: a retry is not idempotent. First find \
+     out whether it ran (query the rows or globals it would have written; for a production, \
+     iris_interop_query(what=\"messages\") or what=\"logs\"). Only then resend, with \
+     timeout=<seconds> — it is a parameter of this tool and defaults to 30. For a long unit \
+     test use iris_test, which has its own timeout, rather than raising this one.";
+
 fn builtin_hint(code: &str, msg: &str) -> Option<String> {
     if msg.contains("ErrProductionNotShutdownCleanly") {
         return Some(
@@ -237,6 +257,9 @@ fn builtin_hint(code: &str, msg: &str) -> Option<String> {
                 .into(),
         );
     }
+    if code == "TIMEOUT" {
+        return Some(TIMEOUT_HINT.into());
+    }
     if code == "COMPILE_ERROR" {
         return Some(
             "Fix the first reported error and recompile — later errors are often cascades of \
@@ -250,6 +273,74 @@ fn builtin_hint(code: &str, msg: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #216: a TIMEOUT envelope carried no `hint` at all — `fail` passes Value::Null and
+    /// builtin_hint had no TIMEOUT branch. 6 occurrences, hint empty in all 6. One student
+    /// resent the same production-message block three times (timeout 30 -> 70 -> 60); if the
+    /// code reached IRIS before the client clock expired, three messages entered the circuit.
+    mod timeout_hint {
+        use super::*;
+
+        fn payload(r: Result<CallToolResult, McpError>) -> serde_json::Value {
+            let result = r.unwrap();
+            let text = result.content[0].raw.as_text().unwrap().text.clone();
+            serde_json::from_str(&text).unwrap()
+        }
+
+        /// `fail` is what both exec legs call, so one arm has to reach both.
+        #[test]
+        fn a_timeout_envelope_now_carries_a_hint() {
+            let v = payload(fail("TIMEOUT", "execution timed out after 30s"));
+            let h = v["hint"].as_str().unwrap_or("");
+            assert!(
+                !h.is_empty(),
+                "the field was absent in all 6 measured cases: {v}"
+            );
+            // The correctness point, not just the knob.
+            assert!(
+                h.contains("does NOT mean the code stopped running"),
+                "must say the job may still be alive: {h}"
+            );
+            assert!(
+                h.contains("not rolled back"),
+                "must say side effects already applied persist: {h}"
+            );
+            assert!(
+                h.contains("retry is not idempotent"),
+                "must warn against a blind resend: {h}"
+            );
+            // And the knob itself, which neither the error nor the schema mentioned.
+            assert!(h.contains("timeout=<seconds>"), "{h}");
+            assert!(h.contains("30"), "must name the default: {h}");
+        }
+
+        /// It must tell the caller HOW to find out whether the code ran, not just that it might
+        /// have — an unactionable warning is what sends them back to retrying.
+        #[test]
+        fn it_names_a_way_to_check_whether_the_code_ran() {
+            let h = TIMEOUT_HINT;
+            assert!(h.contains("iris_interop_query"), "{h}");
+            assert!(
+                h.contains("iris_test"),
+                "a long test belongs in iris_test: {h}"
+            );
+        }
+
+        /// Other codes keep their own hints; TIMEOUT must not become a catch-all.
+        #[test]
+        fn the_other_codes_are_unaffected() {
+            let v = payload(fail("IRIS_UNREACHABLE", "no answer"));
+            assert!(
+                v["hint"].as_str().unwrap_or("").contains("check_config"),
+                "IRIS_UNREACHABLE lost its hint: {v}"
+            );
+            let v = payload(fail("SOME_UNMAPPED_CODE", "whatever"));
+            assert!(
+                v.get("hint").is_none(),
+                "an unmapped code must not borrow the timeout advice: {v}"
+            );
+        }
+    }
 
     fn payload(r: &CallToolResult) -> serde_json::Value {
         let text = match &r.content[0].raw {

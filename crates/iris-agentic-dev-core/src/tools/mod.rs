@@ -2215,6 +2215,12 @@ pub struct ExecuteParams {
     /// (IRIS_NAMESPACE) — only pass a value to deliberately target a different namespace.
     #[serde(default)]
     pub namespace: Option<String>,
+    // #216: the schema said nothing about this knob either — unlike `namespace` and
+    // `translate_sql` beside it, `timeout` carried no doc comment at all. Issue refs stay in
+    // `//` comments: the guard in mcp_handshake bans them from the advertised inputSchema.
+    /// Seconds this server waits for IRIS before giving up (default 30). A TIMEOUT means the
+    /// server stopped waiting, NOT that the code stopped running — side effects already
+    /// applied are not rolled back, so check before resending.
     #[serde(default = "default_execute_timeout")]
     pub timeout: u64,
     #[serde(default)]
