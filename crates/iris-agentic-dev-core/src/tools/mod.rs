@@ -340,13 +340,16 @@ pub enum Toolset {
     /// iris_containers, iris_admin, iris_get_log. 50 - 8 + 4 = 46.
     /// Not this fork's default.
     Merged,
-    /// 23 tools advertised (measured 2026-08-26) — exactly `INTEROP_TOOLS`. THIS FORK'S
+    /// 24 tools advertised (measured 2026-09-18) — exactly `INTEROP_TOOLS`. THIS FORK'S
     /// DEFAULT: `--toolset` carries `default_value = "interop"` (see
     /// crates/iris-agentic-dev-bin/src/cmd/mcp.rs). Keeps only the tools the iris-interop
     /// skills actually exercise; everything else (skill_*/kb_*/agent_*/generate_*/
-    /// individual debug_*/container/scm) is pruned. Two of the 23 (iris_production_item,
-    /// iris_credential_manage) are write-gated off when the connection is not
-    /// write-allowed, so a Live-mode server advertises 21.
+    /// individual debug_*/container/scm) is pruned. The count does NOT drop on a
+    /// write-disallowed connection: #114 stopped the gate removing iris_production_item and
+    /// iris_credential_manage from the router, because removing them took their READ actions
+    /// with them (no iris_production_item meant no get_settings). All 24 stay advertised and
+    /// a write is refused at CALL time instead — see
+    /// a_write_disallowed_connection_still_lists_every_tool.
     /// Additive: tool *code* is unchanged so upstream stays mergeable.
     Interop,
 }
@@ -405,6 +408,15 @@ pub const INTEROP_TOOLS: &[&str] = &[
     "iris_message_body",
     "iris_business_rule_info",
     "iris_production_diff",
+    // The local-disk symbol search. It was the ONLY consumer of the ObjectScript
+    // tree-sitter grammars, and being outside this list made those grammars unreachable
+    // from the fork's default profile — compiled in, exposed to nobody. It needs no IRIS
+    // connection, and it reads the filesystem, which the interop skills treat as the
+    // source of truth (a class is written to src/ BEFORE it is put into IRIS). It also
+    // answers the one question the class dictionary cannot during a session: see #242 —
+    // a class written and compiled in this process stays invisible to %Dictionary reads
+    // from that same process, while it is on disk the whole time.
+    "iris_symbols_local",
 ];
 
 pub const ERR_NO_TESTS_FOUND: &str = "NO_TESTS_FOUND";
@@ -1840,7 +1852,7 @@ impl<'de> serde::Deserialize<'de> for GetLogParams {
 
 /// Issue #78: the keys iris_get_log tolerates without acting on them.
 ///
-/// Not leniency for its own sake. `namespace` is advertised by 11 of the 23 tools in
+/// Not leniency for its own sake. `namespace` is advertised by 11 of the 24 tools in
 /// this fork's default (interop) profile — the only key that spans tool families — and
 /// the agent harness sends it on nearly every call, including the correct index call in
 /// the issue's own repro. It cannot mean anything here: the log store is a single
@@ -4136,6 +4148,9 @@ pub(crate) fn mutating_call(tool: &str, args: &serde_json::Value) -> Option<&'st
         | "iris_message_body"
         | "iris_production_diff"
         | "iris_symbols"
+        // Reads .cls/.mac/.inc from the workspace on disk and never opens a connection,
+        // so there is nothing on the instance for the write gate to protect.
+        | "iris_symbols_local"
         | "iris_table_info" => None,
         _ => None,
     }
@@ -4287,6 +4302,7 @@ pub(crate) const CLASSIFIED_TOOLS: &[&str] = &[
     "iris_production_item",
     "iris_query",
     "iris_symbols",
+    "iris_symbols_local",
     "iris_table_info",
     "iris_test",
 ];
@@ -9252,7 +9268,7 @@ fn wildcard_listing_filter(pattern: &str) -> Option<&str> {
 /// authors, and refuses only whole-library trees and whole-namespace expansions.
 ///
 /// Deliberately no `force`/`confirm` escape hatch: that would widen the advertised schema
-/// of a tool in the locked 23-tool interop profile, and a caller who genuinely wants 500+
+/// of a tool in the locked 24-tool interop profile, and a caller who genuinely wants 500+
 /// classes can name the subpackages.
 const WILDCARD_EXPANSION_CAP: usize = 500;
 
