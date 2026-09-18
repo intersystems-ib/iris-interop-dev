@@ -81,12 +81,23 @@ pub fn is_table_not_found(err: &str) -> bool {
         || low.contains("sqlcode: -30")
         || low.contains("sqlcode=-30")
         || low.contains("sqlcode -30")
-        || (low.contains("not found") && (low.contains("table") || low.contains("class")))
+        // #208: the catch-all must not swallow SQLCODE -29, whose IRIS wording is
+        // "Field 'X' not found in the applicable tables" — it contains both "not found" and
+        // "table", so it matched, and the caller was told the TABLE was wrong when the table
+        // had resolved perfectly and only the column was wrong. 8 of 14 students, 7 of 10
+        // -29 errors carried the wrong hint. Both halves of TABLE_NOT_FOUND_HINT are false
+        // for a -29: nothing to discover about the table, and dots-to-underscores has
+        // nothing to do with a wrong column.
+        || (low.contains("not found")
+            && (low.contains("table") || low.contains("class"))
+            && sqlcode(err) != Some(-29)
+            && !low.contains("field '"))
 }
 
 /// Hint string pointing the model at the real schema-discovery path instead of guessing.
-pub const TABLE_NOT_FOUND_HINT: &str = "Table/view not found. Call iris_table_info(schema=...) to \
-list the real tables and columns before querying. IRIS SQL uses Schema.Table and maps package \
+pub const TABLE_NOT_FOUND_HINT: &str = "Table/view not found. Call \
+iris_table_info(table=\"Schema.Table\" or the class name) to list the real tables and columns \
+before querying. IRIS SQL uses Schema.Table and maps package \
 dots to '_' (e.g. class Ens.Util.Log -> table Ens_Util.Log; Ens.MessageHeader stays Ens.MessageHeader).";
 
 /// The SQLCODE an IRIS SQL error reports, in any of the three spellings seen in the wild
@@ -105,8 +116,13 @@ pub fn sqlcode(err: &str) -> Option<i32> {
 
 /// Hints for the SQLCODEs the table did not reach (#126).
 ///
-/// The two most common codes (-30 table not found, -29 field not found) were already covered
-/// and are demonstrably effective; -359 was the third most common and the largest single
+/// #208 corrected the premise of this comment. It used to claim that "-30 table not found and
+/// -29 field not found were already covered and are demonstrably effective". -30 was; -29 never
+/// had an arm here at all — it was merely ABSORBED by `is_table_not_found`'s catch-all, which is
+/// exactly how the wrong hint got out. The one code this comment named as covered was the one
+/// the server diagnosed backwards.
+///
+/// -359 was the third most common and the largest single
 /// unhinted group, and it is the one where a hint helps most. `STRING_AGG` is real in other
 /// dialects, so a model reaching for it learns only that THAT name is absent and tries the next
 /// synonym — nothing tells it IRIS spells this `LIST()`.
@@ -114,6 +130,18 @@ pub fn sqlcode(err: &str) -> Option<i32> {
 /// Both suggestions below were executed against IRIS 2026.1 before being written down.
 pub fn sqlcode_hint(err: &str) -> Option<&'static str> {
     match sqlcode(err)? {
+        // #208: the table RESOLVED. Only the column did not, and a column name is not
+        // derivable from a property name — SqlFieldName overrides the projection, so
+        // `DeptCode` can project as `UnitCode`. Do not send the caller back to the table.
+        -29 => Some(
+            "SQLCODE -29 is a COLUMN error, not a table error: the table resolved and the field \
+             name did not. Column names are NOT derivable from property names — SqlTableName and \
+             SqlFieldName override the projection, so a property `DeptCode` can project as \
+             column `UnitCode`. Call iris_table_info(table=\"<the table you just queried>\") to \
+             list its real columns, or docs_introspect(class_name=\"<Class>\") for the class's \
+             properties and their SqlFieldName. Do not re-derive the name from the class \
+             definition.",
+        ),
         -359 => Some(
             "No such SQL function in IRIS. IRIS does not carry the T-SQL/Postgres aggregate \
              names: string aggregation is LIST(expr) (verified: SELECT LIST(Name) FROM \
@@ -330,6 +358,79 @@ fn strip_quoted(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #208: `is_table_not_found`'s catch-all matched SQLCODE -29, whose IRIS wording is
+    /// "Field 'X' not found in the applicable tables" — both "not found" and "table" are in
+    /// it. The caller was told the table was wrong when the table had resolved and only the
+    /// column was wrong. 8 of 14 students; 7 of 10 -29 errors carried the wrong hint.
+    mod sqlcode_29 {
+        use super::*;
+
+        /// The five measured errors, verbatim in shape.
+        const MEASURED: [&str; 5] = [
+            "ERROR #5540: SQLCODE: -29 Message: Field 'OUTCOME' not found in the applicable tables^ SELECT TOP ? Name , Outcome ,",
+            "ERROR #5540: SQLCODE: -29 Message: Field 'SOURCECONFIGNAME' not found in the applicable tables",
+            "ERROR #5540: SQLCODE: -29 Message: Field 'CLASSNAME' not found in the applicable tables",
+            "ERROR #5540: SQLCODE: -29 Message: Field 'RULEDEFINITIONCLASS' not found in the applicable tables",
+            "ERROR #5540: SQLCODE: -29 Message: Field 'PORT' not found in the applicable tables",
+        ];
+
+        #[test]
+        fn a_field_error_is_no_longer_claimed_as_a_table_error() {
+            for err in MEASURED {
+                assert!(
+                    !is_table_not_found(err),
+                    "-29 must not be absorbed by the table branch: {err}"
+                );
+            }
+        }
+
+        /// It must now reach `sqlcode_hint`, which had no -29 arm despite its own comment
+        /// claiming the code was covered.
+        #[test]
+        fn it_reaches_a_hint_that_says_the_table_was_fine() {
+            for err in MEASURED {
+                let h = sqlcode_hint(err).unwrap_or_else(|| panic!("no hint for: {err}"));
+                assert!(h.contains("COLUMN error, not a table error"), "{h}");
+                assert!(
+                    h.contains("SqlFieldName"),
+                    "must say why the name is not derivable: {h}"
+                );
+                // The two claims that were FALSE for a -29 must not come back.
+                assert!(!h.contains("Table/view not found"), "{h}");
+                assert!(
+                    !h.contains("dots"),
+                    "dots-to-underscores is irrelevant here: {h}"
+                );
+            }
+        }
+
+        /// The regression that matters: a real -30 must still take the table branch.
+        #[test]
+        fn a_real_table_error_is_unaffected() {
+            for err in [
+                "ERROR #5540: SQLCODE: -30 Message: Table 'SQLUSER.NOPE' not found",
+                "Table or view not found",
+                "[SQLCODE: -30] Table or view not found",
+            ] {
+                assert!(is_table_not_found(err), "{err} must still be a table error");
+            }
+        }
+
+        /// The hint pointed at a parameter that does not exist: iris_table_info takes
+        /// `table`, never `schema` (TableInfoParams is table/namespace/include_row_count).
+        #[test]
+        fn the_table_hint_names_a_parameter_that_exists() {
+            assert!(
+                !TABLE_NOT_FOUND_HINT.contains("schema=..."),
+                "{TABLE_NOT_FOUND_HINT}"
+            );
+            assert!(
+                TABLE_NOT_FOUND_HINT.contains("iris_table_info(table="),
+                "{TABLE_NOT_FOUND_HINT}"
+            );
+        }
+    }
 
     /// #206: the gateway redirect is written for SQL QUERY text. Delegating to it from
     /// `iris_execute` let a bare substring match claim the caller had queried a table —
@@ -562,13 +663,27 @@ mod sqlcode_hint_tests {
         );
     }
 
-    /// The two codes that already had coverage must keep reaching their own hint, not this one:
-    /// the new branch runs only after `is_table_not_found` declines.
+    /// #208 CORRECTED THIS TEST'S PREMISE. It used to assert that both F30 and F29 matched
+    /// `is_table_not_found`, describing that as "the two codes that already had coverage" —
+    /// the same false belief as the design comment on `sqlcode_hint`. -29 being absorbed by
+    /// the table branch was not coverage; it was the defect, and it made the server answer a
+    /// COLUMN error with "Table/view not found" plus a dots-to-underscores lesson, neither of
+    /// which is true for a -29. 7 of 10 measured -29 errors carried that wrong hint.
+    ///
+    /// So: -30 still belongs to the table branch, -29 must NOT, and -29 now has its own arm.
     #[test]
-    fn the_codes_that_were_already_covered_are_untouched() {
-        for msg in [F30, F29] {
-            assert!(is_table_not_found(msg), "existing coverage lost for: {msg}");
-        }
+    fn a_table_code_takes_the_table_branch_and_a_field_code_does_not() {
+        assert!(
+            is_table_not_found(F30),
+            "a real table error must still match: {F30}"
+        );
+        assert!(
+            !is_table_not_found(F29),
+            "a FIELD error must not be claimed as a table error (#208): {F29}"
+        );
+        // And the field error is not merely un-matched — it reaches a hint of its own.
+        let h = sqlcode_hint(F29).expect("-29 must now have its own arm");
+        assert!(h.contains("COLUMN error, not a table error"), "{h}");
     }
 
     #[test]
