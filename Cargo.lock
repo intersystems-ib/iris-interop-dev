@@ -945,7 +945,7 @@ dependencies = [
 
 [[package]]
 name = "iris-agentic-dev"
-version = "0.23.0"
+version = "0.24.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -963,7 +963,7 @@ dependencies = [
 
 [[package]]
 name = "iris-agentic-dev-core"
-version = "0.23.0"
+version = "0.24.0"
 dependencies = [
  "anyhow",
  "bollard",
@@ -2131,9 +2131,9 @@ checksum = "009994f150cc0cd50ff54917d5bc8bffe8cad10ca10d81c34da2ec421ae61782"
 
 [[package]]
 name = "tree-sitter-objectscript"
-version = "1.9.19"
+version = "1.9.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e50d3effd4b876714f8445bd1bf5d07a2e64a7f1407d0495eed036dabd8b323d"
+checksum = "ffb71c366ec010c3fa727c396f3578d995b1344ed266603e602034ca625d5a24"
 dependencies = [
  "cc",
  "tree-sitter",
@@ -2142,9 +2142,9 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter-objectscript-routine"
-version = "1.9.19"
+version = "1.9.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb41f878498199e240eca6c59fb2b5685239164d3a38396ef436aa4a5e0e7e55"
+checksum = "fd3b0be623340bea1a0465ebf1e554ba67b9a2cb8dcd5abb25a453ac69592cde"
 dependencies = [
  "cc",
  "tree-sitter",
