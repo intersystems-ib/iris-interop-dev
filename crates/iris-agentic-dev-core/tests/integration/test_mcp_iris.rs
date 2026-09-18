@@ -111,10 +111,17 @@ fn e2e_iris_compile_success() {
     let responses = mcp_exchange(&[
         serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
         serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
-        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"iris_compile","arguments":{"target":"IrisDevTest.LiveCheck","flags":"ck"}}}),
+        // #240: this compiled `IrisDevTest.LiveCheck` without creating it, and nothing in the
+        // tree ever creates that class. Against a REACHABLE IRIS the compile therefore fails
+        // with `ERROR #5351: Class 'IrisDevTest.LiveCheck' does not exist` — so the test could
+        // only pass on the environment-skip branch below, i.e. exactly when it tested nothing.
+        // It ran in no job, so that was never visible. Write the class first, as
+        // `test_scm::iris_compile_open_uri` already does.
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"iris_doc","arguments":{"mode":"put","name":"IrisDevTest.LiveCheck.cls","content":"Class IrisDevTest.LiveCheck\n{\n}\n","compile":false}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"iris_compile","arguments":{"target":"IrisDevTest.LiveCheck","flags":"ck"}}}),
     ]);
 
-    let tool_response = find_response(&responses, 2).expect("no response for id:2");
+    let tool_response = find_response(&responses, 3).expect("no response for id:3");
     let result = parse_tool_result(&tool_response);
 
     assert!(

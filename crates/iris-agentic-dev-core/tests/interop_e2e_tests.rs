@@ -26,12 +26,69 @@ fn interop_ns() -> String {
 }
 
 fn mcp_exchange(messages: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    mcp_exchange_with_toolset(None, messages)
+}
+
+/// Same harness, but able to name a toolset.
+///
+/// #240: `test_search_scope_and_case_insensitive_default` exercises `iris_search`, which is a
+/// BASELINE tool and deliberately not in `INTEROP_TOOLS`. Started with the fork's default
+/// profile the server never advertises it, so the call comes back "tool not found" and the
+/// test's `SCOPE_REQUIRED` assertion can never be reached — it was unrunnable for a reason
+/// that had nothing to do with the behaviour under test (#17).
+fn mcp_exchange_with_toolset(
+    toolset: Option<&str>,
+    messages: &[serde_json::Value],
+) -> Vec<serde_json::Value> {
+    mcp_exchange_timed_with_toolset(toolset, messages).0
+}
+
+/// Returns the responses AND how long the LAST id-bearing message took, measured from just
+/// before it is written to when its response is read.
+///
+/// #240: the SC-003 latency assertions timed the whole of `mcp_exchange` — `Command::spawn` of
+/// a debug binary, the MCP handshake, and the IRIS connect — and then reported the total as
+/// "tool call exceeded 3s". It was never measuring the tool call, and four tests failed the 3s
+/// budget on a machine that was merely busy, which would have made the newly-wired CI job
+/// flaky on day one for a reason unrelated to any product behaviour. Time the call itself.
+fn mcp_exchange_timed_with_toolset(
+    toolset: Option<&str>,
+    messages: &[serde_json::Value],
+) -> (Vec<serde_json::Value>, std::time::Duration) {
+    mcp_exchange_full(toolset, None, messages)
+}
+
+/// Start the server with an explicit connection namespace.
+///
+/// #240: `test_execute_and_query_namespace_defaults_to_connection` required the OPERATOR to set
+/// `IRIS_NAMESPACE` to something other than USER, because "ran in the connection namespace" and
+/// "ran in a hardcoded USER" are indistinguishable when the connection namespace IS USER. That
+/// requirement is sound methodology and a bad precondition: CI sets IRIS_NAMESPACE=USER, so the
+/// test could not run there at all. Letting the test choose its own connection namespace makes
+/// the discrimination intrinsic instead of delegated.
+fn mcp_exchange_in_namespace(
+    namespace: &str,
+    messages: &[serde_json::Value],
+) -> Vec<serde_json::Value> {
+    mcp_exchange_full(None, Some(namespace), messages).0
+}
+
+fn mcp_exchange_full(
+    toolset: Option<&str>,
+    ns_override: Option<&str>,
+    messages: &[serde_json::Value],
+) -> (Vec<serde_json::Value>, std::time::Duration) {
     let bin = iris_dev_bin();
     let iris_host = std::env::var("IRIS_HOST").unwrap_or_default();
     let iris_port = std::env::var("IRIS_WEB_PORT").unwrap_or_else(|_| "52780".to_string());
 
+    let mut args: Vec<&str> = vec!["mcp"];
+    if let Some(ts) = toolset {
+        args.push("--toolset");
+        args.push(ts);
+    }
     let mut child = Command::new(&bin)
-        .args(["mcp"])
+        .args(&args)
         .env("IRIS_HOST", &iris_host)
         .env("IRIS_WEB_PORT", &iris_port)
         .env(
@@ -44,7 +101,9 @@ fn mcp_exchange(messages: &[serde_json::Value]) -> Vec<serde_json::Value> {
         )
         .env(
             "IRIS_NAMESPACE",
-            std::env::var("IRIS_NAMESPACE").unwrap_or_else(|_| "USER".to_string()),
+            ns_override.map(str::to_string).unwrap_or_else(|| {
+                std::env::var("IRIS_NAMESPACE").unwrap_or_else(|_| "USER".to_string())
+            }),
         )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -56,8 +115,10 @@ fn mcp_exchange(messages: &[serde_json::Value]) -> Vec<serde_json::Value> {
     let stdout = child.stdout.take().unwrap();
     let mut reader = BufReader::new(stdout);
     let mut results = vec![];
+    let mut last_call = std::time::Duration::ZERO;
 
     for msg in messages.iter() {
+        let sent_at = std::time::Instant::now();
         stdin
             .write_all((serde_json::to_string(msg).unwrap() + "\n").as_bytes())
             .unwrap();
@@ -70,6 +131,7 @@ fn mcp_exchange(messages: &[serde_json::Value]) -> Vec<serde_json::Value> {
                 if reader.read_line(&mut line).unwrap_or(0) > 0 {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
                         results.push(v);
+                        last_call = sent_at.elapsed();
                         break;
                     }
                 }
@@ -82,7 +144,7 @@ fn mcp_exchange(messages: &[serde_json::Value]) -> Vec<serde_json::Value> {
         }
     }
     child.kill().ok();
-    results
+    (results, last_call)
 }
 
 fn find_response(responses: &[serde_json::Value], id: u64) -> Option<serde_json::Value> {
@@ -260,22 +322,23 @@ fn interop_query_partners_and_what_enum() {
 #[test]
 #[ignore = "requires live IRIS with Interoperability and a running production"]
 fn test_production_item_enable_disable() {
-    use std::time::Instant;
     let iris_host = std::env::var("IRIS_HOST").unwrap_or_default();
     assert!(!iris_host.is_empty(), "IRIS_HOST must be set");
     let item = std::env::var("TEST_PROD_ITEM").unwrap_or_else(|_| "TestService".to_string());
     let ns = std::env::var("IRIS_NAMESPACE").unwrap_or_else(|_| "USER".to_string());
 
     // disable
-    let start = Instant::now();
-    let responses = mcp_exchange(&[
-        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
-        serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
-        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"iris_production_item","arguments":{"action":"disable","item":item,"namespace":ns}}}),
-    ]);
+    let (responses, call_took) = mcp_exchange_timed_with_toolset(
+        None,
+        &[
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
+            serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"iris_production_item","arguments":{"action":"disable","item":item,"namespace":ns}}}),
+        ],
+    );
     assert!(
-        start.elapsed().as_secs() < 3,
-        "SC-003: tool call exceeded 3s"
+        call_took.as_secs() < 3,
+        "SC-003: the tool call itself took {call_took:?} (budget 3s)"
     );
     let resp = find_response(&responses, 2).expect("no response");
     let result = parse_tool_text(&resp);
@@ -298,20 +361,24 @@ fn test_production_item_enable_disable() {
 #[test]
 #[ignore = "requires live IRIS with Interoperability"]
 fn test_credential_crud() {
-    use std::time::Instant;
     let iris_host = std::env::var("IRIS_HOST").unwrap_or_default();
     assert!(!iris_host.is_empty(), "IRIS_HOST must be set");
     let ns = std::env::var("IRIS_NAMESPACE").unwrap_or_else(|_| "USER".to_string());
     let cred_id = "IrisDevTestCred";
 
     // list — assert no password in response
-    let start = Instant::now();
-    let responses = mcp_exchange(&[
-        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
-        serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
-        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"iris_credential_list","arguments":{"namespace":ns}}}),
-    ]);
-    assert!(start.elapsed().as_secs() < 3, "SC-003: list exceeded 3s");
+    let (responses, call_took) = mcp_exchange_timed_with_toolset(
+        None,
+        &[
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
+            serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"iris_credential_list","arguments":{"namespace":ns}}}),
+        ],
+    );
+    assert!(
+        call_took.as_secs() < 3,
+        "SC-003: the list call itself took {call_took:?} (budget 3s)"
+    );
     let resp = find_response(&responses, 2).expect("no response");
     let raw_text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
     assert!(
@@ -345,7 +412,6 @@ fn test_credential_crud() {
 #[test]
 #[ignore = "requires live IRIS with Interoperability"]
 fn test_lookup_crud() {
-    use std::time::Instant;
     let iris_host = std::env::var("IRIS_HOST").unwrap_or_default();
     assert!(!iris_host.is_empty(), "IRIS_HOST must be set");
     let ns = std::env::var("IRIS_NAMESPACE").unwrap_or_else(|_| "USER".to_string());
@@ -354,13 +420,18 @@ fn test_lookup_crud() {
     // set 3 keys — Key3's value carries a quote, an apostrophe and an accent:
     // the old SQL-style escaping corrupted ' to '' and died with <SYNTAX> on "
     for (key, val) in &[("Key1", "Val1"), ("Key2", "Val2"), ("Key3", "Va\"l'ñ3")] {
-        let start = Instant::now();
-        let responses = mcp_exchange(&[
-            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
-            serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
-            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"iris_lookup_manage","arguments":{"action":"set","table":table,"key":key,"value":val,"namespace":ns}}}),
-        ]);
-        assert!(start.elapsed().as_secs() < 3, "SC-003: set exceeded 3s");
+        let (responses, call_took) = mcp_exchange_timed_with_toolset(
+            None,
+            &[
+                serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
+                serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+                serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"iris_lookup_manage","arguments":{"action":"set","table":table,"key":key,"value":val,"namespace":ns}}}),
+            ],
+        );
+        assert!(
+            call_took.as_secs() < 3,
+            "SC-003: the set call itself took {call_took:?} (budget 3s)"
+        );
         let r = parse_tool_text(&find_response(&responses, 2).expect("no response"));
         assert_eq!(r["success"], true, "set {key} failed: {r}");
     }
@@ -440,21 +511,22 @@ fn test_lookup_crud() {
 #[test]
 #[ignore = "requires live IRIS with Interoperability"]
 fn test_production_autostart() {
-    use std::time::Instant;
     let iris_host = std::env::var("IRIS_HOST").unwrap_or_default();
     assert!(!iris_host.is_empty(), "IRIS_HOST must be set");
     let ns = std::env::var("IRIS_NAMESPACE").unwrap_or_else(|_| "USER".to_string());
 
     // get current state
-    let start = Instant::now();
-    let responses = mcp_exchange(&[
-        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
-        serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
-        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"iris_production","arguments":{"action":"get_autostart","namespace":ns}}}),
-    ]);
+    let (responses, call_took) = mcp_exchange_timed_with_toolset(
+        None,
+        &[
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
+            serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"iris_production","arguments":{"action":"get_autostart","namespace":ns}}}),
+        ],
+    );
     assert!(
-        start.elapsed().as_secs() < 3,
-        "SC-003: get_autostart exceeded 3s"
+        call_took.as_secs() < 3,
+        "SC-003: the get_autostart call itself took {call_took:?} (budget 3s)"
     );
     let r = parse_tool_text(&find_response(&responses, 2).expect("no response"));
     assert!(
@@ -495,11 +567,20 @@ fn test_namespace_default_and_interop_hint() {
     // found") that never named the cause.
     let iris_host = std::env::var("IRIS_HOST").unwrap_or_default();
     assert!(!iris_host.is_empty(), "IRIS_HOST must be set");
-    let conn_ns = std::env::var("IRIS_NAMESPACE").unwrap_or_else(|_| "USER".to_string());
-    assert_ne!(
-        conn_ns, "USER",
-        "run with IRIS_NAMESPACE pointing at an interop-enabled namespace"
-    );
+
+    // #240: this used to require `IRIS_NAMESPACE != "USER"` and then assert that namespace
+    // "USER" comes back NAMESPACE_NOT_INTEROP. Both halves are assumptions about how the
+    // instance happens to be configured, and on CI's pinned image BOTH are false: the job sets
+    // IRIS_NAMESPACE=USER, and on intersystemsdc/iris-community:2025.3 `USER` IS
+    // interop-enabled (measured with the product's own predicate, plus a positive control on
+    // %Studio.Project and a negative control on a class that does not exist). The test was
+    // therefore unsatisfiable on that container — not merely unmet, unsatisfiable, since the
+    // image has only %SYS and USER.
+    //
+    // `%SYS` answers the question without assuming anything: it exists on every IRIS and is
+    // never interop-enabled. Measured against a live instance it returns exactly what this test
+    // is about — NAMESPACE_NOT_INTEROP, a hint naming `namespace=`, and the namespaces listed.
+    let conn_ns = std::env::var("IRIS_NAMESPACE").unwrap_or_default();
 
     // 1. No namespace argument at all → must target the connection namespace
     //    and succeed (this exact call failed 14/14 in the workshop data).
@@ -509,6 +590,30 @@ fn test_namespace_default_and_interop_hint() {
         serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"iris_credential_list","arguments":{}}}),
     ]);
     let r = parse_tool_text(&find_response(&responses, 2).expect("no response"));
+    // If the connection namespace is not interop-enabled, this test's premise is about the
+    // operator's configuration rather than the product. Say so out loud and stop — a silent
+    // pass would read as coverage.
+    if r["error_code"] == "NAMESPACE_NOT_INTEROP" {
+        // Same rule as #240 applies to the container test: a skip that can fire inside the CI
+        // job is green-by-absence. CI's image has an interop-enabled USER, so this must not
+        // trigger there.
+        let on_ci = std::env::var("CI").is_ok_and(|v| !v.is_empty() && v != "false");
+        assert!(
+            !on_ci,
+            "on CI the connection namespace must be interop-enabled — skipping here would \
+             report coverage this job did not have: {r}"
+        );
+        println!(
+            "SKIP test_namespace_default_and_interop_hint: the connection namespace ({}) is \
+             not interop-enabled, so part 1 cannot succeed here: {r}",
+            if conn_ns.is_empty() {
+                "unset"
+            } else {
+                &conn_ns
+            }
+        );
+        return;
+    }
     assert_eq!(r["success"], true, "credential_list without namespace: {r}");
 
     // 2. Explicit non-interop namespace → self-describing error with a hint,
@@ -516,10 +621,10 @@ fn test_namespace_default_and_interop_hint() {
     let responses = mcp_exchange(&[
         serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
         serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
-        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"iris_credential_list","arguments":{"namespace":"USER"}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"iris_credential_list","arguments":{"namespace":"%SYS"}}}),
     ]);
     let r = parse_tool_text(&find_response(&responses, 2).expect("no response"));
-    assert_eq!(r["success"], false, "USER must be rejected: {r}");
+    assert_eq!(r["success"], false, "%SYS must be rejected: {r}");
     assert_eq!(
         r["error_code"], "NAMESPACE_NOT_INTEROP",
         "self-describing code, got: {r}"
@@ -529,13 +634,24 @@ fn test_namespace_default_and_interop_hint() {
         hint.contains("namespace="),
         "hint must name the parameter: {hint}"
     );
+    let listed = r["interop_namespaces"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     assert!(
-        r["interop_namespaces"]
-            .as_array()
-            .map(|a| a.iter().any(|v| v.as_str() == Some(conn_ns.as_str())))
-            .unwrap_or(false),
-        "hint must list the interop namespaces: {r}"
+        !listed.is_empty(),
+        "the hint must LIST the interop namespaces, not just say there are some: {r}"
     );
+    // Part 1 proved the connection namespace is interop-enabled, so it must appear here. Only
+    // assert it when IRIS_NAMESPACE actually named one — unset means the server chose, and this
+    // test cannot know what it chose.
+    if !conn_ns.is_empty() {
+        assert!(
+            listed.iter().any(|v| v.as_str() == Some(conn_ns.as_str())),
+            "the connection namespace '{conn_ns}' succeeded in part 1, so it must be in the \
+             listed interop namespaces: {r}"
+        );
+    }
 }
 
 #[test]
@@ -546,18 +662,27 @@ fn test_execute_and_query_namespace_defaults_to_connection() {
     // IRIS_NAMESPACE — and succeeded silently against the wrong database.
     let iris_host = std::env::var("IRIS_HOST").unwrap_or_default();
     assert!(!iris_host.is_empty(), "IRIS_HOST must be set");
-    let conn_ns = std::env::var("IRIS_NAMESPACE").unwrap_or_else(|_| "USER".to_string());
-    assert_ne!(
-        conn_ns, "USER",
-        "run with IRIS_NAMESPACE pointing at a non-USER namespace"
-    );
+
+    // #240: this required the operator to point IRIS_NAMESPACE at a non-USER namespace, because
+    // "ran in the connection namespace" cannot be told from "ran in a hardcoded USER" when the
+    // connection namespace IS USER. Sound reasoning, unusable precondition: CI sets
+    // IRIS_NAMESPACE=USER, so the test failed there on its own third line.
+    //
+    // The discrimination is now intrinsic — the test starts the server in `%SYS`, which exists
+    // on every IRIS and is never USER. Measured: `WRITE $NAMESPACE` answers `%SYS`, and
+    // `Security.Users` is present in %SYS (1) and absent from USER (0), so the query half
+    // distinguishes the two namespaces by itself rather than by assuming the operator's setup.
+    let conn_ns = "%SYS";
 
     let exchange = |args: serde_json::Value, tool: &str| {
-        let responses = mcp_exchange(&[
-            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
-            serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
-            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":tool,"arguments":args}}),
-        ]);
+        let responses = mcp_exchange_in_namespace(
+            conn_ns,
+            &[
+                serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
+                serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+                serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":tool,"arguments":args}}),
+            ],
+        );
         find_response(&responses, 2).expect("no response")
     };
 
@@ -569,30 +694,32 @@ fn test_execute_and_query_namespace_defaults_to_connection() {
     ));
     assert_eq!(v["success"], true, "{v}");
     assert_eq!(
-        v["output"],
-        conn_ns.as_str(),
+        v["output"], conn_ns,
         "iris_execute ran in the wrong namespace: {v}"
     );
     assert_eq!(
-        v["namespace"],
-        conn_ns.as_str(),
+        v["namespace"], conn_ns,
         "response must name the namespace it ran in: {v}"
     );
 
-    // 2. iris_query without namespace → connection namespace too. The probe
-    //    class Ens.Director exists in the (interop-enabled) connection
-    //    namespace and not in USER, so the count distinguishes them.
+    // 2. iris_query without namespace → connection namespace too. `Security.Users` is a %SYS
+    //    class: 1 there, 0 in USER, so the count itself proves which namespace ran and a
+    //    hardcoded USER cannot produce this answer.
     let v = parse_tool_text(&exchange(
-        serde_json::json!({"query":"SELECT COUNT(*) AS n FROM %Dictionary.CompiledClass WHERE Name = 'Ens.Director'"}),
+        serde_json::json!({"query":"SELECT COUNT(*) AS n FROM %Dictionary.CompiledClass WHERE Name = 'Security.Users'"}),
         "iris_query",
     ));
     assert_eq!(v["success"], true, "{v}");
-    assert_eq!(v["namespace"], conn_ns.as_str(), "{v}");
+    assert_eq!(v["namespace"], conn_ns, "{v}");
     let n = v["rows"][0]["n"]
         .as_i64()
         .or_else(|| v["rows"][0]["n"].as_str().and_then(|s| s.parse().ok()))
         .unwrap_or(-1);
-    assert_eq!(n, 1, "iris_query ran in the wrong namespace: {v}");
+    assert_eq!(
+        n, 1,
+        "Security.Users must be found — 0 would mean the query ran in USER, not the \
+         connection namespace: {v}"
+    );
 }
 
 #[test]
@@ -604,12 +731,18 @@ fn test_search_scope_and_case_insensitive_default() {
     let iris_host = std::env::var("IRIS_HOST").unwrap_or_default();
     assert!(!iris_host.is_empty(), "IRIS_HOST must be set");
 
+    // `iris_search` is a BASELINE tool, deliberately outside INTEROP_TOOLS, so the fork's
+    // default profile never advertises it and every call here came back "tool not found" —
+    // the SCOPE_REQUIRED assertion below was unreachable for a reason unrelated to #17.
     let exchange = |args: serde_json::Value, tool: &str| {
-        let responses = mcp_exchange(&[
-            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
-            serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
-            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":tool,"arguments":args}}),
-        ]);
+        let responses = mcp_exchange_with_toolset(
+            Some("baseline"),
+            &[
+                serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
+                serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+                serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":tool,"arguments":args}}),
+            ],
+        );
         find_response(&responses, 2).expect("no response")
     };
 
@@ -977,26 +1110,33 @@ fn test_message_content_search() {
             "search_table":{"prop":"NoSuchProp","value":"x"}}),
     );
     assert_eq!(r["error_code"], "SEARCH_PROP_NOT_FOUND", "{r}");
-    assert!(
-        r["available_props"]
-            .as_array()
-            .map(|a| a.iter().any(|v| v.as_str() == Some("PatientID")))
-            .unwrap_or(false),
-        "available_props must list the extent's fields: {r}"
-    );
-
-    // 5. valid prop, zero rows → success with the config-time indexing hint.
-    let r = call(
-        "iris_interop_query",
-        serde_json::json!({"what":"messages","namespace":ns,
-            "search_table":{"prop":"MSHControlID","value":"e2e-no-such-value"}}),
-    );
-    assert_eq!(r["success"], true, "{r}");
-    assert_eq!(r["count"], 0, "{r}");
-    assert!(
-        r["hint"].as_str().unwrap_or("").contains("back-indexed"),
-        "zero rows must explain config-time indexing: {r}"
-    );
+    // #240: this asserted `available_props` contains "PatientID", which requires a
+    // SearchTableClass to be configured on some production item. CI's bare container has no
+    // production at all, so `EnsLib.HL7.SearchTable` has no registered properties there and the
+    // assertion could not hold — the tool's answer was correct.
+    //
+    // Both branches assert something real, so neither is a silent skip. Where the extent HAS
+    // properties, they must be listed. Where it has none, the interesting property is the one
+    // this repo keeps having to fix: an empty list must arrive WITH the reason, not bare.
+    let props = r["available_props"].as_array().cloned().unwrap_or_default();
+    let search_props_registered = !props.is_empty();
+    if props.is_empty() {
+        let hint = r["hint"].as_str().unwrap_or("");
+        assert!(
+            hint.contains("no registered properties"),
+            "an empty available_props must say WHY it is empty, or it reads as 'this extent \
+             has no such field': {r}"
+        );
+        assert!(
+            hint.contains("SearchTableClass"),
+            "the hint must name what to configure: {r}"
+        );
+    } else {
+        assert!(
+            props.iter().any(|v| v.as_str() == Some("PatientID")),
+            "available_props must list the extent's fields: {r}"
+        );
+    }
 
     // ── #202: a filter that is DROPPED rather than applied ────────────────────
     //
@@ -1017,23 +1157,62 @@ fn test_message_content_search() {
          else `count == 0` below proves nothing: {unfiltered}"
     );
 
-    // 6. The #202 trigger: the filter object arriving as a JSON *string*, which is what
-    //    a client with no shape to serialise against sends. It used to fail
-    //    from_value(), become None, and return all `baseline` rows as a success.
-    let r = call(
-        "iris_interop_query",
-        serde_json::json!({"what":"messages","namespace":ns,
-            "search_table": r#"{"prop":"MSHControlID","value":"e2e-no-such-value"}"#}),
-    );
-    assert_eq!(
-        r["success"], true,
-        "a stringified filter must be honoured: {r}"
-    );
-    assert_eq!(
-        r["count"], 0,
-        "the stringified filter must FILTER, not degrade into no filter \
-         (baseline is {baseline} rows): {r}"
-    );
+    // 5 and 6 need a prop that is actually REGISTERED on the extent, which requires a
+    // SearchTableClass configured on some production item. #240: CI's container has no
+    // production, so `EnsLib.HL7.SearchTable` has no registered properties there and no prop
+    // name is valid — step 4 above measured that.
+    //
+    // The #202 property survives either way, and it is the one that matters: a filter that
+    // cannot be honoured must NEVER degrade into an unfiltered search. So both environments
+    // assert it; only the shape of "honoured" differs.
+    let filters = [
+        serde_json::json!({"prop":"MSHControlID","value":"e2e-no-such-value"}),
+        // The #202 trigger: the filter arriving as a JSON *string*, which is what a client
+        // with no shape to serialise against sends. It used to fail from_value(), become
+        // None, and return all `baseline` rows as a success.
+        serde_json::json!(r#"{"prop":"MSHControlID","value":"e2e-no-such-value"}"#),
+    ];
+    for filter in &filters {
+        let r = call(
+            "iris_interop_query",
+            serde_json::json!({"what":"messages","namespace":ns,"search_table":filter.clone()}),
+        );
+        if search_props_registered {
+            // 5/6. valid prop, zero rows → success with the config-time indexing hint.
+            assert_eq!(
+                r["success"], true,
+                "a filter on a registered prop must be honoured: {r}"
+            );
+            assert_eq!(
+                r["count"], 0,
+                "the filter must FILTER, not degrade into no filter (baseline is \
+                 {baseline} rows): {r}"
+            );
+            assert!(
+                r["hint"].as_str().unwrap_or("").contains("back-indexed"),
+                "zero rows must explain config-time indexing: {r}"
+            );
+        } else {
+            // No prop can be valid here, so the filter cannot be honoured — and that is
+            // precisely when #202's regression would return the whole archive as a success.
+            assert_eq!(
+                r["success"], false,
+                "an unhonourable filter must be refused, not answered: {r}"
+            );
+            assert_eq!(r["error_code"], "SEARCH_PROP_NOT_FOUND", "{r}");
+            // `success == false` above is the real #202 guard. This one only bites when a
+            // count IS reported, so say that explicitly rather than let `unwrap_or(MAX)`
+            // turn an absent field into a silent pass — the defect being fixed all over
+            // this commit.
+            if let Some(n) = r["count"].as_u64() {
+                assert_ne!(
+                    n, baseline,
+                    "a filter that cannot be honoured must never return the {baseline} \
+                     unfiltered rows — that is #202: {r}"
+                );
+            }
+        }
+    }
 
     // 7. A filter that cannot be honoured is an error — never an unfiltered search.
     //    Each of these used to deserialise to None and return all `baseline` rows.
@@ -1100,6 +1279,7 @@ fn test_message_content_search() {
 /// So an empty answer here would mean the derivation never reached IRIS, and a resolved one
 /// cannot have come from anywhere else: the caller passes NO includes.
 #[test]
+#[ignore = "requires live IRIS"]
 fn macro_includes_are_derived_from_the_document() {
     let iris_host = std::env::var("IRIS_HOST").unwrap_or_default();
     if iris_host.is_empty() {
@@ -1139,6 +1319,7 @@ fn macro_includes_are_derived_from_the_document() {
 
 /// #246: the categories come from IRIS, not from a hardcoded list.
 #[test]
+#[ignore = "requires live IRIS"]
 fn hl7_schema_list_returns_this_instances_categories() {
     let iris_host = std::env::var("IRIS_HOST").unwrap_or_default();
     if iris_host.is_empty() {
@@ -1178,6 +1359,7 @@ fn hl7_schema_list_returns_this_instances_categories() {
 /// and PID:5 must come back NAMED and flagged as repeating, and PID:7 — which does not repeat —
 /// must not be flagged. Both directions, so a hardcoded `repeating: true` would fail.
 #[test]
+#[ignore = "requires live IRIS"]
 fn hl7_schema_inspect_names_repeating_fields() {
     let iris_host = std::env::var("IRIS_HOST").unwrap_or_default();
     if iris_host.is_empty() {
