@@ -1,0 +1,35 @@
+# PostgreSQL behind an IRIS SQL Gateway, for the #214 iris_gateway_query e2e.
+#
+# The point of this rig: #214 asks for a read-only SELECT over a SQL Gateway connection, and
+# the reason it sat unverifiable is that no external database was reachable from the dev IRIS.
+# A tool that merely REGISTERS looks identical to one that works (this fork has shipped two
+# such ports), so the tool is not worth writing without a real external row to read.
+#
+# Joins the EXTERNAL network that already hosts iris-dev-environment, so IRIS can resolve
+# this container by hostname. That compose project lives outside this repo and is not edited.
+#
+# Usage: docker compose -f e2e/gateway/docker-compose.yaml up -d
+services:
+  pg-gateway-e2e:
+    image: postgres:17-alpine
+    container_name: pg-gateway-e2e
+    hostname: pg-gateway-e2e
+    init: true
+    environment:
+      POSTGRES_USER: cocina_app
+      POSTGRES_PASSWORD: cocina_e2e_pw
+      POSTGRES_DB: Cocina
+    ports:
+      - "45432:5432"        # published for host-side inspection; IRIS uses the network name
+    volumes:
+      - ./seed.sql:/docker-entrypoint-initdb.d/10-seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cocina_app -d Cocina"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+networks:
+  default:
+    name: dev-environment_default
+    external: true
