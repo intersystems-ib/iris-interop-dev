@@ -102,6 +102,19 @@ fn mcp_call_with_toml(
     results
 }
 
+/// #240: the container to select. Was the literal "iris-dev-iris" at two call sites, which
+/// need not exist on the host running this — `iris_select_container` then returns no `switched`
+/// field and the assertion reads as a product defect. The sibling target test_iris_test_e2e
+/// already reads IRIS_CONTAINER with that same legacy fallback; this follows it.
+fn target_container() -> String {
+    std::env::var("IRIS_CONTAINER").unwrap_or_else(|_| "iris-dev-iris".to_string())
+}
+
+/// The namespace to pass alongside it (#240).
+fn target_ns() -> String {
+    std::env::var("IRIS_NAMESPACE").unwrap_or_else(|_| "USER".to_string())
+}
+
 fn init_msgs() -> Vec<serde_json::Value> {
     vec![
         serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
@@ -194,7 +207,7 @@ fn test_e2e_select_container_updates_check_config() {
     let mut msgs = init_msgs();
     msgs.push(serde_json::json!({
         "jsonrpc":"2.0","id":2,"method":"tools/call",
-        "params":{"name":"iris_select_container","arguments":{"name":"iris-dev-iris","namespace":"USER"}}
+        "params":{"name":"iris_select_container","arguments":{"name":target_container(),"namespace":target_ns()}}
     }));
     msgs.push(serde_json::json!({
         "jsonrpc":"2.0","id":3,"method":"tools/call",
@@ -233,7 +246,7 @@ fn test_e2e_select_container_execute_uses_new_connection() {
     let mut msgs = init_msgs();
     msgs.push(serde_json::json!({
         "jsonrpc":"2.0","id":2,"method":"tools/call",
-        "params":{"name":"iris_select_container","arguments":{"name":"iris-dev-iris","namespace":"USER"}}
+        "params":{"name":"iris_select_container","arguments":{"name":target_container(),"namespace":target_ns()}}
     }));
     msgs.push(serde_json::json!({
         "jsonrpc":"2.0","id":3,"method":"tools/call",
@@ -307,11 +320,19 @@ fn test_e2e_check_config_returns_all_fields() {
     // Must not return IRIS_UNREACHABLE
     assert_ne!(result["error_code"], "IRIS_UNREACHABLE");
 
+    // #240: this list predated #193 ("check_config reports the source a connection actually
+    // came from") and was never updated, because this target runs in no CI job. Run the way
+    // this file's own header documents — IRIS_HOST=... on the command line — clap merges that
+    // as `explicit_flag`, which the old list rejected: the test could NEVER pass as documented.
+    // The set below is the one check_config's own description enumerates.
     let valid_sources = [
         "config_file",
+        "explicit_flag",
+        "vs_code_settings",
         "env_vars",
         "iris_select_container",
         "auto_discovered",
+        "disconnected",
     ];
     let src = result["connection_source"].as_str().unwrap_or("");
     assert!(

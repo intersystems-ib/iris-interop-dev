@@ -10,6 +10,21 @@ fn iris_dev_bin() -> std::path::PathBuf {
     p
 }
 
+/// #240: the namespace these tests must run against.
+///
+/// Four tests in this file hardcoded `"namespace":"USER"` in the tool arguments while their own
+/// assertion messages said "must succeed on an interop ns". They could therefore only pass on an
+/// instance where USER happens to have Interoperability — and since this target runs in no CI
+/// job, nobody saw them fail. Run against a namespace without Ens.*, all four fail with
+/// "Namespace 'USER' has no Interoperability enabled", which reads as a product defect and is
+/// not one.
+///
+/// The idiom is not new: `test_production_item_disable` in this same file already reads
+/// IRIS_NAMESPACE this way.
+fn interop_ns() -> String {
+    std::env::var("IRIS_NAMESPACE").unwrap_or_else(|_| "USER".to_string())
+}
+
 fn mcp_exchange(messages: &[serde_json::Value]) -> Vec<serde_json::Value> {
     let bin = iris_dev_bin();
     let iris_host = std::env::var("IRIS_HOST").unwrap_or_default();
@@ -143,7 +158,7 @@ fn interop_production_status_returns_structured_json() {
     let responses = mcp_exchange(&[
         serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
         serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
-        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"iris_production","arguments":{"action":"status","namespace":"USER"}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"iris_production","arguments":{"action":"status","namespace":interop_ns()}}}),
     ]);
 
     let resp = find_response(&responses, 2).expect("no tool response");
@@ -167,7 +182,7 @@ fn interop_logs_returns_structured_entries() {
     let responses = mcp_exchange(&[
         serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
         serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
-        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"iris_interop_query","arguments":{"what":"logs","limit":5,"log_type":"error","namespace":"USER"}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"iris_interop_query","arguments":{"what":"logs","limit":5,"log_type":"error","namespace":interop_ns()}}}),
     ]);
 
     let resp = find_response(&responses, 2).expect("no tool response");
@@ -189,7 +204,7 @@ fn interop_queues_returns_array() {
     let responses = mcp_exchange(&[
         serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
         serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
-        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"iris_interop_query","arguments":{"what":"queues","namespace":"USER"}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"iris_interop_query","arguments":{"what":"queues","namespace":interop_ns()}}}),
     ]);
 
     let resp = find_response(&responses, 2).expect("no tool response");
@@ -210,9 +225,9 @@ fn interop_query_partners_and_what_enum() {
     let responses = mcp_exchange(&[
         serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
         serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
-        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"iris_interop_query","arguments":{"what":"partners","namespace":"USER"}}}),
-        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"iris_interop_query","arguments":{"what":"bogus","namespace":"USER"}}}),
-        serde_json::json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"iris_interop_query","arguments":{"namespace":"USER"}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"iris_interop_query","arguments":{"what":"partners","namespace":interop_ns()}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"iris_interop_query","arguments":{"what":"bogus","namespace":interop_ns()}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"iris_interop_query","arguments":{"namespace":interop_ns()}}}),
     ]);
     // B8: partners returns a real (possibly empty) array on an interop ns.
     let partners = parse_tool_text(&find_response(&responses, 2).expect("no partners response"));
