@@ -308,6 +308,7 @@ fn test_interop_preserves_critical_tools() {
 }
 
 /// Interop must prune the meta/non-interop surface (skills/kb/agent/generate/search/info/debug-individual/scm/containers).
+/// `iris_macro` left this list in #247 — see the note inside.
 #[test]
 fn test_interop_excludes_meta_tools() {
     let tools = IrisTools::new_with_toolset(None, Toolset::Interop).expect("interop IrisTools");
@@ -320,7 +321,10 @@ fn test_interop_excludes_meta_tools() {
         "iris_search",
         "iris_info",
         "iris_generate",
-        "iris_macro",
+        // `iris_macro` was excluded here by the original 20-tool interop profile as meta
+        // surface. #247 reverses that on evidence: `$$$` availability was guessed four times
+        // in one day of interop work, and the tool now derives the include list from the
+        // document being written, so it answers that question instead of relaying it.
         "iris_source_control",
         "iris_containers",
         "iris_admin",
@@ -377,7 +381,7 @@ fn test_toolset_counts_match_doc_comments() {
         (Toolset::Baseline, 55usize),
         (Toolset::Nostub, 51),
         (Toolset::Merged, 47),
-        (Toolset::Interop, 25),
+        (Toolset::Interop, 26),
     ] {
         let n = IrisTools::new_with_toolset(None, ts)
             .expect("IrisTools::new")
@@ -393,7 +397,7 @@ fn test_toolset_counts_match_doc_comments() {
     // Two independent anchors for the interop number: the keep-list and the router.
     assert_eq!(
         iris_agentic_dev_core::tools::INTEROP_TOOLS.len(),
-        25,
+        26,
         "INTEROP_TOOLS is the interop profile — it must agree with the measured count"
     );
 }

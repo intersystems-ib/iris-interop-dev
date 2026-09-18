@@ -120,8 +120,8 @@ fn tools_list_returns_interop_profile() {
     // gate removing two tools on a read-only connection — #114 stopped it doing that, so the
     // slack was vestigial and would have hidden a tool going missing.
     assert!(
-        names.len() == 25,
-        "expected the interop profile (25 tools), got {}: {:?}",
+        names.len() == 26,
+        "expected the interop profile (26 tools), got {}: {:?}",
         names.len(),
         names
     );
@@ -1084,4 +1084,55 @@ fn test_message_content_search() {
         serde_json::json!({"namespace": ns, "code": cleanup}),
     );
     assert_eq!(r["output"].as_str(), Some("CLEAN"), "cleanup failed: {r}");
+}
+
+/// #247: the includes are DERIVED from `docname`, not demanded from the caller.
+///
+/// This is the assertion that a unit test cannot make. Measured against the worker the REST
+/// layer calls (`$$GetMacroLocation^%qccServer`) on IRIS for Health 2026.1, with both controls
+/// on the very class used here:
+///
+/// ```text
+/// includes %occInclude,Ensemble (Ens.Director's own IncludeCode) -> %occErrors.inc(1415)
+/// no includes at all                                             -> empty
+/// ```
+///
+/// So an empty answer here would mean the derivation never reached IRIS, and a resolved one
+/// cannot have come from anywhere else: the caller passes NO includes.
+#[test]
+fn macro_includes_are_derived_from_the_document() {
+    let iris_host = std::env::var("IRIS_HOST").unwrap_or_default();
+    if iris_host.is_empty() {
+        return;
+    }
+
+    let responses = mcp_exchange(&[
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
+        serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+        // Ens.Director exists in every interop-enabled namespace and its IncludeCode is
+        // "%occInclude,Ensemble". No `includes` argument is sent.
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"iris_macro","arguments":{"action":"location","name":"$$$GeneralError","docname":"Ens.Director.cls","namespace":interop_ns()}}}),
+    ]);
+
+    let resp = find_response(&responses, 2).expect("no tool response");
+    let result = parse_tool_text(&resp);
+
+    assert_eq!(
+        result["includes_from_document"],
+        serde_json::json!(["%occInclude", "Ensemble"]),
+        "Ens.Director's Include list was not read back: {result}"
+    );
+    assert_eq!(
+        result["resolved"],
+        serde_json::json!(true),
+        "the derived includes did not reach IRIS — this is the empty answer that reads like \
+         'no such macro': {result}"
+    );
+    assert!(
+        result["result"]["document"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("%occErrors.inc"),
+        "GeneralError must resolve to %occErrors.inc: {result}"
+    );
 }

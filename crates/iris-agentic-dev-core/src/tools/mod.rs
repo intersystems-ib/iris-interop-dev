@@ -341,14 +341,14 @@ pub enum Toolset {
     /// iris_containers, iris_admin, iris_get_log. 51 - 8 + 4 = 47.
     /// Not this fork's default.
     Merged,
-    /// 25 tools advertised (measured 2026-09-18) — exactly `INTEROP_TOOLS`. THIS FORK'S
+    /// 26 tools advertised (measured 2026-09-18) — exactly `INTEROP_TOOLS`. THIS FORK'S
     /// DEFAULT: `--toolset` carries `default_value = "interop"` (see
     /// crates/iris-agentic-dev-bin/src/cmd/mcp.rs). Keeps only the tools the iris-interop
     /// skills actually exercise; everything else (skill_*/kb_*/agent_*/generate_*/
     /// individual debug_*/container/scm) is pruned. The count does NOT drop on a
     /// write-disallowed connection: #114 stopped the gate removing iris_production_item and
     /// iris_credential_manage from the router, because removing them took their READ actions
-    /// with them (no iris_production_item meant no get_settings). All 25 stay advertised and
+    /// with them (no iris_production_item meant no get_settings). All 26 stay advertised and
     /// a write is refused at CALL time instead — see
     /// a_write_disallowed_connection_still_lists_every_tool.
     /// Additive: tool *code* is unchanged so upstream stays mergeable.
@@ -422,6 +422,12 @@ pub const INTEROP_TOOLS: &[&str] = &[
     // class with a [SqlProc] wrapper — put + compile + SELECT + delete, twenty-plus times in
     // one session, with the wrapper itself being the defect three of those times.
     "iris_execute_method",
+    // Macro availability is context-dependent and was guessed four times in one session:
+    // GeneralError is not available in a %UnitTest.TestProduction but is in an
+    // Ens.BusinessOperation, Str2MsgTyp needs an EnsDICOM include, and the Sql* family was
+    // asserted wrongly in three files before a peer corrected it. action=location answers
+    // "which Include do I need" from IRIS instead of from memory.
+    "iris_macro",
 ];
 
 pub const ERR_NO_TESTS_FOUND: &str = "NO_TESTS_FOUND";
@@ -1857,7 +1863,7 @@ impl<'de> serde::Deserialize<'de> for GetLogParams {
 
 /// Issue #78: the keys iris_get_log tolerates without acting on them.
 ///
-/// Not leniency for its own sake. `namespace` is advertised by 12 of the 25 tools in
+/// Not leniency for its own sake. `namespace` is advertised by 13 of the 26 tools in
 /// this fork's default (interop) profile — the only key that spans tool families — and
 /// the agent harness sends it on nearly every call, including the correct index call in
 /// the issue's own repro. It cannot mean anything here: the log store is a single
@@ -4159,6 +4165,8 @@ pub(crate) fn mutating_call(tool: &str, args: &serde_json::Value) -> Option<&'st
         // Reads .cls/.mac/.inc from the workspace on disk and never opens a connection,
         // so there is nothing on the instance for the write gate to protect.
         | "iris_symbols_local"
+        // Resolves macros through Atelier's read-only getmacro* endpoints; no write path.
+        | "iris_macro"
         | "iris_table_info" => None,
         _ => None,
     }
@@ -4305,6 +4313,7 @@ pub(crate) const CLASSIFIED_TOOLS: &[&str] = &[
     "iris_interop_query",
     "iris_lookup_manage",
     "iris_lookup_transfer",
+    "iris_macro",
     "iris_message_body",
     "iris_production",
     "iris_production_diff",
@@ -7869,7 +7878,7 @@ Methods:
     }
 
     #[tool(
-        description = "Inspect IRIS macros. action=list returns all macros, action=signature returns parameters, action=location finds definition file/line, action=definition returns text, action=expand expands with arguments."
+        description = "Inspect IRIS macros. action=list lists the include files; action=location finds the file and line a macro is defined at; action=definition returns its text; action=signature returns its parameters; action=expand expands it with arguments. Pass the macro in `name` with or without its $$$ prefix. Availability is decided by the include list alone. Pass `docname` naming the class you are working in and its Include list is derived and applied for you; add `includes` only for scope beyond it, as BARE names ([\"Ensemble\"] for interop macros such as GeneralError, never [\"Ensemble.inc\"] — a .inc suffix is silently dropped and answers like an unknown macro). When nothing resolves the answer carries resolved=false, the includes actually used, and a note; that is NOT the same as the macro being absent."
     )]
     async fn iris_macro(
         &self,
@@ -9290,7 +9299,7 @@ fn wildcard_listing_filter(pattern: &str) -> Option<&str> {
 /// authors, and refuses only whole-library trees and whole-namespace expansions.
 ///
 /// Deliberately no `force`/`confirm` escape hatch: that would widen the advertised schema
-/// of a tool in the locked 25-tool interop profile, and a caller who genuinely wants 500+
+/// of a tool in the locked 26-tool interop profile, and a caller who genuinely wants 500+
 /// classes can name the subpackages.
 const WILDCARD_EXPANSION_CAP: usize = 500;
 

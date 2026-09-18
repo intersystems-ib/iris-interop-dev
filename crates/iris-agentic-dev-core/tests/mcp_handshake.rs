@@ -189,7 +189,7 @@ fn a_write_disallowed_connection_still_lists_every_tool() {
         .collect();
     assert_eq!(
         names.len(),
-        25,
+        26,
         "the write gate must not shrink the tool list — it used to advertise 21 here, and \
          the two it removed took their read actions with them: {names:?}"
     );
@@ -471,12 +471,12 @@ fn mcp_server_tools_list_returns_interop_profile() {
 
     let tool_names: Vec<_> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
-    // Interop profile (this fork's default toolset) exposes exactly the 25-tool
+    // Interop profile (this fork's default toolset) exposes exactly the 26-tool
     // interop keep-list (INTEROP_TOOLS).
     assert_eq!(
         tool_names.len(),
-        25,
-        "expected the 25-tool interop profile, got {}: {:?}",
+        26,
+        "expected the 26-tool interop profile, got {}: {:?}",
         tool_names.len(),
         tool_names
     );
@@ -501,6 +501,9 @@ fn mcp_server_tools_list_returns_interop_profile() {
         // Runs arbitrary code and is write-gated: if it ever silently leaves the profile,
         // the gate tests still pass and callers quietly lose the ability to call a method.
         "iris_execute_method",
+        // Four of its five actions were broken and unnoticed precisely because it sat outside
+        // the profile. Pinned by name so it cannot quietly drop back out.
+        "iris_macro",
     ];
     for name in required {
         assert!(
