@@ -887,6 +887,23 @@ async fn do_write(
                 "compile_errors": compile_errors,
                 "compile_console": compile_console,
             });
+            // #213: #5559 blames braces and is usually wrong. On THIS path the class source is
+            // still in scope, so the hint can name the members whose names carry `_`. Written
+            // BEFORE note_error_undercount, which overwrites `hint` unconditionally when it
+            // fires — that ordering keeps the existing undercount regression green.
+            if let Some((h, offenders)) = crate::tools::hint_5559(&first, Some(&content_for_write))
+            {
+                payload["hint"] = serde_json::Value::String(h);
+                if !offenders.is_empty() {
+                    payload["did_you_mean"] = serde_json::Value::Array(
+                        offenders
+                            .iter()
+                            .map(|m| serde_json::Value::String(m.replace('_', "")))
+                            .collect(),
+                    );
+                    payload["underscored_members"] = serde_json::json!(offenders);
+                }
+            }
             crate::tools::note_error_undercount(
                 &mut payload,
                 crate::tools::detected_error_count(compile_console.iter().map(String::as_str)),

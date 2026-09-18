@@ -2512,16 +2512,22 @@ fn compile_failure(target: &str, payload: serde_json::Value) -> Result<CallToolR
         .map(str::to_string)
         .or_else(|| payload["errors"][0].as_str().map(str::to_string))
         .unwrap_or_else(|| format!("compile of {target} failed — see console"));
+    // #213: iris_compile compiles a document already on the server, with no source in scope —
+    // so this gets the message-level #5559 variant, without did_you_mean. It is also the path
+    // that carries the Storage-block cause, since on the iris_doc(put) path that is already
+    // intercepted earlier as STORAGE_STRIP_BLOCKED.
+    let hint = match hint_5559(&first, None) {
+        Some((h, _)) => h,
+        None => "If several errors are reported, fix the first and recompile — later errors are \
+                 often cascades of the first. Full compiler output is in console."
+            .to_string(),
+    };
     crate::tools::envelope::fail_with(
         "COMPILE_ERROR",
         &first,
         // The built-in COMPILE_ERROR hint names iris_doc's `compile_console`;
         // this payload calls that field `console`.
-        merge_hint(
-            payload,
-            "Fix the first reported error and recompile — later errors are often cascades \
-             of the first. Full compiler output is in console.",
-        ),
+        merge_hint(payload, &hint),
     )
 }
 fn merge_hint(mut payload: serde_json::Value, hint: &str) -> serde_json::Value {
@@ -9873,6 +9879,94 @@ pub fn detected_error_count<'a>(console: impl IntoIterator<Item = &'a str>) -> O
 ///
 /// `console_field` names the field on THIS payload holding the raw compiler output:
 /// `console` for iris_compile, `compile_console` for iris_doc.
+/// #213: `ERROR #5559` blames `{}` / `()` and is wrong about it. The measured cause in 14 of 15
+/// envelopes was an UNDERSCORE IN A MEMBER NAME — braces and parentheses balanced in all 14,
+/// bytes intact, no correlation with size (178 B to 5851 B, both extremes failing, a 4385 B
+/// write succeeding). Longest run: six consecutive retries by one student, each a different
+/// guess at the braces.
+///
+/// RCOS Appendix A §A.9, Rules for Class Member Names: the name must start with a letter or `%`
+/// and "the remaining characters must be letters or numbers". `_` is the concatenation
+/// operator, not an identifier character. The only escape hatch is a delimited name
+/// (`Property "My Property" As %String;`).
+///
+/// `content` is the class source when the caller has it — `iris_doc(mode=put)` still holds it,
+/// so that path can NAME the offending members. `iris_compile` compiles a document already on
+/// the server with no source in scope, so it gets the message-level variant. That path is also
+/// the one carrying the Storage-block cause (#5559 on a Storage XML block), which on the put
+/// path is already intercepted earlier as STORAGE_STRIP_BLOCKED.
+///
+/// Same shape as the #16006 interception in doc.rs, and the same reason: name the remedy rather
+/// than sending the caller hunting for a problem that does not exist.
+pub fn hint_5559(first_error: &str, content: Option<&str>) -> Option<(String, Vec<String>)> {
+    if !first_error.contains("#5559") {
+        return None;
+    }
+    let offenders = content.map(underscored_member_names).unwrap_or_default();
+    let mut hint = String::from(
+        "#5559 blames {} / () and is usually wrong about it. The commonest cause is an \
+         UNDERSCORE IN A MEMBER NAME: identifiers are letters and digits only, and `_` is the \
+         concatenation operator, so `Property patient_id As %String;` cannot parse (RCOS \
+         Appendix A, Rules for Class Member Names). Rename to PascalCase — `PatientId` — or use \
+         a delimited name (`Property \"My Property\" As %String;`). ",
+    );
+    if offenders.is_empty() {
+        hint.push_str(
+            "Check every Property/Method/ClassMethod/Parameter name for `_`. The other cause is \
+             an explicit Storage block, whose XML this UDL parser rejects: remove it and let \
+             IRIS regenerate it. Count your braces LAST — if compile_console says one error, \
+             there is no cascade to prune.",
+        );
+    } else {
+        hint.push_str(&format!(
+            "These member names in the source you sent carry an underscore: {}. \
+             Fix those first; count braces only if it still fails.",
+            offenders.join(", ")
+        ));
+    }
+    Some((hint, offenders))
+}
+
+/// Member declarations whose NAME contains `_`, which #5559 reports as a brace problem (#213).
+/// A delimited name is legal, so a quoted name is skipped rather than reported.
+fn underscored_member_names(content: &str) -> Vec<String> {
+    const MEMBER_KEYWORDS: [&str; 10] = [
+        "Property",
+        "Method",
+        "ClassMethod",
+        "Parameter",
+        "Relationship",
+        "Index",
+        "ForeignKey",
+        "Trigger",
+        "Query",
+        "Projection",
+    ];
+    let mut out: Vec<String> = Vec::new();
+    for line in content.lines() {
+        let t = line.trim_start();
+        let mut it = t.split_whitespace();
+        let Some(kw) = it.next() else { continue };
+        if !MEMBER_KEYWORDS.contains(&kw) {
+            continue;
+        }
+        let Some(raw) = it.next() else { continue };
+        // A delimited name is legal ObjectScript — do not report it.
+        if raw.starts_with('"') {
+            continue;
+        }
+        // Stop at whatever ends the identifier: (, comma, semicolon, As, =.
+        let name: String = raw
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '%')
+            .collect();
+        if name.contains('_') && !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    out
+}
+
 pub fn note_error_undercount(
     payload: &mut serde_json::Value,
     detected: Option<usize>,
@@ -11035,6 +11129,94 @@ mod member_relevance_tests {
         // ...and the generic head alone never is, for any head.
         assert!(!member_list_is_relevant("SetNodeName", "SetWebServerPort"));
         assert!(!member_list_is_relevant("IsNodeName", "IsWebServerPort"));
+    }
+}
+
+#[cfg(test)]
+mod hint_5559_tests {
+    use super::*;
+
+    const ERR: &str = "ERROR #5559: The class definition for class 'Pkg.Tests.HL7.CensoTest' \
+                       could not be parsed correctly, possibly due to non-matching {} or () \
+                       characters...";
+
+    /// The measured cause in 14 of 15 envelopes: an underscore in a member name. Braces were
+    /// balanced in all 14. The shipped hint told the caller to prune a cascade in an envelope
+    /// whose own compile_console said "Detected 1 errors during compilation".
+    #[test]
+    fn it_names_the_underscored_members_when_the_source_is_in_scope() {
+        let src = "Class Pkg.MSG.Req Extends %Persistent\n{\n\
+                   Property patient_id As %String;\n\
+                   Property PatientName As %String;\n\
+                   Method get_thing() As %Status\n{\n Quit $$$OK\n}\n}\n";
+        let (hint, offenders) = hint_5559(ERR, Some(src)).expect("#5559 must be intercepted");
+        assert_eq!(offenders, vec!["patient_id", "get_thing"]);
+        assert!(hint.contains("patient_id"), "{hint}");
+        assert!(hint.contains("get_thing"), "{hint}");
+        // The correction, not just the diagnosis.
+        assert!(hint.contains("concatenation operator"), "{hint}");
+        assert!(
+            hint.contains("PascalCase") || hint.contains("delimited name"),
+            "{hint}"
+        );
+        // It must NOT send the caller back to the braces first — that is the six-retry loop.
+        assert!(
+            !hint.starts_with("Fix the first reported error"),
+            "the generic cascade text is back: {hint}"
+        );
+    }
+
+    /// A delimited name is legal ObjectScript and must not be reported as an offender.
+    #[test]
+    fn a_delimited_name_is_not_an_offender() {
+        let src = "Class X Extends %Persistent\n{\nProperty \"My Property\" As %String;\n}\n";
+        let (_, offenders) = hint_5559(ERR, Some(src)).unwrap();
+        assert!(offenders.is_empty(), "{offenders:?}");
+    }
+
+    /// iris_compile has no source in scope: the message-level variant, and it must carry the
+    /// OTHER cause (an explicit Storage block), because that is the path which reaches #5559
+    /// with a Storage XML block — on the put path that is intercepted as STORAGE_STRIP_BLOCKED.
+    #[test]
+    fn without_source_it_still_names_both_causes() {
+        let (hint, offenders) = hint_5559(ERR, None).unwrap();
+        assert!(offenders.is_empty());
+        assert!(hint.contains("UNDERSCORE IN A MEMBER NAME"), "{hint}");
+        assert!(
+            hint.contains("Storage block"),
+            "the iris_compile cause: {hint}"
+        );
+        assert!(
+            hint.contains("Count your braces LAST"),
+            "the ordering is the whole point: {hint}"
+        );
+    }
+
+    /// Every OTHER compile error must keep the generic handling — this is not a catch-all.
+    #[test]
+    fn other_compile_errors_are_untouched() {
+        for other in [
+            "ERROR #5373: Class 'Pkg.Missing' is not defined",
+            "ERROR #16006: Document '' name is invalid",
+            "compile failed — see compile_console",
+        ] {
+            assert!(
+                hint_5559(other, Some("Property a_b As %String;")).is_none(),
+                "{other}"
+            );
+        }
+    }
+
+    /// The underscore scan reads MEMBER declarations only — a `_` inside code or a comment is
+    /// the concatenation operator doing its job, not a defect.
+    #[test]
+    fn concatenation_in_a_method_body_is_not_an_offender() {
+        let src = "Class X Extends %RegisteredObject\n{\n\
+                   Method Ok() As %String\n{\n Quit \"a\"_\"b\"\n}\n\
+                   /// doc_comment with an underscore\n\
+                   Property Fine As %String;\n}\n";
+        let (_, offenders) = hint_5559(ERR, Some(src)).unwrap();
+        assert!(offenders.is_empty(), "{offenders:?}");
     }
 }
 
