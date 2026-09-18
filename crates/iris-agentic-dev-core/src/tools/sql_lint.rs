@@ -248,7 +248,7 @@ Host-independent and the supported path.",
     // 3. Class/dictionary introspection via %Dictionary.* SQL — typed tools do this in one call.
     if u.contains("%DICTIONARY.") {
         return Some(
-            "Introspect classes with typed tools, not %Dictionary SQL: docs_introspect(class=...) \
+            "Introspect classes with typed tools, not %Dictionary SQL: docs_introspect(class_name=...) \
 for methods/properties, iris_symbols(pattern=...) to find classes, iris_table_info(schema=...) for \
 projected tables. One typed call, no guessing at catalog table/column names.",
         );

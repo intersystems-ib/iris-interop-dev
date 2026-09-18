@@ -246,6 +246,48 @@ impl<'de, S> Deserialize<'de> for Described<S> {
     }
 }
 
+/// #211: answer a parameter miss with THIS server's envelope instead of rmcp's -32602.
+///
+/// A strict `Parameters<T>` fails inside the deserializer, before any handler runs, so the
+/// whole didactic-error machinery (`envelope::fail_with`, `builtin_hint`,
+/// `no_tests_found_guidance`) is bypassed. What the caller gets names the field that is
+/// MISSING but never the field they actually SENT, lists nothing, and carries no
+/// `error_code` — from a server that instructs callers to branch on `error_code`.
+///
+/// Wrapping in `Described<T>` (infallible by construction) routes the same failure here,
+/// where both halves are known: what arrived, and what is accepted.
+fn bad_params(
+    tool: &str,
+    got: &serde_json::Value,
+    required: &str,
+    accepted: &[&str],
+    serde_err: &str,
+) -> Result<CallToolResult, McpError> {
+    let sent: Vec<String> = got
+        .as_object()
+        .map(|o| o.keys().cloned().collect())
+        .unwrap_or_default();
+    let sent_list = if sent.is_empty() {
+        "nothing".to_string()
+    } else {
+        sent.join(", ")
+    };
+    envelope::fail_with(
+        "INVALID_PARAMS",
+        &format!(
+            "{tool}: no recognised parameter carried the required value. You sent: {sent_list}. \
+             Accepted: {}. Retry with {required}=<the value you put in one of the names above>.",
+            accepted.join(", ")
+        ),
+        serde_json::json!({
+            "accepted_parameters": accepted,
+            "required_parameter": required,
+            "parameters_sent": sent,
+            "deserialize_error": serde_err,
+        }),
+    )
+}
+
 impl<S: JsonSchema> JsonSchema for Described<S> {
     fn schema_name() -> std::borrow::Cow<'static, str> {
         S::schema_name()
@@ -1336,6 +1378,17 @@ pub struct ToolCallEntry {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CompileParams {
+    // #211: aliases are a RESCUE PATH, not a second contract — `target` is the
+    // advertised name and the only one the schema publishes. A caller reasoning from the
+    // domain rather than the schema sent the natural synonym, serde failed BEFORE the
+    // handler ran, and rmcp's bare -32602 came back: it names the field that is missing,
+    // never the field that was sent, and carries no error_code to branch on.
+    #[serde(
+        alias = "class",
+        alias = "classname",
+        alias = "className",
+        alias = "class_name"
+    )]
     pub target: String,
     #[serde(default = "default_flags")]
     pub flags: String,
@@ -1351,6 +1404,18 @@ pub struct CompileParams {
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct TestParams {
+    // #211: aliases are a RESCUE PATH, not a second contract — `pattern` is the
+    // advertised name and the only one the schema publishes. A caller reasoning from the
+    // domain rather than the schema sent the natural synonym, serde failed BEFORE the
+    // handler ran, and rmcp's bare -32602 came back: it names the field that is missing,
+    // never the field that was sent, and carries no error_code to branch on.
+    #[serde(
+        alias = "class",
+        alias = "classname",
+        alias = "className",
+        alias = "class_name",
+        alias = "test_class"
+    )]
     pub pattern: String,
     /// IRIS namespace. OMIT this field to use the connection's configured namespace
     /// (IRIS_NAMESPACE) — only pass a value to deliberately target a different namespace.
@@ -1381,6 +1446,14 @@ pub struct SymbolsParams {
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct IntrospectParams {
+    // #211: aliases are a RESCUE PATH, not a second contract — `class_name` is the
+    // advertised name and the only one the schema publishes. A caller reasoning from the
+    // domain rather than the schema sent the natural synonym, serde failed BEFORE the
+    // handler ran, and rmcp's bare -32602 came back: it names the field that is missing,
+    // never the field that was sent, and carries no error_code to branch on.
+    // No `class_name` alias here — this field IS `class_name`. Two fields of one struct
+    // claiming a spelling would make the winner an accident of field order (#211).
+    #[serde(alias = "class", alias = "classname", alias = "className")]
     pub class_name: String,
     /// IRIS namespace. OMIT this field to use the connection's configured namespace
     /// (IRIS_NAMESPACE) — only pass a value to deliberately target a different namespace.
@@ -2156,6 +2229,12 @@ fn default_translate_sql() -> bool {
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct QueryParams {
+    // #211: aliases are a RESCUE PATH, not a second contract — `query` is the
+    // advertised name and the only one the schema publishes. A caller reasoning from the
+    // domain rather than the schema sent the natural synonym, serde failed BEFORE the
+    // handler ran, and rmcp's bare -32602 came back: it names the field that is missing,
+    // never the field that was sent, and carries no error_code to branch on.
+    #[serde(alias = "sql", alias = "statement")]
     pub query: String,
     /// Query parameters as strings (e.g. ["Alice", "42"])
     #[serde(default)]
@@ -4458,8 +4537,28 @@ impl IrisTools {
     )]
     async fn iris_compile(
         &self,
-        Parameters(p): Parameters<CompileParams>,
+        Parameters(p): Parameters<Described<CompileParams>>,
     ) -> Result<CallToolResult, McpError> {
+        // #211: Described is infallible, so a synonym the aliases do not cover
+        // reaches HERE and gets this server's envelope, not rmcp's bare -32602.
+        let p: CompileParams = match serde_json::from_value(p.0.clone()) {
+            Ok(v) => v,
+            Err(e) => {
+                return bad_params(
+                    "iris_compile",
+                    &p.0,
+                    "target",
+                    &[
+                        "target (required, the class or routine to compile)",
+                        "flags",
+                        "namespace",
+                        "force_writable",
+                        "inline",
+                    ],
+                    &e.to_string(),
+                )
+            }
+        };
         let iris = self.get_iris_reloaded().await?;
         let namespace = interop::resolve_namespace(p.namespace.as_deref(), Some(&iris));
         tracing::info!(namespace = %namespace, target = %p.target, "iris_compile");
@@ -5038,8 +5137,26 @@ impl IrisTools {
     )]
     async fn iris_test(
         &self,
-        Parameters(p): Parameters<TestParams>,
+        Parameters(p): Parameters<Described<TestParams>>,
     ) -> Result<CallToolResult, McpError> {
+        // #211: Described is infallible, so a synonym the aliases do not cover
+        // reaches HERE and gets this server's envelope, not rmcp's bare -32602.
+        let p: TestParams = match serde_json::from_value(p.0.clone()) {
+            Ok(v) => v,
+            Err(e) => {
+                return bad_params(
+                    "iris_test",
+                    &p.0,
+                    "pattern",
+                    &[
+                        "pattern (required, the EXACT compiled test class name)",
+                        "namespace",
+                        "timeout",
+                    ],
+                    &e.to_string(),
+                )
+            }
+        };
         tracing::info!(requested_namespace = ?p.namespace, pattern = %p.pattern, "iris_test");
         let timeout = std::time::Duration::from_secs(p.timeout);
 
@@ -5866,8 +5983,27 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
     )]
     async fn iris_query(
         &self,
-        Parameters(p): Parameters<QueryParams>,
+        Parameters(p): Parameters<Described<QueryParams>>,
     ) -> Result<CallToolResult, McpError> {
+        // #211: Described is infallible, so a synonym the aliases do not cover
+        // reaches HERE and gets this server's envelope, not rmcp's bare -32602.
+        let p: QueryParams = match serde_json::from_value(p.0.clone()) {
+            Ok(v) => v,
+            Err(e) => {
+                return bad_params(
+                    "iris_query",
+                    &p.0,
+                    "query",
+                    &[
+                        "query (required, the SQL text)",
+                        "parameters",
+                        "namespace",
+                        "force",
+                    ],
+                    &e.to_string(),
+                )
+            }
+        };
         tracing::info!(requested_namespace = ?p.namespace, force = p.force, "iris_query");
 
         // Pre-flight: ObjectScript typed into a SQL tool — fail fast with a clear redirect
@@ -6566,8 +6702,26 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
     )]
     async fn docs_introspect(
         &self,
-        Parameters(p): Parameters<IntrospectParams>,
+        Parameters(p): Parameters<Described<IntrospectParams>>,
     ) -> Result<CallToolResult, McpError> {
+        // #211: Described is infallible, so a synonym the aliases do not cover
+        // reaches HERE and gets this server's envelope, not rmcp's bare -32602.
+        let p: IntrospectParams = match serde_json::from_value(p.0.clone()) {
+            Ok(v) => v,
+            Err(e) => {
+                return bad_params(
+                    "docs_introspect",
+                    &p.0,
+                    "class_name",
+                    &[
+                        "class_name (required, the class to introspect)",
+                        "namespace",
+                        "include_inherited",
+                    ],
+                    &e.to_string(),
+                )
+            }
+        };
         let iris = self.get_iris_reloaded().await?;
         let client = self.http_client();
         // Bug 15: use parameterized queries instead of manual string escaping.
@@ -11537,12 +11691,9 @@ mod query_parity_tests {
     async fn tool_answer(server: &MockServer) -> serde_json::Value {
         let tools = IrisTools::new_with_toolset(Some(conn(server)), Toolset::Interop).unwrap();
         let r = tools
-            .iris_query(rmcp::handler::server::wrapper::Parameters(QueryParams {
-                query: "SELECT 1".into(),
-                parameters: vec![],
-                namespace: None,
-                force: false,
-            }))
+            .iris_query(rmcp::handler::server::wrapper::Parameters(Described::new(
+                serde_json::json!({"query": "SELECT 1"}),
+            )))
             .await
             .expect("the tool must answer, not error out of the transport");
         let text = match &r.content[0].raw {
@@ -11735,13 +11886,12 @@ mod wildcard_listing_failure_tests {
         );
         let tools = IrisTools::new_with_toolset(Some(conn), Toolset::Interop).unwrap();
         let r = tools
-            .iris_compile(rmcp::handler::server::wrapper::Parameters(CompileParams {
-                target: target.into(),
-                flags: "cuk".into(),
-                namespace: namespace.map(str::to_string),
-                force_writable: false,
-                inline: false,
-            }))
+            .iris_compile(rmcp::handler::server::wrapper::Parameters(Described::new(
+                match namespace {
+                    Some(ns) => serde_json::json!({"target": target, "namespace": ns}),
+                    None => serde_json::json!({"target": target}),
+                },
+            )))
             .await
             .expect("the tool must answer, not error out of the transport");
         let text = match &r.content[0].raw {
@@ -11827,13 +11977,9 @@ mod wildcard_listing_failure_tests {
             let tools = IrisTools::new_with_toolset(Some(conn), Toolset::Interop).unwrap();
 
             let r = tools
-                .iris_compile(rmcp::handler::server::wrapper::Parameters(CompileParams {
-                    target: "APPPKG.*".into(),
-                    flags: "cuk".into(),
-                    namespace: None,
-                    force_writable: false,
-                    inline: false,
-                }))
+                .iris_compile(rmcp::handler::server::wrapper::Parameters(Described::new(
+                    serde_json::json!({"target": "APPPKG.*"}),
+                )))
                 .await
                 .expect("the tool must answer, not error out of the transport");
 
@@ -14980,13 +15126,10 @@ mod http_status_answer_tests {
             let server =
                 server_with("POST", r".*/action/compile$", ResponseTemplate::new(401)).await;
             let r = tools_for(&server)
-                .iris_compile(Parameters(CompileParams {
-                    target: "Ens.Director.cls".into(),
-                    flags: "cuk".into(),
-                    namespace: Some("APP".into()),
-                    force_writable: false,
-                    inline: false,
-                }))
+                .iris_compile(Parameters(Described::new(serde_json::json!({
+                    "target": "Ens.Director.cls",
+                    "namespace": "APP"
+                }))))
                 .await
                 .expect("the tool must answer");
             let v = payload(&r);
