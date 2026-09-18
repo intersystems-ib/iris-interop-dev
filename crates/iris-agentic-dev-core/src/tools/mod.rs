@@ -5294,7 +5294,7 @@ impl IrisTools {
     }
 
     #[tool(
-        description = "Run %UnitTest.Manager tests on IRIS and return structured pass/fail results. Uses pure-HTTP execution via Atelier REST — works with or without IRIS_CONTAINER. Pass ONE exact compiled class name, e.g. 'MyApp.Tests.DT.Censo2Menus', or a package PREFIX such as 'MyApp.Tests', which expands to every compiled test class under that package and runs them in one call (uses /noload automatically). Pass a directory path like 'MyApp/Tests' to load from disk. Returns suite-level summary inline plus log_id for per-test-case detail via iris_get_log. Result fields: `completed` (the suite ran — the tool worked), `outcome` ('passed'|'failed'|'errors'|'no_tests'), `tests_passed`, and `success` (==tests_passed, kept for back-compat). A completed run with failed>0 is a REAL test result, NOT a tool failure — fix the test/code, don't retry the tool."
+        description = "Run %UnitTest.Manager tests on IRIS and return structured pass/fail results. Uses pure-HTTP execution via Atelier REST — works with or without IRIS_CONTAINER. Pass ONE exact compiled class name, e.g. 'MyApp.Tests.DT.Censo2Menus', or a package PREFIX such as 'MyApp.Tests', which expands to every compiled test class under that package and runs them in one call (uses /noload automatically). Pass a directory path like 'MyApp/Tests' to load from disk. Returns suite-level summary inline plus log_id for per-test-case detail via iris_get_log. A failed run ALSO returns failed_tests: the first 10 failures as {class_name, method, failure_message, failure_location, failure_assert}. Read those before calling anything else — log_id has the rest. Result fields: `completed` (the suite ran — the tool worked), `outcome` ('passed'|'failed'|'errors'|'no_tests'), `tests_passed`, and `success` (==tests_passed, kept for back-compat). A completed run with failed>0 is a REAL test result, NOT a tool failure — fix the test/code, don't retry the tool."
     )]
     async fn iris_test(
         &self,
@@ -5560,7 +5560,9 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
         {
             let read_sql = format!(
                 "SELECT tc.Name Class, tm.Name Method, tm.Status St, \
-                 (SELECT TOP 1 ta.Description FROM %UnitTest_Result.TestAssert ta WHERE ta.TestMethod=tm.ID AND ta.Status=0) FailMsg \
+                 (SELECT TOP 1 ta.Description FROM %UnitTest_Result.TestAssert ta WHERE ta.TestMethod=tm.ID AND ta.Status=0 ORDER BY ta.Counter) FailMsg, \
+                 (SELECT TOP 1 ta.Location FROM %UnitTest_Result.TestAssert ta WHERE ta.TestMethod=tm.ID AND ta.Status=0 ORDER BY ta.Counter) FailLoc, \
+                 (SELECT TOP 1 ta.Action FROM %UnitTest_Result.TestAssert ta WHERE ta.TestMethod=tm.ID AND ta.Status=0 ORDER BY ta.Counter) FailAct \
                  FROM %UnitTest_Result.TestMethod tm, %UnitTest_Result.TestCase tc, %UnitTest_Result.TestSuite ts \
                  WHERE tm.TestCase=tc.ID AND tc.TestSuite=ts.ID AND ts.TestInstance > {} ORDER BY tc.Name, tm.Name",
                 before_id
@@ -5582,11 +5584,16 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                                 serde_json::Value::Number(n) => n.as_i64() == Some(1),
                                 _ => false,
                             };
-                            let failure_message = r["FailMsg"]
-                                .as_str()
-                                .filter(|s| !s.is_empty())
-                                .map(|s| serde_json::Value::String(s.to_string()))
-                                .unwrap_or(serde_json::Value::Null);
+                            let str_or_null = |v: &serde_json::Value| {
+                                v.as_str()
+                                    .filter(|s| !s.is_empty())
+                                    .map(|s| serde_json::Value::String(s.to_string()))
+                                    .unwrap_or(serde_json::Value::Null)
+                            };
+                            let failure_message = str_or_null(&r["FailMsg"]);
+                            // #233: the line to open, and which assertion failed.
+                            let failure_location = str_or_null(&r["FailLoc"]);
+                            let failure_assert = str_or_null(&r["FailAct"]);
                             if is_passed {
                                 passed += 1;
                             } else {
@@ -5598,6 +5605,8 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                                 "status": if is_passed { "passed" } else { "failed" },
                                 "duration_ms": null,
                                 "failure_message": failure_message,
+                                "failure_location": failure_location,
+                                "failure_assert": failure_assert,
                             });
                             test_cases.push(tc.clone());
                             class_map.entry(cls).or_default().push(tc);
@@ -5689,6 +5698,10 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                         "status": if is_passed { "passed" } else { "failed" },
                         "duration_ms": null,
                         "failure_message": failure_message,
+                        // #233: the stdout fallback has no assert row to read, so these are
+                        // null here by construction — the shape stays uniform for callers.
+                        "failure_location": null,
+                        "failure_assert": null,
                     });
                     test_cases.push(tc.clone());
                     class_map.entry(current_class.clone()).or_default().push(tc);
@@ -5858,6 +5871,19 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
 
         // Record the TOOL call by whether the tool worked (the suite ran), not by whether the
         // tests passed — otherwise red tests inflate the tool's failure rate (issue #8).
+        // #233: the per-case detail is already parsed (from %UnitTest_Result.TestAssert, or
+        // the stdout fallback) and already stored behind log_id — and was then dropped at the
+        // last statement, so the tool description sent every red run for a second call. In the
+        // measured bench, 23 of 77 red runs were IMMEDIATELY followed by iris_get_log, and
+        // that 30% is a floor: it counts only the next call, not a get_log two later nor the
+        // Ens_Util.Log sweeps serving the same purpose. This is an exposure change — no new
+        // query, no new round trip.
+        //
+        // `failed_tests`, not `failures`: that name already means a COUNT inside each
+        // test_suites entry, and a reader should not have to work out which they hold.
+        let (failed_tests, failed_tests_total, failed_tests_truncated) =
+            inline_failed_tests(&test_cases);
+
         self.record_call("iris_test", completed);
         ok_json(serde_json::json!({
             "success": success,
@@ -5875,6 +5901,9 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
             "pattern": p.pattern,
             "namespace": namespace,
             "test_suites": test_suites,
+            "failed_tests": failed_tests,
+            "failed_tests_total": failed_tests_total,
+            "failed_tests_truncated": failed_tests_truncated,
         }))
     }
 
@@ -9985,6 +10014,42 @@ fn underscored_member_names(content: &str) -> Vec<String> {
     out
 }
 
+/// #233: the red cases to surface inline, the total, and whether the inline list was capped.
+///
+/// The per-case detail is already parsed (from %UnitTest_Result.TestAssert, or the stdout
+/// fallback) and already stored behind `log_id` — it was then dropped at the last statement, so
+/// the tool description sent every red run for a second call. In the measured bench 23 of 77 red
+/// runs were IMMEDIATELY followed by iris_get_log, and that 30% is a floor: it counts only the
+/// next call, not a get_log two later, nor the Ens_Util.Log sweeps serving the same purpose.
+///
+/// Pure and named so the FILTER and the CAP are testable without a live IRIS.
+pub fn inline_failed_tests(
+    test_cases: &[serde_json::Value],
+) -> (Vec<serde_json::Value>, usize, bool) {
+    /// Keeps a pathological suite from flooding the envelope. The caller learns about the
+    /// cap from the returned total and flag, so the truncation is never silent.
+    const MAX_INLINE_FAILURES: usize = 10;
+    let failed: Vec<&serde_json::Value> = test_cases
+        .iter()
+        .filter(|c| c["status"] == "failed")
+        .collect();
+    let inline: Vec<serde_json::Value> = failed
+        .iter()
+        .take(MAX_INLINE_FAILURES)
+        .map(|c| {
+            serde_json::json!({
+                "class_name": c["class_name"].clone(),
+                "method": c["name"].clone(),
+                "failure_message": c["failure_message"].clone(),
+                "failure_location": c["failure_location"].clone(),
+                "failure_assert": c["failure_assert"].clone(),
+            })
+        })
+        .collect();
+    let truncated = failed.len() > inline.len();
+    (inline, failed.len(), truncated)
+}
+
 pub fn note_error_undercount(
     payload: &mut serde_json::Value,
     detected: Option<usize>,
@@ -11167,6 +11232,128 @@ mod member_relevance_tests {
         // ...and the generic head alone never is, for any head.
         assert!(!member_list_is_relevant("SetNodeName", "SetWebServerPort"));
         assert!(!member_list_is_relevant("IsNodeName", "IsWebServerPort"));
+    }
+}
+
+#[cfg(test)]
+mod inline_failed_tests_tests {
+    use super::*;
+
+    fn case(name: &str, status: &str) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "class_name": "MyApp.Tests.DT.PatientToCensus",
+            "status": status,
+            "duration_ms": null,
+            "failure_message": if status == "failed" { serde_json::json!("1962-03-15 -> 15/03/1962 (DD/MM/YYYY)") } else { serde_json::Value::Null },
+            "failure_location": if status == "failed" { serde_json::json!("TestIso+3^MyApp.Tests.DT.PatientToCensus.cls") } else { serde_json::Value::Null },
+            "failure_assert": if status == "failed" { serde_json::json!("AssertEquals") } else { serde_json::Value::Null },
+        })
+    }
+
+    /// The whole point: a red run carries the method AND the assertion AND the line to open,
+    /// so the caller does not need the second iris_get_log trip.
+    #[test]
+    fn a_red_case_is_surfaced_with_the_line_to_open() {
+        let cases = vec![case("TestIsoDate", "failed"), case("TestOther", "passed")];
+        let (inline, total, truncated) = inline_failed_tests(&cases);
+        assert_eq!(total, 1);
+        assert!(!truncated);
+        assert_eq!(inline.len(), 1);
+        assert_eq!(inline[0]["method"], "TestIsoDate");
+        assert_eq!(inline[0]["class_name"], "MyApp.Tests.DT.PatientToCensus");
+        assert_eq!(inline[0]["failure_assert"], "AssertEquals");
+        // Measured on IRIS 2026.1: ta.Location is "<Method>+<n>^<Class>.cls".
+        assert!(
+            inline[0]["failure_location"]
+                .as_str()
+                .unwrap()
+                .contains("^"),
+            "{:?}",
+            inline[0]
+        );
+    }
+
+    /// A green run must not carry an entry, and must not invent one.
+    #[test]
+    fn a_green_run_surfaces_nothing() {
+        let cases = vec![case("TestA", "passed"), case("TestB", "passed")];
+        let (inline, total, truncated) = inline_failed_tests(&cases);
+        assert!(inline.is_empty());
+        assert_eq!(total, 0);
+        assert!(!truncated);
+    }
+
+    /// The cap must be visible, never silent: a suite with more than ten failures says how
+    /// many there really are and that log_id holds the rest.
+    #[test]
+    fn the_cap_is_reported_rather_than_hidden() {
+        let cases: Vec<_> = (0..14)
+            .map(|i| case(&format!("Test{i}"), "failed"))
+            .collect();
+        let (inline, total, truncated) = inline_failed_tests(&cases);
+        assert_eq!(inline.len(), 10, "the inline list is capped");
+        assert_eq!(
+            total, 14,
+            "the TOTAL must be the real count, not the capped one"
+        );
+        assert!(truncated, "a caller must be able to tell the list was cut");
+    }
+
+    /// Exactly ten is not truncated — an off-by-one here would claim log_id has more when
+    /// it does not.
+    #[test]
+    fn exactly_the_cap_is_not_truncated() {
+        let cases: Vec<_> = (0..10)
+            .map(|i| case(&format!("Test{i}"), "failed"))
+            .collect();
+        let (inline, total, truncated) = inline_failed_tests(&cases);
+        assert_eq!((inline.len(), total, truncated), (10, 10, false));
+    }
+
+    /// The stdout fallback has no assert row, so its location/assert are null by
+    /// construction — the shape stays uniform and the caller can tell "unknown" from "green".
+    #[test]
+    fn the_stdout_fallback_shape_survives() {
+        let fallback = serde_json::json!({
+            "name": "TestThing",
+            "class_name": "MyApp.Tests.X",
+            "status": "failed",
+            "duration_ms": null,
+            "failure_message": "some generic text",
+            "failure_location": null,
+            "failure_assert": null,
+        });
+        let (inline, total, _) = inline_failed_tests(&[fallback]);
+        assert_eq!(total, 1);
+        assert_eq!(inline[0]["failure_message"], "some generic text");
+        assert!(inline[0]["failure_location"].is_null());
+        assert!(inline[0]["failure_assert"].is_null());
+    }
+
+    /// #233 point 1: `TOP 1` with no ORDER BY left it unpinned which failing assert was
+    /// reported. ORDER BY ta.Counter makes it deterministically the FIRST, which is the one
+    /// wanted when a method fails several.
+    ///
+    /// WHAT THIS DOES NOT COVER: it checks the SELECT text, not that IRIS orders as expected —
+    /// that was verified separately against a live instance.
+    #[test]
+    fn every_failure_subquery_is_ordered() {
+        let src = include_str!("mod.rs");
+        let start = src
+            .find("SELECT tc.Name Class, tm.Name Method")
+            .expect("result query moved");
+        let q = &src[start..start + 1200];
+        let tops = q.matches("SELECT TOP 1 ta.").count();
+        assert_eq!(
+            tops, 3,
+            "expected Description, Location and Action subqueries: {q}"
+        );
+        assert_eq!(
+            q.matches("ORDER BY ta.Counter").count(),
+            tops,
+            "every TOP 1 over TestAssert must be ordered, or which assert is reported is luck"
+        );
     }
 }
 
