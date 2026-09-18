@@ -55,6 +55,29 @@ fn mcp_exchange_timed_with_toolset(
     toolset: Option<&str>,
     messages: &[serde_json::Value],
 ) -> (Vec<serde_json::Value>, std::time::Duration) {
+    mcp_exchange_full(toolset, None, messages)
+}
+
+/// Start the server with an explicit connection namespace.
+///
+/// #240: `test_execute_and_query_namespace_defaults_to_connection` required the OPERATOR to set
+/// `IRIS_NAMESPACE` to something other than USER, because "ran in the connection namespace" and
+/// "ran in a hardcoded USER" are indistinguishable when the connection namespace IS USER. That
+/// requirement is sound methodology and a bad precondition: CI sets IRIS_NAMESPACE=USER, so the
+/// test could not run there at all. Letting the test choose its own connection namespace makes
+/// the discrimination intrinsic instead of delegated.
+fn mcp_exchange_in_namespace(
+    namespace: &str,
+    messages: &[serde_json::Value],
+) -> Vec<serde_json::Value> {
+    mcp_exchange_full(None, Some(namespace), messages).0
+}
+
+fn mcp_exchange_full(
+    toolset: Option<&str>,
+    ns_override: Option<&str>,
+    messages: &[serde_json::Value],
+) -> (Vec<serde_json::Value>, std::time::Duration) {
     let bin = iris_dev_bin();
     let iris_host = std::env::var("IRIS_HOST").unwrap_or_default();
     let iris_port = std::env::var("IRIS_WEB_PORT").unwrap_or_else(|_| "52780".to_string());
@@ -78,7 +101,9 @@ fn mcp_exchange_timed_with_toolset(
         )
         .env(
             "IRIS_NAMESPACE",
-            std::env::var("IRIS_NAMESPACE").unwrap_or_else(|_| "USER".to_string()),
+            ns_override.map(str::to_string).unwrap_or_else(|| {
+                std::env::var("IRIS_NAMESPACE").unwrap_or_else(|_| "USER".to_string())
+            }),
         )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -637,18 +662,27 @@ fn test_execute_and_query_namespace_defaults_to_connection() {
     // IRIS_NAMESPACE — and succeeded silently against the wrong database.
     let iris_host = std::env::var("IRIS_HOST").unwrap_or_default();
     assert!(!iris_host.is_empty(), "IRIS_HOST must be set");
-    let conn_ns = std::env::var("IRIS_NAMESPACE").unwrap_or_else(|_| "USER".to_string());
-    assert_ne!(
-        conn_ns, "USER",
-        "run with IRIS_NAMESPACE pointing at a non-USER namespace"
-    );
+
+    // #240: this required the operator to point IRIS_NAMESPACE at a non-USER namespace, because
+    // "ran in the connection namespace" cannot be told from "ran in a hardcoded USER" when the
+    // connection namespace IS USER. Sound reasoning, unusable precondition: CI sets
+    // IRIS_NAMESPACE=USER, so the test failed there on its own third line.
+    //
+    // The discrimination is now intrinsic — the test starts the server in `%SYS`, which exists
+    // on every IRIS and is never USER. Measured: `WRITE $NAMESPACE` answers `%SYS`, and
+    // `Security.Users` is present in %SYS (1) and absent from USER (0), so the query half
+    // distinguishes the two namespaces by itself rather than by assuming the operator's setup.
+    let conn_ns = "%SYS";
 
     let exchange = |args: serde_json::Value, tool: &str| {
-        let responses = mcp_exchange(&[
-            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
-            serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
-            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":tool,"arguments":args}}),
-        ]);
+        let responses = mcp_exchange_in_namespace(
+            conn_ns,
+            &[
+                serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
+                serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+                serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":tool,"arguments":args}}),
+            ],
+        );
         find_response(&responses, 2).expect("no response")
     };
 
@@ -660,30 +694,32 @@ fn test_execute_and_query_namespace_defaults_to_connection() {
     ));
     assert_eq!(v["success"], true, "{v}");
     assert_eq!(
-        v["output"],
-        conn_ns.as_str(),
+        v["output"], conn_ns,
         "iris_execute ran in the wrong namespace: {v}"
     );
     assert_eq!(
-        v["namespace"],
-        conn_ns.as_str(),
+        v["namespace"], conn_ns,
         "response must name the namespace it ran in: {v}"
     );
 
-    // 2. iris_query without namespace → connection namespace too. The probe
-    //    class Ens.Director exists in the (interop-enabled) connection
-    //    namespace and not in USER, so the count distinguishes them.
+    // 2. iris_query without namespace → connection namespace too. `Security.Users` is a %SYS
+    //    class: 1 there, 0 in USER, so the count itself proves which namespace ran and a
+    //    hardcoded USER cannot produce this answer.
     let v = parse_tool_text(&exchange(
-        serde_json::json!({"query":"SELECT COUNT(*) AS n FROM %Dictionary.CompiledClass WHERE Name = 'Ens.Director'"}),
+        serde_json::json!({"query":"SELECT COUNT(*) AS n FROM %Dictionary.CompiledClass WHERE Name = 'Security.Users'"}),
         "iris_query",
     ));
     assert_eq!(v["success"], true, "{v}");
-    assert_eq!(v["namespace"], conn_ns.as_str(), "{v}");
+    assert_eq!(v["namespace"], conn_ns, "{v}");
     let n = v["rows"][0]["n"]
         .as_i64()
         .or_else(|| v["rows"][0]["n"].as_str().and_then(|s| s.parse().ok()))
         .unwrap_or(-1);
-    assert_eq!(n, 1, "iris_query ran in the wrong namespace: {v}");
+    assert_eq!(
+        n, 1,
+        "Security.Users must be found — 0 would mean the query ran in USER, not the \
+         connection namespace: {v}"
+    );
 }
 
 #[test]
@@ -1074,13 +1110,32 @@ fn test_message_content_search() {
             "search_table":{"prop":"NoSuchProp","value":"x"}}),
     );
     assert_eq!(r["error_code"], "SEARCH_PROP_NOT_FOUND", "{r}");
-    assert!(
-        r["available_props"]
-            .as_array()
-            .map(|a| a.iter().any(|v| v.as_str() == Some("PatientID")))
-            .unwrap_or(false),
-        "available_props must list the extent's fields: {r}"
-    );
+    // #240: this asserted `available_props` contains "PatientID", which requires a
+    // SearchTableClass to be configured on some production item. CI's bare container has no
+    // production at all, so `EnsLib.HL7.SearchTable` has no registered properties there and the
+    // assertion could not hold — the tool's answer was correct.
+    //
+    // Both branches assert something real, so neither is a silent skip. Where the extent HAS
+    // properties, they must be listed. Where it has none, the interesting property is the one
+    // this repo keeps having to fix: an empty list must arrive WITH the reason, not bare.
+    let props = r["available_props"].as_array().cloned().unwrap_or_default();
+    if props.is_empty() {
+        let hint = r["hint"].as_str().unwrap_or("");
+        assert!(
+            hint.contains("no registered properties"),
+            "an empty available_props must say WHY it is empty, or it reads as 'this extent \
+             has no such field': {r}"
+        );
+        assert!(
+            hint.contains("SearchTableClass"),
+            "the hint must name what to configure: {r}"
+        );
+    } else {
+        assert!(
+            props.iter().any(|v| v.as_str() == Some("PatientID")),
+            "available_props must list the extent's fields: {r}"
+        );
+    }
 
     // 5. valid prop, zero rows → success with the config-time indexing hint.
     let r = call(
