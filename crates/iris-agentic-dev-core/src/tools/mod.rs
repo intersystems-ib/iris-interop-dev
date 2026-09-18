@@ -456,7 +456,9 @@ pub fn no_tests_found_guidance(
     } else if !did_you_mean.is_empty() {
         format!(
             "Pattern '{pattern}' matched no runnable tests, but it is one segment away from a \
-             compiled test class in '{namespace}'. Did you mean: {}? Pass the exact class name \
+             compiled test class in '{namespace}'. Did you mean: {}? Pass the exact class name, \
+             or a package prefix — a prefix expands to every compiled test class UNDER it, so \
+             '{pattern}' reaching here means nothing is compiled under '{pattern}.' \
              (class names use /noload automatically). {count} test class(es) exist in this namespace.",
             did_you_mean.join(", ")
         )
@@ -637,8 +639,24 @@ pub async fn probe_test_class_shape(
 /// results and failures come back the same way they do for a production suite.
 ///
 /// A pattern that is not a compiled class — a package prefix like `MyApp.Tests`, which the
-/// tool description advertises — keeps the RunTest spec: there is no class to run, and
-/// `no_tests_found_guidance` answers with the near misses.
+/// tool description advertises — used to keep the RunTest spec, i.e. run NOTHING and answer
+/// NO_TESTS_FOUND with near misses. The traces then showed N `iris_test` calls in the same
+/// second, one per name in that list: the caller doing by hand what the server had computed
+/// and declined to act on. 5 of 14 students, 7 occurrences (#210).
+///
+/// It now EXPANDS, server-side, in this same body: one query for the compiled test classes
+/// under `<pattern>.`, then the same TestProduction/TestCase dispatch per class. One round
+/// trip, one correlation token, and the existing read-back aggregates because `test_suites`
+/// is already a list. If nothing is under the prefix, it falls back to the RunTest spec and
+/// today's NO_TESTS_FOUND + did_you_mean remains the right answer.
+///
+/// The TRAILING DOT is what makes it a package rather than a substring, so `MyApp.Tests`
+/// never picks up `MyApp.TestsOld`. Verified on IRIS 2026.1 against the live catalog:
+/// `%STARTSWITH '%UnitTest.'` returns 11 rows, `%STARTSWITH 'UnitTest.'` returns 0 (so it is
+/// a genuine prefix match, not a substring one), and dropping the dot returns 31. System
+/// classes are excluded, so a bare `%` cannot expand to the instance's own test suite.
+/// `PrimarySuper LIKE '%UnitTest.TestCase%'` also catches `%UnitTest.TestProduction`
+/// subclasses — verified: its chain is `~%UnitTest.TestProduction~%UnitTest.TestCase~...`.
 ///
 /// `^UnitTestRoot` is platform-aware (a temp dir under mgr on Windows, `/tmp/httest/`
 /// elsewhere) and the spec directory is created unconditionally — `CreateDirectoryChain`
@@ -657,7 +675,7 @@ set specDir=##class(%File).NormalizeDirectory($translate({pattern},".","/"),^Uni
 do ##class(%File).CreateDirectoryChain(specDir)
 set tCls={pattern}
 set tCC=##class(%Dictionary.CompiledClass).%OpenId(tCls)
-if $isobject(tCC)&&(tCC.PrimarySuper["%UnitTest.TestProduction") {{ do $classmethod(tCls,"Run") }} elseif $isobject(tCC)&&(tCC.PrimarySuper["%UnitTest.TestCase") {{ do ##class(%UnitTest.Manager).DebugRunTestCase("",tCls,"{flags}","","{token}") }} else {{ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}") }}"#,
+if $isobject(tCC)&&(tCC.PrimarySuper["%UnitTest.TestProduction") {{ do $classmethod(tCls,"Run") }} elseif $isobject(tCC)&&(tCC.PrimarySuper["%UnitTest.TestCase") {{ do ##class(%UnitTest.Manager).DebugRunTestCase("",tCls,"{flags}","","{token}") }} else {{ set tN=0 set tRS=##class(%SQL.Statement).%ExecDirect(,"SELECT Name FROM %Dictionary.CompiledClass WHERE PrimarySuper LIKE '%UnitTest.TestCase%' AND Name NOT LIKE '\%%' ESCAPE '\' AND Name %STARTSWITH ? ORDER BY Name",tCls_".") while tRS.%Next() {{ set tSub=tRS.%Get("Name") set tSCC=##class(%Dictionary.CompiledClass).%OpenId(tSub) if $isobject(tSCC)&&(tSCC.PrimarySuper["%UnitTest.TestProduction") {{ do $classmethod(tSub,"Run") set tN=tN+1 }} elseif $isobject(tSCC) {{ do ##class(%UnitTest.Manager).DebugRunTestCase("",tSub,"{flags}","","{token}") set tN=tN+1 }} }} if 'tN {{ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}") }} }}"#,
         token = token,
         pattern = pattern,
         flags = flags,
@@ -5276,7 +5294,7 @@ impl IrisTools {
     }
 
     #[tool(
-        description = "Run %UnitTest.Manager tests on IRIS and return structured pass/fail results. Uses pure-HTTP execution via Atelier REST — works with or without IRIS_CONTAINER. Pass a class name pattern like 'MyApp.Tests' or 'ISC.sql.TestFoo' to run already-compiled test classes (uses /noload automatically). Pass a directory path like 'MyApp/Tests' to load from disk. Returns suite-level summary inline plus log_id for per-test-case detail via iris_get_log. Result fields: `completed` (the suite ran — the tool worked), `outcome` ('passed'|'failed'|'errors'|'no_tests'), `tests_passed`, and `success` (==tests_passed, kept for back-compat). A completed run with failed>0 is a REAL test result, NOT a tool failure — fix the test/code, don't retry the tool."
+        description = "Run %UnitTest.Manager tests on IRIS and return structured pass/fail results. Uses pure-HTTP execution via Atelier REST — works with or without IRIS_CONTAINER. Pass ONE exact compiled class name, e.g. 'MyApp.Tests.DT.Censo2Menus', or a package PREFIX such as 'MyApp.Tests', which expands to every compiled test class under that package and runs them in one call (uses /noload automatically). Pass a directory path like 'MyApp/Tests' to load from disk. Returns suite-level summary inline plus log_id for per-test-case detail via iris_get_log. Result fields: `completed` (the suite ran — the tool worked), `outcome` ('passed'|'failed'|'errors'|'no_tests'), `tests_passed`, and `success` (==tests_passed, kept for back-compat). A completed run with failed>0 is a REAL test result, NOT a tool failure — fix the test/code, don't retry the tool."
     )]
     async fn iris_test(
         &self,
@@ -10747,10 +10765,30 @@ mod class_run_code_tests {
         let dispatch = code.lines().last().unwrap();
         assert!(dispatch.starts_with("if $isobject(tCC)"), "{dispatch}");
         assert!(dispatch.contains("elseif"), "{dispatch}");
+        // #210: TWO now, and the count is not the point — the ONE LINE is. The exact-class
+        // branch dispatches directly, and the else branch expands a package prefix and
+        // dispatches per class. Both must stay on this single line: the count used to be a
+        // proxy for "runs the class directly", and the assertions below state that directly.
         assert_eq!(
             dispatch.matches("DebugRunTestCase").count(),
+            2,
+            "one for the exact class, one inside the package expansion: {dispatch}"
+        );
+        assert!(
+            dispatch.contains("%STARTSWITH"),
+            "the package expansion must share the dispatch line, not add a new one: {dispatch}"
+        );
+        // The invariant this test exists for: no ObjectScript literal spans a source line.
+        assert!(
+            !code.trim_end().ends_with('\n'),
+            "trailing newline would split the dispatch: {code}"
+        );
+        assert_eq!(
+            code.lines()
+                .filter(|l| l.contains("DebugRunTestCase"))
+                .count(),
             1,
-            "the compiled-class branch runs the class directly: {dispatch}"
+            "both dispatches must live on ONE line: {code}"
         );
     }
 }
@@ -11129,6 +11167,99 @@ mod member_relevance_tests {
         // ...and the generic head alone never is, for any head.
         assert!(!member_list_is_relevant("SetNodeName", "SetWebServerPort"));
         assert!(!member_list_is_relevant("IsNodeName", "IsWebServerPort"));
+    }
+}
+
+#[cfg(test)]
+mod package_expansion_tests {
+    use super::*;
+
+    const FLAGS: &str = "/verbose=1/nodelete/noload";
+
+    /// #210: a package prefix was handed to RunTest, whose spec is a suite DIRECTORY under
+    /// ^UnitTestRoot that /noload deliberately leaves empty — so zero tests ran and the tool
+    /// answered NO_TESTS_FOUND while the server had already computed the class list for
+    /// did_you_mean. The traces show N iris_test calls in the same second, one per name.
+    #[test]
+    fn a_package_prefix_expands_under_the_trailing_dot() {
+        let code = build_class_test_run_code("MyApp.Tests", FLAGS, "tok");
+        // The trailing dot is what makes it a package and not a substring: 'MyApp.Tests'
+        // must never pick up 'MyApp.TestsOld'. Verified live on IRIS 2026.1 —
+        // %STARTSWITH 'UnitTest.' returns 0 rows where '%UnitTest.' returns 11.
+        assert!(code.contains(r#"Name %STARTSWITH ?"#), "{code}");
+        assert!(
+            code.contains(r#"tCls_".""#),
+            "the bound prefix must carry the dot: {code}"
+        );
+        // The probe must keep PrimarySuper, not Super: TestProduction subclasses extend
+        // TestCase through the chain (verified: ~%UnitTest.TestProduction~%UnitTest.TestCase~).
+        assert!(
+            code.contains("PrimarySuper LIKE '%UnitTest.TestCase%'"),
+            "{code}"
+        );
+        // System classes must not expand — a bare '%' cannot run the instance's own suite.
+        assert!(code.contains(r#"Name NOT LIKE '\%%' ESCAPE '\'"#), "{code}");
+    }
+
+    /// The fallback must survive: when nothing is compiled under the prefix, the RunTest spec
+    /// still runs and NO_TESTS_FOUND + did_you_mean remains the right answer.
+    #[test]
+    fn it_falls_back_to_the_runtest_spec_when_nothing_is_under_the_prefix() {
+        let code = build_class_test_run_code("MyApp.Tests", FLAGS, "tok");
+        assert!(
+            code.contains("if 'tN {"),
+            "the zero-expansion guard is missing: {code}"
+        );
+        assert!(code.contains("RunTest("), "{code}");
+    }
+
+    /// Each expanded class goes through the SAME dispatch as an exact class name — a
+    /// TestProduction subclass through its own Run(), anything else through DebugRunTestCase.
+    /// That is the proven path; the expansion must not invent a second way to run a class.
+    #[test]
+    fn expanded_classes_use_the_same_dispatch_as_an_exact_class() {
+        let code = build_class_test_run_code("MyApp.Tests", FLAGS, "tok");
+        assert_eq!(
+            code.matches(r#"PrimarySuper["%UnitTest.TestProduction""#)
+                .count(),
+            2,
+            "one for the exact class, one per expanded class: {code}"
+        );
+        assert_eq!(code.matches("DebugRunTestCase").count(), 2, "{code}");
+        // The correlation token reaches the expanded runs too, or the read-back finds nothing.
+        assert_eq!(
+            code.matches("\"tok\"").count(),
+            3,
+            "token missing from a branch: {code}"
+        );
+    }
+
+    /// An exact class name must be unaffected: it still runs as one class, and the expansion
+    /// query is never reached for it (the else branch is not taken).
+    #[test]
+    fn an_exact_class_name_still_runs_as_one_class() {
+        let code = build_class_test_run_code("MyApp.Tests.DT.Censo2Menus", FLAGS, "tok");
+        assert!(
+            code.contains(r#"set tCls="MyApp.Tests.DT.Censo2Menus""#),
+            "{code}"
+        );
+        // The dispatch order is what makes this true: $isobject(tCC) wins before the else.
+        assert!(
+            code.find("$isobject(tCC)").unwrap() < code.find("%STARTSWITH").unwrap(),
+            "the exact-class branch must be evaluated first: {code}"
+        );
+    }
+
+    /// #67: the pattern is escaped ObjectScript-style wherever it appears, including the new
+    /// expansion. A quote in the pattern must not break out of the literal.
+    #[test]
+    fn the_pattern_is_escaped_in_every_position() {
+        let code = build_class_test_run_code(r#"Foo"Bar.Tests"#, FLAGS, "tok");
+        assert!(
+            !code.contains("\\\""),
+            "no C-style escaping may survive: {code}"
+        );
+        assert!(code.contains(r#""Foo""Bar.Tests""#), "{code}");
     }
 }
 
