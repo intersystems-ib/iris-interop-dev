@@ -164,6 +164,32 @@ pub fn http_status_fail(
 /// Mechanical recoveries for failures the workshop data showed carry no hint
 /// (22/38 in issue #2). A hint earns its place only when the fix is known and
 /// mechanical — generic advice is noise.
+/// #205: `ErrProductionSuspendedMismatch` had no hint arm, so it arrived bare — and it is the
+/// worse of the two to read bare, because it names the OLD REGISTERED production, not the one
+/// the caller asked to start. The model concludes it typed the wrong name and starts renaming
+/// and re-creating production classes, which is the opposite of the fix. In the measured
+/// cohort 7 of 7 ErrProductionNotShutdownCleanly envelopes carried a hint and 0 of 9 of these
+/// did.
+///
+/// Three branches, not the obvious one-liner: "stop the suspended one" is useless for the
+/// dominant case, where the registered class does not exist and a force-stop leaves the
+/// namespace Stopped with the next differently-named start refused again.
+///
+/// Provenance: RecoverProduction's no-op-unless-Troubled behaviour is Developing Productions
+/// §12.3; CleanProduction and its warning are §13.1.3. `iris_doc(mode="head")` is a real mode.
+pub const SUSPENDED_MISMATCH_HINT: &str =
+    "The QUOTED name is the production REGISTERED in this namespace, not the one you asked \
+     for — do NOT change the name you typed. (1) Check whether that class exists: \
+     iris_doc(mode=\"head\", name=\"<quoted name>.cls\"). (2) exists:true -> \
+     iris_production(action=\"stop\", force=true); stop takes no name, it always targets the \
+     registered production, which is the one quoted here — then start yours. (3) exists:false \
+     -> the quoted name is an orphaned RUNTIME registration and not a production at all: \
+     neither stop nor recover clears it (RecoverProduction returns without acting unless the \
+     production is Troubled, EGDV 12.3). Run iris_execute(namespace=\"<NS>\", \
+     code=\"Do ##class(Ens.Director).CleanProduction()\") and start again. CAUTION: \
+     CleanProduction removes all messages from queues and all current information about the \
+     production (EGDV 13.1.3) — development only, never on a deployed production.";
+
 fn builtin_hint(code: &str, msg: &str) -> Option<String> {
     if msg.contains("ErrProductionNotShutdownCleanly") {
         return Some(
@@ -172,6 +198,9 @@ fn builtin_hint(code: &str, msg: &str) -> Option<String> {
              iris_production action=recover, then retry."
                 .into(),
         );
+    }
+    if msg.contains("ErrProductionSuspendedMismatch") {
+        return Some(SUSPENDED_MISMATCH_HINT.into());
     }
     if code == "IRIS_UNREACHABLE" {
         return Some(

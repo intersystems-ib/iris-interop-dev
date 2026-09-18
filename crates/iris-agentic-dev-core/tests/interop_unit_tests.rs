@@ -1262,7 +1262,9 @@ mod enumeration_redirect_tests {
         let v = envelope(rt().block_on(interop_production_item_impl(
             None,
             ProductionItemParams {
-                action: "list".into(),
+                // #204 made `list` a REAL action, so it can no longer stand in for an
+                // invalid one. `items` is the neighbouring guess and is still not an action.
+                action: "items".into(),
                 // #218's refusal must not pre-empt this: the ACTION is the error here.
                 item: "Any.Item".into(),
                 namespace: "APP".into(),
@@ -1278,16 +1280,77 @@ mod enumeration_redirect_tests {
         assert_eq!(v["error_code"], "INVALID_ACTION");
         let hint = v["hint"].as_str().unwrap_or("");
         assert!(!hint.is_empty(), "7 of 7 envelopes carried no hint: {v}");
-        // It must say where the answer IS, and be honest that no listing action exists.
-        assert!(hint.contains("iris_doc"), "{hint}");
+        // #215 shipped this saying "no listing action exists", which was the honest answer
+        // then. #204 built one, so the hint now names the real capability. The invariant
+        // that survives the change: it only ever names actions that actually work.
         assert!(
-            hint.contains("no listing action"),
-            "must admit the capability does not exist rather than invent one: {hint}"
+            hint.contains("action='list'"),
+            "must name the enumeration #204 added: {hint}"
         );
-        // And must NOT forward-reference the capabilities that do not work yet (#204).
+        assert!(hint.contains("full=true"), "{hint}");
         assert!(
-            !hint.contains("full=true") && !hint.contains("config_items"),
+            !hint.contains("no listing action"),
+            "stale text from before #204: {hint}"
+        );
+        // `config_items` never existed on iris_interop_query and still does not.
+        assert!(
+            !hint.contains("config_items"),
             "points at a capability that does not exist: {hint}"
+        );
+    }
+
+    /// #204: `list` is now a real action, so the action guard must let it through. With
+    /// iris: None it can only reach the connection check — IRIS_UNREACHABLE here is the
+    /// evidence it was NOT refused as an unknown action, and that `item` is not required
+    /// for it (the #218 refusal was narrowed to the actions that name one item).
+    #[test]
+    fn list_is_a_real_action_and_needs_no_item() {
+        let v = envelope(rt().block_on(interop_production_item_impl(
+            None,
+            ProductionItemParams {
+                action: "list".into(),
+                item: String::new(),
+                namespace: "APP".into(),
+                settings: HashMap::new(),
+                apply: true,
+                class_name: None,
+                enabled: None,
+                production: None,
+                pool_size: None,
+                category: None,
+            },
+        )));
+        assert_eq!(
+            v["error_code"], "IRIS_UNREACHABLE",
+            "list with no item must reach the connection check, not be refused: {v}"
+        );
+        assert!(
+            PRODUCTION_ITEM_ACTIONS.contains(&"list"),
+            "list must be advertised in the action set"
+        );
+        assert!(
+            !ACTIONS_NEEDING_AN_ITEM.contains(&"list"),
+            "list enumerates; it must not require an item"
+        );
+        // ...while an action that DOES name one item still refuses a blank one (#218).
+        let v = envelope(rt().block_on(interop_production_item_impl(
+            None,
+            ProductionItemParams {
+                action: "get_settings".into(),
+                item: String::new(),
+                namespace: "APP".into(),
+                settings: HashMap::new(),
+                apply: true,
+                class_name: None,
+                enabled: None,
+                production: None,
+                pool_size: None,
+                category: None,
+            },
+        )));
+        assert_eq!(
+            v["error_code"], "MISSING_PARAMETER",
+            "#218 must still hold: {v}"
         );
     }
 
@@ -1328,5 +1391,206 @@ mod enumeration_redirect_tests {
         let h = enumeration_redirect("iris_lookup_manage", "list").expect("must redirect");
         assert!(h.contains("list_keys"), "{h}");
         assert!(h.contains("list_tables"), "{h}");
+    }
+}
+
+/// #204: `full` was parsed into full_status, advertised as "include per-item detail", and
+/// never read — 13 of 14 students, 55 full:true calls, every one answered byte-identically
+/// to the same call without it. Nothing in the toolset returned the config-item names, so the
+/// model guessed them and collected ITEM_NOT_FOUND.
+mod production_item_enumeration {
+    use super::*;
+
+    /// The trap the issue names as the most likely wrong turn: the item list lives in the
+    /// production class's XData ProductionDefinition, NOT in a queryable extent. The cohort's
+    /// own attempts against ENS_CONFIG.SETTING came back SQLCODE -30.
+    #[test]
+    fn items_are_read_from_the_production_object_never_from_sql() {
+        let code = build_list_items_code("My.Production");
+        assert!(
+            !code.to_ascii_uppercase().contains("SELECT"),
+            "enumeration must not go through SQL:\n{code}"
+        );
+        for token in ["Ens_Config.Item", "ENS_CONFIG", "Ens_Config.Setting"] {
+            assert!(
+                !code.contains(token),
+                "{token} is not the source of truth:\n{code}"
+            );
+        }
+        assert!(
+            code.contains("##class(Ens.Config.Production).%OpenId"),
+            "{code}"
+        );
+        assert!(code.contains("tProd.Items.Count()"), "{code}");
+        assert!(code.contains("tProd.Items.GetAt(i)"), "{code}");
+    }
+
+    /// THE DEFECT ITSELF: `full` was parsed into full_status and never read. The codegen and
+    /// parser tests above both pass with the flag ignored again — mutation proved it — so this
+    /// is the one that actually covers #204. The status path needs a live IRIS to drive, so it
+    /// is guarded in the source, scoped to that function.
+    ///
+    /// WHAT THIS DOES NOT COVER: that the items reach the envelope correctly at runtime, only
+    /// that the flag is consulted and feeds the shared codegen. The parse is covered above.
+    #[test]
+    fn full_status_is_actually_read_by_the_status_path() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("tools")
+                .join("interop.rs"),
+        )
+        .expect("readable interop.rs");
+        let func = "pub async fn interop_production_status_impl";
+        let start = src
+            .find(func)
+            .unwrap_or_else(|| panic!("{func} moved — re-point this guard (#204)"));
+        let rest = &src[start + func.len()..];
+        let body = &rest[..rest.find("\npub async fn ").unwrap_or(rest.len())];
+
+        assert!(
+            body.contains("params.full_status"),
+            "full_status is parsed and advertised but not READ — that IS #204"
+        );
+        assert!(
+            body.contains("build_list_items_code"),
+            "the enumeration must come from the shared codegen, not a second copy"
+        );
+        assert!(
+            body.contains("parse_list_items"),
+            "the rows must go through the shared parser"
+        );
+    }
+
+    /// It must open the production the SHARED way, so `production=` and the running-production
+    /// fallback behave exactly as they do for every other action (#119).
+    #[test]
+    fn it_uses_the_shared_prologue() {
+        let prologue = resolve_production_prologue("My.Production");
+        assert!(build_list_items_code("My.Production").starts_with(&prologue));
+        // ...and with no name it resolves the running production rather than embedding "".
+        let empty = build_list_items_code("");
+        assert!(empty.starts_with(&resolve_production_prologue("")));
+        assert!(empty.contains("GetProductionStatus"), "{empty}");
+    }
+
+    /// Only the five properties build_add_item_code already WRITES are read back, so nothing
+    /// new is assumed about Ens.Config.Item.
+    #[test]
+    fn the_tab_delimited_rows_parse_into_the_items_array() {
+        let out = "BS.In\tEnsLib.HL7.Service.FileService\t1\t2\tInbound\n\
+                   BO.Out\tDemo.BO.Writer\t0\t0\t\n";
+        let items = parse_list_items(out);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["name"], "BS.In");
+        assert_eq!(items[0]["class_name"], "EnsLib.HL7.Service.FileService");
+        assert_eq!(items[0]["enabled"], true);
+        assert_eq!(items[0]["pool_size"], 2);
+        assert_eq!(items[0]["category"], "Inbound");
+        // A disabled item with no category must not become a missing key or a panic.
+        assert_eq!(items[1]["enabled"], false);
+        assert_eq!(items[1]["pool_size"], 0);
+        assert_eq!(items[1]["category"], "");
+    }
+
+    /// Blank and short lines are survivable: the output is device text, and a trailing newline
+    /// is normal. A truncated row must not drop the whole enumeration.
+    #[test]
+    fn ragged_output_does_not_lose_the_list() {
+        let items = parse_list_items("A\tCls.A\t1\t0\tCat\n\n   \nB\tCls.B\n");
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert_eq!(items[1]["name"], "B");
+        assert_eq!(items[1]["class_name"], "Cls.B");
+        // Absent fields default rather than vanish.
+        assert_eq!(items[1]["enabled"], false);
+        assert_eq!(items[1]["pool_size"], serde_json::Value::Null);
+        assert_eq!(items[1]["category"], "");
+    }
+}
+
+/// #205: recover returned the LITERAL {"state":"Running"} without reading it back.
+/// RecoverProduction cleans up a Troubled instance; it does not start one, and it returns
+/// without acting at all when the production is not Troubled (EGDV 12.3). A Suspended
+/// production is not Troubled, so the method did nothing and the server reported Running.
+mod recover_state_readback {
+
+    /// The asserted literal must be gone from both lifecycle paths.
+    #[test]
+    fn no_lifecycle_action_asserts_a_state_it_did_not_read() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("tools")
+                .join("interop.rs"),
+        )
+        .expect("readable interop.rs");
+
+        // Scoped to the two functions #205 names. An earlier version of this guard scanned
+        // the whole file and failed on interop_production_start_impl — where the assertion is
+        // SOUND: an OK from StartProduction means it started, unlike RecoverProduction, which
+        // returns without acting at all unless the production is Troubled (EGDV 12.3). So
+        // `start` is deliberately out of scope, not overlooked.
+        //
+        // WHAT THIS DOES NOT COVER: it checks these two windows for one spelling of the
+        // literal. A third lifecycle action that asserts a state it never read would pass.
+        fn body_of<'a>(src: &'a str, func: &str) -> &'a str {
+            let start = src
+                .find(func)
+                .unwrap_or_else(|| panic!("{func} moved — re-point this guard (#205)"));
+            let rest = &src[start + func.len()..];
+            let end = rest.find("\npub async fn ").unwrap_or(rest.len());
+            &rest[..end]
+        }
+        for (func, literal) in [
+            (
+                "pub async fn interop_production_recover_impl",
+                "\"state\": \"Running\"",
+            ),
+            (
+                "pub async fn interop_production_stop_impl",
+                "\"state\": \"Stopped\"",
+            ),
+        ] {
+            let body = body_of(&src, func);
+            assert!(
+                body.contains("GetProductionStatus"),
+                "{func} must READ the state back, not assert it (#205)"
+            );
+            // The literal may still appear as the no-production-registered fallback, which is
+            // a real reading of an actual status response — so what is asserted is that the
+            // read happens, plus that the OK branch no longer returns the bare two-key form.
+            assert!(
+                !body.contains(&format!(
+                    "ok_json(serde_json::json!({{\"success\": true, {literal}}}))"
+                )),
+                "{func} still returns the asserted state without reading it (#205)"
+            );
+        }
+    }
+
+    /// The hint that was missing from 9 of 9 envelopes, and what it must NOT say.
+    #[test]
+    fn the_suspended_mismatch_hint_says_not_to_rename() {
+        let h = iris_agentic_dev_core::tools::envelope::SUSPENDED_MISMATCH_HINT;
+        // The trap: the quoted name is the REGISTERED production, not the caller's.
+        assert!(h.contains("do NOT change the name you typed"), "{h}");
+        // All three branches, because "just stop it" is useless when the class is orphaned.
+        assert!(
+            h.contains("mode=\"head\""),
+            "branch 1 (does the class exist) missing"
+        );
+        assert!(
+            h.contains("force=true"),
+            "branch 2 (stop the registered one) missing"
+        );
+        assert!(
+            h.contains("CleanProduction"),
+            "branch 3 (orphaned registration) missing"
+        );
+        // CleanProduction is destructive — the caution is not optional.
+        assert!(
+            h.contains("CAUTION") && h.contains("never on a deployed production"),
+            "the CleanProduction warning (EGDV 13.1.3) must travel with it: {h}"
+        );
     }
 }
