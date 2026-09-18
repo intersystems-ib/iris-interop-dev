@@ -3215,24 +3215,44 @@ async fn enrich_abort(
                 .collect();
 
             if !members.is_empty() {
-                resp["did_you_mean"] = members
-                    .iter()
-                    .take(8)
-                    .map(|m| serde_json::Value::String(m.clone()))
-                    .collect();
-                if !hint.is_empty() {
-                    hint.push(' ');
-                }
-                hint.push_str(&format!(
-                    "'{class}' has no '{member}'. It declares: {}. \
-                     (docs_introspect(class_name='{class}') lists all of them.)",
-                    members
+                // #207: `rank_members` has already put the best candidate first, so one score
+                // is enough. When even that one shares no >3-character word and matches no
+                // more than the generic head (Get/Set/Is), the eight names that follow are the
+                // TIE-BREAK order — shape then length — and have nothing to do with the
+                // question, while being worded exactly like the case where the first entry IS
+                // the answer. 11 of 14 students, 47 occurrences; the observed next move was
+                // another invented class, not docs_introspect.
+                if !member_list_is_relevant(&members[0], member) {
+                    if !hint.is_empty() {
+                        hint.push(' ');
+                    }
+                    hint.push_str(&format!(
+                        "'{class}' has no '{member}', and nothing it declares resembles it — \
+                         this is probably not the class that carries it. Do not guess another \
+                         class name: docs_introspect(class_name='{class}') lists every member \
+                         of this one, and find_subclass_implementations(method_name='{member}', \
+                         base_classes=[...]) finds which classes implement that member."
+                    ));
+                } else {
+                    resp["did_you_mean"] = members
                         .iter()
                         .take(8)
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
+                        .map(|m| serde_json::Value::String(m.clone()))
+                        .collect();
+                    if !hint.is_empty() {
+                        hint.push(' ');
+                    }
+                    hint.push_str(&format!(
+                        "'{class}' has no '{member}'. It declares: {}. \
+                         (docs_introspect(class_name='{class}') lists all of them.)",
+                        members
+                            .iter()
+                            .take(8)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
             }
         }
     }
@@ -3714,6 +3734,51 @@ fn camel_words(name: &str) -> Vec<String> {
 /// What the caller wants shares a WORD — `StartProduction`, `StopProduction`,
 /// `GetProductionStatus`. Words of three characters or fewer (`get`, `is`, `on`) are skipped:
 /// they match everything and therefore rank nothing.
+/// #207: how well the best-ranked member ACTUALLY matches the name the caller wrote.
+///
+/// `rank_members` sorts by shared CamelCase word, then common prefix, then shape — but keeps
+/// no score, so "nothing here resembles what you asked for" and "the first one is your answer"
+/// left the server worded identically. This is the member-level equivalent of the floor
+/// `rank_near_misses` already applies to CLASS names, whose design comment argues this case:
+/// "The whole package is not an answer — 'did you mean one of these 20?' is the same guess the
+/// caller already made."
+///
+/// `rank_near_misses` cannot simply be reused here, and it is worth saying why so nobody tries:
+/// its floor is 3 shared opening characters, and shared_prefix_len("getwebserverport",
+/// "getuniqueinstancename") is exactly 3 — every `Get*` member of the class clears it, and the
+/// motivating case would still publish five unrelated getters. A member needs a shared WORD,
+/// with the generic head explicitly not counting.
+fn member_match_score(name: &str, wanted: &str) -> (usize, usize) {
+    let words: Vec<String> = camel_words(wanted)
+        .into_iter()
+        .filter(|w| w.len() > 3)
+        .collect();
+    let lower = name.to_ascii_lowercase();
+    let want_lower = wanted.to_ascii_lowercase();
+    let shared = words.iter().filter(|w| lower.contains(w.as_str())).count();
+    let prefix = lower
+        .chars()
+        .zip(want_lower.chars())
+        .take_while(|(a, b)| a == b)
+        .count();
+    (shared, prefix)
+}
+
+/// Is a member list worth publishing at all (#207)? `rank_members` has already put the best
+/// candidate first, so its score decides for the whole list. Named rather than inlined at the
+/// call site so the DECISION is unit-testable, not merely its two inputs — the branch is what
+/// shipped wrong for 47 occurrences.
+fn member_list_is_relevant(best: &str, wanted: &str) -> bool {
+    let (shared, prefix) = member_match_score(best, wanted);
+    shared > 0 || prefix > generic_head_len(wanted)
+}
+
+/// The generic head of an identifier — `Get`, `Set`, `Is`. A common prefix no longer than this
+/// is evidence of nothing: every getter on the class shares it (#207).
+fn generic_head_len(wanted: &str) -> usize {
+    camel_words(wanted).first().map_or(0, |w| w.len())
+}
+
 fn rank_members(names: &mut [String], wanted: &str) {
     let words: Vec<String> = camel_words(wanted)
         .into_iter()
@@ -10889,6 +10954,81 @@ mod member_kind_tests {
             member_kind_mismatch_hint("My.Cls", "Thing", "CLASS PROPERTY", MemberKind::Method)
                 .is_some()
         );
+    }
+}
+
+#[cfg(test)]
+mod member_relevance_tests {
+    use super::*;
+
+    /// The 47-occurrence field case. `%SYS.System` has no member containing `server` or
+    /// `port`, so every candidate scored 0 and what got published was the TIE-BREAK order:
+    /// GetUniqueInstanceName leads because it has four words and is 21 characters long, not
+    /// because it relates to a web server port.
+    #[test]
+    fn the_field_case_is_scored_as_the_non_match_it_is() {
+        assert_eq!(
+            member_match_score("GetUniqueInstanceName", "GetWebServerPort"),
+            (0, 3),
+            "shared words must be 0 and the prefix only the generic `get`"
+        );
+        assert_eq!(generic_head_len("GetWebServerPort"), 3);
+        assert!(
+            !member_list_is_relevant("GetUniqueInstanceName", "GetWebServerPort"),
+            "the list must be suppressed for the measured case"
+        );
+        // Every one of the eight published names fails the floor, not just the first.
+        for m in [
+            "GetUniqueInstanceName",
+            "GetDefaultSignatureHash",
+            "GetInstanceName",
+            "GetRoutineCache",
+            "GetGlobalCache",
+            "GetSwitchState",
+            "GetNodeName",
+            "GetCPFFileName",
+        ] {
+            assert!(
+                !member_list_is_relevant(m, "GetWebServerPort"),
+                "{m} should not qualify"
+            );
+        }
+    }
+
+    /// The case the list was BUILT for (#124) must keep it. `ValidateProduction` shares the
+    /// word `production` with `StartProduction`, so the floor is cleared and the eight names
+    /// are published exactly as before.
+    #[test]
+    fn a_shared_word_still_publishes_the_list() {
+        assert_eq!(
+            member_match_score("StartProduction", "ValidateProduction").0,
+            1
+        );
+        assert!(member_list_is_relevant(
+            "StartProduction",
+            "ValidateProduction"
+        ));
+        assert!(member_list_is_relevant(
+            "StopProduction",
+            "ValidateProduction"
+        ));
+        assert!(member_list_is_relevant(
+            "GetProductionStatus",
+            "ValidateProduction"
+        ));
+    }
+
+    /// A real prefix match beyond the generic head still counts, even with no shared word —
+    /// `GetWebServerPort` vs `GetWebServer` is a genuine near-miss, not a coincidence.
+    #[test]
+    fn a_prefix_longer_than_the_generic_head_qualifies() {
+        assert!(
+            member_list_is_relevant("GetWebServer", "GetWebServerPort"),
+            "a 12-char shared prefix is evidence, unlike the 3-char `get`"
+        );
+        // ...and the generic head alone never is, for any head.
+        assert!(!member_list_is_relevant("SetNodeName", "SetWebServerPort"));
+        assert!(!member_list_is_relevant("IsNodeName", "IsWebServerPort"));
     }
 }
 
