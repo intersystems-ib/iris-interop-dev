@@ -18,7 +18,7 @@
   "profile_surface": {
     "test": "mcp_handshake::mcp_server_tools_list_returns_interop_profile",
     "status": "OK",
-    "note": "asserts exactly the 23 interop tools, meta tools pruned"
+    "note": "asserts exactly the 28 interop tools, meta tools pruned"
   },
   "tools": [
     {
@@ -158,6 +158,36 @@
       "unit": null,
       "e2e": null,
       "status": "profile-only"
+    },
+    {
+      "tool": "iris_symbols_local",
+      "unit": "tools::symbols_local (grammar-backed outline)",
+      "e2e": "mcp_handshake::mcp_server_tools_list_returns_interop_profile (pinned by name)",
+      "status": "OK"
+    },
+    {
+      "tool": "iris_execute_method",
+      "unit": "tools::execute_method::* (21)",
+      "e2e": "mcp_handshake::mcp_server_tools_list_returns_interop_profile (pinned by name)",
+      "status": "OK"
+    },
+    {
+      "tool": "iris_macro",
+      "unit": "tools::info::macro_action_tests::* (12)",
+      "e2e": "interop_e2e_tests::macro_includes_are_derived_from_the_document",
+      "status": "OK"
+    },
+    {
+      "tool": "hl7_schema_list",
+      "unit": "tools::hl7_schema::tests::categories_parse_with_the_standard_flag",
+      "e2e": "interop_e2e_tests::hl7_schema_list_returns_this_instances_categories",
+      "status": "OK"
+    },
+    {
+      "tool": "hl7_schema_inspect",
+      "unit": "tools::hl7_schema::tests::* (13)",
+      "e2e": "interop_e2e_tests::hl7_schema_inspect_names_repeating_fields",
+      "status": "OK"
     }
   ]
 }

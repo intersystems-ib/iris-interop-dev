@@ -310,6 +310,7 @@ pub mod dict;
 pub mod doc;
 pub mod envelope;
 pub mod execute_method;
+pub mod hl7_schema;
 pub mod info;
 pub mod interop;
 pub mod log_store;
@@ -326,29 +327,29 @@ pub use scm::ScmParams;
 /// Read from `IRIS_TOOLSET` env var or `--toolset` CLI flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Toolset {
-    /// 55 tools advertised (measured 2026-09-18). NOT this fork's default —
+    /// 57 tools advertised (measured 2026-09-18). NOT this fork's default —
     /// `--toolset` defaults to `interop`; baseline is opt-in via IRIS_TOOLSET/--toolset.
     /// Note this is already a pruned router: the 59 tools the `#[tool_router]` macro
     /// registers minus the 4 merged-only ones. Was 54 of 58 before iris_execute_method.
     Baseline,
-    /// 51 tools advertised (measured 2026-09-18). Baseline minus the 4 NOT_IMPLEMENTED
+    /// 53 tools advertised (measured 2026-09-18). Baseline minus the 4 NOT_IMPLEMENTED
     /// stubs (skill_propose, skill_optimize, skill_share, skill_community_install).
     /// No merged dispatchers. Not this fork's default.
     Nostub,
-    /// 47 tools advertised (measured 2026-09-18). Nostub (51) minus 8 — the 4 debug_*
+    /// 49 tools advertised (measured 2026-09-18). Nostub (53) minus 8 — the 4 debug_*
     /// folded into iris_debug, the 3 container tools folded into iris_containers, and
     /// agent_info dropped outright — plus the 4 merged-only tools iris_debug,
-    /// iris_containers, iris_admin, iris_get_log. 51 - 8 + 4 = 47.
+    /// iris_containers, iris_admin, iris_get_log. 53 - 8 + 4 = 49.
     /// Not this fork's default.
     Merged,
-    /// 26 tools advertised (measured 2026-09-18) — exactly `INTEROP_TOOLS`. THIS FORK'S
+    /// 28 tools advertised (measured 2026-09-18) — exactly `INTEROP_TOOLS`. THIS FORK'S
     /// DEFAULT: `--toolset` carries `default_value = "interop"` (see
     /// crates/iris-agentic-dev-bin/src/cmd/mcp.rs). Keeps only the tools the iris-interop
     /// skills actually exercise; everything else (skill_*/kb_*/agent_*/generate_*/
     /// individual debug_*/container/scm) is pruned. The count does NOT drop on a
     /// write-disallowed connection: #114 stopped the gate removing iris_production_item and
     /// iris_credential_manage from the router, because removing them took their READ actions
-    /// with them (no iris_production_item meant no get_settings). All 26 stay advertised and
+    /// with them (no iris_production_item meant no get_settings). All 28 stay advertised and
     /// a write is refused at CALL time instead — see
     /// a_write_disallowed_connection_still_lists_every_tool.
     /// Additive: tool *code* is unchanged so upstream stays mergeable.
@@ -428,6 +429,12 @@ pub const INTEROP_TOOLS: &[&str] = &[
     // asserted wrongly in three files before a peer corrected it. action=location answers
     // "which Include do I need" from IRIS instead of from memory.
     "iris_macro",
+    // #246: "address HL7 segments and fields by NAME, not by position" was promoted across six
+    // skills, and the only documented way to look a name up was the Schema Editor GUI or a
+    // hand-rolled probe of GetFieldNameFromNumber — which returns empty for exactly the
+    // repeating fields people convert first (PID:3, PID:5, OBX:5).
+    "hl7_schema_list",
+    "hl7_schema_inspect",
 ];
 
 pub const ERR_NO_TESTS_FOUND: &str = "NO_TESTS_FOUND";
@@ -1863,7 +1870,7 @@ impl<'de> serde::Deserialize<'de> for GetLogParams {
 
 /// Issue #78: the keys iris_get_log tolerates without acting on them.
 ///
-/// Not leniency for its own sake. `namespace` is advertised by 13 of the 26 tools in
+/// Not leniency for its own sake. `namespace` is advertised by 13 of the 28 tools in
 /// this fork's default (interop) profile — the only key that spans tool families — and
 /// the agent harness sends it on nearly every call, including the correct index call in
 /// the issue's own repro. It cannot mean anything here: the log store is a single
@@ -4167,6 +4174,11 @@ pub(crate) fn mutating_call(tool: &str, args: &serde_json::Value) -> Option<&'st
         | "iris_symbols_local"
         // Resolves macros through Atelier's read-only getmacro* endpoints; no write path.
         | "iris_macro"
+        // Read the HL7 schema dictionary; no write path. They run generated ObjectScript, but
+        // only %ResultSet reads and getFieldsContentArray, with the caller's strings escaped
+        // through os_str_expr rather than spliced.
+        | "hl7_schema_list"
+        | "hl7_schema_inspect"
         | "iris_table_info" => None,
         _ => None,
     }
@@ -4309,6 +4321,8 @@ pub(crate) const CLASSIFIED_TOOLS: &[&str] = &[
     "iris_doc",
     "iris_execute",
     "iris_execute_method",
+    "hl7_schema_inspect",
+    "hl7_schema_list",
     "iris_get_log",
     "iris_interop_query",
     "iris_lookup_manage",
@@ -7808,6 +7822,32 @@ Methods:
     }
 
     #[tool(
+        description = "List the HL7 schema categories this instance has (e.g. 2.1 through 2.8.1, plus any custom category), with whether each is a standard schema and what it is based on. Call this first to learn the exact category string hl7_schema_inspect wants. Requires IRIS for Health or HealthShare — a plain IRIS has no HL7 schemas and the tool says so rather than returning an empty list. namespace: optional — defaults to the connection namespace (IRIS_NAMESPACE)."
+    )]
+    async fn hl7_schema_list(
+        &self,
+        Parameters(p): Parameters<hl7_schema::Hl7SchemaListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let iris = self.get_iris_reloaded().await?;
+        let result = hl7_schema::handle_hl7_schema_list(&iris, self.http_client(), p).await;
+        self.record_call("hl7_schema_list", Self::call_ok(&result));
+        result
+    }
+
+    #[tool(
+        description = "Address HL7 segments and fields by NAME instead of by position. With `version` alone, lists that category's segment names. With `version` + `segment` (e.g. \"2.5\" + \"PID\"), returns every field: number, name, description, data type, whether it is required, its enumerated values, and whether it REPEATS. Repeating fields such as PID:3, PID:5 and OBX:5 are named here — EnsLib.HL7.Schema.GetFieldNameFromNumber returns empty for those because it matches a stored \"3()\" against a bare \"3\", and this tool does not inherit that gap. Requires IRIS for Health or HealthShare. namespace: optional — defaults to the connection namespace (IRIS_NAMESPACE)."
+    )]
+    async fn hl7_schema_inspect(
+        &self,
+        Parameters(p): Parameters<hl7_schema::Hl7SchemaInspectParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let iris = self.get_iris_reloaded().await?;
+        let result = hl7_schema::handle_hl7_schema_inspect(&iris, self.http_client(), p).await;
+        self.record_call("hl7_schema_inspect", Self::call_ok(&result));
+        result
+    }
+
+    #[tool(
         description = "Inspect a SQL table: returns whether it is a class-projected table or DDL-created, the backing data/index globals, and (optionally) an approximate row count. Works for both class-projected tables (with real storage globals from %Dictionary.CompiledStorage) and DDL tables (globals inferred by IRIS naming convention). Use include_row_count=true to add a COUNT(*) estimate. Accepts either the SQL name (Ens_Config.Item) or the CLASS name (Ens.Config.Item) — the class→table projection is resolved for you, and a miss lists the tables that do exist in that package. Call this (or docs_introspect) to discover the real schema/table/column names BEFORE iris_query, rather than guessing catalog tables."
     )]
     async fn iris_table_info(
@@ -9299,7 +9339,7 @@ fn wildcard_listing_filter(pattern: &str) -> Option<&str> {
 /// authors, and refuses only whole-library trees and whole-namespace expansions.
 ///
 /// Deliberately no `force`/`confirm` escape hatch: that would widen the advertised schema
-/// of a tool in the locked 26-tool interop profile, and a caller who genuinely wants 500+
+/// of a tool in the locked 28-tool interop profile, and a caller who genuinely wants 500+
 /// classes can name the subpackages.
 const WILDCARD_EXPANSION_CAP: usize = 500;
 
