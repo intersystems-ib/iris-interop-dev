@@ -1241,3 +1241,92 @@ mod set_settings_target_resolution {
         assert!(unknown_prefix_warnings(&quiet).is_empty());
     }
 }
+
+/// #215: an INVALID_ACTION answers what THIS tool accepts and stops. The model asked for the
+/// same thing every time — enumerate — and `iris_production_item` has no listing action at
+/// all, so its enum is a list of things that do not help. 3 of 14 students, 7 occurrences,
+/// none carrying a hint.
+mod enumeration_redirect_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn envelope(r: Result<rmcp::model::CallToolResult, rmcp::ErrorData>) -> serde_json::Value {
+        let result = r.unwrap();
+        let text = result.content[0].raw.as_text().unwrap().text.clone();
+        serde_json::from_str(&text).unwrap()
+    }
+
+    /// The literal call from the field report: action=list on iris_production_item.
+    #[test]
+    fn an_enumeration_verb_gets_told_where_the_answer_is() {
+        let v = envelope(rt().block_on(interop_production_item_impl(
+            None,
+            ProductionItemParams {
+                action: "list".into(),
+                // #218's refusal must not pre-empt this: the ACTION is the error here.
+                item: "Any.Item".into(),
+                namespace: "APP".into(),
+                settings: HashMap::new(),
+                apply: true,
+                class_name: None,
+                enabled: None,
+                production: None,
+                pool_size: None,
+                category: None,
+            },
+        )));
+        assert_eq!(v["error_code"], "INVALID_ACTION");
+        let hint = v["hint"].as_str().unwrap_or("");
+        assert!(!hint.is_empty(), "7 of 7 envelopes carried no hint: {v}");
+        // It must say where the answer IS, and be honest that no listing action exists.
+        assert!(hint.contains("iris_doc"), "{hint}");
+        assert!(
+            hint.contains("no listing action"),
+            "must admit the capability does not exist rather than invent one: {hint}"
+        );
+        // And must NOT forward-reference the capabilities that do not work yet (#204).
+        assert!(
+            !hint.contains("full=true") && !hint.contains("config_items"),
+            "points at a capability that does not exist: {hint}"
+        );
+    }
+
+    /// The helper covers the verbs the cohort actually guessed, and nothing else — a
+    /// non-enumeration typo must keep the plain enum message with no misleading redirect.
+    #[test]
+    fn only_enumeration_verbs_trigger_the_redirect() {
+        for verb in [
+            "list",
+            "list_all",
+            "items",
+            "show",
+            "all",
+            "enumerate",
+            "LIST",
+        ] {
+            assert!(
+                enumeration_redirect("iris_production_item", verb).is_some(),
+                "{verb} should redirect"
+            );
+        }
+        // `update` is genuinely not an action of this tool, but it is not an enumeration —
+        // the field report's own sequence shows it, and it must not borrow this hint.
+        for verb in ["update", "restart", "get", ""] {
+            assert!(
+                enumeration_redirect("iris_production_item", verb).is_none(),
+                "{verb} must not redirect"
+            );
+        }
+        // A tool with no entry gets nothing rather than another tool's advice.
+        assert!(enumeration_redirect("iris_compile", "list").is_none());
+    }
+
+    /// iris_lookup_manage DOES have the capability, so its redirect names the actions rather
+    /// than admitting absence. This half has no dependency on #204.
+    #[test]
+    fn lookup_manage_names_its_own_listing_actions() {
+        let h = enumeration_redirect("iris_lookup_manage", "list").expect("must redirect");
+        assert!(h.contains("list_keys"), "{h}");
+        assert!(h.contains("list_tables"), "{h}");
+    }
+}

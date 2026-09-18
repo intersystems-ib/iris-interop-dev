@@ -128,6 +128,76 @@ pub fn production_only_arg(p: &serde_json::Value) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// #215: an INVALID_ACTION message answers TWO questions, not one — what this tool accepts,
+/// and where the action that was ASKED FOR actually lives. The enum alone resolves the first.
+///
+/// Enumeration is the only verb the measured cohort guessed, and it is the one the enum cannot
+/// resolve: `iris_production_item` has no listing action at all, so its enum is a list of
+/// things that do not help and the message never said where the answer was. 3 of 14 students,
+/// 7 occurrences, NONE carrying a hint. Where the capability does not exist yet, this says so
+/// rather than pointing at something that would produce a second error.
+///
+/// Written in the GET_LOG_HINT style — one shared text per tool, quoted by every surface — so
+/// the wordings cannot drift apart.
+/// The actions `iris_production_item` accepts. Named so the early guard and the match's
+/// catch-all answer from ONE list (#215).
+pub const PRODUCTION_ITEM_ACTIONS: [&str; 6] = [
+    "add",
+    "remove",
+    "enable",
+    "disable",
+    "get_settings",
+    "set_settings",
+];
+
+/// One INVALID_ACTION envelope per tool, quoted by every surface — the GET_LOG_HINT
+/// discipline, so two wordings of the same refusal cannot drift apart (#215).
+pub fn invalid_action(
+    tool: &str,
+    requested: &str,
+    accepted: &[&str],
+) -> Result<CallToolResult, McpError> {
+    let mut extra = serde_json::json!({
+        "requested_action": requested,
+        "accepted_actions": accepted,
+    });
+    if let Some(h) = enumeration_redirect(tool, requested) {
+        extra["hint"] = serde_json::Value::String(h.into());
+    }
+    crate::tools::envelope::fail_with(
+        "INVALID_ACTION",
+        &format!("{tool}: action must be one of {}", accepted.join(", ")),
+        extra,
+    )
+}
+
+pub fn enumeration_redirect(tool: &str, requested: &str) -> Option<&'static str> {
+    let wants_list = matches!(
+        requested.to_ascii_lowercase().as_str(),
+        "list" | "list_all" | "list_items" | "items" | "show" | "all" | "enumerate"
+    );
+    if !wants_list {
+        return None;
+    }
+    match tool {
+        // No forward reference: iris_production(action=status) does NOT return items today
+        // (its `full` parameter is declared, read, and then never used — #204), and
+        // iris_interop_query has no `config_items`. Naming either would cost a second round
+        // trip and teach a capability that does not exist.
+        "iris_production_item" => Some(
+            "This tool acts on ONE item, named by `item`; there is no listing action in the \
+             toolset yet. To see what a production contains, read the production class: \
+             iris_doc(mode=get, name=<Package.ProductionName>) — the items live in its \
+             XData ProductionDefinition, not in a queryable table.",
+        ),
+        "iris_lookup_manage" => Some(
+            "To enumerate: action='list_keys' (the keys of one table=<name>) or \
+             action='list_tables' (every lookup table in the namespace).",
+        ),
+        _ => None,
+    }
+}
+
 /// Positive probe results, keyed "base_url|namespace". Never invalidated: a
 /// namespace does not lose Interoperability within a server process lifetime.
 /// Negatives are NOT cached — a namespace can gain interop (or be created)
@@ -1822,6 +1892,16 @@ pub async fn interop_production_item_impl(
             }),
         );
     }
+    // #215: an unknown ACTION is knowable without a connection, so it is refused here rather
+    // than surfacing as IRIS_UNREACHABLE — the same ordering #63/#218 established for a
+    // missing parameter. The match's catch-all below answers from the same list.
+    if !PRODUCTION_ITEM_ACTIONS.contains(&params.action.as_str()) {
+        return invalid_action(
+            "iris_production_item",
+            &params.action,
+            &PRODUCTION_ITEM_ACTIONS,
+        );
+    }
     let iris = match iris {
         Some(i) => i,
         None => return err_json("IRIS_UNREACHABLE", "No IRIS connection"),
@@ -1865,10 +1945,7 @@ Write "OK""#
                         interop_fail(out, params.production.as_deref())
                     }
                 }
-                Err(e) => err_json(
-                    classify_iris_error(&e.to_string()),
-                    &e.to_string(),
-                ),
+                Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
             }
         }
         "get_settings" => {
@@ -1908,10 +1985,7 @@ Set tKey="" For {{ Set tSetting=tItem.Settings.GetNext(.tKey) Quit:tKey=""
                         serde_json::json!({"success":true,"item":params.item,"settings":settings}),
                     )
                 }
-                Err(e) => err_json(
-                    classify_iris_error(&e.to_string()),
-                    &e.to_string(),
-                ),
+                Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
             }
         }
         "set_settings" => {
@@ -1960,10 +2034,7 @@ Set tKey="" For {{ Set tSetting=tItem.Settings.GetNext(.tKey) Quit:tKey=""
                         interop_fail(out, params.production.as_deref())
                     }
                 }
-                Err(e) => err_json(
-                    classify_iris_error(&e.to_string()),
-                    &e.to_string(),
-                ),
+                Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
             }
         }
         "add" => {
@@ -2004,17 +2075,18 @@ Set tKey="" For {{ Set tSetting=tItem.Settings.GetNext(.tKey) Quit:tKey=""
                     } else if let Some(msg) = out.strip_prefix("ERROR:UPDATE_FAILED:") {
                         err_json("UPDATE_FAILED", msg)
                     } else {
-                        err_json("INTEROP_ERROR", out.strip_prefix("ERROR:INTEROP_ERROR:").unwrap_or(out))
+                        err_json(
+                            "INTEROP_ERROR",
+                            out.strip_prefix("ERROR:INTEROP_ERROR:").unwrap_or(out),
+                        )
                     }
                 }
-                Err(e) => err_json(
-                    classify_iris_error(&e.to_string()),
-                    &e.to_string(),
-                ),
+                Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
             }
         }
         "remove" => {
-            let code = build_remove_item_code(params.production.as_deref().unwrap_or(""), &params.item);
+            let code =
+                build_remove_item_code(params.production.as_deref().unwrap_or(""), &params.item);
             match iris.execute_via_generator(&code, ns, &client).await {
                 Ok(out) => {
                     let out = out.trim();
@@ -2032,19 +2104,18 @@ Set tKey="" For {{ Set tSetting=tItem.Settings.GetNext(.tKey) Quit:tKey=""
                     } else if let Some(msg) = out.strip_prefix("ERROR:UPDATE_FAILED:") {
                         err_json("UPDATE_FAILED", msg)
                     } else {
-                        err_json("INTEROP_ERROR", out.strip_prefix("ERROR:INTEROP_ERROR:").unwrap_or(out))
+                        err_json(
+                            "INTEROP_ERROR",
+                            out.strip_prefix("ERROR:INTEROP_ERROR:").unwrap_or(out),
+                        )
                     }
                 }
-                Err(e) => err_json(
-                    classify_iris_error(&e.to_string()),
-                    &e.to_string(),
-                ),
+                Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
             }
         }
-        _ => err_json(
-            "INVALID_ACTION",
-            "iris_production_item: action must be add, remove, enable, disable, get_settings, or set_settings",
-        ),
+        // Unreachable in practice — the guard above catches it before any IRIS work — but
+        // kept for exhaustiveness and answering from the same list, never a second wording.
+        other => invalid_action("iris_production_item", other, &PRODUCTION_ITEM_ACTIONS),
     }
 }
 
@@ -2296,7 +2367,21 @@ pub async fn interop_lookup_manage_impl(
             };
             let key = match &params.key {
                 Some(k) => os_str_expr(k),
-                None => return err_json("INVALID_PARAMS", "get requires key"),
+                // #215, the second shape of the same defect: "get requires key" twice in a
+                // row, when what was wanted was an enumeration OF the keys. Name the action
+                // that answers that.
+                None => {
+                    return crate::tools::envelope::fail_with(
+                        "INVALID_PARAMS",
+                        "iris_lookup_manage action=get requires `key` — it reads ONE key.",
+                        serde_json::json!({
+                            "hint": "To list the keys of a table instead of reading one: \
+                                     action='list_keys' with table=<name>. \
+                                     action='list_tables' lists every lookup table in the \
+                                     namespace.",
+                        }),
+                    )
+                }
             };
             let code = format!(
                 r#"If '$DATA(^Ens.LookupTable({t})) {{ Write "ERROR:TABLE_NOT_FOUND:Table not found: "_{t} Quit }}
@@ -2413,9 +2498,10 @@ Set tKey="" For {{ Set tKey=$ORDER(^Ens.LookupTable({t},tKey)) Quit:tKey=""  Wri
                 Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
             }
         }
-        _ => err_json(
-            "INVALID_ACTION",
-            "iris_lookup_manage: action must be get, set, delete, list_keys, or list_tables",
+        other => invalid_action(
+            "iris_lookup_manage",
+            other,
+            &["get", "set", "delete", "list_keys", "list_tables"],
         ),
     }
 }
