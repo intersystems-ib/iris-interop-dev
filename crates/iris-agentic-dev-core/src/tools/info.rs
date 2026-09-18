@@ -1061,13 +1061,14 @@ if found = "" {{
 set sqlSchema = $PIECE(found, "^", 1), sqlTable = $PIECE(found, "^", 2)
 write "RESOLVED:",sqlSchema,".",sqlTable,!
 // Look for backing class
-set rs = ##class(%SQL.Statement).%ExecDirect(,"SELECT c.Name, c.ClassType, s.DataLocation, s.IndexLocation, s.IDLocation FROM %Dictionary.CompiledClass c LEFT JOIN %Dictionary.CompiledStorage s ON s.parent = c.Name WHERE c.SqlSchemaName = ? AND c.SqlTableName = ?", sqlSchema, sqlTable)
+set rs = ##class(%SQL.Statement).%ExecDirect(,"SELECT c.Name, c.ClassType, s.DataLocation, s.IndexLocation, s.IDLocation, s.StreamLocation FROM %Dictionary.CompiledClass c LEFT JOIN %Dictionary.CompiledStorage s ON s.parent = c.Name WHERE c.SqlSchemaName = ? AND c.SqlTableName = ?", sqlSchema, sqlTable)
 if rs.%Next() {{
     write "CLASS:",rs.Name,!
     write "CLASSTYPE:",rs.ClassType,!
     write "DATA:",rs.DataLocation,!
     write "INDEX:",rs.IndexLocation,!
     write "ID:",rs.IDLocation,!
+    write "STREAM:",rs.StreamLocation,!
 }} else {{
     write "DDL_TABLE",!
 }}
@@ -1172,14 +1173,47 @@ if rs.%Next() {{
         let class_name = lines.get("CLASS").copied().unwrap_or("").trim();
         let data_global = lines.get("DATA").copied().unwrap_or("").trim();
         let index_global = lines.get("INDEX").copied().unwrap_or("").trim();
+        // #248: both of these were already SELECTed. `IDLocation` was read into `lines` and
+        // then discarded, and `StreamLocation` was never asked for — so the tool knew the id
+        // global and threw it away, and could not answer the question that matters most for
+        // interop.
+        //
+        // The stream global is where an HL7 message's CONTENT lives, and its name is not
+        // derivable from the class: measured on IRIS for Health 2026.1, EnsLib.HL7.Message
+        // stores to `^EnsLib.H.MessageD` / `^EnsLib.H.MessageS` — an abbreviated global nobody
+        // would guess. Subclasses inherit the parent's: Ens.AlarmRequest reports
+        // `^Ens.MessageBodyS`. For purge sizing, orphaned-extent diagnosis, or "where did the
+        // message bodies actually go", this is the global you need.
+        //
+        // `ExtentSize` is deliberately NOT reported. Measured: 1476 of this instance's 3177
+        // storage rows carry exactly "100000" and the rest are blank — it is the query
+        // optimizer's declared hint, not a row count, and surfacing it as one would invite
+        // exactly the misreading. `include_row_count` gives the real figure.
+        let id_global = lines.get("ID").copied().unwrap_or("").trim();
+        let stream_global = lines.get("STREAM").copied().unwrap_or("").trim();
+        let or_null = |v: &str| -> serde_json::Value {
+            if v.is_empty() {
+                serde_json::Value::Null
+            } else {
+                v.into()
+            }
+        };
 
         let mut obj = serde_json::json!({
             "table": resolved_table,
             "type": "class_projection",
             "class": class_name,
             "namespace": namespace,
-            "data_global": if data_global.is_empty() { serde_json::Value::Null } else { data_global.into() },
-            "index_global": if index_global.is_empty() { serde_json::Value::Null } else { index_global.into() },
+            "data_global": or_null(data_global),
+            "index_global": or_null(index_global),
+            "id_global": or_null(id_global),
+            // Null means the class declares NO STORAGE at all — the same condition that nulls
+            // data_global and index_global — not "no stream properties". Measured with the
+            // control: 1387 storage rows carry both a data and a stream global, ZERO carry a
+            // data global without one, and all 609 rows lacking a stream global lack a data
+            // global too. IRIS declares the stream global whenever it declares storage,
+            // whether or not the class uses stream properties.
+            "stream_global": or_null(stream_global),
             "accessible_from_embedded_python": true,
         });
 
@@ -1189,7 +1223,12 @@ if rs.%Next() {{
         }
         obj
     } else {
-        // DDL-created table — infer global names by IRIS naming convention
+        // DDL-created table — infer global names by IRIS naming convention.
+        //
+        // #248 adds `stream_global` for class-projected tables, where IRIS states it. It is
+        // deliberately NOT inferred here: the D/I/C convention is established, a stream
+        // convention for DDL tables is not something this fork has measured, and emitting an
+        // unverified global name is worse than omitting the field.
         let data_global = format!("^{}.{}D", sql_schema, sql_table);
         let index_global = format!("^{}.{}I", sql_schema, sql_table);
         let id_counter_global = format!("^{}.{}C", sql_schema, sql_table);
