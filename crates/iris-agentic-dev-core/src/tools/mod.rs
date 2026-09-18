@@ -3168,6 +3168,23 @@ async fn enrich_abort(
         _ => String::new(),
     };
 
+    // #209: no `RunUser+N` means the trap fired inside code the caller never wrote. Name the
+    // routine so an UNKNOWN library frame is at least located rather than silent — the table
+    // in `library_frame_hint` covers the frames we know, this covers the rest.
+    if frame.line.is_none() {
+        if let Some(routine) = abort_frame_routine(abort) {
+            resp["library_frame"] = serde_json::Value::String(routine.to_string());
+            if hint.is_empty() {
+                hint = format!(
+                    "The trap fired inside `{routine}`, not in any line of the code you sent — \
+                     your code called into it. Do not hunt for the bug line by line in your \
+                     script: look at what that routine needs (a setting, a running production, \
+                     an open connection) before editing anything."
+                );
+            }
+        }
+    }
+
     if abort_wants_member_list(frame.signal) {
         if let (Some(member), Some(class)) = (frame.member, frame.class) {
             let (members, member_kind) =
@@ -3744,6 +3761,15 @@ pub struct AbortFrame<'a> {
     pub class: Option<&'a str>,
 }
 
+/// The routine reference carried by an abort frame — `initAdapterJG+2^EnsLib.JavaGateway.Common.1`,
+/// or `RunUser+3^IrisDevTmp.Run<hash>.1` when the code that trapped is the caller's own (#209).
+pub fn abort_frame_routine(abort: &str) -> Option<&str> {
+    let close = abort.find('>')?;
+    abort[close + 1..]
+        .split_whitespace()
+        .find(|t| t.contains('^'))
+}
+
 pub fn parse_abort_frame(abort: &str) -> Option<AbortFrame<'_>> {
     let open = abort.find('<')?;
     let close = abort[open..].find('>')? + open;
@@ -3848,7 +3874,47 @@ pub fn runtime_abort_line(output: &str) -> Option<&str> {
 /// intended terminator rather than a defect. It is still reported as a failure, because the
 /// script did stop early and the ask in #123 was consistency; the hint says so, so a caller
 /// can tell this apart from a real fault without the flag having to lie.
+/// #209: aborts that fire INSIDE library code rather than on a line the caller wrote.
+///
+/// `enrich_abort` explains frames shaped `RunUser+N`. When the trap fires deeper —
+/// `initAdapterJG+2^EnsLib.JavaGateway.Common.1` — `parse_abort_frame` returns `line: None`,
+/// every branch that depends on `source_line` is skipped, the tail parse yields no
+/// member/class either, and the envelope went out with NO hint at all: 9 of 9 envelopes
+/// across 6 of 14 students, on the class of failure where the caller has least idea what to do.
+///
+/// Gated on the ABSENCE of a `RunUser+` frame deliberately. This is a first-writer-wins slot
+/// and `abort_hint` runs before `enrich_abort`, so an ungated entry would silently outrank the
+/// precise per-line explanation for any `RunUser` abort that merely mentions these names.
+fn library_frame_hint(abort: &str) -> Option<&'static str> {
+    if abort.contains("RunUser+") {
+        return None;
+    }
+    if abort.contains("INVALID OREF")
+        && (abort.contains("^EnsLib.JavaGateway.Common") || abort.contains("initAdapterJG"))
+    {
+        return Some(
+            "This abort happened inside EnsLib.JavaGateway.Common, not in the code you sent — \
+             your code called into it. That routine is the JDBC adapter's gateway \
+             initialisation. Per the SQL Gateway documentation, JGService is REQUIRED for all \
+             JDBC data sources, even with a working SQL gateway connection: a business service \
+             of type EnsLib.JavaGateway.Service must be present, and the adapter needs that \
+             configuration item's exact name. Check, in this order: (1) an \
+             EnsLib.JavaGateway.Service item exists in the production, (2) the production is \
+             started, (3) the operation's JGService setting names that item exactly — set it \
+             with iris_production_item(action=set_settings, item=<BO>, \
+             settings={\"Adapter.JGService\": \"<that item name>\"}). Do not hunt for the bug \
+             line by line in your script; the line that trapped is not in it.",
+        );
+    }
+    None
+}
+
 fn abort_hint(abort: &str) -> Option<&'static str> {
+    // #209: known library frames first — they only match when there is no RunUser+ frame,
+    // so this cannot take the slot from a per-line explanation.
+    if let Some(h) = library_frame_hint(abort) {
+        return Some(h);
+    }
     abort.contains("<ENDOFFILE>").then_some(
         "<ENDOFFILE> is usually a READ loop reaching the end of the file, not a defect — the \
          output above is everything that was read. If that is what you intended, treat this as \
@@ -10823,6 +10889,84 @@ mod member_kind_tests {
             member_kind_mismatch_hint("My.Cls", "Thing", "CLASS PROPERTY", MemberKind::Method)
                 .is_some()
         );
+    }
+}
+
+#[cfg(test)]
+mod library_frame_tests {
+    use super::*;
+
+    /// The measured frame, 9 envelopes across 6 of 14 students, all with NO hint.
+    const MEASURED: &str = "ERROR: <INVALID OREF> 192 initAdapterJG+2^EnsLib.JavaGateway.Common.1";
+
+    #[test]
+    fn the_measured_frame_no_longer_comes_back_silent() {
+        let h = abort_hint(MEASURED).expect("this frame produced no hint at all, 9 times of 9");
+        assert!(h.contains("JGService"), "{h}");
+        assert!(
+            h.contains("EnsLib.JavaGateway.Service"),
+            "must name the item type that has to exist: {h}"
+        );
+        // It must tell the caller to stop reading their own script for the bug.
+        assert!(h.contains("not in the code you sent"), "{h}");
+    }
+
+    /// The false claim the issue explicitly forbids: adapters DO instantiate and work when
+    /// newed up (measured on 2026.1 — it is Ens.BusinessOperation/BusinessService that do
+    /// not). One appearance of that sentence would invalidate the whole hint.
+    #[test]
+    fn the_hint_never_claims_an_adapter_cannot_be_instantiated() {
+        let h = abort_hint(MEASURED).unwrap();
+        for forbidden in ["BusinessHost", "does not connect outside", "by design"] {
+            assert!(
+                !h.contains(forbidden),
+                "the hint reintroduced the refuted %New() claim ('{forbidden}'): {h}"
+            );
+        }
+    }
+
+    /// The precedence gate. `abort_hint` writes BEFORE enrich_abort into a first-writer-wins
+    /// slot, so a library entry that fired on a RunUser frame would displace the precise
+    /// per-line explanation. Same failure shape as #185, one slot over.
+    #[test]
+    fn a_runuser_frame_keeps_its_precise_explanation() {
+        let own_code =
+            "ERROR: <INVALID OREF> 3 RunUser+3^IrisDevTmp.Run1.1 initAdapterJG EnsLib.JavaGateway.Common";
+        assert_eq!(
+            library_frame_hint(own_code),
+            None,
+            "a RunUser frame mentioning these names must NOT take the hint slot"
+        );
+        assert_eq!(abort_hint(own_code), None);
+    }
+
+    /// An unknown library frame is located rather than silent — the general half of the fix.
+    #[test]
+    fn an_unknown_library_frame_is_still_named() {
+        let unknown = "ERROR: <UNDEFINED> 42 SomeMethod+7^Totally.Unknown.Routine.1 zzz";
+        assert_eq!(
+            abort_frame_routine(unknown),
+            Some("SomeMethod+7^Totally.Unknown.Routine.1")
+        );
+        // ...and it is NOT in the known table, so it must not borrow the JDBC advice.
+        assert_eq!(library_frame_hint(unknown), None);
+    }
+
+    #[test]
+    fn a_runuser_frame_reports_its_own_routine_too() {
+        assert_eq!(
+            abort_frame_routine("ERROR: <UNDEFINED> 9 RunUser+5^IrisDevTmp.Run1.1 ID"),
+            Some("RunUser+5^IrisDevTmp.Run1.1")
+        );
+        // parse_abort_frame still extracts the submitted line for it — unchanged.
+        assert_eq!(
+            parse_abort_frame("ERROR: <UNDEFINED> 9 RunUser+5^IrisDevTmp.Run1.1 ID")
+                .unwrap()
+                .line,
+            Some(5)
+        );
+        // The measured library frame, by contrast, has no line — which is the whole bug.
+        assert_eq!(parse_abort_frame(MEASURED).unwrap().line, None);
     }
 }
 
