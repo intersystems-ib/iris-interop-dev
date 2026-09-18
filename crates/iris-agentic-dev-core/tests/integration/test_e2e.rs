@@ -411,6 +411,21 @@ Storage Default
         "refusal must carry STORAGE_STRIP_BLOCKED: {}",
         blocked
     );
+    // #217: the code alone was all this asserted, and the message underneath it made the
+    // BYPASS its only executable sentence — so callers took the bypass on classes they had
+    // just authored. This is the wire-level check that the repaired text actually reaches a
+    // client: the unit tests in doc.rs cover the wording, but only this covers the wiring.
+    let refusal = blocked["error"].as_str().unwrap_or("");
+    assert!(
+        refusal.contains("FIX: delete the Storage block"),
+        "refusal must lead with the fix, not the bypass: {refusal}"
+    );
+    if let Some(bypass) = refusal.find("allow_storage_regeneration") {
+        let fix = refusal
+            .find("FIX: delete the Storage block")
+            .expect("checked above");
+        assert!(fix < bypass, "the fix must precede the bypass: {refusal}");
+    }
 
     // Opting in strips the Storage block and writes the class.
     let result = call_tool(

@@ -704,6 +704,12 @@ fn test_doc_guards_storage_name_and_mode() {
     assert_eq!(frame["result"]["isError"], true, "{frame}");
     let v = parse_tool_text(&frame);
     assert_eq!(v["error_code"], "STORAGE_STRIP_BLOCKED", "{v}");
+    // #217: the refusal must name the fix (delete the block) ahead of the bypass flag.
+    let refusal = v["error"].as_str().unwrap_or("");
+    assert!(
+        refusal.contains("FIX: delete the Storage block"),
+        "refusal must lead with the fix: {refusal}"
+    );
 
     // 2. Same PUT with the opt-in → proceeds (storage stripped, class written).
     let frame = exchange(
