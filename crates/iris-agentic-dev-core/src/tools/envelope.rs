@@ -239,8 +239,9 @@ fn builtin_hint(code: &str, msg: &str) -> Option<String> {
     }
     if code == "COMPILE_ERROR" {
         return Some(
-            "Fix the first reported error and recompile — later errors are often cascades of \
-             the first. Full compiler output is in compile_console."
+            "If several errors are reported, fix the first and recompile — later errors are \
+             often cascades of the first. If compile_console says ONE error, there is no \
+             cascade to prune: read that error. Full compiler output is in compile_console."
                 .into(),
         );
     }
