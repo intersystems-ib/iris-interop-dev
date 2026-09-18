@@ -309,6 +309,7 @@ pub mod concurrency;
 pub mod dict;
 pub mod doc;
 pub mod envelope;
+pub mod execute_method;
 pub mod info;
 pub mod interop;
 pub mod log_store;
@@ -325,29 +326,29 @@ pub use scm::ScmParams;
 /// Read from `IRIS_TOOLSET` env var or `--toolset` CLI flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Toolset {
-    /// 54 tools advertised (measured 2026-08-26 on v0.8.3). NOT this fork's default —
+    /// 55 tools advertised (measured 2026-09-18). NOT this fork's default —
     /// `--toolset` defaults to `interop`; baseline is opt-in via IRIS_TOOLSET/--toolset.
-    /// Note this is already a pruned router: the 58 tools the `#[tool_router]` macro
-    /// registers minus the 4 merged-only ones.
+    /// Note this is already a pruned router: the 59 tools the `#[tool_router]` macro
+    /// registers minus the 4 merged-only ones. Was 54 of 58 before iris_execute_method.
     Baseline,
-    /// 50 tools advertised (measured 2026-08-26). Baseline minus the 4 NOT_IMPLEMENTED
+    /// 51 tools advertised (measured 2026-09-18). Baseline minus the 4 NOT_IMPLEMENTED
     /// stubs (skill_propose, skill_optimize, skill_share, skill_community_install).
     /// No merged dispatchers. Not this fork's default.
     Nostub,
-    /// 46 tools advertised (measured 2026-08-26). Nostub (50) minus 8 — the 4 debug_*
+    /// 47 tools advertised (measured 2026-09-18). Nostub (51) minus 8 — the 4 debug_*
     /// folded into iris_debug, the 3 container tools folded into iris_containers, and
     /// agent_info dropped outright — plus the 4 merged-only tools iris_debug,
-    /// iris_containers, iris_admin, iris_get_log. 50 - 8 + 4 = 46.
+    /// iris_containers, iris_admin, iris_get_log. 51 - 8 + 4 = 47.
     /// Not this fork's default.
     Merged,
-    /// 24 tools advertised (measured 2026-09-18) — exactly `INTEROP_TOOLS`. THIS FORK'S
+    /// 25 tools advertised (measured 2026-09-18) — exactly `INTEROP_TOOLS`. THIS FORK'S
     /// DEFAULT: `--toolset` carries `default_value = "interop"` (see
     /// crates/iris-agentic-dev-bin/src/cmd/mcp.rs). Keeps only the tools the iris-interop
     /// skills actually exercise; everything else (skill_*/kb_*/agent_*/generate_*/
     /// individual debug_*/container/scm) is pruned. The count does NOT drop on a
     /// write-disallowed connection: #114 stopped the gate removing iris_production_item and
     /// iris_credential_manage from the router, because removing them took their READ actions
-    /// with them (no iris_production_item meant no get_settings). All 24 stay advertised and
+    /// with them (no iris_production_item meant no get_settings). All 25 stay advertised and
     /// a write is refused at CALL time instead — see
     /// a_write_disallowed_connection_still_lists_every_tool.
     /// Additive: tool *code* is unchanged so upstream stays mergeable.
@@ -417,6 +418,10 @@ pub const INTEROP_TOOLS: &[&str] = &[
     // a class written and compiled in this process stays invisible to %Dictionary reads
     // from that same process, while it is on disk the whole time.
     "iris_symbols_local",
+    // Calling a method was the gap that forced every runtime measurement through a scratch
+    // class with a [SqlProc] wrapper — put + compile + SELECT + delete, twenty-plus times in
+    // one session, with the wrapper itself being the defect three of those times.
+    "iris_execute_method",
 ];
 
 pub const ERR_NO_TESTS_FOUND: &str = "NO_TESTS_FOUND";
@@ -1852,7 +1857,7 @@ impl<'de> serde::Deserialize<'de> for GetLogParams {
 
 /// Issue #78: the keys iris_get_log tolerates without acting on them.
 ///
-/// Not leniency for its own sake. `namespace` is advertised by 11 of the 24 tools in
+/// Not leniency for its own sake. `namespace` is advertised by 12 of the 25 tools in
 /// this fork's default (interop) profile — the only key that spans tool families — and
 /// the agent harness sends it on nearly every call, including the correct index call in
 /// the issue's own repro. It cannot mean anything here: the log store is a single
@@ -4099,6 +4104,9 @@ pub(crate) fn mutating_call(tool: &str, args: &serde_json::Value) -> Option<&'st
         // iris_execute runs arbitrary ObjectScript, and its generator path writes, compiles
         // and deletes a scratch class even for a read-shaped `write` statement.
         "iris_execute" => Some("run ObjectScript"),
+        // Invoking a ClassMethod by name is the $classmethod indirection vector: whatever the
+        // method does, this call did it. Gated exactly like iris_execute, never weaker.
+        "iris_execute_method" => Some("invoke a ClassMethod"),
         // Compiling regenerates storage and replaces the compiled class.
         "iris_compile" => Some("compile"),
         // %UnitTest runs arbitrary test code, and TestProduction starts productions.
@@ -4292,6 +4300,7 @@ pub(crate) const CLASSIFIED_TOOLS: &[&str] = &[
     "iris_debug",
     "iris_doc",
     "iris_execute",
+    "iris_execute_method",
     "iris_get_log",
     "iris_interop_query",
     "iris_lookup_manage",
@@ -7777,6 +7786,19 @@ Methods:
     }
 
     #[tool(
+        description = "Invoke a ClassMethod directly by class + method + positional args, with no wrapper class to write. Returns the return value AND, for a method declared to return %Status, the decoded verdict (status_ok plus status_text) — so a failed status does not arrive as an opaque string. The method's declared return type drives the call: a method returning nothing is invoked without reading a value, an object comes back as its class name, and a value reported shorter than IRIS measured it is refused rather than returned incomplete. Runs arbitrary code, so it is write-gated exactly like iris_execute. Use iris_query for SELECTs and iris_doc(put,compile) to create a class. namespace: optional — defaults to the connection namespace (IRIS_NAMESPACE)."
+    )]
+    async fn iris_execute_method(
+        &self,
+        Parameters(p): Parameters<execute_method::IrisExecuteMethodParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let iris = self.get_iris_reloaded().await?;
+        let result = execute_method::handle_iris_execute_method(&iris, self.http_client(), p).await;
+        self.record_call("iris_execute_method", Self::call_ok(&result));
+        result
+    }
+
+    #[tool(
         description = "Inspect a SQL table: returns whether it is a class-projected table or DDL-created, the backing data/index globals, and (optionally) an approximate row count. Works for both class-projected tables (with real storage globals from %Dictionary.CompiledStorage) and DDL tables (globals inferred by IRIS naming convention). Use include_row_count=true to add a COUNT(*) estimate. Accepts either the SQL name (Ens_Config.Item) or the CLASS name (Ens.Config.Item) — the class→table projection is resolved for you, and a miss lists the tables that do exist in that package. Call this (or docs_introspect) to discover the real schema/table/column names BEFORE iris_query, rather than guessing catalog tables."
     )]
     async fn iris_table_info(
@@ -9268,7 +9290,7 @@ fn wildcard_listing_filter(pattern: &str) -> Option<&str> {
 /// authors, and refuses only whole-library trees and whole-namespace expansions.
 ///
 /// Deliberately no `force`/`confirm` escape hatch: that would widen the advertised schema
-/// of a tool in the locked 24-tool interop profile, and a caller who genuinely wants 500+
+/// of a tool in the locked 25-tool interop profile, and a caller who genuinely wants 500+
 /// classes can name the subpackages.
 const WILDCARD_EXPANSION_CAP: usize = 500;
 
@@ -12184,6 +12206,17 @@ mod write_gate_tests {
                 serde_json::json!({"mode": "delete", "name": "A.B.cls"}),
             ),
             ("iris_execute", serde_json::json!({"code": "write 1"})),
+            // Whatever the invoked method does, this call did it — so it must be gated as a
+            // write no matter how harmless the arguments look. Classification alone is not
+            // enough: a tool can be "classified" into the read-only arm and still be wrong.
+            (
+                "iris_execute_method",
+                serde_json::json!({"class": "Ens.Director", "method": "StopProduction"}),
+            ),
+            (
+                "iris_execute_method",
+                serde_json::json!({"class": "%SYSTEM.OBJ", "method": "Delete"}),
+            ),
             ("iris_compile", serde_json::json!({"target": "A.B.cls"})),
             ("iris_test", serde_json::json!({"pattern": "A"})),
             ("iris_lookup_manage", serde_json::json!({"action": "set"})),

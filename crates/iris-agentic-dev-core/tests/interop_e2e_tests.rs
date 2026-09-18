@@ -120,8 +120,8 @@ fn tools_list_returns_interop_profile() {
     // gate removing two tools on a read-only connection — #114 stopped it doing that, so the
     // slack was vestigial and would have hidden a tool going missing.
     assert!(
-        names.len() == 24,
-        "expected the interop profile (24 tools), got {}: {:?}",
+        names.len() == 25,
+        "expected the interop profile (25 tools), got {}: {:?}",
         names.len(),
         names
     );
