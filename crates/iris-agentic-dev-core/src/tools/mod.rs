@@ -4965,10 +4965,8 @@ impl IrisTools {
                     "console",
                 );
                 if !success {
-                    return compile_failure_enriched(
-                        &doc_name, payload, &iris, &client, &namespace,
-                    )
-                    .await;
+                    return compile_failure_enriched(&doc_name, payload, &iris, client, &namespace)
+                        .await;
                 }
                 return ok_json(payload);
             }
@@ -5412,7 +5410,7 @@ impl IrisTools {
         }
 
         if !success {
-            return compile_failure_enriched(&p.target, resp, &iris, &client, &namespace).await;
+            return compile_failure_enriched(&p.target, resp, &iris, client, &namespace).await;
         }
         ok_json(resp)
     }
