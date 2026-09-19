@@ -2239,9 +2239,6 @@ mod head_get_delete_status_tests {
     }
 }
 
-/// #217: the STORAGE_STRIP_BLOCKED wording. Nothing in the tree asserted on this text before
-/// — both e2e tests check only `error_code` — which is how a message whose only executable
-/// sentence was its own bypass survived. These pin the properties, not the prose.
 #[cfg(test)]
 mod prop_collision_put_tests {
     //! #263 on the tool the report actually used: `iris_doc{mode:put, compile:true}`.
@@ -2377,6 +2374,9 @@ mod prop_collision_put_tests {
     }
 }
 
+/// #217: the STORAGE_STRIP_BLOCKED wording. Nothing in the tree asserted on this text before
+/// — both e2e tests check only `error_code` — which is how a message whose only executable
+/// sentence was its own bypass survived. These pin the properties, not the prose.
 #[cfg(test)]
 mod storage_strip_message_tests {
     use super::super::ClassPresence;
