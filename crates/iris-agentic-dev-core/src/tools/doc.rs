@@ -2468,6 +2468,42 @@ mod prop_collision_put_tests {
         });
     }
 
+    /// Found by a SURVIVING MUTATION: changing `Undetermined => None` to `Undetermined => Some(false)`
+    /// in `enrich` passed every test, because the only assertion on that mapping went through
+    /// `build` with a hand-written `None`. The real path was unasserted — so a broken class probe
+    /// could have reported `accused_class_exists: false`, i.e. "that class is gone", on the strength
+    /// of a failed query. The registration route is mounted and the class probe is NOT, which is
+    /// what makes `class_presence` return `Undetermined`.
+    #[test]
+    fn an_unanswerable_class_probe_omits_the_existence_claim_on_the_real_path() {
+        rt().block_on(async {
+            let v = put_compile_and_query(
+                PROP_COLLISION,
+                vec![PROP_COLLISION],
+                Some(serde_json::json!([{
+                    "ID": "EnsLib.HL7.SearchTable||PatientFirstName",
+                    "Name": "PatientFirstName",
+                    "PropId": 5,
+                    "ClassExtent": "EnsLib.HL7.SearchTable",
+                    "ClassDerivation": "Hospital.SearchTable.PatientFirstName~EnsLib.HL7.SearchTable",
+                }])),
+                None,
+            )
+            .await;
+            let sr = &v["stale_registration"];
+            // the lookup itself still succeeded, so the useful part is present
+            assert_eq!(
+                sr["delete_id"], "EnsLib.HL7.SearchTable||PatientFirstName",
+                "{v}"
+            );
+            // but nothing is claimed about the accused class
+            assert!(
+                sr.get("accused_class_exists").is_none(),
+                "an undetermined probe must not become a false: {v}"
+            );
+        });
+    }
+
     /// Zero rows is a different real answer, and the hint must not then promise a delete id.
     #[test]
     fn no_registered_row_is_reported_as_a_live_collision_not_a_stale_one() {
