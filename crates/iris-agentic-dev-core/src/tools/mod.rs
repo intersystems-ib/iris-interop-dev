@@ -322,6 +322,7 @@ pub mod search;
 pub mod skills_tools;
 pub mod sql_lint;
 pub mod symbols_local;
+pub mod unittest_result;
 
 pub use doc::{DocMode, IrisDocParams};
 pub use scm::ScmParams;
@@ -5682,6 +5683,13 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
         let mut passed = 0u64;
         let mut failed = 0u64;
         let errors = 0u64;
+        // #273: aborts counted SEPARATELY rather than folded into `errors`. `errors` feeds both
+        // `total = passed + failed + errors` and the `outcome` string, so moving aborts into it would
+        // double-count them (they are already in `failed`) and flip outcome from "failed" to "errors"
+        // — a contract change that belongs to its own decision. This is additive and cannot mislead:
+        // the report's complaint is that `errors:0, failed:3` for three traps is false, and a
+        // populated `runtime_errors` answers exactly that.
+        let mut runtime_errors = 0u64;
         let mut class_map: std::collections::HashMap<String, Vec<serde_json::Value>> =
             std::collections::HashMap::new();
 
@@ -5695,7 +5703,8 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                 "SELECT tc.Name Class, tm.Name Method, tm.Status St, \
                  (SELECT TOP 1 ta.Description FROM %UnitTest_Result.TestAssert ta WHERE ta.TestMethod=tm.ID AND ta.Status=0 ORDER BY ta.Counter) FailMsg, \
                  (SELECT TOP 1 ta.Location FROM %UnitTest_Result.TestAssert ta WHERE ta.TestMethod=tm.ID AND ta.Status=0 ORDER BY ta.Counter) FailLoc, \
-                 (SELECT TOP 1 ta.Action FROM %UnitTest_Result.TestAssert ta WHERE ta.TestMethod=tm.ID AND ta.Status=0 ORDER BY ta.Counter) FailAct \
+                 (SELECT TOP 1 ta.Action FROM %UnitTest_Result.TestAssert ta WHERE ta.TestMethod=tm.ID AND ta.Status=0 ORDER BY ta.Counter) FailAct, \
+                 tm.ErrorDescription ErrDesc, tm.ErrorAction ErrAct \
                  FROM %UnitTest_Result.TestMethod tm, %UnitTest_Result.TestCase tc, %UnitTest_Result.TestSuite ts \
                  WHERE tm.TestCase=tc.ID AND tc.TestSuite=ts.ID AND ts.TestInstance > {} ORDER BY tc.Name, tm.Name",
                 before_id
@@ -5711,36 +5720,25 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                         from_global = true;
                         for r in rows {
                             let cls = r["Class"].as_str().unwrap_or("").to_string();
-                            let method = r["Method"].as_str().unwrap_or("").to_string();
-                            let is_passed = match &r["St"] {
-                                serde_json::Value::String(s) => s == "1",
-                                serde_json::Value::Number(n) => n.as_i64() == Some(1),
-                                _ => false,
-                            };
-                            let str_or_null = |v: &serde_json::Value| {
-                                v.as_str()
-                                    .filter(|s| !s.is_empty())
-                                    .map(|s| serde_json::Value::String(s.to_string()))
-                                    .unwrap_or(serde_json::Value::Null)
-                            };
-                            let failure_message = str_or_null(&r["FailMsg"]);
-                            // #233: the line to open, and which assertion failed.
-                            let failure_location = str_or_null(&r["FailLoc"]);
-                            let failure_assert = str_or_null(&r["FailAct"]);
+                            // #273: an ABORT writes no TestAssert row, so the three subqueries above
+                            // are all NULL for it — which is how 34% of red tests came back with no
+                            // detail at all. The text is on the TestMethod row itself
+                            // (ErrorDescription / ErrorAction), written by LogStateStatus^%SYS.UNITTEST
+                            // before the log line is even printed. Same row the query already reads.
+                            let (tc, is_runtime) =
+                                crate::tools::unittest_result::shape_method_row(r);
+                            // Read the verdict off the SHAPED row rather than re-deriving it from
+                            // `r["St"]`: two copies of "did this pass" could disagree, and the shaped
+                            // row is what the caller receives.
+                            let is_passed = tc["status"] == "passed";
                             if is_passed {
                                 passed += 1;
                             } else {
                                 failed += 1;
+                                if is_runtime {
+                                    runtime_errors += 1;
+                                }
                             }
-                            let tc = serde_json::json!({
-                                "name": method,
-                                "class_name": cls.clone(),
-                                "status": if is_passed { "passed" } else { "failed" },
-                                "duration_ms": null,
-                                "failure_message": failure_message,
-                                "failure_location": failure_location,
-                                "failure_assert": failure_assert,
-                            });
                             test_cases.push(tc.clone());
                             class_map.entry(cls).or_default().push(tc);
                         }
@@ -6027,6 +6025,9 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
             "passed": passed,
             "failed": failed,
             "errors": errors,
+            // #273: how many of `failed` aborted with an ObjectScript trap rather than failing an
+            // assertion. `errors` is left alone deliberately — see where runtime_errors is counted.
+            "runtime_errors": runtime_errors,
             "skipped": 0,
             "duration_ms": null,
             "path": path_label,
@@ -10301,6 +10302,10 @@ pub fn inline_failed_tests(
                 "failure_message": c["failure_message"].clone(),
                 "failure_location": c["failure_location"].clone(),
                 "failure_assert": c["failure_assert"].clone(),
+                // #273: an abort has no assert, so a caller needs to know WHICH kind this is rather
+                // than inferring it from a null `failure_assert` — which is also what a red test with
+                // nothing recorded looks like.
+                "failure_kind": c["failure_kind"].clone(),
             })
         })
         .collect();
@@ -11704,6 +11709,43 @@ mod member_relevance_tests {
 
 #[cfg(test)]
 mod inline_failed_tests_tests {
+    /// #273: the inline list must carry `failure_kind`. Without it a caller cannot tell an abort from
+    /// an assert, and `failure_assert: null` looks identical to a red test with nothing recorded.
+    #[test]
+    fn the_inline_list_carries_the_failure_kind() {
+        let cases = vec![
+            serde_json::json!({
+                "name": "TestAbort", "class_name": "Pkg.T", "status": "failed",
+                "failure_message": "ERROR #5002: ObjectScript error: <PROPERTY DOES NOT EXIST>x+1^Pkg.T.1",
+                "failure_location": "x+1^Pkg.T.1", "failure_assert": null,
+                "failure_kind": "runtime_error",
+            }),
+            serde_json::json!({
+                "name": "TestAssert", "class_name": "Pkg.T", "status": "failed",
+                "failure_message": "ERROR #5023: nope", "failure_location": "y+2^Pkg.T.1",
+                "failure_assert": "AssertStatusOK", "failure_kind": "assert",
+            }),
+        ];
+        let (inline, total, truncated) = inline_failed_tests(&cases);
+        assert_eq!(total, 2);
+        assert!(!truncated);
+        assert_eq!(
+            inline[0]["failure_kind"], "runtime_error",
+            "{:?}",
+            inline[0]
+        );
+        assert_eq!(inline[1]["failure_kind"], "assert", "{:?}", inline[1]);
+        // and the abort's message survives into the inline list — the point of the issue
+        assert!(
+            inline[0]["failure_message"]
+                .as_str()
+                .unwrap()
+                .contains("PROPERTY DOES NOT EXIST"),
+            "{:?}",
+            inline[0]
+        );
+    }
+
     use super::*;
 
     fn case(name: &str, status: &str) -> serde_json::Value {
