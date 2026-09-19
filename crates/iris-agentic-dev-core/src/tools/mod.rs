@@ -306,6 +306,7 @@ impl<S: JsonSchema> JsonSchema for Described<S> {
 }
 pub mod admin;
 pub mod concurrency;
+pub mod coverage;
 pub mod dict;
 pub mod doc;
 pub mod envelope;
