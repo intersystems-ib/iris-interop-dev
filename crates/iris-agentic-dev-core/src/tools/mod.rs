@@ -2926,17 +2926,30 @@ fn class_not_found_error(
         extra["resolved"] =
             serde_json::Value::String(format!("'{r}' is shorthand for '{class_name}'"));
     }
+    // #242: this said "does not exist in namespace", which the probe has not earned. The
+    // dictionary read has a measured stale direction — a class written AND COMPILED earlier in
+    // this same MCP process is still invisible to %Dictionary.CompiledClass / ClassDefinition
+    // SQL from that process, and becomes visible only to a later one. So `Absent` means "this
+    // process could not see it", not "it is not there".
+    //
+    // #217 fixed exactly this wording in the sibling consumer of the same probe
+    // (`storage_strip_blocked_message`, doc.rs) and did not reach here — the same defect living
+    // in two call sites, where fixing one makes the other look MORE trustworthy. Both consumers
+    // of `class_presence` now report the probe rather than the world.
+    //
+    // Only the CLAIM is softened. `ERR_CLASS_NOT_FOUND` and the branch are untouched, so
+    // nothing that switches on `error_code` changes behaviour — the same rule #217 used.
     let absent = format!(
-        "Class '{class_name}' does not exist in namespace '{namespace}' — it is in neither \
-         %Dictionary.CompiledClass nor %Dictionary.ClassDefinition. Nothing was introspected. \
-         (An empty methods/properties list would have meant a class that exists and has no \
-         members, which is a different fact.)"
+        "Class '{class_name}' was not found in namespace '{namespace}' by the class-dictionary \
+         probe — it is in neither %Dictionary.CompiledClass nor %Dictionary.ClassDefinition. \
+         Nothing was introspected. (An empty methods/properties list would have meant a class \
+         that exists and has no members, which is a different fact.)"
     );
     let msg = if !candidates.is_empty() {
         extra["did_you_mean"] = serde_json::json!(candidates);
         format!(
-            "Class '{class_name}' does not exist in namespace '{namespace}'. Did you mean: {}? \
-             Nothing was introspected.",
+            "Class '{class_name}' was not found in namespace '{namespace}' by the \
+             class-dictionary probe. Did you mean: {}? Nothing was introspected.",
             candidates.join(", ")
         )
     } else if in_package > 0 {
@@ -2949,10 +2962,20 @@ fn class_not_found_error(
     } else {
         absent
     };
+    // #242: the hint now names the ONE population the probe is blind to, because that caller
+    // is the one this envelope misleads. An agent that just wrote a class and is told it "does
+    // not exist" concludes its own write failed.
     extra["hint"] = serde_json::json!(
         "Check the name with iris_doc(mode='head', name='<class>.cls'), or compile the class \
-         first if it has not been compiled in this namespace."
+         first if it has not been compiled in this namespace. If you created this class earlier \
+         in THIS session, the dictionary probe can be stale for it — read the source with \
+         iris_symbols_local (which reads the .cls on disk and does not consult the dictionary) \
+         rather than concluding the write failed."
     );
+    // Machine-readable, so a caller does not have to parse prose to learn which probe answered
+    // or that a same-session write is the known blind spot.
+    extra["probe"] = serde_json::json!("%Dictionary.CompiledClass/%Dictionary.ClassDefinition");
+    extra["may_be_stale_if_created_this_session"] = serde_json::json!(true);
     envelope::fail_with(ERR_CLASS_NOT_FOUND, &msg, extra)
 }
 
@@ -12542,7 +12565,36 @@ mod near_miss_tests {
                 j.get("methods").is_none() && j.get("properties").is_none(),
                 "a class that does not exist has no member lists, not empty ones: {j}"
             );
-            assert!(j["error"].as_str().unwrap().contains("does not exist"));
+            // #242: this used to assert `contains("does not exist")`, which PINNED the false
+            // claim — the test enforced the defect, so softening the wording had to start here.
+            // The pair mirrors doc.rs's `the_absent_branch_reports_the_probe_not_the_world`.
+            let err = j["error"].as_str().unwrap();
+            assert!(
+                !err.contains("does not exist"),
+                "must not state non-existence as fact — the dictionary probe is stale for a \
+                 class written and compiled earlier in this same process: {j}"
+            );
+            assert!(
+                err.contains("was not found"),
+                "must report what the probe saw: {j}"
+            );
+            assert!(
+                err.contains("class-dictionary probe"),
+                "must name the probe that answered: {j}"
+            );
+            // The blind spot must be machine-readable, not only prose.
+            assert_eq!(
+                j["may_be_stale_if_created_this_session"],
+                serde_json::json!(true),
+                "{j}"
+            );
+            assert!(
+                j["hint"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("iris_symbols_local"),
+                "the hint must route to the reader that does NOT consult the dictionary: {j}"
+            );
         }
     }
 }
