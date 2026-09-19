@@ -306,6 +306,7 @@ impl<S: JsonSchema> JsonSchema for Described<S> {
 }
 pub mod admin;
 pub mod concurrency;
+pub mod coverage;
 pub mod dict;
 pub mod doc;
 pub mod envelope;
@@ -329,22 +330,22 @@ pub use scm::ScmParams;
 /// Read from `IRIS_TOOLSET` env var or `--toolset` CLI flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Toolset {
-    /// 58 tools advertised (measured 2026-09-18). NOT this fork's default —
+    /// 59 tools advertised (measured 2026-09-19). NOT this fork's default —
     /// `--toolset` defaults to `interop`; baseline is opt-in via IRIS_TOOLSET/--toolset.
     /// Note this is already a pruned router: the 59 tools the `#[tool_router]` macro
     /// registers minus the 4 merged-only ones. Was 54 of 58 before iris_execute_method.
     Baseline,
-    /// 54 tools advertised (measured 2026-09-18). Baseline minus the 4 NOT_IMPLEMENTED
+    /// 55 tools advertised (measured 2026-09-19). Baseline minus the 4 NOT_IMPLEMENTED
     /// stubs (skill_propose, skill_optimize, skill_share, skill_community_install).
     /// No merged dispatchers. Not this fork's default.
     Nostub,
-    /// 50 tools advertised (measured 2026-09-19). Nostub (54) minus 8 — the 4 debug_*
+    /// 51 tools advertised (measured 2026-09-19). Nostub (55) minus 8 — the 4 debug_*
     /// folded into iris_debug, the 3 container tools folded into iris_containers, and
     /// agent_info dropped outright — plus the 4 merged-only tools iris_debug,
     /// iris_containers, iris_admin, iris_get_log. 54 - 8 + 4 = 50.
     /// Not this fork's default.
     Merged,
-    /// 29 tools advertised (measured 2026-09-19) — exactly `INTEROP_TOOLS`. THIS FORK'S
+    /// 30 tools advertised (measured 2026-09-19) — exactly `INTEROP_TOOLS`. THIS FORK'S
     /// DEFAULT: `--toolset` carries `default_value = "interop"` (see
     /// crates/iris-agentic-dev-bin/src/cmd/mcp.rs). Keeps only the tools the iris-interop
     /// skills actually exercise; everything else (skill_*/kb_*/agent_*/generate_*/
@@ -391,6 +392,7 @@ pub const INTEROP_TOOLS: &[&str] = &[
     "iris_execute",
     "iris_compile",
     "iris_test",
+    "iris_coverage",
     // diagnostics / introspection
     "iris_symbols",
     "docs_introspect",
@@ -1878,11 +1880,14 @@ impl<'de> serde::Deserialize<'de> for GetLogParams {
 
 /// Issue #78: the keys iris_get_log tolerates without acting on them.
 ///
-/// Not leniency for its own sake. `namespace` is advertised by 26 of the 29 tools in
+/// Not leniency for its own sake. `namespace` is advertised by 27 of the 30 tools in
 /// this fork's default (interop) profile — the only key that spans tool families — and
 /// (this said "13 of the 28"; measured 2026-09-19 by counting tools whose advertised
-/// `inputSchema.properties` carries `namespace`, the figure is 26. The old number was
-/// wrong, not merely stale by one tool, so it is corrected rather than incremented.)
+/// `inputSchema.properties` carries `namespace`, the figure was 26 of 29. The old number
+/// was wrong, not merely stale by one tool, so it was corrected rather than incremented.
+/// Re-MEASURED the same way on 2026-09-19 after iris_coverage was added: 27 of 30. The
+/// increment happens to be right here, but it was measured rather than assumed — assuming
+/// is what produced the wrong figure the first time.)
 /// the agent harness sends it on nearly every call, including the correct index call in
 /// the issue's own repro. It cannot mean anything here: the log store is a single
 /// process-global ring buffer (`log_store::LogStore`) with no namespace dimension, so
@@ -4191,6 +4196,11 @@ pub(crate) fn mutating_call(tool: &str, args: &serde_json::Value) -> Option<&'st
         "iris_compile" => Some("compile"),
         // %UnitTest runs arbitrary test code, and TestProduction starts productions.
         "iris_test" => Some("run tests"),
+        // #24/064. Never weaker than iris_test, because it RUNS iris_test's work: same arbitrary
+        // test code, same productions. And it additionally starts %Monitor.System.LineByLine, which
+        // is instance-wide, exclusive, and degrades performance for every process while it runs —
+        // so this is mutating even for a test suite that only reads.
+        "iris_coverage" => Some("run tests under the line-by-line monitor"),
         // Every action of this tool writes a credential.
         "iris_credential_manage" => Some("change credentials"),
 
@@ -4387,6 +4397,7 @@ pub(crate) const CLASSIFIED_TOOLS: &[&str] = &[
     "find_subclass_implementations",
     "iris_business_rule_info",
     "iris_compile",
+    "iris_coverage",
     "iris_credential_list",
     "iris_credential_manage",
     "iris_debug",
@@ -6027,6 +6038,79 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
             "failed_tests_total": failed_tests_total,
             "failed_tests_truncated": failed_tests_truncated,
         }))
+    }
+
+    #[tool(
+        description = "Measure ObjectScript LINE COVERAGE of a %UnitTest run, via %Monitor.System.LineByLine. Pass `test_spec` exactly as iris_test takes it, plus `routines` — the code to measure. IMPORTANT: a CLASS does not name a routine. `Pkg.Cls` compiles to routines `Pkg.Cls.1`, `Pkg.Cls.2`, …, so pass `Pkg.Cls*`; the bare class name matches nothing and the monitor reports an empty result with NO error. Wildcards are a trailing `*` only. Returns per-routine `routine_lines_total` / `routine_lines_hit` / `coverage_pct` and a `hits` map of line number to execution count. The denominator is COMPILED-ROUTINE lines, not executable .cls source lines — it is not directly comparable to a source-coverage percentage from another tool. Collection is scoped to the calling process, and the monitor is stopped even if the test throws (a partial result is returned with `run_error` and `partial: true`). Refuses to run when a monitor is already active, since it is instance-wide and exclusive. Metrics: RtnLine (always), optionally Time and TotalTime, already in seconds."
+    )]
+    async fn iris_coverage(
+        &self,
+        Parameters(p): Parameters<coverage::CoverageParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let iris = self.get_iris_reloaded().await?;
+        let client = self.http_client();
+        let namespace =
+            crate::tools::interop::resolve_namespace(p.namespace.as_deref(), Some(&iris));
+        let req = coverage::CoverageRequest {
+            test_spec: p.test_spec.clone(),
+            routines: p.routines.clone(),
+            metrics: p.metrics.clone(),
+        };
+        if let Err(bad) = coverage::validate(&req) {
+            self.record_call("iris_coverage", false);
+            return envelope::fail("INVALID_PARAMS", &bad.message());
+        }
+        let program = coverage::build_program(&req);
+        let out = match tokio::time::timeout(
+            std::time::Duration::from_secs(p.timeout),
+            iris.execute_via_generator(&program, &namespace, client),
+        )
+        .await
+        {
+            // A timeout abandons the program mid-flight, so the branch that calls Stop() never
+            // ran. Say that plainly rather than leaving the caller to discover it on the next call.
+            Err(_) => {
+                self.record_call("iris_coverage", false);
+                return envelope::fail_with(
+                    "TIMEOUT",
+                    &format!("coverage run timed out after {}s", p.timeout),
+                    serde_json::json!({
+                        "hint": "The monitor may STILL BE RUNNING — the timeout abandoned the \
+                                 program before it could Stop(). It is instance-wide and \
+                                 exclusive, so stop it before anything else: Do \
+                                 ##class(%Monitor.System.LineByLine).Stop()",
+                        "namespace": namespace,
+                    }),
+                );
+            }
+            Ok(Err(e)) => {
+                self.record_call("iris_coverage", false);
+                return envelope::transport_fail("iris_coverage", &e.to_string());
+            }
+            Ok(Ok(v)) => v,
+        };
+        let rep = coverage::parse_output(&out);
+        if let Some(refused) = &rep.refused {
+            self.record_call("iris_coverage", false);
+            return envelope::fail_with(
+                "COVERAGE_REFUSED",
+                refused,
+                serde_json::json!({"namespace": namespace, "output": out.trim()}),
+            );
+        }
+        self.record_call("iris_coverage", true);
+        let mut payload = coverage::report_json(&rep, &namespace);
+        payload["success"] = serde_json::Value::Bool(true);
+        // The raw device output carries the %UnitTest result, which is the other half of what the
+        // caller asked for — a coverage number without knowing whether the tests passed is not
+        // actionable.
+        payload["output"] = serde_json::Value::String(out.trim().to_string());
+        if let Some(h) = coverage::report_hint(&rep) {
+            payload["hint"] = serde_json::Value::String(h);
+        }
+        Ok(CallToolResult::success(vec![Content::text(
+            payload.to_string(),
+        )]))
     }
 
     #[tool(
@@ -12623,6 +12707,34 @@ mod write_gate_tests {
             assert!(
                 call(tool, args.clone()).is_some(),
                 "{tool} {args} MUTATES and must be gated on a Live connection"
+            );
+        }
+    }
+
+    /// #24/064: iris_coverage RUNS iris_test's work — the same arbitrary %UnitTest code, the same
+    /// productions — and additionally starts an instance-wide, exclusive monitor. So it must be
+    /// gated at least as strongly as iris_test, never weaker. Asserted as a RELATION rather than a
+    /// literal, so the two cannot drift apart if iris_test's own classification ever changes.
+    #[test]
+    fn iris_coverage_is_gated_at_least_as_strongly_as_iris_test() {
+        let empty = serde_json::json!({});
+        assert!(
+            call("iris_test", empty.clone()).is_some(),
+            "precondition: iris_test is gated"
+        );
+        assert!(
+            call("iris_coverage", empty.clone()).is_some(),
+            "iris_coverage runs test code AND starts the line-by-line monitor — it must be gated"
+        );
+        // and no argument makes it look read-only, the way a mode/action-aware tool has a read half
+        for probe in [
+            serde_json::json!({"test_spec": "T", "routines": ["A*"]}),
+            serde_json::json!({"action": "read"}),
+            serde_json::json!({"mode": "get"}),
+        ] {
+            assert!(
+                call("iris_coverage", probe.clone()).is_some(),
+                "no argument may downgrade iris_coverage to read-only: {probe}"
             );
         }
     }
