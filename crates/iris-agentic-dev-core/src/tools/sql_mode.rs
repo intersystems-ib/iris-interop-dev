@@ -300,6 +300,10 @@ mod tests {
     }
 
     /// Word boundary: a column called `ORDERS` or `REORDER` must not look like the keyword.
+    ///
+    /// These three are caught by the `BY` lookahead rather than by the boundary check — verified by
+    /// mutation: removing the boundary guard left all three passing. The case that NEEDS the guard is
+    /// the next test.
     #[test]
     fn a_column_named_like_the_keyword_is_not_mistaken_for_it() {
         for q in [
@@ -311,6 +315,35 @@ mod tests {
             assert!(!stripped, "{q} -> {s}");
             assert_eq!(s, q);
         }
+    }
+
+    /// A MUTATION SURVIVED until this existed: dropping the word-boundary guard passed every case in
+    /// the test above, because each is rejected by the `BY` lookahead instead. The input that reaches
+    /// the guard is an identifier ENDING in `order` followed by `BY` — measured, without the guard
+    /// `SELECT x FROM WORKORDER BY` becomes `SELECT x FROM WORK`, silently truncating a table name.
+    #[test]
+    fn an_identifier_ending_in_order_is_not_a_keyword() {
+        let q = "SELECT x FROM WORKORDER BY";
+        let (s, stripped) = strip_trailing_order_by(q);
+        assert!(!stripped, "must not match inside WORKORDER: {s}");
+        assert_eq!(s, q, "the table name must survive intact");
+        // the same identifier followed by a REAL ORDER BY strips only the real one
+        let (s2, stripped2) = strip_trailing_order_by("SELECT x FROM WORKORDER ORDER BY x");
+        assert!(stripped2);
+        assert_eq!(s2, "SELECT x FROM WORKORDER");
+    }
+
+    /// A MUTATION SURVIVED until this existed too: keeping the FIRST top-level match instead of the
+    /// LAST passed, because every other fixture has at most one top-level ORDER BY. With two, only the
+    /// last can be the trailing one — taking the first would delete a clause still in use.
+    #[test]
+    fn the_last_top_level_order_by_wins_not_the_first() {
+        let (s, stripped) = strip_trailing_order_by("SELECT 1 ORDER BY a ORDER BY b");
+        assert!(stripped);
+        assert_eq!(
+            s, "SELECT 1 ORDER BY a",
+            "first-wins would return 'SELECT 1'"
+        );
     }
 
     /// `TOP` in the inner query is respected by the count — verified live (`TOP 2` → 2), so it must
