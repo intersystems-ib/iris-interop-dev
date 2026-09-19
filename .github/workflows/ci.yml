@@ -69,9 +69,16 @@ jobs:
       #
       # KNOWN LOAD-SENSITIVE ASSERTIONS — wall-clock budgets, not logic. If one of these
       # is the only red, RE-RUN IT ALONE before calling it a regression:
-      #   * mcp_handshake::mcp_server_startup_latency_under_100ms  (p50 < 100ms)
       #   * symbols_local_tests::sc003_parse_500_lines_under_100ms (tree-sitter budget)
       #   * discovery_tests::probe_atelier_respects_timeout        (< 500ms vs 10.255.255.1)
+      #
+      # #200: mcp_handshake::mcp_server_startup_latency_under_100ms WAS on that list and is
+      # gone. It asserted p50 < 100ms and failed ~1 run in 5. Measured: p50 16-18ms idle, but
+      # 6/6 failures with 16 busy loops running — it read machine load as a regression, and
+      # "re-run it alone" is the instruction that teaches everyone to re-run a red instead of
+      # reading it. Replaced by initialize_does_not_block_on_discovery, which asserts the FLOOR
+      # of warm samples against a 1000ms budget: still catches discovery blocking (~2.3s) and
+      # does not care how busy the runner is.
       #
       # NOT a flake source any more: manifest_tests and skills_tests used to reach GitHub
       # unauthenticated (60 req/hr per IP, shared by every job on a runner, reported as a
