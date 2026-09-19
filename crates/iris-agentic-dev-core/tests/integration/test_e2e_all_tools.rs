@@ -77,6 +77,7 @@ fn mcp_exchange_with_env(
 
 /// T079: All 20 v2 tools are listed and none return INTERNAL_ERROR on minimal input.
 #[test]
+#[ignore = "requires live IRIS"]
 fn e2e_all_tools_respond() {
     let iris_host = std::env::var("IRIS_HOST").unwrap_or_default();
     if iris_host.is_empty() {

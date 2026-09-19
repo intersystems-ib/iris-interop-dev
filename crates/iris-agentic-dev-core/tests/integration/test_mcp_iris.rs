@@ -97,6 +97,7 @@ fn parse_tool_result(response: &serde_json::Value) -> serde_json::Value {
 
 /// iris_compile on real IRIS returns a structured response.
 #[test]
+#[ignore = "requires live IRIS"]
 fn e2e_iris_compile_success() {
     let iris_host = std::env::var("IRIS_HOST").unwrap_or_default();
     if iris_host.is_empty() {

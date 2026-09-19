@@ -3755,6 +3755,7 @@ const OPENCODE_DOCKER_README_SNIPPET: &str = r#"{
 /// 4. Call tools/list → verify binary responds
 /// 5. Call check_config → verify IRIS connection is established
 #[test]
+#[ignore = "requires live IRIS"]
 fn e2e_opencode_setup_follows_readme() {
     require_iris!();
 
