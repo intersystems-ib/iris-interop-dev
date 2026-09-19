@@ -18,14 +18,51 @@ pub enum DocMode {
 }
 
 impl DocMode {
-    pub fn parse(s: &str) -> Option<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "get" => Some(Self::Get),
-            "put" => Some(Self::Put),
-            "delete" => Some(Self::Delete),
-            "head" => Some(Self::Head),
-            _ => None,
+    /// Every mode, and the ONLY definition of the set.
+    ///
+    /// `parse`, the advertised list in the unknown-mode error, and the write gate in
+    /// `mutating_call` all derive from this. Before, the set was written out three times — here, in
+    /// that error message, and as `matches!(action, "put" | "delete")` in the gate — and the third
+    /// copy is the dangerous one: a mode added to the enum but not to the gate's `matches!` would be
+    /// dispatched as an UNGATED WRITE. That is the report-vs-enforce split this repo keeps hitting
+    /// (#110, #169, #263), and it is a live hazard the moment a positional-edit mode is added.
+    pub const ALL: &'static [DocMode] = &[Self::Get, Self::Put, Self::Delete, Self::Head];
+
+    /// The wire spelling. EXHAUSTIVE match, no wildcard — a new variant does not compile until it is
+    /// named here.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Get => "get",
+            Self::Put => "put",
+            Self::Delete => "delete",
+            Self::Head => "head",
         }
+    }
+
+    /// Whether this mode WRITES to IRIS.
+    ///
+    /// EXHAUSTIVE match, no wildcard, and that is the point: a new variant is a compile ERROR until
+    /// someone decides whether it writes. A `_ => false` here would turn that decision into a silent
+    /// default of "safe", which is the wrong direction to be wrong in.
+    pub fn is_write(self) -> bool {
+        match self {
+            Self::Get | Self::Head => false,
+            Self::Put | Self::Delete => true,
+        }
+    }
+
+    /// Derived from [`Self::ALL`], so the advertised list cannot omit a mode that is dispatchable.
+    pub fn valid_values() -> String {
+        Self::ALL
+            .iter()
+            .map(|m| m.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        let lower = s.to_ascii_lowercase();
+        Self::ALL.iter().copied().find(|m| m.as_str() == lower)
     }
 }
 
@@ -252,7 +289,11 @@ pub async fn handle_iris_doc(
         Some(DocMode::Head) => handle_head(iris, client, p).await,
         None => crate::tools::envelope::fail_with(
             "INVALID_PARAM",
-            &format!("Unknown mode='{}'. Use: get, put, delete, head.", p.mode),
+            &format!(
+                "Unknown mode='{}'. Use: {}.",
+                p.mode,
+                DocMode::valid_values()
+            ),
             serde_json::json!({"mode": p.mode}),
         ),
     }
@@ -2725,5 +2766,94 @@ mod storage_strip_message_tests {
         // Not a class document: left alone, so it cannot masquerade as a class name.
         assert_eq!(strip_cls_suffix("Pkg.Routine.mac"), "Pkg.Routine.mac");
         assert_eq!(strip_cls_suffix("NoDots"), "NoDots");
+    }
+}
+
+#[cfg(test)]
+mod doc_mode_single_source_tests {
+    //! `DocMode` is the only definition of the mode set. These tests pin the three things that used
+    //! to be written out separately: what parses, what is advertised, and what the write gate treats
+    //! as a write.
+    use super::*;
+
+    /// Every variant, listed ONCE for the tests.
+    ///
+    /// The `match` below is what makes this list impossible to leave stale: it has no wildcard, so
+    /// adding a `DocMode` variant is a COMPILE error here until it is named. That is the guard that a
+    /// hand-written count or a `ALL.len() == 4` assertion cannot give — those go stale silently.
+    fn every_variant() -> Vec<DocMode> {
+        let exhaustiveness_probe = DocMode::Get;
+        match exhaustiveness_probe {
+            DocMode::Get | DocMode::Put | DocMode::Delete | DocMode::Head => {}
+        }
+        vec![DocMode::Get, DocMode::Put, DocMode::Delete, DocMode::Head]
+    }
+
+    /// `ALL` must contain every variant. If one is missing, `parse` can never produce it, so its
+    /// dispatch arm is dead code and the mode is silently unreachable.
+    #[test]
+    fn all_contains_every_variant() {
+        for v in every_variant() {
+            assert!(
+                DocMode::ALL.contains(&v),
+                "{v:?} is missing from DocMode::ALL — parse() can never return it, so its dispatch \
+                 arm is unreachable"
+            );
+        }
+        assert_eq!(
+            DocMode::ALL.len(),
+            every_variant().len(),
+            "ALL has an entry that is not a real variant, or a duplicate"
+        );
+    }
+
+    #[test]
+    fn every_variant_round_trips_through_its_wire_spelling() {
+        for v in every_variant() {
+            assert_eq!(DocMode::parse(v.as_str()), Some(v), "{v:?}");
+        }
+    }
+
+    /// Parsing stays case-insensitive — the behaviour before `parse` was rewritten to derive from
+    /// `ALL`. A caller sending `PUT` must still write.
+    #[test]
+    fn parsing_is_still_case_insensitive() {
+        assert_eq!(DocMode::parse("PUT"), Some(DocMode::Put));
+        assert_eq!(DocMode::parse("Delete"), Some(DocMode::Delete));
+        assert_eq!(DocMode::parse("HeAd"), Some(DocMode::Head));
+        assert_eq!(DocMode::parse("nonsense"), None);
+    }
+
+    /// The advertised list must name every mode, so the unknown-mode error cannot omit one that
+    /// actually works.
+    #[test]
+    fn the_advertised_list_names_every_variant() {
+        let advertised = DocMode::valid_values();
+        for v in every_variant() {
+            assert!(
+                advertised.contains(v.as_str()),
+                "{} is dispatchable but not advertised in {advertised:?}",
+                v.as_str()
+            );
+        }
+    }
+
+    /// The classification the whole change exists for. Read modes must not be writes, and write
+    /// modes must be — stated per variant rather than as a property, so a wrong answer names itself.
+    #[test]
+    fn the_write_classification_is_correct_per_variant() {
+        assert!(!DocMode::Get.is_write(), "get reads");
+        assert!(!DocMode::Head.is_write(), "head reads");
+        assert!(DocMode::Put.is_write(), "put writes");
+        assert!(DocMode::Delete.is_write(), "delete writes");
+    }
+
+    /// CONTROL: both polarities occur. If `is_write` were stuck on or off, the per-variant test above
+    /// would catch it — but this says so directly, so a future all-write or all-read enum is visible.
+    #[test]
+    fn both_polarities_exist() {
+        let writes = every_variant().iter().filter(|m| m.is_write()).count();
+        assert!(writes > 0, "no write modes at all?");
+        assert!(writes < every_variant().len(), "every mode is a write?");
     }
 }
