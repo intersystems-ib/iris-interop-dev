@@ -404,6 +404,25 @@ mod tests {
         );
     }
 
+    /// The SAME clamp exists in `find_top_level`, and mutating THAT copy survived the test above —
+    /// two copies of one guard, only one exercised. A stray `)` before the `:` drives that function's
+    /// depth negative, so the `:` is no longer seen at depth 0 and the type is silently lost.
+    #[test]
+    fn a_stray_paren_before_the_colon_does_not_hide_the_type() {
+        let a = parse("x):%String");
+        assert_eq!(a.len(), 1, "{a:?}");
+        assert_eq!(a[0].name, "x)", "{a:?}");
+        assert_eq!(
+            a[0].type_name.as_deref(),
+            Some("%String"),
+            "a stray ')' must not swallow the type: {a:?}"
+        );
+        // and the same for the `=` scan
+        let b = parse("y)=3");
+        assert_eq!(b.len(), 1, "{b:?}");
+        assert_eq!(b[0].default.as_deref(), Some("3"), "{b:?}");
+    }
+
     /// A colon inside a default string must not be mistaken for the type separator.
     #[test]
     fn a_colon_inside_a_default_string_is_not_a_type_separator() {
