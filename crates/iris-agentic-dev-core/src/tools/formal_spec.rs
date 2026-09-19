@@ -383,13 +383,25 @@ mod tests {
 
     /// A malformed spec must degrade, never panic and never start splitting inside parentheses —
     /// which is what an unbalanced `)` would do if depth were allowed to go negative.
+    /// A MUTATION SURVIVED the first version of this test: letting paren depth go NEGATIVE passed,
+    /// because the test only asserted `!result.is_empty()` — "something came back" rather than "the
+    /// right thing came back". With a negative depth, one stray `)` makes every later comma a
+    /// non-separator, so the whole spec collapses into a single argument. The saturating clamp is what
+    /// keeps a comma after a stray `)` working as a separator, so the assertion has to COUNT.
     #[test]
     fn an_unbalanced_paren_does_not_panic_or_split_wrongly() {
+        // unclosed `(` — everything after it is legitimately inside the parens, so one argument
         let a = parse("x:%String(MAXLEN=,y:%Integer");
-        assert!(!a.is_empty(), "must recover something: {a:?}");
+        assert_eq!(a.len(), 1, "an unclosed paren swallows the rest: {a:?}");
         assert_eq!(a[0].name, "x");
+
+        // a STRAY `)` must not drive depth below zero; the following comma still separates
         let b = parse("x)y,z:%Integer");
-        assert!(!b.is_empty(), "{b:?}");
+        assert_eq!(
+            b.iter().map(|v| v.name.as_str()).collect::<Vec<_>>(),
+            vec!["x)y", "z"],
+            "a stray ')' must not stop later commas separating: {b:?}"
+        );
     }
 
     /// A colon inside a default string must not be mistaken for the type separator.
