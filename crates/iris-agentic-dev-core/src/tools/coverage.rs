@@ -310,6 +310,102 @@ pub fn parse_output(out: &str) -> CoverageReport {
     rep
 }
 
+/// Tool parameters. `routines` carries the aliases a caller is most likely to reach for, because the
+/// class-vs-routine distinction is the one thing about this tool that is genuinely surprising.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CoverageParams {
+    /// The %UnitTest spec to run while monitoring — exactly what iris_test takes.
+    #[serde(alias = "pattern", alias = "test", alias = "tests")]
+    pub test_spec: String,
+    /// Routine patterns. A CLASS must be given as `Pkg.Cls*`, since it compiles to `Pkg.Cls.1` …
+    #[serde(
+        alias = "routine",
+        alias = "classes",
+        alias = "class",
+        alias = "target"
+    )]
+    pub routines: Vec<String>,
+    /// Extra metrics beyond `RtnLine`: `Time`, `TotalTime`.
+    #[serde(default)]
+    pub metrics: Vec<String>,
+    /// IRIS namespace. OMIT to use the connection's configured namespace.
+    #[serde(default)]
+    pub namespace: Option<String>,
+    #[serde(default = "default_coverage_timeout")]
+    pub timeout: u64,
+}
+
+fn default_coverage_timeout() -> u64 {
+    // A monitored test run is slower than the same run unmonitored — every executed line is
+    // counted. Generous on purpose: a timeout here abandons the program mid-flight, and the branch
+    // that would have called Stop() never runs.
+    300
+}
+
+/// Turn a report into the tool payload.
+pub fn report_json(rep: &CoverageReport, namespace: &str) -> serde_json::Value {
+    let routines: Vec<serde_json::Value> = rep
+        .routines
+        .iter()
+        .map(|r| {
+            let mut o = serde_json::json!({
+                "name": r.name,
+                "routine_lines_total": r.routine_lines_total,
+                "routine_lines_hit": r.routine_lines_hit,
+                "hits": r.hits.iter().map(|(k, v)| (k.to_string(), serde_json::json!(*v))).collect::<serde_json::Map<String, serde_json::Value>>(),
+            });
+            // Omitted rather than 0 when nothing is tracked — see RoutineCoverage::pct.
+            if let Some(p) = r.pct() {
+                o["coverage_pct"] = serde_json::json!((p * 100.0).round() / 100.0);
+            }
+            o
+        })
+        .collect();
+    let total: usize = rep.routines.iter().map(|r| r.routine_lines_total).sum();
+    let hit: usize = rep.routines.iter().map(|r| r.routine_lines_hit).sum();
+    let mut out = serde_json::json!({
+        "namespace": namespace,
+        "metrics": rep.metrics,
+        "routines_monitored": rep.routines_monitored,
+        "routines": routines,
+        "routine_lines_total": total,
+        "routine_lines_hit": hit,
+        "monitor_stopped": rep.stopped,
+    });
+    if total > 0 {
+        out["coverage_pct"] =
+            serde_json::json!(((hit as f64) * 10000.0 / (total as f64)).round() / 100.0);
+    }
+    if let Some(e) = &rep.run_error {
+        out["run_error"] = serde_json::Value::String(e.clone());
+        out["partial"] = serde_json::Value::Bool(true);
+    }
+    out
+}
+
+/// Advice that only makes sense once the numbers are in hand.
+pub fn report_hint(rep: &CoverageReport) -> Option<String> {
+    if !rep.stopped {
+        return Some(
+            "THE MONITOR DID NOT STOP. It is instance-wide and exclusive, so it is still costing              every process on this instance performance and the next iris_coverage call will be              refused. Stop it: Do ##class(%Monitor.System.LineByLine).Stop()"
+                .into(),
+        );
+    }
+    if rep.routines_monitored == 0 {
+        return Some(
+            "No routine matched, so nothing was measured. A CLASS does not name a routine:              `Pkg.Cls` compiles to `Pkg.Cls.1`, `Pkg.Cls.2` …, so pass `Pkg.Cls*`. The monitor              reports no error for a pattern that matches nothing — an empty result IS the symptom."
+                .into(),
+        );
+    }
+    if rep.routines.iter().all(|r| r.routine_lines_hit == 0) {
+        return Some(
+            "Routines were monitored but no line ran. Most often the test did not exercise this              code at all, or the test spec matched no test class — check the %UnitTest output in              `output`. Coverage of 0% is a real measurement; it is not a tool failure."
+                .into(),
+        );
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

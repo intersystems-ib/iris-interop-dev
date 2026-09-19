@@ -213,7 +213,7 @@ fn test_merged_excludes_original_interop_production_tools() {
     }
 }
 
-/// Merged must advertise exactly 47 tools (measured 2026-09-18; 51 - 8 + 4).
+/// Merged must advertise exactly 51 tools (measured 2026-09-19; 55 - 8 + 4).
 /// Renamed: the old `test_merged_tool_count_is_23` contradicted its own assertion (33),
 /// and both numbers came from a hardcoded list that had drifted away from the router.
 #[test]
@@ -221,8 +221,8 @@ fn test_merged_tool_count() {
     let tools = IrisTools::new_with_toolset(None, Toolset::Merged).expect("IrisTools::new");
     let count = tools.registered_tool_names().len();
     assert_eq!(
-        count, 50,
-        "Merged toolset must advertise exactly 50 tools, got {}",
+        count, 51,
+        "Merged toolset must advertise exactly 51 tools, got {}",
         count
     );
     // iris_get_log must be registered in Merged (027-progressive-disclosure)
@@ -355,8 +355,8 @@ fn test_baseline_tool_count() {
         .registered_tool_names()
         .len();
     assert_eq!(
-        n, 58,
-        "Baseline must advertise exactly 58 tools (Toolset::Baseline doc comment says 58), got {}",
+        n, 59,
+        "Baseline must advertise exactly 59 tools (Toolset::Baseline doc comment says 59), got {}",
         n
     );
 }
@@ -369,7 +369,7 @@ fn test_nostub_tool_count_absolute() {
         .expect("IrisTools::new")
         .registered_tool_names()
         .len();
-    assert_eq!(n, 54, "Nostub must advertise exactly 54 tools, got {}", n);
+    assert_eq!(n, 55, "Nostub must advertise exactly 55 tools, got {}", n);
 }
 
 /// The single regression gate for the four doc-comment numbers. A failure here means the
@@ -378,10 +378,10 @@ fn test_nostub_tool_count_absolute() {
 #[test]
 fn test_toolset_counts_match_doc_comments() {
     for (ts, expected) in [
-        (Toolset::Baseline, 58usize),
-        (Toolset::Nostub, 54),
-        (Toolset::Merged, 50),
-        (Toolset::Interop, 29),
+        (Toolset::Baseline, 59usize),
+        (Toolset::Nostub, 55),
+        (Toolset::Merged, 51),
+        (Toolset::Interop, 30),
     ] {
         let n = IrisTools::new_with_toolset(None, ts)
             .expect("IrisTools::new")
@@ -397,7 +397,7 @@ fn test_toolset_counts_match_doc_comments() {
     // Two independent anchors for the interop number: the keep-list and the router.
     assert_eq!(
         iris_agentic_dev_core::tools::INTEROP_TOOLS.len(),
-        29,
+        30,
         "INTEROP_TOOLS is the interop profile — it must agree with the measured count"
     );
 }
@@ -443,7 +443,7 @@ fn test_new_uses_pruned_baseline_router() {
         .registered_tool_names();
     assert_eq!(
         via_new.len(),
-        58,
+        59,
         "new() claims Toolset::Baseline, so it must advertise the baseline surface"
     );
     assert_eq!(

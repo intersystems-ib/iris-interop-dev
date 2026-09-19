@@ -179,7 +179,7 @@ fn tools_list_returns_interop_profile() {
         .expect("no tools array");
     let names: Vec<_> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
-    // Interop profile (fork default): exactly 29. The old range here allowed for the write
+    // Interop profile (fork default): exactly 30. The old range here allowed for the write
     // gate removing two tools on a read-only connection — #114 stopped it doing that, so the
     // slack was vestigial and would have hidden a tool going missing.
     //
@@ -193,8 +193,8 @@ fn tools_list_returns_interop_profile() {
     // them. A skip that reports `ok` is indistinguishable from a pass, which is why the CI
     // dispatch (where IRIS_HOST IS set) is the only thing that actually exercises this.
     assert!(
-        names.len() == 29,
-        "expected the interop profile (29 tools), got {}: {:?}",
+        names.len() == 30,
+        "expected the interop profile (30 tools), got {}: {:?}",
         names.len(),
         names
     );
