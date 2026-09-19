@@ -1,0 +1,76 @@
+name: docker-discovery
+
+# #225: the one target that runs nowhere else, on a schedule, so "it has not recurred" can
+# become a statement about observation rather than about absence of observation.
+#
+# `docker_discovery_e2e` is the sole entry in scripts/ci-test-targets.sh's EXCLUDED list, with a
+# sound reason: it `docker run`s real intersystemsdc/iris-community images and waits for them, so
+# it does not belong in front of every push. Since #240 both the required gate and the e2e job
+# derive their targets from that script, which means this target ran in NO job at all — and #225's
+# exit criterion ("if it never recurs, close this") could never be met, because nothing was
+# looking. A single local failure on 2026-09-17 has never been reproduced, and until now that fact
+# carried no information.
+#
+# Weekly rather than nightly: the observed rate is one failure, once, and each run pulls IRIS
+# images. ~52 observations a year is enough to distinguish "rare" from "gone".
+#
+# Deliberately NOT a required check and not on pull_request: it must never gate a push, which is
+# the whole reason it was excluded in the first place.
+
+on:
+  schedule:
+    # Sundays 04:23 UTC. Off the :00 mark on purpose — every scheduler on the planet fires at :00.
+    - cron: "23 4 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  docker-discovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # The test spawns target/debug/iris-interop-dev, which lives in the OTHER package. Building
+      # the test target alone leaves a stale or absent binary and the verdict then describes a
+      # binary nobody wrote — a trap this repo has hit repeatedly. Build the bin explicitly.
+      - name: build the binary the test spawns
+        run: cargo build -p iris-agentic-dev
+
+      # Community images only, no license key needed — exactly what the test file's own header
+      # prescribes. The two enterprise tests stay #[ignore]d and are not run here.
+      - name: run docker_discovery_e2e (community)
+        run: |
+          set -o pipefail
+          cargo test -p iris-agentic-dev-core --test docker_discovery_e2e 2>&1 | tee result.txt
+
+      # A run that executed NOTHING exits 0 and reads exactly like a pass — which is the failure
+      # mode #225 is about. So the observation is only counted if tests actually ran.
+      - name: "guard: the run actually executed tests"
+        if: always()
+        run: |
+          set -euo pipefail
+          if ! grep -q "test result:" result.txt; then
+            echo "::error::no 'test result:' line — the target did not run, so this run observed nothing"
+            exit 1
+          fi
+          ran=$(grep "test result:" result.txt \
+            | awk '{for(i=1;i<=NF;i++){if($i=="passed;")p+=$(i-1); if($i=="failed;")f+=$(i-1)}} END{print p+f}')
+          echo "tests executed: $ran"
+          if [ "${ran:-0}" -eq 0 ]; then
+            echo "::error::0 tests executed — a green job here would be a false observation"
+            exit 1
+          fi
+          grep "test result:" result.txt
+
+      - name: upload the log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: docker-discovery-result
+          path: result.txt
+          retention-days: 90
