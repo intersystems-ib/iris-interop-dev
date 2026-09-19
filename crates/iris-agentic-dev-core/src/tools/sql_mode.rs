@@ -89,10 +89,17 @@ pub fn strip_trailing_order_by(sql: &str) -> (String, bool) {
             '\'' => in_str = !in_str,
             '(' if !in_str => depth += 1,
             ')' if !in_str => depth = depth.saturating_sub(1).max(0),
-            'O' | 'o' if !in_str && depth == 0 => {
-                // Word-boundary match on ORDER ... BY, tolerating any run of whitespace between.
-                if upper[i..].starts_with("ORDER")
-                    && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_')
+            // Word-boundary match on ORDER ... BY, tolerating any run of whitespace between. The
+            // boundary half is load-bearing: without it `SELECT x FROM WORKORDER BY` truncates to
+            // `SELECT x FROM WORK` — measured. Expressed as a match GUARD rather than a nested `if`
+            // (clippy::collapsible_if); a failed guard falls through to `_ => {}`, same as before.
+            'O' | 'o'
+                if !in_str
+                    && depth == 0
+                    && upper[i..].starts_with("ORDER")
+                    && (i == 0
+                        || !bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_') =>
+            {
                 {
                     let rest = &upper[i + 5..];
                     let trimmed = rest.trim_start();
