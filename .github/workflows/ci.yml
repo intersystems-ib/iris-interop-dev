@@ -122,6 +122,12 @@ jobs:
           cargo test --workspace --lib --bins $TARGETS --no-fail-fast
         env:
           RUST_LOG: warn
+      # #224: the release-asset guard's logic, exercised here because the failure it catches
+      # (four green build jobs, a release with zero assets) only reproduces on a tag push. 7
+      # cases including a positive control, so a script that always failed could not pass them.
+      # Runs in the ordinary `test` job so it cannot rot unnoticed until the next release.
+      - name: "release-asset guard logic (#224)"
+        run: bash scripts/test-verify-release-assets.sh
       # Advisory: exercises the real api.github.com and raw.githubusercontent.com paths
       # with the token Actions injects (1000 req/hr per repo, not 60 per IP).
       # continue-on-error so a GitHub-side outage or limit can never redden the gate above.

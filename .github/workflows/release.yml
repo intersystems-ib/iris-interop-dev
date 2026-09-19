@@ -116,13 +116,28 @@ jobs:
     permissions:
       contents: write
     steps:
+      # #224: this job did NOT check out the repo. It did not need to while the only publishing
+      # step was the action itself, but the asset guard below runs a script from scripts/, so the
+      # tree has to be here. Placed BEFORE download-artifact: checkout cleans the workspace, and
+      # running it after would delete the artifacts it just downloaded.
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
-      - uses: softprops/action-gh-release@v3
+      # #224: the release is created WITHOUT assets here, and each asset is uploaded on its own
+      # in the next step. Publishing all four through this action's `files:` glob failed twice
+      # for v0.20.0-interop with one unattributable "Error saving asset" — no asset name, no
+      # HTTP status, a single line for four parallel operations — leaving a DRAFT release with
+      # ZERO assets while all four build jobs reported success. Uploading the identical bytes to
+      # the identical release sequentially succeeded on the first attempt, every time.
+      # Concurrency was the only variable that changed.
+      #
+      # Also un-floated: `@v3` would silently pick up a new upload implementation, and this step
+      # is the only thing that publishes anything. (A commit SHA is stricter still; no other
+      # action in this repo is SHA-pinned, so this stays a tag to match.)
+      - uses: softprops/action-gh-release@v3.0.3
         with:
-          files: dist/*
           generate_release_notes: true
           body: |
             Streamlined **iris-interop-dev** MCP server (interop-focused fork of iris-agentic-dev).
@@ -133,5 +148,44 @@ jobs:
             claude mcp add --scope user iris-interop-dev --env IRIS_HOST=localhost --env IRIS_WEB_PORT=80 --env IRIS_WEB_PREFIX=irishealth --env IRIS_USERNAME=_SYSTEM --env IRIS_PASSWORD=SYS --env IRIS_NAMESPACE=USER -- C:/iris-interop-dev/iris-interop-dev.exe mcp
             ```
             Tool names are identical to iris-agentic-dev, so the iris-interop-skills work unchanged.
+
+      # #224: one asset at a time. `--clobber` so a retry of a partially-published release is
+      # idempotent rather than a "already exists" failure.
+      - name: upload assets sequentially
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          for f in dist/*; do
+            name=$(basename "$f")
+            for attempt in 1 2 3; do
+              if gh release upload "$TAG" "$f" --clobber; then
+                echo "uploaded $name (attempt $attempt)"
+                break
+              fi
+              if [ "$attempt" -eq 3 ]; then
+                echo "::error::failed to upload $name after 3 attempts"
+                exit 1
+              fi
+              echo "upload of $name failed, retrying in $((attempt * 5))s"
+              sleep $((attempt * 5))
+            done
+          done
+
+      # #224: publication is read back, not assumed — the failure being fixed was a green run
+      # with an empty release. The comparison lives in scripts/verify-release-assets.sh so it has
+      # ONE implementation that scripts/test-verify-release-assets.sh can exercise (7 cases,
+      # including the four-green-builds-zero-assets failure itself). The real failure only
+      # reproduces on a tag push, so testing the logic is how it gets verified at all.
+      - name: "guard: every staged asset is published, with bytes"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" --json assets --jq '.assets[] | "\(.name) \(.size)"' > published.txt
+          echo "--- published assets ---"; cat published.txt
+          bash scripts/verify-release-assets.sh dist published.txt
 
 # (workflow registered under intersystems-ib/iris-interop-dev)
