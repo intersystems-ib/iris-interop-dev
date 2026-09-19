@@ -4178,6 +4178,100 @@ pub struct IrisTools {
 /// The classification is per-tool-and-arguments and comes from each tool's verified reach
 /// — a name-based guess got this wrong twice (it read `iris_get_log`, an in-memory store
 /// lookup, as a writer and missed `iris_doc` entirely).
+/// #24/d3bc028: every argument shape that reaches a write arm of [`mutating_call`].
+///
+/// This is the input side of that function enumerated exhaustively — `{}` for the unconditional arms,
+/// every `action`/`mode` value its `matches!` arms name, and `force` for `iris_query`. Kept beside it
+/// on purpose: a new write arm means a new probe, and `the_probe_battery_detects_every_write_arm`
+/// fails until one is added.
+#[cfg(test)]
+pub(crate) const MUTATING_PROBES_SRC: &[&str] = &[
+    "put",
+    "delete",
+    "set",
+    "import",
+    "start",
+    "stop",
+    "restart",
+    "update",
+    "recover",
+    "set_autostart",
+    "add",
+    "remove",
+    "enable",
+    "disable",
+    "set_settings",
+    "source_map",
+];
+
+/// The probe argument shapes, built from [`MUTATING_PROBES_SRC`] plus `{}` and `{"force":true}`.
+fn mutating_probes() -> Vec<serde_json::Value> {
+    // Not derived from the const at runtime: this list must exist in non-test builds too, and
+    // duplicating sixteen short strings is cheaper than a lazy static. The test below asserts the
+    // two agree, so they cannot drift.
+    let actions = [
+        "put",
+        "delete",
+        "set",
+        "import",
+        "start",
+        "stop",
+        "restart",
+        "update",
+        "recover",
+        "set_autostart",
+        "add",
+        "remove",
+        "enable",
+        "disable",
+        "set_settings",
+        "source_map",
+    ];
+    let mut v = vec![serde_json::json!({}), serde_json::json!({"force": true})];
+    for a in actions {
+        // Both discriminators. NOT because one alone would miss a tool — MEASURED, it would not:
+        // `mutating_call` reads `args["action"]` OR `args["mode"]`, whichever is PRESENT, so an
+        // `{"action": "put"}` probe reaches iris_doc even though iris_doc's real parameter is `mode`.
+        // A mutation dropping the `mode` probes is therefore EQUIVALENT, not a caught bug. Both are
+        // kept so the battery still works if that fallback is ever narrowed to a per-tool key.
+        v.push(serde_json::json!({"action": a}));
+        v.push(serde_json::json!({"mode": a}));
+    }
+    v
+}
+
+/// Whether `tool` can mutate under ANY argument shape.
+///
+/// DERIVED from `mutating_call` rather than listed separately. That is the whole point: the
+/// `readOnlyHint` this feeds is a PROJECTION of the write gate, so an annotation cannot contradict the
+/// gate that enforces it. A hand-maintained list of read-only tools would be a second source of truth
+/// and would eventually disagree — and the disagreement that matters is the one where a client skips
+/// a confirmation prompt for a tool that writes.
+pub(crate) fn tool_can_mutate(tool: &str) -> bool {
+    mutating_probes()
+        .iter()
+        .any(|p| mutating_call(tool, p).is_some())
+}
+
+/// Attach `readOnlyHint` to one advertised tool.
+///
+/// ONLY `readOnlyHint` is set, deliberately:
+///
+/// * `destructiveHint` cannot be derived here — `mutating_call` returns a description, not a
+///   destroys-vs-adds verdict — and its spec default is `true`, the cautious answer. Omitting it
+///   leaves that caution in place; guessing `false` for a tool that deletes would not.
+/// * `idempotentHint` and `openWorldHint` are likewise omitted rather than asserted; both spec
+///   defaults are the conservative reading for a tool driving a live IRIS instance.
+///
+/// An annotation that over-claims is worse than an absent one: absent means "unknown, ask", and a
+/// wrong `readOnlyHint: true` means "do not ask" for a tool that writes.
+fn annotate_tool(tool: &mut rmcp::model::Tool) {
+    let read_only = !tool_can_mutate(&tool.name);
+    let mut ann = tool.annotations.clone().unwrap_or_default();
+    ann.read_only_hint = Some(read_only);
+    tool.annotations = Some(ann);
+}
+
 pub(crate) fn mutating_call(tool: &str, args: &serde_json::Value) -> Option<&'static str> {
     // The discriminator, whatever this tool calls it.
     let action = args
@@ -4466,6 +4560,28 @@ impl IrisTools {
     /// `iris_admin`, which the router removes for baseline/nostub. The tests that
     /// guarded it compared the hardcoded list against itself, so the drift was
     /// invisible; `test_toolset_counts_match_doc_comments` now pins the real numbers.)
+    /// Exactly what `tools/list` returns: the router's tools with their schemas normalised and their
+    /// annotations attached.
+    ///
+    /// EXTRACTED so the wiring is testable. A mutation removing the `annotate_tool` call from inside
+    /// `list_tools` SURVIVED, because every annotation test called `annotate_tool` directly — the
+    /// integration point was the one thing not covered, and it is the only part a client sees.
+    /// `list_tools` needs a `RequestContext` to call, which is why the loop lives here instead.
+    pub fn advertised_tools(&self) -> Vec<rmcp::model::Tool> {
+        let mut tools = self.tool_router.list_all();
+        for tool in tools.iter_mut() {
+            let schema = std::sync::Arc::make_mut(&mut tool.input_schema);
+            normalize_schema_openapi3(schema);
+            drop_default_additional_properties(schema);
+            drop_struct_name_title(schema);
+            // #24/d3bc028: readOnlyHint, derived from the write gate. Done HERE rather than as ~30
+            // `annotations(...)` attributes on the #[tool] macros, so there is one source of truth
+            // and no per-tool literal to fall out of step with `mutating_call`.
+            annotate_tool(tool);
+        }
+        tools
+    }
+
     pub fn registered_tool_names(&self) -> std::collections::HashSet<String> {
         self.tool_router
             .list_all()
@@ -9127,15 +9243,8 @@ impl ServerHandler for IrisTools {
         _request: Option<rmcp::model::PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
-        let mut tools = self.tool_router.list_all();
-        for tool in tools.iter_mut() {
-            let schema = std::sync::Arc::make_mut(&mut tool.input_schema);
-            normalize_schema_openapi3(schema);
-            drop_default_additional_properties(schema);
-            drop_struct_name_title(schema);
-        }
         Ok(rmcp::model::ListToolsResult {
-            tools,
+            tools: self.advertised_tools(),
             next_cursor: None,
             meta: None,
         })
@@ -10958,6 +11067,217 @@ mod schema_normalization_tests {
             !DOCKER_REQUIRED_HINT.to_lowercase().contains("docker run"),
             "DOCKER_REQUIRED hint must not suggest 'docker run' (guides non-Docker users)"
         );
+    }
+}
+
+#[cfg(test)]
+mod tool_annotation_tests {
+    //! #24/d3bc028: `readOnlyHint` on every advertised tool, derived from the write gate.
+    //!
+    //! The property under test is not "the field is present" — it is that the annotation and the gate
+    //! CANNOT DISAGREE. A wrong `readOnlyHint: true` tells a client not to ask before calling a tool
+    //! that writes, which is strictly worse than no annotation at all (absent means "unknown, ask").
+    use super::*;
+
+    /// POSITIVE CONTROL ON THE BATTERY ITSELF. A battery that detected nothing would mark every tool
+    /// read-only and every other test here would still pass. So: every tool named in a write arm of
+    /// `mutating_call` must be detected as mutating by the probes.
+    ///
+    /// The unconditional arms and the action-gated arms are listed separately because they fail for
+    /// different reasons — an unconditional arm missed means the probe list is empty, an action-gated
+    /// one missed means a specific action string is absent.
+    #[test]
+    fn the_probe_battery_detects_every_write_arm() {
+        for tool in [
+            "iris_execute",
+            "iris_execute_method",
+            "iris_compile",
+            "iris_test",
+            "iris_coverage",
+            "iris_credential_manage",
+        ] {
+            assert!(
+                tool_can_mutate(tool),
+                "{tool} mutates unconditionally and MUST be detected"
+            );
+        }
+        for tool in [
+            "iris_doc",
+            "iris_lookup_manage",
+            "iris_lookup_transfer",
+            "iris_production",
+            "iris_production_item",
+            "iris_debug",
+            "iris_query",
+        ] {
+            assert!(
+                tool_can_mutate(tool),
+                "{tool} mutates for at least one action/mode and MUST be detected — a missing probe                  string would silently annotate it read-only"
+            );
+        }
+    }
+
+    /// The probe list is duplicated between `MUTATING_PROBES_SRC` and `mutating_probes()` (the latter
+    /// must exist in non-test builds). They must agree, or the control above validates a list the
+    /// runtime does not use.
+    #[test]
+    fn the_test_and_runtime_probe_lists_agree() {
+        let runtime: std::collections::HashSet<String> = mutating_probes()
+            .iter()
+            .filter_map(|p| {
+                p.get("action")
+                    .or_else(|| p.get("mode"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
+            .collect();
+        let declared: std::collections::HashSet<String> =
+            MUTATING_PROBES_SRC.iter().map(|s| s.to_string()).collect();
+        assert_eq!(runtime, declared, "the two probe lists have drifted");
+    }
+
+    /// A tool that can mutate must never be advertised read-only. This is the invariant the whole
+    /// design exists to guarantee, checked over the REAL advertised set rather than a hand list.
+    #[test]
+    fn no_mutating_tool_is_advertised_read_only() {
+        for ts in [
+            Toolset::Interop,
+            Toolset::Merged,
+            Toolset::Nostub,
+            Toolset::Baseline,
+        ] {
+            let t = IrisTools::new_with_toolset(None, ts).expect("build");
+            let all = t.tool_router.list_all();
+            assert!(!all.is_empty(), "precondition: {ts:?} advertises tools");
+            for mut tool in all {
+                let name = tool.name.to_string();
+                annotate_tool(&mut tool);
+                let ro = tool
+                    .annotations
+                    .as_ref()
+                    .and_then(|a| a.read_only_hint)
+                    .unwrap_or_else(|| panic!("{name} has no readOnlyHint in {ts:?}"));
+                if tool_can_mutate(&name) {
+                    assert!(
+                        !ro,
+                        "{name} can mutate but is advertised readOnlyHint:true in {ts:?} — a client                          would skip its confirmation prompt"
+                    );
+                }
+            }
+        }
+    }
+
+    /// EVERY advertised tool gets the hint, THROUGH THE REAL PATH.
+    ///
+    /// A MUTATION SURVIVED the first version of this: removing the `annotate_tool` call from
+    /// `list_tools` passed, because this test called `annotate_tool` itself. It was testing the
+    /// function while the wiring — the only part a client actually sees — was uncovered. It now goes
+    /// through `advertised_tools()`, which is what `list_tools` returns.
+    #[test]
+    fn every_advertised_tool_carries_a_read_only_hint() {
+        let t = IrisTools::new_with_toolset(None, Toolset::Interop).expect("build");
+        let all = t.advertised_tools();
+        assert!(!all.is_empty(), "precondition");
+        for tool in all {
+            assert!(
+                tool.annotations
+                    .as_ref()
+                    .and_then(|a| a.read_only_hint)
+                    .is_some(),
+                "{} carries no readOnlyHint — is annotate_tool still wired into advertised_tools?",
+                tool.name
+            );
+        }
+    }
+
+    /// And the invariant through the real path too, for every toolset: what a client receives must
+    /// never say read-only about a tool that writes.
+    #[test]
+    fn the_advertised_list_never_calls_a_writer_read_only() {
+        for ts in [
+            Toolset::Interop,
+            Toolset::Merged,
+            Toolset::Nostub,
+            Toolset::Baseline,
+        ] {
+            let t = IrisTools::new_with_toolset(None, ts).expect("build");
+            let all = t.advertised_tools();
+            assert!(!all.is_empty(), "precondition: {ts:?} advertises tools");
+            // The control: at least one writer and one reader must be present, or the loop below
+            // proves nothing.
+            let names: Vec<String> = all.iter().map(|x| x.name.to_string()).collect();
+            assert!(
+                names.iter().any(|n| tool_can_mutate(n)),
+                "{ts:?} must include a writer for this test to mean anything"
+            );
+            assert!(
+                names.iter().any(|n| !tool_can_mutate(n)),
+                "{ts:?} must include a reader too"
+            );
+            for tool in all {
+                let ro = tool.annotations.as_ref().and_then(|a| a.read_only_hint);
+                if tool_can_mutate(&tool.name) {
+                    assert_eq!(
+                        ro,
+                        Some(false),
+                        "{} writes but is advertised read-only in {ts:?}",
+                        tool.name
+                    );
+                }
+            }
+        }
+    }
+
+    /// Both polarities actually occur — otherwise the derivation could be a constant and every test
+    /// above would still pass. `iris_execute` writes; `check_config` does not.
+    #[test]
+    fn the_hint_is_not_a_constant() {
+        assert!(tool_can_mutate("iris_execute"), "control: a writer");
+        assert!(
+            !tool_can_mutate("check_config"),
+            "control: a reader — if this is true the derivation is stuck on"
+        );
+        assert!(
+            !tool_can_mutate("docs_introspect"),
+            "control: another reader"
+        );
+    }
+
+    /// Only `readOnlyHint` is asserted. The other three are deliberately ABSENT so their spec
+    /// defaults (the cautious readings) apply — asserting that here stops a later change from
+    /// quietly adding a guessed `destructiveHint: false` to a tool that deletes.
+    #[test]
+    fn the_hints_we_cannot_derive_are_left_absent() {
+        let t = IrisTools::new_with_toolset(None, Toolset::Interop).expect("build");
+        let mut tool = t
+            .tool_router
+            .list_all()
+            .into_iter()
+            .find(|x| x.name == "iris_doc")
+            .expect("iris_doc is in the interop profile");
+        annotate_tool(&mut tool);
+        let a = tool.annotations.as_ref().expect("annotations");
+        assert_eq!(a.read_only_hint, Some(false), "iris_doc can write");
+        assert!(a.destructive_hint.is_none(), "must not guess destructive");
+        assert!(a.idempotent_hint.is_none(), "must not guess idempotent");
+        assert!(a.open_world_hint.is_none(), "must not guess open world");
+    }
+
+    /// An existing annotation must be preserved rather than replaced, so a future
+    /// `annotations(title = ...)` on a #[tool] macro is not silently discarded here.
+    #[test]
+    fn an_existing_annotation_is_extended_not_replaced() {
+        let mut tool = rmcp::model::Tool::new(
+            "iris_execute",
+            "d",
+            std::sync::Arc::new(serde_json::Map::new()),
+        );
+        // ToolAnnotations is #[non_exhaustive], so the builder rather than a struct expression.
+        tool.annotations = Some(rmcp::model::ToolAnnotations::with_title("kept"));
+        annotate_tool(&mut tool);
+        let a = tool.annotations.as_ref().unwrap();
+        assert_eq!(a.title.as_deref(), Some("kept"), "title must survive");
+        assert_eq!(a.read_only_hint, Some(false), "and the hint is still set");
     }
 }
 
