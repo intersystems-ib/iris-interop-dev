@@ -235,11 +235,97 @@ fn extract_cls_members(
                             symbols.push(sym);
                         }
                     }
+                    // #24/070: BPL and DTL are stored AS XData, so a reader that drops xdata
+                    // cannot see the two component types the iris-interop skills teach most.
+                    // Measured before writing this: the UDL grammar does emit an `xdata` node,
+                    // wrapped in `class_statement` exactly like the members above.
+                    "xdata" => {
+                        if let Some(sym) =
+                            extract_xdata_symbol(member, source, class_name, rel_path)
+                        {
+                            symbols.push(sym);
+                        }
+                    }
                     _ => {}
                 }
             }
         }
     }
+}
+
+/// #24/070: an `XData` block, which is how BPL and DTL are actually stored.
+///
+/// `Type` carries the XMLNamespace when the block declares one, because that is what
+/// distinguishes a DTL from a BPL from an arbitrary XData payload —
+/// `http://www.intersystems.com/dtl` vs `.../bpl`. The NAME alone does not: a class is free to
+/// call its DTL block anything, and plenty of non-interop XData is named `DTL` by coincidence.
+///
+/// Node shape, dumped from the grammar rather than guessed:
+/// ```text
+/// xdata
+///   keyword_xdata   [XData]
+///   xdata_name      [DTL] -> identifier
+///   xdata_keyword   [XMLNamespace = "..."] -> string_literal
+///   external_method_body_content
+/// ```
+/// A block with no `[ ... ]` keywords has no `xdata_keyword` child at all, so `Type` is None
+/// rather than an empty string — absent and empty are different answers.
+fn extract_xdata_symbol(
+    node: tree_sitter::Node,
+    source: &[u8],
+    class_name: &str,
+    rel_path: &str,
+) -> Option<Symbol> {
+    let mut cursor = node.walk();
+    let mut name: Option<String> = None;
+    let mut xml_namespace: Option<String> = None;
+
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "xdata_name" => {
+                name = child
+                    .utf8_text(source)
+                    .ok()
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .map(str::to_string);
+            }
+            "xdata_keyword" => {
+                // The name check is load-bearing, and measured: `SchemaSpec` parses to the SAME
+                // node kind `xdata_keyword` with the same `string_literal` child, so without it a
+                // SchemaSpec would be reported as the XMLNamespace. (`MimeType` gets its own kind,
+                // `xdata_keyword_mimetype` with a `typename` child, so it cannot reach here —
+                // which is why a MimeType-only test does NOT exercise this branch. A mutation
+                // that dropped this check survived such a test; `SchemaSpec` is what kills it.)
+                //
+                // Only XMLNamespace is reported: it is the one that identifies the payload, and a
+                // field per keyword would grow this for no interop gain.
+                let text = child.utf8_text(source).unwrap_or("");
+                if text.to_ascii_lowercase().contains("xmlnamespace") {
+                    let mut kc = child.walk();
+                    for k in child.children(&mut kc) {
+                        if k.kind() == "string_literal" {
+                            xml_namespace = k
+                                .utf8_text(source)
+                                .ok()
+                                .map(|t| t.trim().trim_matches('"').to_string())
+                                .filter(|t| !t.is_empty());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let name = name?;
+    Some(Symbol {
+        name: format!("{class_name}.{name}"),
+        kind: "xdata".to_string(),
+        file: rel_path.to_string(),
+        formal_spec: None,
+        type_name: xml_namespace,
+    })
 }
 
 fn extract_method_symbol(
@@ -707,5 +793,221 @@ mod tests {
     fn glob_empty_query_never_matches() {
         assert!(!glob_match("", "anything"));
         assert!(!glob_match("", ""));
+    }
+
+    // ── #24/070: XData, which is how BPL and DTL are stored ──────────────────────
+
+    const DTL_AND_BPL: &str = r#"Class Demo.DT.Map Extends Ens.DataTransformDTL
+{
+
+Parameter IGNOREMISSINGSOURCE = 1;
+
+XData DTL [ XMLNamespace = "http://www.intersystems.com/dtl" ]
+{
+<transform sourceClass='EnsLib.HL7.Message' targetClass='Demo.MSG.Out'>
+<assign value='source.GetValueAt("PID:5.1")' property='target.Name' action='set'/>
+</transform>
+}
+
+XData BPL [ XMLNamespace = "http://www.intersystems.com/bpl" ]
+{
+<process language='objectscript'>
+<sequence><call name='Op' target='Demo.BO.Out' async='0'/></sequence>
+</process>
+}
+
+Method Run() As %Status
+{
+    Quit $$$OK
+}
+
+}
+"#;
+
+    fn xdata_of(src: &str) -> Vec<Symbol> {
+        let (syms, warns) = extract_cls_symbols(src.as_bytes(), "src/Demo/DT/Map.cls", "*");
+        assert!(warns.is_empty(), "unexpected parse warnings: {warns:?}");
+        syms.into_iter().filter(|s| s.kind == "xdata").collect()
+    }
+
+    /// Before this, the dispatch dropped `xdata` through its `_ => {}` arm, so the two component
+    /// types the iris-interop skills teach most were invisible to symbols_local.
+    #[test]
+    fn xdata_blocks_are_reported_with_their_namespace() {
+        let x = xdata_of(DTL_AND_BPL);
+        assert_eq!(x.len(), 2, "expected both XData blocks: {x:?}");
+
+        assert_eq!(x[0].name, "Demo.DT.Map.DTL");
+        assert_eq!(x[0].kind, "xdata");
+        assert_eq!(x[0].file, "src/Demo/DT/Map.cls");
+        assert_eq!(
+            x[0].type_name.as_deref(),
+            Some("http://www.intersystems.com/dtl"),
+            "the namespace is what distinguishes a DTL from a BPL, not the block name: {:?}",
+            x[0]
+        );
+
+        assert_eq!(x[1].name, "Demo.DT.Map.BPL");
+        assert_eq!(
+            x[1].type_name.as_deref(),
+            Some("http://www.intersystems.com/bpl")
+        );
+
+        // The quotes must be stripped, not carried into the value.
+        assert!(
+            !x[0].type_name.as_deref().unwrap_or("").contains('"'),
+            "{:?}",
+            x[0]
+        );
+    }
+
+    /// POSITIVE CONTROL for the test above: the other members must still be found. A change that
+    /// broke the dispatch while adding xdata would otherwise pass the xdata assertions alone.
+    #[test]
+    fn adding_xdata_did_not_displace_the_other_members() {
+        let (syms, _) = extract_cls_symbols(DTL_AND_BPL.as_bytes(), "src/Demo/DT/Map.cls", "*");
+        let kinds: std::collections::BTreeSet<&str> =
+            syms.iter().map(|s| s.kind.as_str()).collect();
+        assert!(kinds.contains("method"), "methods lost: {kinds:?}");
+        assert!(kinds.contains("parameter"), "parameters lost: {kinds:?}");
+        assert!(kinds.contains("xdata"), "xdata missing: {kinds:?}");
+        assert!(
+            syms.iter().any(|s| s.name == "Demo.DT.Map.Run"),
+            "the method is gone: {syms:?}"
+        );
+    }
+
+    /// An XData block with no `[ ... ]` keywords has no namespace. `Type` must be ABSENT, not an
+    /// empty string — absent and empty are different answers, and an empty string would read as
+    /// "declared, and blank".
+    #[test]
+    fn xdata_without_a_namespace_reports_no_type() {
+        let src = r#"Class Demo.Plain Extends %RegisteredObject
+{
+
+XData Config
+{
+<settings><item name="x">1</item></settings>
+}
+
+}
+"#;
+        let x = xdata_of(src);
+        assert_eq!(x.len(), 1, "{x:?}");
+        assert_eq!(x[0].name, "Demo.Plain.Config");
+        assert_eq!(
+            x[0].type_name, None,
+            "no namespace means absent: {:?}",
+            x[0]
+        );
+    }
+
+    /// A keyword that is NOT XMLNamespace must not be mistaken for one.
+    #[test]
+    fn a_non_namespace_keyword_is_not_reported_as_the_namespace() {
+        let src = r#"Class Demo.Mime Extends %RegisteredObject
+{
+
+XData Payload [ MimeType = "application/json" ]
+{
+{"a":1}
+}
+
+}
+"#;
+        let x = xdata_of(src);
+        assert_eq!(x.len(), 1, "{x:?}");
+        assert_eq!(x[0].name, "Demo.Mime.Payload");
+        assert_eq!(
+            x[0].type_name, None,
+            "MimeType is not an XMLNamespace: {:?}",
+            x[0]
+        );
+    }
+
+    /// The keyword that shares `xdata_keyword`'s node kind, and therefore the only one that can
+    /// reach the name check. Measured: `SchemaSpec` parses to `xdata_keyword` with a
+    /// `string_literal` child, exactly like `XMLNamespace`.
+    ///
+    /// This test exists because the first version of this suite used `MimeType` instead, and a
+    /// mutation that removed the name check SURVIVED — `MimeType` gets its own node kind, so it
+    /// never reaches the branch and proved nothing about it.
+    #[test]
+    fn schemaspec_is_not_mistaken_for_the_namespace() {
+        let src = r#"Class Demo.Schema Extends %RegisteredObject
+{
+
+XData Spec [ SchemaSpec = "http://x/schema" ]
+{
+<xs:schema/>
+}
+
+}
+"#;
+        let x = xdata_of(src);
+        assert_eq!(x.len(), 1, "{x:?}");
+        assert_eq!(x[0].name, "Demo.Schema.Spec");
+        assert_eq!(
+            x[0].type_name, None,
+            "SchemaSpec shares xdata_keyword's node kind and must NOT be read as the \
+             XMLNamespace: {:?}",
+            x[0]
+        );
+    }
+
+    /// Both keywords present: the namespace is picked and the other is not, whichever order.
+    #[test]
+    fn the_namespace_is_picked_out_of_several_keywords() {
+        for src in [
+            r#"Class Demo.Both Extends %RegisteredObject
+{
+
+XData P [ XMLNamespace = "http://x/ns", MimeType = "application/json" ]
+{
+<x/>
+}
+
+}
+"#,
+            r#"Class Demo.Both Extends %RegisteredObject
+{
+
+XData P [ SchemaSpec = "http://x/schema", XMLNamespace = "http://x/ns" ]
+{
+<x/>
+}
+
+}
+"#,
+        ] {
+            let x = xdata_of(src);
+            assert_eq!(x.len(), 1, "{x:?}");
+            assert_eq!(
+                x[0].type_name.as_deref(),
+                Some("http://x/ns"),
+                "the XMLNamespace must win over the sibling keyword: {:?}",
+                x[0]
+            );
+        }
+    }
+
+    /// The glob still applies: xdata is filtered by the CLASS name like every other member, so a
+    /// query that excludes the class must not leak its XData.
+    #[test]
+    fn xdata_respects_the_class_glob() {
+        let (syms, _) =
+            extract_cls_symbols(DTL_AND_BPL.as_bytes(), "src/Demo/DT/Map.cls", "Other.*");
+        assert!(
+            syms.is_empty(),
+            "a non-matching glob must return nothing, xdata included: {syms:?}"
+        );
+        // Control: the matching glob does return it, so the emptiness above means filtering
+        // rather than a parser that found nothing.
+        let (syms2, _) =
+            extract_cls_symbols(DTL_AND_BPL.as_bytes(), "src/Demo/DT/Map.cls", "Demo.*");
+        assert!(
+            syms2.iter().any(|s| s.kind == "xdata"),
+            "the control must find xdata: {syms2:?}"
+        );
     }
 }
