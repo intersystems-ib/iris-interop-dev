@@ -271,6 +271,21 @@ pub fn apply_prop_collision_hint(payload: &mut serde_json::Value, msg: &str) -> 
     let Some(obj) = payload.as_object_mut() else {
         return false;
     };
+    // #263 proposal 2: if the lookup already ran, the caller does not need the SELECT at all —
+    // name the argument. This is the 29-calls-to-1 case from the report.
+    let answered = obj
+        .get("stale_registration")
+        .and_then(|sr| sr.get("delete_id"))
+        .and_then(|v| v.as_str())
+        .map(|id| {
+            format!(
+                "THE ANSWER IS ALREADY ON THIS PAYLOAD: `stale_registration.delete_id` is '{id}'. \
+             Pass exactly that to ##class(Ens.Config.SearchTableProp).%DeleteId() and recompile — \
+             no diagnostic query needed. For background: "
+            )
+        })
+        .unwrap_or_default();
+    let h = format!("{answered}{h}");
     let incomplete = obj.get("errors_incomplete") == Some(&serde_json::Value::Bool(true));
     let text = if incomplete {
         format!(

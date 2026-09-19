@@ -315,6 +315,7 @@ pub mod hl7_schema;
 pub mod info;
 pub mod interop;
 pub mod log_store;
+pub mod prop_collision;
 pub mod scm;
 pub mod search;
 pub mod skills_tools;
@@ -2559,17 +2560,43 @@ fn ok_json(v: serde_json::Value) -> Result<CallToolResult, McpError> {
 fn err_json(code: &str, msg: &str) -> Result<CallToolResult, McpError> {
     crate::tools::envelope::fail(code, msg)
 }
+/// The message `compile_failure` reports as `error`. Extracted so the enriching wrapper keys its
+/// lookup off the SAME string the envelope will carry — two copies of this drifting apart would put
+/// a `stale_registration` on a payload whose `error` names something else.
+fn first_compile_error(target: &str, payload: &serde_json::Value) -> String {
+    payload["errors"][0]["text"]
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| payload["errors"][0].as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("compile of {target} failed — see console"))
+}
+
+/// #263 proposal 2 for `iris_compile`: look the stale registration up before building the envelope,
+/// so the delete id arrives with the failure.
+///
+/// A wrapper rather than an `async fn compile_failure`, because `compile_failure` is deliberately
+/// synchronous and pure — that is what lets its tests assert the envelope without a runtime or a
+/// mock server. The lookup is a no-op for every error that is not a PropCollision, and makes no
+/// request in that case.
+async fn compile_failure_enriched(
+    target: &str,
+    mut payload: serde_json::Value,
+    iris: &IrisConnection,
+    client: &reqwest::Client,
+    namespace: &str,
+) -> Result<CallToolResult, McpError> {
+    let first = first_compile_error(target, &payload);
+    crate::tools::prop_collision::enrich(&mut payload, iris, client, namespace, &first).await;
+    compile_failure(target, payload)
+}
+
 /// Issue #46: a compile that IRIS rejected is a genuine tool failure, so it gets
 /// `isError` on the wire and the standard envelope — same contract iris_doc's
 /// compile path already follows (issue #2). Diagnostics ride along unchanged in
 /// `errors`/`warnings`/`console`; `payload` carries `success:false`, which the
 /// envelope owns and re-asserts.
 fn compile_failure(target: &str, payload: serde_json::Value) -> Result<CallToolResult, McpError> {
-    let first = payload["errors"][0]["text"]
-        .as_str()
-        .map(str::to_string)
-        .or_else(|| payload["errors"][0].as_str().map(str::to_string))
-        .unwrap_or_else(|| format!("compile of {target} failed — see console"));
+    let first = first_compile_error(target, &payload);
     // #213: iris_compile compiles a document already on the server, with no source in scope —
     // so this gets the message-level #5559 variant, without did_you_mean. It is also the path
     // that carries the Storage-block cause, since on the iris_doc(put) path that is already
@@ -4938,7 +4965,10 @@ impl IrisTools {
                     "console",
                 );
                 if !success {
-                    return compile_failure(&doc_name, payload);
+                    return compile_failure_enriched(
+                        &doc_name, payload, &iris, &client, &namespace,
+                    )
+                    .await;
                 }
                 return ok_json(payload);
             }
@@ -5382,7 +5412,7 @@ impl IrisTools {
         }
 
         if !success {
-            return compile_failure(&p.target, resp);
+            return compile_failure_enriched(&p.target, resp, &iris, &client, &namespace).await;
         }
         ok_json(resp)
     }
