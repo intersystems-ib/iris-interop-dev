@@ -1594,3 +1594,126 @@ mod recover_state_readback {
         );
     }
 }
+
+/// #255, crate-wide: a test that self-skips must not be indistinguishable from one that passed.
+///
+/// The required gate runs `env -u IRIS_HOST -u IRIS_CONTAINER` deliberately, so it needs no live
+/// instance. Tests that respond by returning early — without `#[ignore]` — report `ok` having
+/// asserted nothing, and the gate's pass count then overstates coverage.
+///
+/// That is not hypothetical. #214 moved every toolset's count; five stale assertions failed the
+/// gate and were fixed, and a SIXTH (`tools_list_returns_interop_profile`, asserting 28) passed
+/// the gate and then failed the dispatched CI run where `IRIS_HOST` is set. Same assertion, same
+/// code, opposite verdicts, one variable.
+///
+/// This is a RATCHET, not the fix. Deciding what to do about the existing population changes what
+/// the required gate covers for eight tests at once, which is a coverage-policy call (#255 lists
+/// the options). What this guard does is stop the population GROWING unnoticed: a new
+/// self-skipping test is a build failure that names itself.
+///
+/// Shrinking `KNOWN` is always correct and needs no discussion — mark a test `#[ignore]` (so the
+/// gate reports it as ignored rather than passed, and `--include-ignored` reaches it) and delete
+/// its line here. An empty `KNOWN` is the goal state.
+#[test]
+fn no_new_test_self_skips_on_iris_host_without_being_ignored() {
+    // The eight measured on 2026-09-19 at master a0c5d1c. Sorted; `file::fn`.
+    const KNOWN: &[&str] = &[
+        "interop_e2e_tests.rs::interop_logs_returns_structured_entries",
+        "interop_e2e_tests.rs::interop_production_status_returns_structured_json",
+        "interop_e2e_tests.rs::interop_queues_returns_array",
+        "interop_e2e_tests.rs::interop_query_partners_and_what_enum",
+        "interop_e2e_tests.rs::tools_list_returns_interop_profile",
+        "test_e2e.rs::e2e_opencode_setup_follows_readme",
+        "test_e2e_all_tools.rs::e2e_all_tools_respond",
+        "test_mcp_iris.rs::e2e_iris_compile_success",
+    ];
+
+    // A guard that searches for a pattern must not match its own description of the pattern.
+    // This file quotes the idiom in the literals below, so it is skipped by name rather than by
+    // a cleverer regex that would be harder to read and easier to get wrong.
+    const SELF: &str = "interop_unit_tests.rs";
+
+    fn scan(dir: &std::path::Path, found: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).expect("readable tests dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                scan(&path, found);
+                continue;
+            }
+            if !path.extension().is_some_and(|e| e == "rs") {
+                continue;
+            }
+            let file = path
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or_default()
+                .to_string();
+            if file == SELF {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("readable test source");
+            let lines: Vec<&str> = text.lines().collect();
+            for (n, line) in lines.iter().enumerate() {
+                // The idiom: read IRIS_HOST, defaulting to empty, then bail out if empty.
+                if !(line.contains("IRIS_HOST") && line.contains("unwrap_or_default()")) {
+                    continue;
+                }
+                // Walk back to the enclosing fn and inspect its attributes.
+                for j in (0..=n).rev() {
+                    let t = lines[j].trim_start();
+                    if !t.starts_with("fn ") {
+                        continue;
+                    }
+                    let name = t
+                        .trim_start_matches("fn ")
+                        .split('(')
+                        .next()
+                        .unwrap_or_default();
+                    let attrs = lines[j.saturating_sub(6)..j].join("\n");
+                    // Only real tests, and only those NOT already declared as needing IRIS.
+                    if attrs.contains("#[test]") && !attrs.contains("#[ignore") {
+                        found.push(format!("{file}::{name}"));
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    let tests_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let mut found = Vec::new();
+    scan(&tests_dir, &mut found);
+    found.sort();
+    found.dedup();
+
+    // POSITIVE CONTROL. If the scanner matched nothing — a moved directory, a changed idiom, a
+    // broken walk — every assertion below would pass by comparing two empty sets, which is the
+    // very false green this guard exists to prevent. So an empty result is a failure until KNOWN
+    // is deliberately emptied too.
+    assert!(
+        !found.is_empty() || KNOWN.is_empty(),
+        "the scanner found NO self-skipping tests while {} are expected — it is broken, not the \
+         tree. Check that {} still exists and that the idiom still reads IRIS_HOST via \
+         unwrap_or_default().",
+        KNOWN.len(),
+        tests_dir.display()
+    );
+
+    let known: std::collections::BTreeSet<&str> = KNOWN.iter().copied().collect();
+    let found_set: std::collections::BTreeSet<&str> = found.iter().map(String::as_str).collect();
+
+    let new: Vec<&&str> = found_set.difference(&known).collect();
+    assert!(
+        new.is_empty(),
+        "NEW test(s) self-skip on IRIS_HOST without #[ignore], so under the required gate they \
+         report ok having asserted nothing: {new:?}\n\nAdd `#[ignore = \"requires live IRIS\"]` \
+         so the gate counts them as ignored and --include-ignored reaches them. See #255."
+    );
+
+    let gone: Vec<&&str> = known.difference(&found_set).collect();
+    assert!(
+        gone.is_empty(),
+        "KNOWN lists test(s) that no longer self-skip: {gone:?}\nThat is good news — delete those \
+         lines from KNOWN. A stale entry silently permits a future test of the same name."
+    );
+}
