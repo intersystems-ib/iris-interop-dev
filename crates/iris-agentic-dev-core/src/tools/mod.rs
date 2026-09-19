@@ -311,6 +311,7 @@ pub mod dict;
 pub mod doc;
 pub mod envelope;
 pub mod execute_method;
+pub mod formal_spec;
 pub mod gateway;
 pub mod hl7_schema;
 pub mod info;
@@ -7212,7 +7213,11 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                 ClassPresence::Compiled | ClassPresence::Undetermined => {}
             }
         }
-        let mut payload = serde_json::json!({"success": true, "class_name": class_name, "methods": methods["result"]["content"], "properties": props["result"]["content"], "include_inherited": p.include_inherited});
+        // #24/070: structured args alongside the raw FormalSpec. Additive — the raw string stays,
+        // because it is the only lossless record of what IRIS holds and a caller may already read it.
+        let mut method_rows = methods["result"]["content"].clone();
+        crate::tools::formal_spec::annotate_methods(&mut method_rows);
+        let mut payload = serde_json::json!({"success": true, "class_name": class_name, "methods": method_rows, "properties": props["result"]["content"], "include_inherited": p.include_inherited});
         if let Some(requested) = &expanded_from {
             // #157: say that the name was expanded, or the caller cannot learn the rule.
             payload["requested_class_name"] = serde_json::Value::String(requested.clone());
