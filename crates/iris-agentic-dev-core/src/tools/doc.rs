@@ -2838,14 +2838,54 @@ mod doc_mode_single_source_tests {
         }
     }
 
-    /// The classification the whole change exists for. Read modes must not be writes, and write
-    /// modes must be — stated per variant rather than as a property, so a wrong answer names itself.
+    /// The expected verdict for every mode, stated as DATA and independently of `is_write`.
+    ///
+    /// A MUTATION SURVIVED without this. The gate now DERIVES from `is_write`, which is right — but it
+    /// makes "the gate agrees with is_write" TAUTOLOGICAL: a mode dispatched to a write handler and
+    /// classified as a read has both sides reading the same wrong answer, and they agree. The risk
+    /// moved from "two copies disagree" to "the one copy is wrong", and only an independent statement
+    /// of the verdict catches that.
+    ///
+    /// Same shape as `every_interop_tool_is_classified` for tools: a second, deliberate assertion so a
+    /// new entry cannot inherit a default.
+    const EXPECTED_WRITE: &[(&str, bool)] = &[
+        ("get", false),
+        ("head", false),
+        ("put", true),
+        ("delete", true),
+    ];
+
+    /// Every mode must appear in `EXPECTED_WRITE`. A new mode FAILS here, by name, until someone
+    /// states whether it writes — rather than silently taking whatever `is_write` happens to say.
     #[test]
-    fn the_write_classification_is_correct_per_variant() {
-        assert!(!DocMode::Get.is_write(), "get reads");
-        assert!(!DocMode::Head.is_write(), "head reads");
-        assert!(DocMode::Put.is_write(), "put writes");
-        assert!(DocMode::Delete.is_write(), "delete writes");
+    fn every_mode_has_an_independently_stated_verdict() {
+        for v in every_variant() {
+            let stated = EXPECTED_WRITE
+                .iter()
+                .find(|(name, _)| *name == v.as_str())
+                .map(|(_, w)| *w);
+            let Some(stated) = stated else {
+                panic!(
+                    "mode '{}' has no entry in EXPECTED_WRITE. Add one saying whether it WRITES — \
+                     deliberately, because the write gate derives from is_write() and cannot \
+                     second-guess it. If it writes, a missing entry means an ungated write.",
+                    v.as_str()
+                );
+            };
+            assert_eq!(
+                v.is_write(),
+                stated,
+                "mode '{}': is_write() says {} but EXPECTED_WRITE says {}",
+                v.as_str(),
+                v.is_write(),
+                stated
+            );
+        }
+        assert_eq!(
+            EXPECTED_WRITE.len(),
+            every_variant().len(),
+            "EXPECTED_WRITE names a mode that does not exist, or duplicates one"
+        );
     }
 
     /// CONTROL: both polarities occur. If `is_write` were stuck on or off, the per-variant test above
