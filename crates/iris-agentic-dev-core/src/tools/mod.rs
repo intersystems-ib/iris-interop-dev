@@ -11839,13 +11839,17 @@ mod inline_failed_tests_tests {
     ///
     /// WHAT THIS DOES NOT COVER: it checks the SELECT text, not that IRIS orders as expected —
     /// that was verified separately against a live instance.
+    ///
+    /// #273 REWROTE HOW IT READS THE QUERY, and the old way had a real defect. It did
+    /// `include_str!("mod.rs")` and `.find("SELECT tc.Name Class, tm.Name Method")`, taking 1200
+    /// bytes from there. When #273 moved the query into `unittest_result`, that `find` matched the
+    /// LITERAL INSIDE ITS OWN `find` CALL — the only remaining occurrence in this file — and sliced
+    /// its own test body. It failed loudly, which is the good case; the bad case is a source grep
+    /// that keeps matching something harmless and reads as a pass. It now asserts on the SQL the
+    /// function actually produces, which cannot self-match.
     #[test]
     fn every_failure_subquery_is_ordered() {
-        let src = include_str!("mod.rs");
-        let start = src
-            .find("SELECT tc.Name Class, tm.Name Method")
-            .expect("result query moved");
-        let q = &src[start..start + 1200];
+        let q = crate::tools::unittest_result::result_query_sql(0);
         let tops = q.matches("SELECT TOP 1 ta.").count();
         assert_eq!(
             tops, 3,
