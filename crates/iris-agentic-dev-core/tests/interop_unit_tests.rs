@@ -1616,17 +1616,14 @@ mod recover_state_readback {
 /// its line here. An empty `KNOWN` is the goal state.
 #[test]
 fn no_new_test_self_skips_on_iris_host_without_being_ignored() {
-    // The eight measured on 2026-09-19 at master a0c5d1c. Sorted; `file::fn`.
-    const KNOWN: &[&str] = &[
-        "interop_e2e_tests.rs::interop_logs_returns_structured_entries",
-        "interop_e2e_tests.rs::interop_production_status_returns_structured_json",
-        "interop_e2e_tests.rs::interop_queues_returns_array",
-        "interop_e2e_tests.rs::interop_query_partners_and_what_enum",
-        "interop_e2e_tests.rs::tools_list_returns_interop_profile",
-        "test_e2e.rs::e2e_opencode_setup_follows_readme",
-        "test_e2e_all_tools.rs::e2e_all_tools_respond",
-        "test_mcp_iris.rs::e2e_iris_compile_success",
-    ];
+    // EMPTY, and that is the goal state the guard was written for. The eight measured on
+    // 2026-09-19 were all marked `#[ignore = "requires live IRIS"]`, so the required gate now
+    // reports them as ignored rather than counting them as passes, and the e2e job's
+    // `--include-ignored` still runs them against a live instance.
+    //
+    // A new entry here would be a regression, not a normal state: the fix for a test that
+    // cannot assert without IRIS is `#[ignore]`, not an early return that reports ok.
+    const KNOWN: &[&str] = &[];
 
     // A guard that searches for a pattern must not match its own description of the pattern.
     // This file quotes the idiom in the literals below, so it is skipped by name rather than by

@@ -159,6 +159,7 @@ fn parse_tool_text(response: &serde_json::Value) -> serde_json::Value {
 }
 
 #[test]
+#[ignore = "requires live IRIS"]
 fn tools_list_returns_interop_profile() {
     let iris_host = std::env::var("IRIS_HOST").unwrap_or_default();
     if iris_host.is_empty() {
@@ -222,6 +223,7 @@ fn tools_list_returns_interop_profile() {
 }
 
 #[test]
+#[ignore = "requires live IRIS"]
 fn interop_production_status_returns_structured_json() {
     let iris_host = std::env::var("IRIS_HOST").unwrap_or_default();
     if iris_host.is_empty() {
@@ -246,6 +248,7 @@ fn interop_production_status_returns_structured_json() {
 }
 
 #[test]
+#[ignore = "requires live IRIS"]
 fn interop_logs_returns_structured_entries() {
     let iris_host = std::env::var("IRIS_HOST").unwrap_or_default();
     if iris_host.is_empty() {
@@ -268,6 +271,7 @@ fn interop_logs_returns_structured_entries() {
 }
 
 #[test]
+#[ignore = "requires live IRIS"]
 fn interop_queues_returns_array() {
     let iris_host = std::env::var("IRIS_HOST").unwrap_or_default();
     if iris_host.is_empty() {
@@ -291,6 +295,7 @@ fn interop_queues_returns_array() {
 
 // B8/B9: partners introspection + required-with-enum `what`.
 #[test]
+#[ignore = "requires live IRIS"]
 fn interop_query_partners_and_what_enum() {
     if std::env::var("IRIS_HOST").unwrap_or_default().is_empty() {
         return;
