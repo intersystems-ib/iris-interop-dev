@@ -15,6 +15,10 @@ pub enum DocMode {
     Put,
     Delete,
     Head,
+    /// #24: insert lines BEFORE `at`. A write.
+    InsertLines,
+    /// #24: remove `count` lines starting at `at`. A write, and the destructive one.
+    DeleteLines,
 }
 
 impl DocMode {
@@ -26,7 +30,14 @@ impl DocMode {
     /// copy is the dangerous one: a mode added to the enum but not to the gate's `matches!` would be
     /// dispatched as an UNGATED WRITE. That is the report-vs-enforce split this repo keeps hitting
     /// (#110, #169, #263), and it is a live hazard the moment a positional-edit mode is added.
-    pub const ALL: &'static [DocMode] = &[Self::Get, Self::Put, Self::Delete, Self::Head];
+    pub const ALL: &'static [DocMode] = &[
+        Self::Get,
+        Self::Put,
+        Self::Delete,
+        Self::Head,
+        Self::InsertLines,
+        Self::DeleteLines,
+    ];
 
     /// The wire spelling. EXHAUSTIVE match, no wildcard — a new variant does not compile until it is
     /// named here.
@@ -36,6 +47,8 @@ impl DocMode {
             Self::Put => "put",
             Self::Delete => "delete",
             Self::Head => "head",
+            Self::InsertLines => "insert_lines",
+            Self::DeleteLines => "delete_lines",
         }
     }
 
@@ -47,7 +60,9 @@ impl DocMode {
     pub fn is_write(self) -> bool {
         match self {
             Self::Get | Self::Head => false,
-            Self::Put | Self::Delete => true,
+            // A positional edit reads the document, rewrites it and PUTs it back. Every bit as much a
+            // write as `put`, and `delete_lines` destroys content.
+            Self::Put | Self::Delete | Self::InsertLines | Self::DeleteLines => true,
         }
     }
 
@@ -70,7 +85,7 @@ fn default_mode() -> String {
     "get".to_string()
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct IrisDocParams {
     /// Operation: get=fetch source, put=write, delete=remove, head=check existence. Defaults to "get".
     #[serde(default = "default_mode", alias = "action")]
@@ -111,6 +126,22 @@ pub struct IrisDocParams {
     /// storage layout of a live %Persistent extent.
     #[serde(default)]
     pub allow_storage_regeneration: bool,
+    /// mode=insert_lines / delete_lines: the 1-BASED line to act at. For insert, the new lines go
+    /// BEFORE this line; `at` = one past the last line appends.
+    #[serde(default)]
+    pub at: Option<usize>,
+    /// mode=insert_lines: the lines to insert, without newlines.
+    #[serde(default)]
+    pub lines: Option<Vec<String>>,
+    /// mode=delete_lines: how many lines to remove starting at `at`. Defaults to 1.
+    #[serde(default)]
+    pub count: Option<usize>,
+    /// mode=delete_lines (REQUIRED) / insert_lines (optional): the text you believe is currently at
+    /// `at`. The edit is REFUSED if it does not match, because your line numbers came from an earlier
+    /// read and the document may have changed since — in which case the edit would silently land
+    /// somewhere else. Required for delete_lines because a delete on the wrong line destroys content.
+    #[serde(default)]
+    pub expect: Option<String>,
 }
 
 /// A blank/missing `name` on get/put/delete/head produces Atelier requests against
@@ -287,6 +318,9 @@ pub async fn handle_iris_doc(
         Some(DocMode::Put) => handle_put(iris, client, p, elicitation_store, checkout_cache).await,
         Some(DocMode::Delete) => handle_delete(iris, client, p).await,
         Some(DocMode::Head) => handle_head(iris, client, p).await,
+        Some(DocMode::InsertLines) | Some(DocMode::DeleteLines) => {
+            handle_line_edit(iris, client, p, elicitation_store, checkout_cache).await
+        }
         None => crate::tools::envelope::fail_with(
             "INVALID_PARAM",
             &format!(
@@ -511,6 +545,147 @@ async fn handle_get(
         }
     }
     ok_json(out)
+}
+
+/// #24: `insert_lines` / `delete_lines` — a positional edit instead of a full re-upload.
+///
+/// READ, MODIFY, WRITE, and every step has a way of going quietly wrong:
+///
+/// * The read goes through `handle_get`, so all of its behaviour is inherited rather than
+///   reimplemented — the namespace-404 answer, the not-found envelope, the Atelier error shapes. If it
+///   fails, its envelope is returned unchanged.
+/// * **`handle_get` PAGINATES.** Editing a partial read and writing it back TRUNCATES THE DOCUMENT. The
+///   request forces a full read (`max_bytes: 0`, `offset: 0`) AND the result is checked for
+///   `truncated` anyway: the forcing is what should make it impossible, the check is what makes a
+///   mistake in that reasoning loud instead of destructive.
+/// * The write goes through `write_with_scm`, the same path `put` uses, so source control behaves
+///   identically. Calling `do_write` directly would skip the checkout and fail with #5865 on an
+///   SCM-enabled instance.
+async fn handle_line_edit(
+    iris: &IrisConnection,
+    client: &reqwest::Client,
+    p: IrisDocParams,
+    elicitation_store: &crate::elicitation::ElicitationStore,
+    checkout_cache: &crate::elicitation::CheckoutCache,
+) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+    use crate::tools::line_edit::{self, LineOp};
+
+    let mode = DocMode::parse(&p.mode).unwrap_or(DocMode::InsertLines);
+    let mode_name = mode.as_str();
+    let name = match require_name(&p, mode_name) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let ns = crate::tools::interop::resolve_namespace(p.namespace.as_deref(), Some(iris));
+
+    let Some(at) = p.at else {
+        return err_json(
+            "MISSING_PARAMS",
+            &format!("iris_doc mode={mode_name} requires `at` — the 1-based line to act at."),
+        );
+    };
+
+    // Build the operation before reading, so a malformed request costs no round trip.
+    let op =
+        match mode {
+            DocMode::DeleteLines => LineOp::Delete {
+                at,
+                count: p.count.unwrap_or(1),
+            },
+            _ => match p.lines.clone() {
+                Some(lines) => LineOp::Insert { at, lines },
+                None => return err_json(
+                    "MISSING_PARAMS",
+                    "iris_doc mode=insert_lines requires `lines` — the lines to insert, without \
+                     newlines.",
+                ),
+            },
+        };
+
+    // ── read ────────────────────────────────────────────────────────────────────────────────
+    let get_params = IrisDocParams {
+        mode: "get".into(),
+        name: Some(name.clone()),
+        names: vec![],
+        // FORCE a complete read. See the truncation note above.
+        max_bytes: 0,
+        offset: 0,
+        ..p.clone()
+    };
+    let got = handle_get(iris, client, get_params).await?;
+    let payload = match result_payload(&got) {
+        Some(v) => v,
+        None => return Ok(got),
+    };
+    if payload["success"] != serde_json::Value::Bool(true) {
+        // The read failed. Return its envelope verbatim — it already names the real cause.
+        return Ok(got);
+    }
+    if payload["truncated"] == serde_json::Value::Bool(true) {
+        return err_json(
+            "READ_TRUNCATED",
+            &format!(
+                "REFUSED: the read of {name} came back truncated, and editing a partial document \
+                 would write back a TRUNCATED one — destroying everything past the cut. This should \
+                 be impossible (the read forces max_bytes=0, offset=0), so treat it as a bug rather \
+                 than retrying."
+            ),
+        );
+    }
+    let Some(content) = payload["content"].as_str() else {
+        return err_json(
+            "READ_UNREADABLE",
+            &format!("The read of {name} returned no `content` to edit."),
+        );
+    };
+
+    // ── modify ──────────────────────────────────────────────────────────────────────────────
+    let (before, trailing_newline) = line_edit::split_lines(content);
+    if let Err(bad) = line_edit::validate(&op, &before, p.expect.as_deref()) {
+        return crate::tools::envelope::fail_with(
+            bad.code(),
+            &bad.message(),
+            serde_json::json!({
+                "name": name, "namespace": ns, "mode": mode_name,
+                "lines_total": before.len(),
+            }),
+        );
+    }
+    let after = line_edit::apply(&before, &op);
+    let summary = line_edit::summarise(&before, &after, &op);
+    let new_content = line_edit::join_lines(&after, trailing_newline);
+
+    // ── write ───────────────────────────────────────────────────────────────────────────────
+    let written = write_with_scm(
+        iris,
+        client,
+        &name,
+        &new_content,
+        &ns,
+        p.compile,
+        p.allow_storage_regeneration,
+        elicitation_store,
+        checkout_cache,
+    )
+    .await?;
+    // On failure return the write envelope unchanged: it carries the compile errors or the SCM
+    // elicitation, which is what the caller has to act on. Attaching an edit summary to a failed write
+    // would read as though the edit had landed.
+    if !write_result_succeeded(&written) {
+        return Ok(written);
+    }
+    let mut out = result_payload(&written).unwrap_or_else(|| serde_json::json!({"success": true}));
+    out["mode"] = serde_json::Value::String(mode_name.to_string());
+    out["line_edit"] = serde_json::to_value(&summary).unwrap_or(serde_json::Value::Null);
+    ok_json(out)
+}
+
+/// The JSON a handler put in its `CallToolResult`, for composing one handler out of another.
+fn result_payload(r: &rmcp::model::CallToolResult) -> Option<serde_json::Value> {
+    match &r.content.first()?.raw {
+        rmcp::model::RawContent::Text(t) => serde_json::from_str(&t.text).ok(),
+        _ => None,
+    }
 }
 
 async fn handle_put(
@@ -2285,6 +2460,303 @@ mod head_get_delete_status_tests {
 }
 
 #[cfg(test)]
+mod line_edit_mode_tests {
+    //! #24: `insert_lines` / `delete_lines` driven through the REAL handler with wiremock, not through
+    //! the pure helpers — those are covered in `line_edit`. What is only testable here is the wiring:
+    //! that the read is complete, that the bytes PUT back are the edited document, and that a refusal
+    //! writes nothing at all.
+    use super::*;
+    use crate::iris::connection::DiscoverySource;
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// LF, because that is what this transport can actually produce.
+    ///
+    /// MEASURED, after a first attempt built a CRLF fixture and asserted the CRs survived a write:
+    /// Atelier is LINE-BASED IN BOTH DIRECTIONS. `doc_content_to_string` joins the returned lines with
+    /// LF, and `do_write` sends `content.lines()` — terminators stripped. So a document read through
+    /// this path never carries a CR, and one written back cannot either. Line endings are the
+    /// transport's business, not this feature's.
+    ///
+    /// `line_edit::split_lines` is still CR-safe, and `the_split_is_cr_safe_even_though_the_transport_is_not`
+    /// in that module covers it — but asserting CRLF survives an `iris_doc` write would be asserting
+    /// something the write path deliberately does not do.
+    fn doc() -> String {
+        let mut d = [
+            "Class Demo.T Extends %RegisteredObject",
+            "{",
+            "Method A()",
+            "{",
+            "}",
+            "}",
+        ]
+        .join("\n");
+        d.push('\n');
+        d
+    }
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    fn params(mode: &str) -> IrisDocParams {
+        serde_json::from_value(serde_json::json!({
+            "mode": mode, "name": "Demo.T.cls", "namespace": "APP"
+        }))
+        .unwrap()
+    }
+
+    /// GET returns `DOC`; PUT and the compile succeed. Returns the handler payload AND every PUT body
+    /// the server received, so a test can assert on the BYTES that were written — the only way to know
+    /// the document was not corrupted.
+    async fn run(p: IrisDocParams) -> (serde_json::Value, Vec<String>) {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r".*/doc/.*"))
+            // Atelier returns result.content as a FLAT array of line strings — see
+            // doc_content_to_string. Wrapping it as content[0].content (my first attempt) makes
+            // filter_map(as_str) drop everything, so the document parses as ZERO lines and every edit
+            // is refused as out of range. The tests caught the harness, which is the right order.
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": {"content": doc().split('\n').collect::<Vec<_>>()}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path_regex(r".*/doc/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r".*/action/compile.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": {"errors": []}, "console": []
+            })))
+            .mount(&server)
+            .await;
+        let iris = IrisConnection::new(
+            server.uri(),
+            "APP",
+            "_SYSTEM",
+            "SYS",
+            DiscoverySource::EnvVar,
+        );
+        let client = reqwest::Client::new();
+        let store = crate::elicitation::ElicitationStore::default();
+        let cache = crate::elicitation::CheckoutCache::default();
+        let r = handle_iris_doc(&iris, &client, p, &store, &cache)
+            .await
+            .expect("the tool must answer, not error out of the transport");
+        let payload = match &r.content[0].raw {
+            rmcp::model::RawContent::Text(t) => {
+                serde_json::from_str(&t.text).unwrap_or(serde_json::Value::Null)
+            }
+            _ => serde_json::Value::Null,
+        };
+        // Every PUT body the mock saw.
+        let puts: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            // Only the DOCUMENT put — not write_with_scm's temp IrisDevTmp probe class.
+            .filter(|r| r.method.as_str() == "PUT" && r.url.path().ends_with("/Demo.T.cls"))
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .collect();
+        (payload, puts)
+    }
+
+    /// The document that gets written back must be the edited one — reconstructed from the `content`
+    /// line array the PUT body carries.
+    fn written_doc(puts: &[String]) -> String {
+        // There are TWO PUTs: write_with_scm first PUTs a temp class (IrisDevTmp.Run*.cls) for its
+        // source-control probe, then PUTs the document. Selecting by path rather than assuming one PUT —
+        // asserting `len == 1` failed here and the cause was the SCM probe, not the edit.
+        assert_eq!(puts.len(), 1, "expected one DOCUMENT PUT, got: {puts:?}");
+        let v: serde_json::Value = serde_json::from_str(&puts[0]).expect("PUT body is JSON");
+        v["content"]
+            .as_array()
+            .expect("content array")
+            .iter()
+            .map(|l| l.as_str().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// FIXTURE CONTROL. Six lines and a trailing newline — if the fixture drifted, every count
+    /// assertion below would be measuring something else. It also pins that the fixture carries NO CR,
+    /// which is what this transport really produces; a CRLF fixture here would test a case that cannot
+    /// occur and did, on the first attempt, assert something the write path does not do.
+    #[test]
+    fn the_fixture_matches_what_atelier_can_actually_return() {
+        let d = doc();
+        assert!(!d.contains('\r'), "Atelier joins lines with LF: {d:?}");
+        let (lines, trailing) = crate::tools::line_edit::split_lines(&d);
+        assert_eq!(lines.len(), 6, "{lines:?}");
+        assert!(trailing, "a .cls ends with a newline");
+    }
+
+    /// The transport NORMALISES terminators, and that is worth pinning so the next reader does not
+    /// reintroduce a CRLF expectation: whatever is written, `do_write` sends `content.lines()`, so the
+    /// PUT body is an array of terminator-free lines.
+    #[test]
+    fn the_put_body_is_an_array_of_terminator_free_lines() {
+        rt().block_on(async {
+            let mut p = params("insert_lines");
+            p.at = Some(1);
+            p.lines = Some(vec!["// top".into()]);
+            let (_v, puts) = run(p).await;
+            let body: serde_json::Value = serde_json::from_str(&puts[0]).expect("JSON");
+            let arr = body["content"].as_array().expect("content array");
+            assert!(!arr.is_empty());
+            for l in arr {
+                let t = l.as_str().unwrap_or("");
+                assert!(
+                    !t.contains('\r') && !t.contains('\n'),
+                    "line carries a terminator: {t:?}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn insert_writes_back_the_document_with_the_lines_added() {
+        rt().block_on(async {
+            let mut p = params("insert_lines");
+            p.at = Some(3);
+            p.lines = Some(vec!["/// doc".to_string()]);
+            let (v, puts) = run(p).await;
+            assert_eq!(v["success"], true, "{v}");
+            assert_eq!(v["line_edit"]["lines_before"], 6, "{v}");
+            assert_eq!(v["line_edit"]["lines_after"], 7, "{v}");
+            assert_eq!(v["line_edit"]["inserted"][0], "/// doc", "{v}");
+            let doc = written_doc(&puts);
+            assert!(
+                doc.contains("/// doc"),
+                "the new line must be written: {doc:?}"
+            );
+            // No CR assertions: the transport strips terminators, see
+            // the_put_body_is_an_array_of_terminator_free_lines.
+            assert!(doc.contains("Method A()"), "the rest survives: {doc:?}");
+        });
+    }
+
+    #[test]
+    fn delete_writes_back_the_document_with_the_line_gone() {
+        rt().block_on(async {
+            let mut p = params("delete_lines");
+            p.at = Some(3);
+            p.expect = Some("Method A()".into());
+            let (v, puts) = run(p).await;
+            assert_eq!(v["success"], true, "{v}");
+            assert_eq!(v["line_edit"]["removed"][0], "Method A()", "{v}");
+            assert_eq!(v["line_edit"]["lines_after"], 5, "{v}");
+            let doc = written_doc(&puts);
+            assert!(
+                !doc.contains("Method A()"),
+                "the line must be gone: {doc:?}"
+            );
+            assert!(
+                doc.starts_with("Class Demo.T"),
+                "the rest survives: {doc:?}"
+            );
+        });
+    }
+
+    /// THE REFUSAL MUST NOT WRITE. A rejected edit that still PUT something would be the worst outcome
+    /// available: the caller is told no, and the document changed anyway.
+    #[test]
+    fn a_wrong_expect_refuses_and_writes_nothing() {
+        rt().block_on(async {
+            let mut p = params("delete_lines");
+            p.at = Some(3);
+            p.expect = Some("Method NOPE()".into());
+            let (v, puts) = run(p).await;
+            assert_eq!(v["error_code"], "LINE_EXPECT_MISMATCH", "{v}");
+            assert!(puts.is_empty(), "a refused edit must PUT nothing: {puts:?}");
+        });
+    }
+
+    /// Same for delete without `expect`: refused, and nothing written.
+    #[test]
+    fn delete_without_expect_refuses_and_writes_nothing() {
+        rt().block_on(async {
+            let mut p = params("delete_lines");
+            p.at = Some(3);
+            let (v, puts) = run(p).await;
+            assert_eq!(v["success"], false, "{v}");
+            assert!(
+                v["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("requires `expect`"),
+                "{v}"
+            );
+            assert!(puts.is_empty(), "{puts:?}");
+        });
+    }
+
+    /// An out-of-range `at` is refused before any write, and the message carries the real line count.
+    #[test]
+    fn an_out_of_range_at_refuses_and_writes_nothing() {
+        rt().block_on(async {
+            let mut p = params("insert_lines");
+            p.at = Some(99);
+            p.lines = Some(vec!["x".into()]);
+            let (v, puts) = run(p).await;
+            assert_eq!(v["success"], false, "{v}");
+            assert_eq!(v["lines_total"], 6, "must report the real total: {v}");
+            assert!(puts.is_empty(), "{puts:?}");
+        });
+    }
+
+    /// A missing `at` is refused with no round trip at all — not even the read.
+    #[test]
+    fn a_missing_at_is_refused_before_reading() {
+        rt().block_on(async {
+            let p = params("insert_lines");
+            let (v, puts) = run(p).await;
+            assert_eq!(v["error_code"], "MISSING_PARAMS", "{v}");
+            assert!(puts.is_empty(), "{puts:?}");
+        });
+    }
+
+    /// insert_lines without `lines` is refused — inserting nothing is not an edit.
+    #[test]
+    fn insert_without_lines_is_refused() {
+        rt().block_on(async {
+            let mut p = params("insert_lines");
+            p.at = Some(1);
+            let (v, puts) = run(p).await;
+            assert_eq!(v["error_code"], "MISSING_PARAMS", "{v}");
+            assert!(puts.is_empty(), "{puts:?}");
+        });
+    }
+
+    /// The read must be forced COMPLETE. A caller passing max_bytes must not cause a partial read to be
+    /// edited and written back — that would truncate the document at the byte cap.
+    #[test]
+    fn a_caller_supplied_max_bytes_cannot_cause_a_truncated_write() {
+        rt().block_on(async {
+            let mut p = params("insert_lines");
+            p.at = Some(1);
+            p.lines = Some(vec!["// top".into()]);
+            p.max_bytes = 10; // would slice the document to 10 bytes if it were honoured
+            let (v, puts) = run(p).await;
+            assert_eq!(v["success"], true, "{v}");
+            let doc = written_doc(&puts);
+            // the WHOLE document came back, plus the inserted line
+            assert!(doc.contains("Method A()"), "tail must survive: {doc:?}");
+            assert!(doc.ends_with("}"), "and the last line: {doc:?}");
+            assert_eq!(v["line_edit"]["lines_before"], 6, "a full read: {v}");
+        });
+    }
+}
+
+#[cfg(test)]
 mod prop_collision_put_tests {
     //! #263 on the tool the report actually used: `iris_doc{mode:put, compile:true}`.
     //!
@@ -2784,9 +3256,21 @@ mod doc_mode_single_source_tests {
     fn every_variant() -> Vec<DocMode> {
         let exhaustiveness_probe = DocMode::Get;
         match exhaustiveness_probe {
-            DocMode::Get | DocMode::Put | DocMode::Delete | DocMode::Head => {}
+            DocMode::Get
+            | DocMode::Put
+            | DocMode::Delete
+            | DocMode::Head
+            | DocMode::InsertLines
+            | DocMode::DeleteLines => {}
         }
-        vec![DocMode::Get, DocMode::Put, DocMode::Delete, DocMode::Head]
+        vec![
+            DocMode::Get,
+            DocMode::Put,
+            DocMode::Delete,
+            DocMode::Head,
+            DocMode::InsertLines,
+            DocMode::DeleteLines,
+        ]
     }
 
     /// `ALL` must contain every variant. If one is missing, `parse` can never produce it, so its
@@ -2853,6 +3337,12 @@ mod doc_mode_single_source_tests {
         ("head", false),
         ("put", true),
         ("delete", true),
+        // #24: a positional edit reads the document, rewrites it and PUTs it back — as much a write as
+        // `put`, and `delete_lines` destroys content. Stated here deliberately: the compile error from
+        // the exhaustiveness probe above is what forced this decision rather than letting the new modes
+        // inherit whatever `is_write` happened to say.
+        ("insert_lines", true),
+        ("delete_lines", true),
     ];
 
     /// Every mode must appear in `EXPECTED_WRITE`. A new mode FAILS here, by name, until someone

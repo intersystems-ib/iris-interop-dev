@@ -4,9 +4,15 @@
 //! THE TWO WAYS THIS FEATURE CORRUPTS A FILE, both guarded here:
 //!
 //! 1. **A LOSSY ROUND TRIP.** Splitting and rejoining must reproduce the input byte for byte, or every
-//!    edit silently rewrites the whole document — line endings, trailing newline and all. `str::lines()`
-//!    is NOT usable: it strips a trailing `\r`, so a CRLF file would come back LF-converted. This splits
-//!    on `\n` and leaves any `\r` inside the line, which round-trips both.
+//!    edit silently rewrites the whole document — trailing newline and all. `str::lines()` is NOT
+//!    usable: it also strips a trailing `\r`. This splits on `\n` and leaves any `\r` inside the line.
+//!
+//!    SCOPE, measured rather than assumed: the Atelier transport is LINE-BASED IN BOTH DIRECTIONS —
+//!    `doc_content_to_string` joins the returned lines with `\n`, and `do_write` sends
+//!    `content.lines()`. So a document reaching here through `iris_doc` never carries a CR, and CRLF
+//!    cannot survive a write no matter what this module does. The CR-safety below is therefore
+//!    DEFENSIVE, not a promise that `iris_doc` preserves line endings — it does not, by design. Keeping
+//!    it costs nothing and is correct if content ever arrives with CRs embedded as data.
 //! 2. **EDITING A TRUNCATED READ.** `iris_doc(get)` paginates. Applying an edit to a partial read and
 //!    writing it back TRUNCATES THE DOCUMENT. The handler refuses unless the read was complete; that
 //!    guard is the single most important line in the feature.
@@ -269,10 +275,11 @@ mod tests {
         }
     }
 
-    /// CRLF must survive. `str::lines()` strips the `\r`, which would convert the file on every edit —
-    /// a whole-file diff from a one-line change.
+    /// CR-safety of THESE FUNCTIONS, not of an `iris_doc` round trip — the transport strips terminators
+    /// either way (see the scope note in the module docs). Kept because `str::lines()` would drop the CR
+    /// here too, and a caller handing this module CRLF content should get it back unchanged.
     #[test]
-    fn crlf_survives_the_round_trip() {
+    fn the_split_is_cr_safe_even_though_the_transport_is_not() {
         let content = "Class X\r\n{\r\n}\r\n";
         let (lines, trailing) = split_lines(content);
         assert_eq!(join_lines(&lines, trailing), content);
