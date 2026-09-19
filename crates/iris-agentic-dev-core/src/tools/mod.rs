@@ -321,6 +321,7 @@ pub mod scm;
 pub mod search;
 pub mod skills_tools;
 pub mod sql_lint;
+pub mod sql_mode;
 pub mod symbols_local;
 
 pub use doc::{DocMode, IrisDocParams};
@@ -2317,6 +2318,12 @@ pub struct QueryParams {
     /// Has no effect on production IRIS instances (where write tools are disabled).
     #[serde(default)]
     pub force: bool,
+    /// #24/057: `rows` (default), `count`, or `explain`. `count` returns how many rows the statement
+    /// would produce without transferring them; `explain` returns the query plan and its cost without
+    /// running it. There is deliberately no `write` mode — `force` is the one write path, and it is
+    /// already the one the write gate knows about.
+    #[serde(default)]
+    pub mode: Option<String>,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListContainersParams {
@@ -6395,12 +6402,26 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                         "parameters",
                         "namespace",
                         "force",
+                        "mode (rows|count|explain)",
                     ],
                     &e.to_string(),
                 )
             }
         };
         tracing::info!(requested_namespace = ?p.namespace, force = p.force, "iris_query");
+
+        // #24/057: an unknown mode is refused here, before any network call, naming the valid set —
+        // rather than silently falling back to `rows`, which would answer a different question than
+        // the one asked and look like a correct result.
+        let mode_str = p.mode.clone().unwrap_or_default();
+        let Some(query_mode) = sql_mode::QueryMode::parse(&mode_str) else {
+            self.record_call("iris_query", false);
+            return envelope::fail_with(
+                "INVALID_PARAMS",
+                &format!("Unknown mode '{mode_str}'."),
+                serde_json::json!({"hint": format!("Valid modes: {}.", sql_mode::QueryMode::valid_values())}),
+            );
+        };
 
         // Pre-flight: ObjectScript typed into a SQL tool — fail fast with a clear redirect
         // (28/447 workshop iris_query calls were ObjectScript, not SQL).
@@ -6457,8 +6478,18 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
             .iter()
             .map(|v| serde_json::Value::String(v.clone()))
             .collect();
+        // #24/057: the transform happens HERE, after the gate above has accepted `p.query`. The
+        // `Validated` newtype is what enforces that order: `count_sql`/`explain_sql` cannot be handed
+        // a bare &str, so the wrap cannot be applied before validation — which would have the gate
+        // inspect `SELECT COUNT(*) FROM (DROP ...)` instead of `DROP ...`.
+        let gated = sql_mode::Validated::after_safety_gate(&p.query);
+        let effective_sql = match query_mode {
+            sql_mode::QueryMode::Rows => p.query.clone(),
+            sql_mode::QueryMode::Count => sql_mode::count_sql(gated),
+            sql_mode::QueryMode::Explain => sql_mode::explain_sql(gated),
+        };
         let outcome = match iris
-            .query_outcome(&p.query, params, &namespace, client)
+            .query_outcome(&effective_sql, params, &namespace, client)
             .await
         {
             Ok(o) => o,
@@ -6545,6 +6576,25 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
             .unwrap_or_default();
         let count = rows.len();
         self.record_call("iris_query", true);
+        // #24/057: count and explain answer a different question, so they get their own payload
+        // rather than a rows array the caller has to interpret.
+        match query_mode {
+            sql_mode::QueryMode::Count => {
+                self.record_call("iris_query", true);
+                let payload = sql_mode::count_payload(&rows, &namespace, &effective_sql);
+                return Ok(CallToolResult::success(vec![Content::text(
+                    payload.to_string(),
+                )]));
+            }
+            sql_mode::QueryMode::Explain => {
+                self.record_call("iris_query", true);
+                let payload = sql_mode::explain_payload(&rows, &namespace);
+                return Ok(CallToolResult::success(vec![Content::text(
+                    payload.to_string(),
+                )]));
+            }
+            sql_mode::QueryMode::Rows => {}
+        }
         let mut resp = serde_json::json!({"success": true, "rows": rows, "count": count, "namespace": namespace});
         if !sql_warnings.is_empty() {
             resp["warnings"] = serde_json::Value::Array(
