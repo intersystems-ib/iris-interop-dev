@@ -981,6 +981,10 @@ async fn do_write(
                 "compile_console",
             );
             note_compile_time_methods(&mut payload, &generators);
+            // #263 proposal 2: run the lookup FIRST, so the hint below can name the delete id
+            // instead of prescribing a SELECT. No-op (and no request) for anything else.
+            crate::tools::prop_collision::enrich(&mut payload, iris, client, namespace, &first)
+                .await;
             // #263: AFTER note_error_undercount, which overwrites `hint` unconditionally when
             // IRIS's count beats the parsed list. Its facts are kept; only the text yields.
             crate::tools::envelope::apply_prop_collision_hint(&mut payload, &first);
@@ -2271,7 +2275,43 @@ mod prop_collision_put_tests {
     /// PUT succeeds, then the compile comes back with `console` as given and the first line as the
     /// structured error — the shape `compile_error_list` reads.
     async fn put_then_compile(first_error: &str, console: Vec<&str>) -> serde_json::Value {
+        put_compile_and_query(first_error, console, None, None).await
+    }
+
+    /// As above, but also answers `/action/query`. #263 proposal 2 issues two of them and they must
+    /// be told apart, so each is routed on the SQL text in the request body:
+    /// `SearchTableProp` for the registration lookup, `CompiledClass` for the class probe.
+    /// `None` leaves that route unmounted, which is how the "the lookup failed" case is produced —
+    /// wiremock answers an unmatched request with a 404.
+    async fn put_compile_and_query(
+        first_error: &str,
+        console: Vec<&str>,
+        registration_rows: Option<serde_json::Value>,
+        class_probe_rows: Option<serde_json::Value>,
+    ) -> serde_json::Value {
         let server = MockServer::start().await;
+        if let Some(rows) = registration_rows {
+            Mock::given(method("POST"))
+                .and(path_regex(r".*/action/query.*"))
+                .and(wiremock::matchers::body_string_contains("SearchTableProp"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"result": {"content": rows}})),
+                )
+                .mount(&server)
+                .await;
+        }
+        if let Some(rows) = class_probe_rows {
+            Mock::given(method("POST"))
+                .and(path_regex(r".*/action/query.*"))
+                .and(wiremock::matchers::body_string_contains("CompiledClass"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"result": {"content": rows}})),
+                )
+                .mount(&server)
+                .await;
+        }
         Mock::given(method("PUT"))
             .and(path_regex(r".*/doc/.*"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
@@ -2355,6 +2395,141 @@ mod prop_collision_put_tests {
                 h.contains("INCOMPLETE"),
                 "and must not silently swallow the undercount: {v}"
             );
+        });
+    }
+
+    // ── #263 proposal 2: the answer on the payload ──────────────────────────────────────────
+
+    /// The whole point: the delete argument arrives with the failure, and the hint names it, so the
+    /// fix is one `%DeleteId` with no diagnostic query.
+    #[test]
+    fn the_stale_registration_is_looked_up_and_the_hint_names_the_delete_id() {
+        rt().block_on(async {
+            let v = put_compile_and_query(
+                PROP_COLLISION,
+                vec![PROP_COLLISION],
+                Some(serde_json::json!([{
+                    "ID": "EnsLib.HL7.SearchTable||PatientFirstName",
+                    "Name": "PatientFirstName",
+                    "PropId": 5,
+                    "ClassExtent": "EnsLib.HL7.SearchTable",
+                    "ClassDerivation": "Hospital.SearchTable.PatientFirstName~EnsLib.HL7.SearchTable",
+                }])),
+                // the accused class probe comes back EMPTY — the class really is gone
+                Some(serde_json::json!([])),
+            )
+            .await;
+            let sr = &v["stale_registration"];
+            assert_eq!(
+                sr["delete_id"], "EnsLib.HL7.SearchTable||PatientFirstName",
+                "{v}"
+            );
+            assert_eq!(sr["prop"], "PatientFirstName", "{v}");
+            assert_eq!(
+                sr["accused_class"], "Hospital.SearchTable.PatientFirstName",
+                "{v}"
+            );
+            assert_eq!(
+                sr["accused_class_exists"], false,
+                "an empty dictionary probe means the accused class is gone: {v}"
+            );
+            let h = v["hint"].as_str().unwrap_or_default();
+            assert!(
+                h.contains("ALREADY ON THIS PAYLOAD"),
+                "the hint must stop prescribing a SELECT once the answer is present: {v}"
+            );
+            assert!(
+                h.contains("EnsLib.HL7.SearchTable||PatientFirstName"),
+                "the hint must name the actual id: {v}"
+            );
+        });
+    }
+
+    /// The honest-silence case. With no `/action/query` route mounted the lookup gets a 404, and a
+    /// broken query must NOT be reported as "no stale registration" — that would read as a clean
+    /// answer. The field is absent and the hint falls back to prescribing the SELECT.
+    #[test]
+    fn a_failed_lookup_attaches_nothing_and_keeps_the_select_in_the_hint() {
+        rt().block_on(async {
+            let v = put_compile_and_query(PROP_COLLISION, vec![PROP_COLLISION], None, None).await;
+            assert!(
+                v["stale_registration"].is_null(),
+                "a failed lookup must not invent an answer: {v}"
+            );
+            let h = v["hint"].as_str().unwrap_or_default();
+            assert!(
+                h.contains("Ens_Config.SearchTableProp"),
+                "the hint is still correct and still actionable: {v}"
+            );
+            assert!(
+                !h.contains("ALREADY ON THIS PAYLOAD"),
+                "must not claim an answer it does not have: {v}"
+            );
+        });
+    }
+
+    /// Found by a SURVIVING MUTATION: changing `Undetermined => None` to `Undetermined => Some(false)`
+    /// in `enrich` passed every test, because the only assertion on that mapping went through
+    /// `build` with a hand-written `None`. The real path was unasserted — so a broken class probe
+    /// could have reported `accused_class_exists: false`, i.e. "that class is gone", on the strength
+    /// of a failed query. The registration route is mounted and the class probe is NOT, which is
+    /// what makes `class_presence` return `Undetermined`.
+    #[test]
+    fn an_unanswerable_class_probe_omits_the_existence_claim_on_the_real_path() {
+        rt().block_on(async {
+            let v = put_compile_and_query(
+                PROP_COLLISION,
+                vec![PROP_COLLISION],
+                Some(serde_json::json!([{
+                    "ID": "EnsLib.HL7.SearchTable||PatientFirstName",
+                    "Name": "PatientFirstName",
+                    "PropId": 5,
+                    "ClassExtent": "EnsLib.HL7.SearchTable",
+                    "ClassDerivation": "Hospital.SearchTable.PatientFirstName~EnsLib.HL7.SearchTable",
+                }])),
+                None,
+            )
+            .await;
+            let sr = &v["stale_registration"];
+            // the lookup itself still succeeded, so the useful part is present
+            assert_eq!(
+                sr["delete_id"], "EnsLib.HL7.SearchTable||PatientFirstName",
+                "{v}"
+            );
+            // but nothing is claimed about the accused class
+            assert!(
+                sr.get("accused_class_exists").is_none(),
+                "an undetermined probe must not become a false: {v}"
+            );
+        });
+    }
+
+    /// Zero rows is a different real answer, and the hint must not then promise a delete id.
+    #[test]
+    fn no_registered_row_is_reported_as_a_live_collision_not_a_stale_one() {
+        rt().block_on(async {
+            let v = put_compile_and_query(
+                PROP_COLLISION,
+                vec![PROP_COLLISION],
+                Some(serde_json::json!([])),
+                Some(serde_json::json!([{"IsCompiled": 1}])),
+            )
+            .await;
+            let sr = &v["stale_registration"];
+            assert!(sr["delete_id"].is_null(), "{v}");
+            assert!(
+                sr["note"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("NOT a stale"),
+                "{v}"
+            );
+            assert_eq!(
+                sr["accused_class_exists"], true,
+                "the probe found the class compiled: {v}"
+            );
+            let h = v["hint"].as_str().unwrap_or_default();
+            assert!(!h.contains("ALREADY ON THIS PAYLOAD"), "{v}");
         });
     }
 
