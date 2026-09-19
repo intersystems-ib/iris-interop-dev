@@ -119,6 +119,8 @@ jobs:
             exit 1
           fi
           # Unquoted on purpose: $TARGETS must word-split into the --test flags.
+          # That word-splitting is the point, not an oversight:
+          # shellcheck disable=SC2086
           cargo test --workspace --lib --bins $TARGETS --no-fail-fast
         env:
           RUST_LOG: warn
@@ -128,6 +130,35 @@ jobs:
       # Runs in the ordinary `test` job so it cannot rot unnoticed until the next release.
       - name: "release-asset guard logic (#224)"
         run: bash scripts/test-verify-release-assets.sh
+      # The workflows themselves were unlinted until now. actionlint caught 7 shellcheck
+      # findings on first run, and — more usefully — it is the only thing that would have told us
+      # whether a NEW workflow file is even valid before it reaches the default branch.
+      # docker-discovery.yml (#225) was merged on YAML-parses-locally alone; GitHub accepting it
+      # was luck confirmed after the fact rather than a check.
+      #
+      # Pinned to a release rather than a floating tag, for the reason #224 un-floated
+      # action-gh-release: a linter that silently changes what it rejects turns an unrelated push
+      # red.
+      - name: lint the workflows (actionlint)
+        run: |
+          set -euo pipefail
+          # The official binary, version-pinned, rather than a third-party wrapper action. This
+          # repo just un-floated softprops/action-gh-release for supply-chain reasons (#224), and
+          # adding a 51-star third-party action to lint four files would trade that back.
+          VER=1.7.12
+          curl -sSLo actionlint.tgz \
+            "https://github.com/rhysd/actionlint/releases/download/v${VER}/actionlint_${VER}_linux_amd64.tar.gz"
+          tar -xzf actionlint.tgz actionlint
+          ./actionlint --version
+          # A linter that found nothing because it linted nothing is the failure mode to avoid,
+          # so the file count is asserted before trusting a clean exit.
+          n=$(find .github/workflows -maxdepth 1 -name '*.yml' -type f | wc -l | tr -d ' ')
+          echo "linting $n workflow file(s)"
+          if [ "$n" -lt 4 ]; then
+            echo "::error::expected at least 4 workflow files, found $n - actionlint would pass by linting almost nothing"
+            exit 1
+          fi
+          ./actionlint .github/workflows/*.yml
       # Advisory: exercises the real api.github.com and raw.githubusercontent.com paths
       # with the token Actions injects (1000 req/hr per repo, not 60 per IP).
       # continue-on-error so a GitHub-side outage or limit can never redden the gate above.
@@ -240,7 +271,7 @@ jobs:
                 -u _SYSTEM:SYS "http://$host:52773/api/atelier/" 2>/dev/null || echo "000")
               if [ "$status" = "200" ] || [ "$status" = "401" ]; then
                 echo "IRIS Atelier API ready at $host:52773 (HTTP $status)"
-                echo "IRIS_HOST=$host" >> $GITHUB_ENV
+                echo "IRIS_HOST=$host" >> "$GITHUB_ENV"
                 exit 0
               fi
               echo "  $host: HTTP $status"
@@ -261,16 +292,16 @@ jobs:
             pass="${user_pass##*:}"
             status=$(curl -s -o /dev/null -w "%{http_code}" -u "$user:$pass" "http://$HOST:52773/api/atelier/" 2>/dev/null)
             if [ "$status" = "200" ]; then
-              echo "IRIS_USERNAME=$user" >> $GITHUB_ENV
-              echo "IRIS_PASSWORD=$pass" >> $GITHUB_ENV
+              echo "IRIS_USERNAME=$user" >> "$GITHUB_ENV"
+              echo "IRIS_PASSWORD=$pass" >> "$GITHUB_ENV"
               echo "Using credentials: $user (HTTP $status)"
               exit 0
             fi
             echo "  $user:$pass — HTTP $status"
           done
           echo "WARNING: Could not authenticate with any known credentials"
-          echo "IRIS_USERNAME=_SYSTEM" >> $GITHUB_ENV
-          echo "IRIS_PASSWORD=SYS" >> $GITHUB_ENV
+          echo "IRIS_USERNAME=_SYSTEM" >> "$GITHUB_ENV"
+          echo "IRIS_PASSWORD=SYS" >> "$GITHUB_ENV"
       - name: Create UnitTest directories in IRIS container
         run: |
           # iris_test uses RunTest which needs pre-existing directories with .cls files
@@ -306,6 +337,8 @@ jobs:
             exit 1
           fi
           # Unquoted on purpose: $TARGETS must word-split into the --test flags.
+          # That word-splitting is the point, not an oversight:
+          # shellcheck disable=SC2086
           cargo test --workspace --lib --bins $TARGETS --no-fail-fast -- --include-ignored --nocapture
         env:
           IRIS_HOST: ${{ env.IRIS_HOST }}
