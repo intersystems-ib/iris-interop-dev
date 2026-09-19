@@ -981,6 +981,9 @@ async fn do_write(
                 "compile_console",
             );
             note_compile_time_methods(&mut payload, &generators);
+            // #263: AFTER note_error_undercount, which overwrites `hint` unconditionally when
+            // IRIS's count beats the parsed list. Its facts are kept; only the text yields.
+            crate::tools::envelope::apply_prop_collision_hint(&mut payload, &first);
             return crate::tools::envelope::fail_with("COMPILE_ERROR", &first, payload);
         }
         let mut payload = serde_json::json!({
@@ -2232,6 +2235,141 @@ mod head_get_delete_status_tests {
             assert_eq!(v["namespace"], "APP", "{v}");
             assert!(v["documents"][0]["content"].is_string(), "{v}");
             assert_eq!(v["documents"][1]["error_code"], "NOT_FOUND", "{v}");
+        });
+    }
+}
+
+#[cfg(test)]
+mod prop_collision_put_tests {
+    //! #263 on the tool the report actually used: `iris_doc{mode:put, compile:true}`.
+    //!
+    //! The first attempt at this fix put the branch in `builtin_hint` and verified it there. That
+    //! is invisible to the real defect: `fail_with` lets the payload's own `hint` beat the built-in
+    //! one, and this path sets `hint` whenever `note_error_undercount` fires. So the coverage has
+    //! to run through `do_write`, which is what this does.
+    //!
+    //! NOTE: `do_write` writes the VS Code breadcrumb `~/.iris-agentic-dev/open-hint.json` on every
+    //! successful PUT, so running these rewrites that one transient file — exactly as a real put
+    //! does. Nothing else outside the process is touched.
+    use super::*;
+    use crate::iris::connection::DiscoverySource;
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// The verbatim console line from the report.
+    const PROP_COLLISION: &str = "ERROR <EnsSearchTable>PropCollision: SearchTable property \
+         collision: Property 'PatientFirstName' in class 'HOSPITAL.Search.HL7' cannot override \
+         the definition from class 'Hospital.SearchTable.PatientFirstName'";
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// PUT succeeds, then the compile comes back with `console` as given and the first line as the
+    /// structured error — the shape `compile_error_list` reads.
+    async fn put_then_compile(first_error: &str, console: Vec<&str>) -> serde_json::Value {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path_regex(r".*/doc/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r".*/action/compile.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": {"errors": [{"error": first_error}]},
+                "console": console,
+            })))
+            .mount(&server)
+            .await;
+        let iris = IrisConnection::new(
+            server.uri(),
+            "HOSPITAL",
+            "_SYSTEM",
+            "SYS",
+            DiscoverySource::EnvVar,
+        );
+        let client = reqwest::Client::new();
+        let r = do_write(
+            &iris,
+            &client,
+            "HOSPITAL.Search.HL7.cls",
+            "Class HOSPITAL.Search.HL7 Extends EnsLib.HL7.SearchTable\n{\n}\n",
+            "HOSPITAL",
+            true,
+            false,
+        )
+        .await
+        .expect("the tool must answer, not error out of the transport");
+        match &r.content[0].raw {
+            rmcp::model::RawContent::Text(t) => serde_json::from_str(&t.text).unwrap(),
+            _ => panic!("expected text content"),
+        }
+    }
+
+    /// End to end on the reported tool. NOTE: this one passes even without the explicit
+    /// `apply_prop_collision_hint` call on this path, because with no undercount nothing sets
+    /// `hint` and the envelope's built-in branch supplies it. It is here to pin the OUTCOME the
+    /// report asked for; `the_diagnosis_beats_the_undercount_hint_on_the_put_path` is the one that
+    /// pins the call.
+    #[test]
+    fn iris_doc_put_carries_the_prop_collision_diagnosis() {
+        rt().block_on(async {
+            let v = put_then_compile(PROP_COLLISION, vec![PROP_COLLISION]).await;
+            assert_eq!(v["error_code"], "COMPILE_ERROR", "{v}");
+            let h = v["hint"].as_str().unwrap_or_default();
+            assert!(h.contains("Ens_Config.SearchTableProp"), "{v}");
+            assert!(h.contains("%DeleteId"), "{v}");
+            assert!(
+                !h.contains("cascades of the first"),
+                "the generic text must not be what the caller gets: {v}"
+            );
+        });
+    }
+
+    /// The case that defeats a naive fix, and the one that kills the mutation: IRIS counted more
+    /// errors than were parsed, so `note_error_undercount` overwrites `hint` AFTER everything else.
+    /// The diagnosis must still win, and the incompleteness must survive as a fact and in the text.
+    #[test]
+    fn the_diagnosis_beats_the_undercount_hint_on_the_put_path() {
+        rt().block_on(async {
+            let v = put_then_compile(
+                PROP_COLLISION,
+                vec![
+                    PROP_COLLISION,
+                    "  > ERROR #5490: Error running generator for method 'IndexDoc'",
+                    "Detected 7 errors during compilation in 0.03s.",
+                ],
+            )
+            .await;
+            assert_eq!(v["errors_incomplete"], true, "precondition — {v}");
+            let h = v["hint"].as_str().unwrap_or_default();
+            assert!(
+                h.contains("Ens_Config.SearchTableProp"),
+                "the diagnosis must beat the undercount text: {v}"
+            );
+            assert!(
+                h.contains("INCOMPLETE"),
+                "and must not silently swallow the undercount: {v}"
+            );
+        });
+    }
+
+    /// POSITIVE CONTROL on this path: an ordinary compile error is untouched.
+    #[test]
+    fn an_ordinary_put_compile_error_keeps_the_generic_hint() {
+        rt().block_on(async {
+            let v = put_then_compile(
+                "ERROR #1026: Invalid command",
+                vec!["ERROR #1026: Invalid command"],
+            )
+            .await;
+            let h = v["hint"].as_str().unwrap_or_default();
+            assert!(!h.contains("SearchTableProp"), "{v}");
+            assert!(h.contains("cascades of the first"), "{v}");
         });
     }
 }

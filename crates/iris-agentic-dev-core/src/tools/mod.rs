@@ -2580,12 +2580,19 @@ fn compile_failure(target: &str, payload: serde_json::Value) -> Result<CallToolR
                  often cascades of the first. Full compiler output is in console."
             .to_string(),
     };
+    let mut payload = merge_hint(payload, &hint);
+    // #263: LAST, on purpose. Everything above has already put a `hint` on this payload — either
+    // `note_error_undercount` (which overwrites unconditionally) or `merge_hint` with the #5559 or
+    // generic text — and `fail_with` lets the payload's hint beat the built-in one. So the branch
+    // in `builtin_hint` never fires on this path; applying it here is what makes iris_compile
+    // carry the diagnosis at all.
+    crate::tools::envelope::apply_prop_collision_hint(&mut payload, &first);
     crate::tools::envelope::fail_with(
         "COMPILE_ERROR",
         &first,
         // The built-in COMPILE_ERROR hint names iris_doc's `compile_console`;
         // this payload calls that field `console`.
-        merge_hint(payload, &hint),
+        payload,
     )
 }
 fn merge_hint(mut payload: serde_json::Value, hint: &str) -> serde_json::Value {
@@ -10839,7 +10846,7 @@ mod schema_normalization_tests {
 
 #[cfg(test)]
 mod compile_envelope_tests {
-    use super::compile_failure;
+    use super::{compile_failure, note_error_undercount};
     use rmcp::model::RawContent;
 
     fn payload(r: &rmcp::model::CallToolResult) -> serde_json::Value {
@@ -10881,6 +10888,91 @@ mod compile_envelope_tests {
             v["hint"].as_str().unwrap().contains("console"),
             "hint must name this payload's console field, not iris_doc's: {v}"
         );
+    }
+
+    // ── #263: PropCollision must reach the iris_compile path too ────────────────────────────
+    //
+    // These are the tests that catch the mistake the first attempt made: a branch added to
+    // `builtin_hint` and verified only THERE looks complete, while being inert on this whole tool,
+    // because `compile_failure` always sets `hint` and the payload's hint beats the built-in one.
+    // Unit-testing `builtin_hint` in isolation cannot see that. These go through the real path.
+
+    const PROP_COLLISION: &str = "ERROR <EnsSearchTable>PropCollision: SearchTable property \
+         collision: Property 'PatientFirstName' in class 'HOSPITAL.Search.HL7' cannot override \
+         the definition from class 'Hospital.SearchTable.PatientFirstName'";
+
+    #[test]
+    fn iris_compile_carries_the_prop_collision_diagnosis() {
+        let r = compile_failure(
+            "HOSPITAL.Search.HL7.cls",
+            serde_json::json!({
+                "success": false,
+                "errors": [{"severity":"error","text": PROP_COLLISION}],
+                "console": [PROP_COLLISION],
+            }),
+        )
+        .unwrap();
+        let v = payload(&r);
+        let h = v["hint"].as_str().unwrap_or_default();
+        assert!(h.contains("Ens_Config.SearchTableProp"), "{v}");
+        assert!(h.contains("%DeleteId"), "{v}");
+        assert!(
+            !h.contains("cascades of the first"),
+            "the generic text must not be what survives on this path: {v}"
+        );
+    }
+
+    /// `note_error_undercount` overwrites `hint` unconditionally, so it is the one hint-setter that
+    /// beats even `merge_hint`. The diagnosis must still win — and the incompleteness must NOT be
+    /// silently dropped, because that is a real fact about the payload.
+    #[test]
+    fn the_prop_collision_diagnosis_survives_an_error_undercount_without_losing_it() {
+        let mut payload_in = serde_json::json!({
+            "success": false,
+            "errors": [{"severity":"error","text": PROP_COLLISION}],
+            "console": [PROP_COLLISION, "Detected 2 errors during compilation"],
+        });
+        // exactly what the live path does before compile_failure: IRIS counted 2, we parsed 1
+        note_error_undercount(&mut payload_in, Some(2), 1, "console");
+        assert!(
+            payload_in["hint"].as_str().unwrap().contains("INCOMPLETE"),
+            "precondition: the undercount hint must be in place first"
+        );
+        let r = compile_failure("HOSPITAL.Search.HL7.cls", payload_in).unwrap();
+        let v = payload(&r);
+        let h = v["hint"].as_str().unwrap_or_default();
+        assert!(
+            h.contains("Ens_Config.SearchTableProp"),
+            "the diagnosis must beat the undercount text: {v}"
+        );
+        // the facts survive untouched
+        assert_eq!(v["errors_incomplete"], true, "{v}");
+        assert_eq!(v["errors_detected_by_iris"], 2, "{v}");
+        assert_eq!(v["errors_reported"], 1, "{v}");
+        // and the incompleteness is still stated, just not as the whole hint
+        assert!(
+            h.contains("INCOMPLETE"),
+            "the caller must still be told to read the console: {v}"
+        );
+    }
+
+    /// POSITIVE CONTROL for the path, not just the branch: an ordinary compile error through
+    /// `compile_failure` must still get the generic advice, with no SearchTable text at all.
+    #[test]
+    fn an_ordinary_compile_failure_is_untouched_by_the_prop_collision_branch() {
+        let r = compile_failure(
+            "MyApp.Broken.cls",
+            serde_json::json!({
+                "success": false,
+                "errors": [{"severity":"error","text":"ERROR #1026: Invalid command"}],
+                "console": [],
+            }),
+        )
+        .unwrap();
+        let v = payload(&r);
+        let h = v["hint"].as_str().unwrap_or_default();
+        assert!(h.contains("cascades of the first"), "{v}");
+        assert!(!h.contains("SearchTableProp"), "{v}");
     }
 
     #[test]
