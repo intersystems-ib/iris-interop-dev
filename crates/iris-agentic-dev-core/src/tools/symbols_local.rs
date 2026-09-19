@@ -245,7 +245,18 @@ fn extract_cls_members(
                     // Measured before writing this: the UDL grammar does emit an `xdata` node,
                     // wrapped in `class_statement` exactly like the members above.
                     "xdata" => extract_xdata_symbol(member, source, class_name, rel_path),
-                    _ => None,
+                    // #24/070: the remaining eight, table-driven. A `_ => None` fall-through is how
+                    // xdata was silently dropped before, so anything the grammar emits and this
+                    // table does not name is still invisible — see EXTRA_MEMBERS for the list the
+                    // grammar was measured to produce.
+                    other => EXTRA_MEMBERS
+                        .iter()
+                        .find(|(node_kind, _, _)| *node_kind == other)
+                        .and_then(|(_, name_kind, kind)| {
+                            extract_extra_member(
+                                member, source, class_name, rel_path, name_kind, kind,
+                            )
+                        }),
                 };
                 if let Some(mut sym) = extracted {
                     // The MEMBER node rather than the `class_statement` wrapper. NOT because the
@@ -382,6 +393,121 @@ fn extract_method_symbol(
                 });
             }
         }
+    }
+    None
+}
+
+/// #24/070: the member kinds beyond method/property/parameter/xdata.
+///
+/// MEASURED from the UDL grammar rather than taken from the UDL reference — the two are not the same
+/// set. Dumping a class carrying every member form showed the grammar emits 13 member node kinds, and
+/// gave the exact child node holding each name and type:
+///
+/// | node kind      | name node         | type comes from                        |
+/// |----------------|-------------------|----------------------------------------|
+/// | relationship   | relationship_name | `return_type` (`As Demo.Item`)         |
+/// | index          | index_name        | the `column_name`s after `On`          |
+/// | foreignkey     | foreignkey_name   | `class_name` (the referenced class)    |
+/// | clientmethod   | method_name       | `method_keyword_external_language`     |
+/// | query          | query_name        | `return_type` (`As %SQLQuery`)         |
+/// | trigger        | trigger_name      | the `trigger_keyword`s (Event / Time)  |
+/// | projection     | projection_name   | `return_type`                          |
+/// | storage        | storage_name      | nothing — Storage has no type          |
+///
+/// Each entry is (member node kind, node holding the name, reported `kind`). Table-driven because
+/// eight near-identical extractors is eight places for one of them to drift.
+const EXTRA_MEMBERS: &[(&str, &str, &str)] = &[
+    ("relationship", "relationship_name", "relationship"),
+    ("index", "index_name", "index"),
+    ("foreignkey", "foreignkey_name", "foreignkey"),
+    ("clientmethod", "method_name", "clientmethod"),
+    ("query", "query_name", "query"),
+    ("trigger", "trigger_name", "trigger"),
+    ("projection", "projection_name", "projection"),
+    ("storage", "storage_name", "storage"),
+];
+
+/// `As %String` -> `%String`. The grammar's `return_type` node INCLUDES the `As` keyword, measured;
+/// carrying that into a `Type` field would make every type unusable as a class name.
+fn strip_as(text: &str) -> String {
+    let t = text.trim();
+    t.strip_prefix("As ")
+        .or_else(|| t.strip_prefix("as "))
+        .unwrap_or(t)
+        .trim()
+        .to_string()
+}
+
+/// Concatenate the text of every child of `node` whose kind is `want`, comma-separated.
+fn texts_of_kind(node: tree_sitter::Node, source: &[u8], want: &str) -> Vec<String> {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .filter(|c| c.kind() == want)
+        .map(|c| node_text(c, source).trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+/// The `Type` reported for one of the extra member kinds, or `None` where the grammar offers nothing
+/// meaningful (Storage). Each arm reads the child the probe actually found.
+fn extra_member_type(node: tree_sitter::Node, source: &[u8], kind: &str) -> Option<String> {
+    let first =
+        |want: &str| -> Option<String> { texts_of_kind(node, source, want).into_iter().next() };
+    match kind {
+        // A relationship's target class, a query's result class, a projection's projection class.
+        "relationship" | "query" | "projection" => first("return_type").map(|t| strip_as(&t)),
+        // The class the key REFERENCES — the useful half of a foreign key.
+        "foreignkey" => first("class_name"),
+        // What is indexed. Several columns are possible, so all of them, in source order.
+        "index" => {
+            let cols = texts_of_kind(node, source, "column_name");
+            (!cols.is_empty()).then(|| cols.join(","))
+        }
+        // Event and Time are what distinguish one trigger from another; the name rarely says.
+        "trigger" => {
+            let kws = texts_of_kind(node, source, "trigger_keyword");
+            (!kws.is_empty()).then(|| kws.join(", "))
+        }
+        // A ClientMethod's Language is the whole point — it is why the body is not ObjectScript.
+        "clientmethod" => first("method_keyword_external_language"),
+        // Storage genuinely has no type. None, not an empty string.
+        _ => None,
+    }
+}
+
+/// One extractor for all eight. `name_kind` is the child holding the name; it may wrap an
+/// `identifier` (as `property_name` does) or carry the text directly, so both are handled.
+fn extract_extra_member(
+    node: tree_sitter::Node,
+    source: &[u8],
+    class_name: &str,
+    rel_path: &str,
+    name_kind: &str,
+    kind: &str,
+) -> Option<Symbol> {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() != name_kind {
+            continue;
+        }
+        let ident = first_identifier_text(child, source);
+        let name = if ident.is_empty() {
+            node_text(child, source).trim().to_string()
+        } else {
+            ident
+        };
+        if name.is_empty() {
+            continue;
+        }
+        return Some(Symbol {
+            name: format!("{class_name}.{name}"),
+            kind: kind.into(),
+            file: rel_path.into(),
+            formal_spec: None,
+            type_name: extra_member_type(node, source, kind),
+            // Filled in centrally by extract_cls_members — one source of truth for the line.
+            line: None,
+        });
     }
     None
 }
@@ -1226,6 +1352,269 @@ XData Conf [ XMLNamespace = "http://example.com/x" ]
             by_kind("label"),
             vec![("Util:Start".to_string(), 4usize)],
             "the Start label is on line 4: {syms:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod all_member_kinds_tests {
+    //! #24/070: the eight member kinds beyond method/property/parameter/xdata.
+    //!
+    //! The fixture carries EVERY member form UDL has, and `PARSE_ERROR` is asserted false, so a
+    //! grammar that cannot parse one of them fails here rather than silently reporting 12 of 13.
+    use super::*;
+
+    /// Lines are in the comment so the line assertions below are checkable by eye.
+    ///
+    /// ```text
+    ///  4 Parameter    6 Property     8 Relationship  10 Index      12 ForeignKey
+    /// 14 Method      19 ClassMethod 24 ClientMethod  29 Query      34 Trigger
+    /// 39 Projection  41 XData       46 Storage
+    /// ```
+    const EVERY: &str = r#"Class Demo.Every.Member Extends (%Persistent, %XML.Adaptor)
+{
+
+Parameter VERSION = 1;
+
+Property Name As %String;
+
+Relationship Items As Demo.Item [ Cardinality = many, Inverse = Parent ];
+
+Index NameIdx On Name [ Unique ];
+
+ForeignKey FKItem(ItemId) References Demo.Item(IdKey);
+
+Method Run() As %Status
+{
+    Quit $$$OK
+}
+
+ClassMethod Build() As %Status
+{
+    Quit $$$OK
+}
+
+ClientMethod onload() [ Language = javascript ]
+{
+    return true;
+}
+
+Query ListAll() As %SQLQuery
+{
+    SELECT Name FROM Demo.Every.Member
+}
+
+Trigger AfterIns [ Event = INSERT, Time = AFTER ]
+{
+    Set x = 1
+}
+
+Projection Proj As %Projection.StudioDocument;
+
+XData Conf [ XMLNamespace = "http://example.com/x" ]
+{
+<x/>
+}
+
+Storage Default
+{
+<Type>%Storage.Persistent</Type>
+}
+
+}
+"#;
+
+    fn syms() -> Vec<Symbol> {
+        let (s, w) = extract_cls_symbols(EVERY.as_bytes(), "src/Demo/Every/Member.cls", "*");
+        assert!(w.is_empty(), "unexpected parse warnings: {w:?}");
+        s
+    }
+
+    fn get(name: &str) -> Symbol {
+        let all = syms();
+        all.iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no symbol {name}; got {:?}",
+                    all.iter().map(|s| (&s.name, &s.kind)).collect::<Vec<_>>()
+                )
+            })
+            .clone()
+    }
+
+    /// The headline: TWELVE member kinds, plus the class itself — the number 070 asks for, reached by
+    /// reading what the grammar emits rather than by matching the issue's count. Before this, 8 of
+    /// them fell through `_ => None` exactly the way `xdata` used to.
+    #[test]
+    fn every_member_kind_the_grammar_emits_is_reported() {
+        let all = syms();
+        let mut kinds: Vec<&str> = all.iter().map(|s| s.kind.as_str()).collect();
+        kinds.sort_unstable();
+        kinds.dedup();
+        // TWELVE member kinds plus `class` — which is exactly the "12 member kinds" 070 asks for,
+        // arrived at independently by reading the grammar. Note `classmethod` is NOT in this list:
+        // extract_method_symbol reports both `Method` and `ClassMethod` as kind "method". That is
+        // PRE-EXISTING and left alone — splitting them would break a caller filtering on "method" —
+        // but it does lose a real distinction, so it is reported on the issue rather than silently
+        // kept or silently changed.
+        let expected = vec![
+            "class",
+            "clientmethod",
+            "foreignkey",
+            "index",
+            "method",
+            "parameter",
+            "projection",
+            "property",
+            "query",
+            "relationship",
+            "storage",
+            "trigger",
+            "xdata",
+        ];
+        assert_eq!(kinds, expected, "got {:?}", all);
+    }
+
+    /// Each new kind reports its OWN name, not the class's and not a sibling's.
+    #[test]
+    fn each_new_kind_reports_its_own_name() {
+        for (name, kind) in [
+            ("Demo.Every.Member.Items", "relationship"),
+            ("Demo.Every.Member.NameIdx", "index"),
+            ("Demo.Every.Member.FKItem", "foreignkey"),
+            ("Demo.Every.Member.onload", "clientmethod"),
+            ("Demo.Every.Member.ListAll", "query"),
+            ("Demo.Every.Member.AfterIns", "trigger"),
+            ("Demo.Every.Member.Proj", "projection"),
+            ("Demo.Every.Member.Default", "storage"),
+        ] {
+            assert_eq!(get(name).kind, kind, "{name}");
+        }
+    }
+
+    /// The `As ` prefix must be stripped: the grammar's `return_type` node INCLUDES it, and a Type of
+    /// "As Demo.Item" is not usable as a class name.
+    #[test]
+    fn a_relationship_reports_its_target_class_without_the_as_keyword() {
+        let r = get("Demo.Every.Member.Items");
+        assert_eq!(r.type_name.as_deref(), Some("Demo.Item"), "{r:?}");
+    }
+
+    #[test]
+    fn a_query_and_a_projection_also_strip_the_as() {
+        assert_eq!(
+            get("Demo.Every.Member.ListAll").type_name.as_deref(),
+            Some("%SQLQuery")
+        );
+        assert_eq!(
+            get("Demo.Every.Member.Proj").type_name.as_deref(),
+            Some("%Projection.StudioDocument")
+        );
+    }
+
+    /// A foreign key's useful half is the class it REFERENCES, not its own name.
+    #[test]
+    fn a_foreign_key_reports_the_referenced_class() {
+        assert_eq!(
+            get("Demo.Every.Member.FKItem").type_name.as_deref(),
+            Some("Demo.Item")
+        );
+    }
+
+    /// An index reports WHAT is indexed; that is the only thing that distinguishes two indexes whose
+    /// names are `Idx1` and `Idx2`.
+    #[test]
+    fn an_index_reports_the_columns_it_covers() {
+        assert_eq!(
+            get("Demo.Every.Member.NameIdx").type_name.as_deref(),
+            Some("Name")
+        );
+    }
+
+    /// Event and Time distinguish one trigger from another; the name usually does not.
+    #[test]
+    fn a_trigger_reports_its_event_and_time() {
+        let t = get("Demo.Every.Member.AfterIns");
+        let ty = t.type_name.as_deref().unwrap_or_default();
+        assert!(ty.contains("Event = INSERT"), "{t:?}");
+        assert!(ty.contains("Time = AFTER"), "{t:?}");
+    }
+
+    /// A ClientMethod's Language is why its body is not ObjectScript — the single most useful fact
+    /// about it, and invisible from the name.
+    #[test]
+    fn a_clientmethod_reports_its_language() {
+        let c = get("Demo.Every.Member.onload");
+        assert!(
+            c.type_name
+                .as_deref()
+                .unwrap_or_default()
+                .contains("javascript"),
+            "{c:?}"
+        );
+    }
+
+    /// Storage has no type in the grammar. `None`, never `Some("")` — absent and empty stay distinct,
+    /// the same rule the XData work established.
+    #[test]
+    fn storage_reports_no_type_rather_than_an_empty_one() {
+        let s = get("Demo.Every.Member.Default");
+        assert!(s.type_name.is_none(), "must be absent, not empty: {s:?}");
+    }
+
+    /// Regression guard: the four kinds that already worked must be untouched, and the class symbol
+    /// must still be there. Adding arms to a dispatch is exactly how a working one gets displaced.
+    #[test]
+    fn the_four_existing_kinds_and_the_class_are_undisturbed() {
+        for (name, kind) in [
+            ("Demo.Every.Member", "class"),
+            ("Demo.Every.Member.VERSION", "parameter"),
+            ("Demo.Every.Member.Name", "property"),
+            ("Demo.Every.Member.Run", "method"),
+            // `Build` is a ClassMethod and is reported as "method" — see the note above.
+            ("Demo.Every.Member.Build", "method"),
+            ("Demo.Every.Member.Conf", "xdata"),
+        ] {
+            assert_eq!(get(name).kind, kind, "{name}");
+        }
+        assert_eq!(
+            get("Demo.Every.Member.Conf").type_name.as_deref(),
+            Some("http://example.com/x"),
+            "the XData namespace must survive the new arms"
+        );
+    }
+
+    /// The new kinds get line numbers from the central stamp, with no per-kind work — which is the
+    /// property the central stamp was introduced for. Exact lines, from the fixture comment.
+    #[test]
+    fn the_new_kinds_get_their_lines_from_the_central_stamp() {
+        for (name, line) in [
+            ("Demo.Every.Member.Items", 8),
+            ("Demo.Every.Member.NameIdx", 10),
+            ("Demo.Every.Member.FKItem", 12),
+            ("Demo.Every.Member.onload", 24),
+            ("Demo.Every.Member.ListAll", 29),
+            ("Demo.Every.Member.AfterIns", 34),
+            ("Demo.Every.Member.Proj", 39),
+            ("Demo.Every.Member.Default", 46),
+        ] {
+            assert_eq!(get(name).line, Some(line), "{name}");
+        }
+    }
+
+    /// The glob still scopes by CLASS name, so a non-matching query yields nothing at all — the new
+    /// kinds must not leak past it.
+    #[test]
+    fn the_new_kinds_respect_the_class_glob() {
+        let (matched, _) =
+            extract_cls_symbols(EVERY.as_bytes(), "src/Demo/Every/Member.cls", "Demo.*");
+        assert!(matched.iter().any(|s| s.kind == "trigger"), "{matched:?}");
+        let (missed, _) =
+            extract_cls_symbols(EVERY.as_bytes(), "src/Demo/Every/Member.cls", "Other.*");
+        assert!(
+            missed.is_empty(),
+            "the glob must exclude everything: {missed:?}"
         );
     }
 }
