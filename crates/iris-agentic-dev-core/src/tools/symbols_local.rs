@@ -17,6 +17,13 @@ pub struct Symbol {
     pub formal_spec: Option<String>,
     #[serde(rename = "Type", skip_serializing_if = "Option::is_none")]
     pub type_name: Option<String>,
+    /// #24/070: 1-BASED line of the declaration, so a caller can jump straight to it.
+    ///
+    /// tree-sitter rows are 0-based; every site adds 1 exactly once. `None` only where the grammar
+    /// gave no node to take a position from — never 0, which would be a plausible-looking line
+    /// number that no editor can use.
+    #[serde(rename = "line", skip_serializing_if = "Option::is_none")]
+    pub line: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -140,8 +147,7 @@ pub fn extract_cls_symbols(
         // Continue — extract what we can from the partial parse.
     }
 
-    let class_name = extract_class_name(&tree, source);
-    let class_name = match class_name {
+    let (class_name, class_line) = match extract_class_name(&tree, source) {
         Some(n) => n,
         None => return (symbols, warnings),
     };
@@ -157,6 +163,7 @@ pub fn extract_cls_symbols(
         file: rel_path.into(),
         formal_spec: None,
         type_name: None,
+        line: Some(class_line),
     });
 
     // Walk the tree for members.
@@ -165,7 +172,18 @@ pub fn extract_cls_symbols(
     (symbols, warnings)
 }
 
-fn extract_class_name(tree: &tree_sitter::Tree, source: &[u8]) -> Option<String> {
+/// The class name and the 1-based line it is declared on.
+///
+/// The line comes from the `class_name` node. MEASURED, because my first guess was wrong: I assumed
+/// `class_definition` starts at the leading `///` block and would point above the `Class ...` line.
+/// It does not — dumping the parse tree shows `documatic_line` is a SIBLING of `class_definition`,
+/// not a child, so both nodes start on the same row and either would work today.
+///
+/// `class_name` is kept anyway because it is the node whose position IS the declaration by
+/// definition, so it stays correct if the grammar ever attaches doc comments to the wrapper. But it
+/// is a robustness choice, not a fix for a real off-by-N — stated that way so the next reader does
+/// not believe a mechanism that is not there.
+fn extract_class_name(tree: &tree_sitter::Tree, source: &[u8]) -> Option<(String, usize)> {
     let root = tree.root_node();
     let mut cursor = root.walk();
     // Find class_definition
@@ -174,7 +192,7 @@ fn extract_class_name(tree: &tree_sitter::Tree, source: &[u8]) -> Option<String>
             let mut c2 = child.walk();
             for sub in child.children(&mut c2) {
                 if sub.kind() == "class_name" {
-                    return Some(node_text(sub, source));
+                    return Some((node_text(sub, source), sub.start_position().row + 1));
                 }
             }
         }
@@ -213,40 +231,30 @@ fn extract_cls_members(
                     Some(m) => m,
                     None => continue,
                 };
-                match member.kind() {
+                // #24/070: the line is stamped ONCE, below, from the member node every arm already
+                // has — not inside the four extractors. Four places to remember is four places to
+                // forget, and a new member kind would arrive with no line and no test failure.
+                let extracted = match member.kind() {
                     "method" | "classmethod" => {
-                        if let Some(sym) =
-                            extract_method_symbol(member, source, class_name, rel_path)
-                        {
-                            symbols.push(sym);
-                        }
+                        extract_method_symbol(member, source, class_name, rel_path)
                     }
-                    "property" => {
-                        if let Some(sym) =
-                            extract_property_symbol(member, source, class_name, rel_path)
-                        {
-                            symbols.push(sym);
-                        }
-                    }
-                    "parameter" => {
-                        if let Some(sym) =
-                            extract_parameter_symbol(member, source, class_name, rel_path)
-                        {
-                            symbols.push(sym);
-                        }
-                    }
+                    "property" => extract_property_symbol(member, source, class_name, rel_path),
+                    "parameter" => extract_parameter_symbol(member, source, class_name, rel_path),
                     // #24/070: BPL and DTL are stored AS XData, so a reader that drops xdata
                     // cannot see the two component types the iris-interop skills teach most.
                     // Measured before writing this: the UDL grammar does emit an `xdata` node,
                     // wrapped in `class_statement` exactly like the members above.
-                    "xdata" => {
-                        if let Some(sym) =
-                            extract_xdata_symbol(member, source, class_name, rel_path)
-                        {
-                            symbols.push(sym);
-                        }
-                    }
-                    _ => {}
+                    "xdata" => extract_xdata_symbol(member, source, class_name, rel_path),
+                    _ => None,
+                };
+                if let Some(mut sym) = extracted {
+                    // The MEMBER node rather than the `class_statement` wrapper. NOT because the
+                    // wrapper includes the doc comment — measured, it does not: `documatic_line` is
+                    // a sibling inside `class_body`, so `stmt` and `member` start on the same row
+                    // and a mutation swapping them is EQUIVALENT, not a caught bug. The member node
+                    // is used because its position is the declaration by definition.
+                    sym.line = Some(member.start_position().row + 1);
+                    symbols.push(sym);
                 }
             }
         }
@@ -325,6 +333,9 @@ fn extract_xdata_symbol(
         file: rel_path.to_string(),
         formal_spec: None,
         type_name: xml_namespace,
+        // Filled in centrally by extract_cls_members from the member node — see
+        // the comment there. Left None here so there is ONE source of truth.
+        line: None,
     })
 }
 
@@ -365,6 +376,9 @@ fn extract_method_symbol(
                     file: rel_path.into(),
                     formal_spec,
                     type_name: None,
+                    // Filled in centrally by extract_cls_members from the member node — see
+                    // the comment there. Left None here so there is ONE source of truth.
+                    line: None,
                 });
             }
         }
@@ -390,6 +404,9 @@ fn extract_property_symbol(
                     file: rel_path.into(),
                     formal_spec: None,
                     type_name: None,
+                    // Filled in centrally by extract_cls_members from the member node — see
+                    // the comment there. Left None here so there is ONE source of truth.
+                    line: None,
                 });
             }
         }
@@ -414,6 +431,9 @@ fn extract_parameter_symbol(
                     file: rel_path.into(),
                     formal_spec: None,
                     type_name: None,
+                    // Filled in centrally by extract_cls_members from the member node — see
+                    // the comment there. Left None here so there is ONE source of truth.
+                    line: None,
                 });
             }
         }
@@ -527,6 +547,9 @@ fn extract_routine_nodes(
                                 file: rel_path.into(),
                                 formal_spec: None,
                                 type_name: None,
+                                // #24/070: the tag / macro_def node is what a reader wants to
+                                // land on, so take the position from `sub`, not the statement.
+                                line: Some(sub.start_position().row + 1),
                             });
                         }
                         break;
@@ -545,6 +568,9 @@ fn extract_routine_nodes(
                                 file: rel_path.into(),
                                 formal_spec: None,
                                 type_name: None,
+                                // #24/070: the tag / macro_def node is what a reader wants to
+                                // land on, so take the position from `sub`, not the statement.
+                                line: Some(sub.start_position().row + 1),
                             });
                         }
                         break;
@@ -564,6 +590,9 @@ fn extract_routine_nodes(
                                 file: rel_path.into(),
                                 formal_spec: None,
                                 type_name: None,
+                                // #24/070: the tag / macro_def node is what a reader wants to
+                                // land on, so take the position from `sub`, not the statement.
+                                line: Some(sub.start_position().row + 1),
                             });
                         }
                         break;
@@ -1008,6 +1037,195 @@ XData P [ SchemaSpec = "http://x/schema", XMLNamespace = "http://x/ns" ]
         assert!(
             syms2.iter().any(|s| s.kind == "xdata"),
             "the control must find xdata: {syms2:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod line_number_tests {
+    //! #24/070: every symbol carries the 1-based line of its declaration, so a caller can jump to
+    //! it instead of grepping the file it was just told the name of.
+    //!
+    //! The whole risk here is an off-by-one, so these assert EXACT lines against a source whose
+    //! layout is written out line by line in the comment beside it. A test that only checked
+    //! `line.is_some()` would pass with every number wrong.
+    use super::*;
+
+    /// Line numbers are in the comment, counted from 1. The leading newline after `r#"` is
+    /// deliberate: it makes line 1 blank, so an off-by-one cannot hide behind "the first line".
+    ///
+    /// ```text
+    ///  1 (blank)
+    ///  2 /// A class with doc comments, to prove the line is the DECLARATION.
+    ///  3 Class Demo.Line.Probe Extends %RegisteredObject
+    ///  4 {
+    ///  5 (blank)
+    ///  6 /// doc for the parameter
+    ///  7 Parameter VERSION = 3;
+    ///  8 (blank)
+    ///  9 Property Name As %String;
+    /// 10 (blank)
+    /// 11 /// doc line one
+    /// 12 /// doc line two
+    /// 13 Method Run() As %Status
+    /// 14 {
+    /// 15     Quit $$$OK
+    /// 16 }
+    /// 17 (blank)
+    /// 18 XData Conf [ XMLNamespace = "http://example.com/x" ]
+    /// 19 {
+    /// 20 <x/>
+    /// 21 }
+    /// 22 (blank)
+    /// 23 }
+    /// ```
+    const PROBE: &str = r#"
+/// A class with doc comments, to prove the line is the DECLARATION.
+Class Demo.Line.Probe Extends %RegisteredObject
+{
+
+/// doc for the parameter
+Parameter VERSION = 3;
+
+Property Name As %String;
+
+/// doc line one
+/// doc line two
+Method Run() As %Status
+{
+    Quit $$$OK
+}
+
+XData Conf [ XMLNamespace = "http://example.com/x" ]
+{
+<x/>
+}
+
+}
+"#;
+
+    fn probe() -> Vec<Symbol> {
+        let (syms, warns) = extract_cls_symbols(PROBE.as_bytes(), "src/Demo/Line/Probe.cls", "*");
+        assert!(warns.is_empty(), "unexpected parse warnings: {warns:?}");
+        syms
+    }
+
+    fn line_of(syms: &[Symbol], name: &str) -> usize {
+        syms.iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("no symbol named {name} in {syms:?}"))
+            .line
+            .unwrap_or_else(|| panic!("{name} carries no line: {syms:?}"))
+    }
+
+    /// The class line must be the `Class ...` line, NOT the `///` above it. This pins the OUTCOME,
+    /// which is the contract a caller depends on. It does not pin the node choice: `documatic_line`
+    /// is a sibling of `class_definition`, so taking the row from either node gives 3 today — a
+    /// mutation swapping them is equivalent. What this test really guards is the 1-based offset and
+    /// the fact that a doc comment above a declaration never shifts the reported line.
+    #[test]
+    fn the_class_line_is_the_declaration_not_its_doc_comment() {
+        let s = probe();
+        assert_eq!(
+            line_of(&s, "Demo.Line.Probe"),
+            3,
+            "line 2 is the doc comment, line 3 is `Class ...`"
+        );
+    }
+
+    /// Same property for members. The two-line doc comment above `Method Run()` must not shift the
+    /// reported line — and note it does not shift it for EITHER node choice, since the comments are
+    /// sibling `documatic_line` nodes rather than part of the wrapper. The value here is the offset
+    /// and the outcome, not a claim about which node was necessary.
+    #[test]
+    fn a_member_line_is_the_declaration_not_its_doc_comment() {
+        let s = probe();
+        assert_eq!(
+            line_of(&s, "Demo.Line.Probe.Run"),
+            13,
+            "lines 11-12 are doc comments; the Method is on 13"
+        );
+        assert_eq!(
+            line_of(&s, "Demo.Line.Probe.VERSION"),
+            7,
+            "line 6 is the doc comment; the Parameter is on 7"
+        );
+    }
+
+    #[test]
+    fn every_member_kind_carries_its_own_line() {
+        let s = probe();
+        assert_eq!(line_of(&s, "Demo.Line.Probe.Name"), 9, "property");
+        assert_eq!(line_of(&s, "Demo.Line.Probe.Conf"), 18, "xdata");
+    }
+
+    /// 1-BASED, and the guard against the classic off-by-one: nothing may report 0, and nothing may
+    /// report a line past the end of the file.
+    #[test]
+    fn no_line_is_zero_or_past_the_end_of_the_file() {
+        let s = probe();
+        let last = PROBE.lines().count();
+        assert!(
+            last > 20,
+            "precondition: the probe has enough lines: {last}"
+        );
+        for sym in &s {
+            let l = sym.line.unwrap_or_else(|| panic!("{sym:?} has no line"));
+            assert!(l >= 1, "0 is not a line an editor can use: {sym:?}");
+            assert!(
+                l <= last,
+                "line {l} is past the file's {last} lines: {sym:?}"
+            );
+        }
+    }
+
+    /// EVERY symbol, not just the ones named above — a kind added later must not arrive without a
+    /// line. This is what the central stamp in `extract_cls_members` buys.
+    #[test]
+    fn no_symbol_is_emitted_without_a_line() {
+        let s = probe();
+        assert!(s.len() >= 5, "precondition: class + 4 members, got {s:?}");
+        let missing: Vec<_> = s.iter().filter(|x| x.line.is_none()).collect();
+        assert!(missing.is_empty(), "symbols with no line: {missing:?}");
+    }
+
+    /// Routine files too — labels are how a .mac is navigated, so a label without a line is the
+    /// least useful symbol of the set.
+    #[test]
+    fn routine_labels_and_macros_carry_their_lines() {
+        // 1 ROUTINE Demo.Util
+        // 2 #define MAXROWS 100
+        // 3 (blank)
+        // 4 Start
+        // 5  quit
+        let src = "ROUTINE Demo.Util\n#define MAXROWS 100\n\nStart\n quit\n";
+        let (syms, _w) = extract_routine_symbols(src.as_bytes(), "src/Demo/Util.mac", "*");
+        assert!(
+            !syms.is_empty(),
+            "precondition: the routine parser produced symbols"
+        );
+        // EXACT lines, not a range: `1 <= l <= 5` is satisfied by a hardcoded 1, which is exactly
+        // the mutation this test exists to kill.
+        let by_kind = |k: &str| -> Vec<(String, usize)> {
+            syms.iter()
+                .filter(|s| s.kind == k)
+                .map(|s| (s.name.clone(), s.line.expect("a line")))
+                .collect()
+        };
+        assert_eq!(
+            by_kind("macro"),
+            vec![("MAXROWS".to_string(), 2usize)],
+            "the #define is on line 2: {syms:?}"
+        );
+        // `Util:Start`, not `Demo.Util:Start` — and that is PRE-EXISTING behaviour this change does
+        // not touch: `routine_name` comes from `Path::file_stem()`, so the package is dropped even
+        // though line 1 of the source says `ROUTINE Demo.Util`. Filed separately rather than
+        // changed here, because renaming symbols is a contract change and this PR is about lines.
+        // The exact assertion is what surfaced it; the `1 <= l <= 5` range it replaced hid it.
+        assert_eq!(
+            by_kind("label"),
+            vec![("Util:Start".to_string(), 4usize)],
+            "the Start label is on line 4: {syms:?}"
         );
     }
 }
