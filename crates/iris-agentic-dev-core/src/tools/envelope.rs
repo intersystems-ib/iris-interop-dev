@@ -260,6 +260,39 @@ fn builtin_hint(code: &str, msg: &str) -> Option<String> {
     if code == "TIMEOUT" {
         return Some(TIMEOUT_HINT.into());
     }
+    // #263: BEFORE the generic COMPILE_ERROR branch, because for this one error the generic
+    // advice is actively wrong. It says "read that error" — and the error names a class that no
+    // longer exists anywhere, so reading it leads nowhere.
+    //
+    // A SearchTable property is registered in Ens_Config.SearchTableProp keyed by EXTENT, and
+    // that row SURVIVES deleting or renaming the class that created it. Measured 2026-09-18 and
+    // recorded in the skills repo's own CI helper (`deregister_search_tables`): rename a
+    // SearchTable and the next compile fails naming the old class, which is already gone.
+    //
+    // Observed cost of not saying so: one model spent 29 tool calls — 36% of its whole run —
+    // and wrote `Kill ^%Dictionary(...)`, `Set ^SYS("Compile","Names",...)` and
+    // `Kill ^oddDEF(...)` into a working namespace before renaming its own property to escape a
+    // phantom. Another model fixed the same error in 2 calls with one SELECT and one %DeleteId.
+    // The difference is knowing which table holds the registration.
+    if msg.contains("PropCollision") {
+        return Some(
+            "A SearchTable property name is registered BY EXTENT in Ens_Config.SearchTableProp, \
+             not in %Dictionary — and that row SURVIVES deleting or renaming the class that \
+             created it. That is why this error can name a class which no longer exists: looking \
+             it up in %Dictionary.CompiledClass will correctly return nothing, and that absence \
+             is not the problem. Find the stale row: SELECT ID, Name, PropId, ClassExtent, \
+             ClassDerivation FROM Ens_Config.SearchTableProp WHERE Name = '<prop>'. The ID that \
+             comes back IS the argument to delete with — it is already '<ClassExtent>||<Name>', \
+             assembled, and that extent owns the registration and is NOT necessarily the class \
+             named in the error. Pass it straight through: Do \
+             ##class(Ens.Config.SearchTableProp).%DeleteId(\"<the ID from that SELECT>\") — \
+             or DELETE FROM Ens_Config.SearchTableProp WHERE ClassDerivation LIKE \
+             '<oldclass>~%'. Then recompile. Do NOT rename your property, do NOT delete the \
+             class again, and do NOT touch ^%Dictionary, ^oddDEF or ^SYS(\"Compile\") — none of \
+             those clears the registration, and writing to them damages the namespace."
+                .into(),
+        );
+    }
     if code == "COMPILE_ERROR" {
         return Some(
             "If several errors are reported, fix the first and recompile — later errors are \
@@ -274,6 +307,91 @@ fn builtin_hint(code: &str, msg: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── #263: PropCollision ─────────────────────────────────────────────────────
+
+    /// The real console line from the report, so the test matches what IRIS actually emits.
+    const PROP_COLLISION: &str = "ERROR <EnsSearchTable>PropCollision: SearchTable property \
+         collision: Property 'PatientFirstName' in class 'HOSPITAL.Search.HL7' cannot override \
+         the definition from class 'Hospital.SearchTable.PatientFirstName'";
+
+    #[test]
+    fn prop_collision_names_the_table_that_actually_holds_the_registration() {
+        let h = builtin_hint("COMPILE_ERROR", PROP_COLLISION).expect("a hint");
+        assert!(h.contains("Ens_Config.SearchTableProp"), "{h}");
+        // The id format, verified live on IRIS for Health 2026.1: rows are keyed
+        // `<ClassExtent>||<Name>` (e.g. EnsLib.HL7.SearchTable||PatientName).
+        assert!(h.contains("||"), "must give the id shape: {h}");
+        assert!(h.contains("%DeleteId"), "must give the remediation: {h}");
+        // The whole point: the accused class being absent is expected, not the bug.
+        assert!(
+            h.contains("no longer exists"),
+            "must explain why the named class cannot be found: {h}"
+        );
+    }
+
+    /// It must WIN over the generic COMPILE_ERROR advice, which for this error is actively
+    /// misleading — "read that error" sends the reader to a class that does not exist.
+    #[test]
+    fn prop_collision_wins_over_the_generic_compile_hint() {
+        let h = builtin_hint("COMPILE_ERROR", PROP_COLLISION).expect("a hint");
+        assert!(
+            !h.contains("cascades of the first"),
+            "the generic branch must not shadow this one: {h}"
+        );
+    }
+
+    /// The destructive detour the report measured — 29 calls, three writes into system globals.
+    /// The hint names each one as ineffective, so a model that considers it is told first.
+    #[test]
+    fn prop_collision_warns_off_the_dictionary_surgery_that_was_observed() {
+        let h = builtin_hint("COMPILE_ERROR", PROP_COLLISION).expect("a hint");
+        for g in ["^%Dictionary", "^oddDEF", "^SYS"] {
+            assert!(h.contains(g), "must warn off {g}: {h}");
+        }
+        assert!(
+            h.contains("Do NOT rename your property"),
+            "renaming the property is what the observed run settled for: {h}"
+        );
+    }
+
+    /// POSITIVE CONTROL: an ordinary compile error must still get the generic hint. Without
+    /// this, a branch that fired on everything would satisfy all three tests above.
+    #[test]
+    fn an_ordinary_compile_error_still_gets_the_generic_hint() {
+        let h = builtin_hint("COMPILE_ERROR", "ERROR #1044: Method 'Foo' already defined")
+            .expect("a hint");
+        assert!(h.contains("cascades of the first"), "{h}");
+        assert!(!h.contains("SearchTableProp"), "{h}");
+    }
+
+    /// The SELECT must be the one that yields the delete argument directly. Verified live on
+    /// IRIS for Health 2026.1: `Ens_Config.SearchTableProp` DOES project an `ID` column, and its
+    /// value is literally `<ClassExtent>||<Name>` (`EnsLib.HL7.SearchTable||PatientName`), i.e.
+    /// exactly what `%DeleteId` takes. So the hint must ask for ID and say it is reusable —
+    /// otherwise the reader concatenates it by hand and can pick the wrong extent, since
+    /// ClassExtent is not always the class the error names.
+    #[test]
+    fn prop_collision_asks_for_the_id_column_and_says_it_is_the_delete_argument() {
+        let h = builtin_hint("COMPILE_ERROR", PROP_COLLISION).expect("a hint");
+        assert!(h.contains("SELECT ID"), "must ask for the ID column: {h}");
+        assert!(
+            h.contains("IS the argument to delete with"),
+            "must say the ID is directly reusable: {h}"
+        );
+        assert!(
+            h.contains("NOT necessarily the class"),
+            "must warn that the owning extent differs from the accused class: {h}"
+        );
+    }
+
+    /// And it is keyed on the MESSAGE, not the code: the same collision surfacing under a
+    /// different envelope code must still be recognised.
+    #[test]
+    fn prop_collision_is_recognised_regardless_of_the_envelope_code() {
+        let h = builtin_hint("IRIS_RUNTIME_ERROR", PROP_COLLISION).expect("a hint");
+        assert!(h.contains("Ens_Config.SearchTableProp"), "{h}");
+    }
 
     /// #216: a TIMEOUT envelope carried no `hint` at all — `fail` passes Value::Null and
     /// builtin_hint had no TIMEOUT branch. 6 occurrences, hint empty in all 6. One student
