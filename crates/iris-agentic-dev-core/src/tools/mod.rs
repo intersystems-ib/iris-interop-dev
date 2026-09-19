@@ -5699,16 +5699,9 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
         // NO_TESTS_FOUND; reading the global fixes it.) Falls back to stdout parsing if the global is empty.
         let mut from_global = false;
         {
-            let read_sql = format!(
-                "SELECT tc.Name Class, tm.Name Method, tm.Status St, \
-                 (SELECT TOP 1 ta.Description FROM %UnitTest_Result.TestAssert ta WHERE ta.TestMethod=tm.ID AND ta.Status=0 ORDER BY ta.Counter) FailMsg, \
-                 (SELECT TOP 1 ta.Location FROM %UnitTest_Result.TestAssert ta WHERE ta.TestMethod=tm.ID AND ta.Status=0 ORDER BY ta.Counter) FailLoc, \
-                 (SELECT TOP 1 ta.Action FROM %UnitTest_Result.TestAssert ta WHERE ta.TestMethod=tm.ID AND ta.Status=0 ORDER BY ta.Counter) FailAct, \
-                 tm.ErrorDescription ErrDesc, tm.ErrorAction ErrAct \
-                 FROM %UnitTest_Result.TestMethod tm, %UnitTest_Result.TestCase tc, %UnitTest_Result.TestSuite ts \
-                 WHERE tm.TestCase=tc.ID AND tc.TestSuite=ts.ID AND ts.TestInstance > {} ORDER BY tc.Name, tm.Name",
-                before_id
-            );
+            // #273: the query lives in unittest_result beside the shaper that reads its aliases, so
+            // a mis-aliased column is a test failure rather than a silent Null.
+            let read_sql = crate::tools::unittest_result::result_query_sql(before_id as i64);
             if let Ok(Ok(body)) = tokio::time::timeout(
                 std::time::Duration::from_secs(10),
                 iris.query(&read_sql, vec![], &namespace, client),

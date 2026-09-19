@@ -144,6 +144,36 @@ pub fn failure_detail(
     FailureDetail::default()
 }
 
+/// The row keys [`shape_method_row`] reads. The query MUST alias every one of them.
+///
+/// A mis-aliased column is invisible: `r["ErrDesc"]` on a row that does not have it is `Null`, which is
+/// exactly what an absent abort looks like — so the feature would silently do nothing. This list is the
+/// contract between the two halves, asserted by `the_query_aliases_every_key_the_shaper_reads`.
+pub const ROW_KEYS: &[&str] = &[
+    "Class", "Method", "St", "FailMsg", "FailLoc", "FailAct", "ErrDesc", "ErrAct",
+];
+
+/// The query that reads a finished run out of the `%UnitTest_Result` tables.
+///
+/// EXTRACTED from the handler so its aliases can be asserted. A mutation replacing
+/// `tm.ErrorDescription ErrDesc` with `NULL ErrDesc` is invisible to a test that only exercises the
+/// shaper — the same gap that let a mutation survive on #271, where the helper was covered and the
+/// wiring was not.
+///
+/// `ErrorDescription` / `ErrorAction` come from the TestMethod row itself and are what an ABORT writes;
+/// the three `Fail*` subqueries only ever see a failed ASSERT.
+pub fn result_query_sql(before_id: i64) -> String {
+    format!(
+        "SELECT tc.Name Class, tm.Name Method, tm.Status St, \
+         (SELECT TOP 1 ta.Description FROM %UnitTest_Result.TestAssert ta WHERE ta.TestMethod=tm.ID AND ta.Status=0 ORDER BY ta.Counter) FailMsg, \
+         (SELECT TOP 1 ta.Location FROM %UnitTest_Result.TestAssert ta WHERE ta.TestMethod=tm.ID AND ta.Status=0 ORDER BY ta.Counter) FailLoc, \
+         (SELECT TOP 1 ta.Action FROM %UnitTest_Result.TestAssert ta WHERE ta.TestMethod=tm.ID AND ta.Status=0 ORDER BY ta.Counter) FailAct, \
+         tm.ErrorDescription ErrDesc, tm.ErrorAction ErrAct \
+         FROM %UnitTest_Result.TestMethod tm, %UnitTest_Result.TestCase tc, %UnitTest_Result.TestSuite ts \
+         WHERE tm.TestCase=tc.ID AND tc.TestSuite=ts.ID AND ts.TestInstance > {before_id} ORDER BY tc.Name, tm.Name"
+    )
+}
+
 /// Shape one row of the result-table query into a test-case object.
 ///
 /// EXTRACTED so the wiring is testable, not just the helpers. On #271 a mutation removing the call
@@ -325,6 +355,58 @@ mod tests {
         assert_eq!(d.location, None);
         assert_eq!(d.assert, None);
         assert!(!d.is_runtime_error(), "absent is not a runtime error");
+    }
+
+    // ── the wiring: the query must alias what the shaper reads ──────────────────────────────
+
+    /// A MUTATION SURVIVED before this: replacing `tm.ErrorDescription ErrDesc` with `NULL ErrDesc`
+    /// passed every test, because the SQL was a string literal in the handler that nothing inspected.
+    /// A mis-aliased column is INVISIBLE — `r["ErrDesc"]` on a row lacking it is `Null`, identical to
+    /// "this test did not abort" — so the whole feature would silently do nothing.
+    #[test]
+    fn the_query_aliases_every_key_the_shaper_reads() {
+        let sql = result_query_sql(0);
+        for key in ROW_KEYS {
+            assert!(
+                sql.contains(key),
+                "the query does not alias '{key}', which shape_method_row reads — it would always \
+                 be Null. SQL: {sql}"
+            );
+        }
+    }
+
+    /// Specifically the two the fix added, and from the TestMethod row rather than a subquery: the
+    /// whole point is that an abort writes there and never creates a TestAssert row.
+    #[test]
+    fn the_abort_columns_come_from_the_test_method_row() {
+        let sql = result_query_sql(0);
+        assert!(
+            sql.contains("tm.ErrorDescription ErrDesc"),
+            "must read ErrorDescription off tm, not a TestAssert subquery: {sql}"
+        );
+        assert!(sql.contains("tm.ErrorAction ErrAct"), "{sql}");
+    }
+
+    /// The three assert subqueries must keep their `Status=0` filter — without it a PASSING assert
+    /// would be reported as the failure, which is worse than reporting nothing.
+    #[test]
+    fn the_assert_subqueries_still_filter_on_a_failed_status() {
+        let sql = result_query_sql(0);
+        assert_eq!(
+            sql.matches("ta.Status=0").count(),
+            3,
+            "all three assert subqueries must filter failed asserts: {sql}"
+        );
+    }
+
+    /// The run boundary is interpolated — without it the query returns every historical run.
+    #[test]
+    fn the_run_boundary_is_interpolated() {
+        assert!(result_query_sql(41).contains("TestInstance > 41"));
+        assert!(
+            !result_query_sql(41).contains("{before_id}"),
+            "unsubstituted placeholder"
+        );
     }
 
     // ── the wiring: shape_method_row on rows shaped like the real query ─────────────────────
