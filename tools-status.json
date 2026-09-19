@@ -18,7 +18,7 @@
   "profile_surface": {
     "test": "mcp_handshake::mcp_server_tools_list_returns_interop_profile",
     "status": "OK",
-    "note": "asserts exactly the 28 interop tools, meta tools pruned"
+    "note": "asserts exactly the 29 interop tools, meta tools pruned"
   },
   "tools": [
     {
@@ -187,6 +187,12 @@
       "tool": "hl7_schema_inspect",
       "unit": "tools::hl7_schema::tests::* (13)",
       "e2e": "interop_e2e_tests::hl7_schema_inspect_names_repeating_fields",
+      "status": "OK"
+    },
+    {
+      "tool": "iris_gateway_query",
+      "unit": "tools::gateway::tests::* (13)",
+      "e2e": "interop_e2e_tests::gateway_query_reads_the_external_postgres_table",
       "status": "OK"
     }
   ]

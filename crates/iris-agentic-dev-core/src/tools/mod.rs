@@ -310,6 +310,7 @@ pub mod dict;
 pub mod doc;
 pub mod envelope;
 pub mod execute_method;
+pub mod gateway;
 pub mod hl7_schema;
 pub mod info;
 pub mod interop;
@@ -327,22 +328,22 @@ pub use scm::ScmParams;
 /// Read from `IRIS_TOOLSET` env var or `--toolset` CLI flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Toolset {
-    /// 57 tools advertised (measured 2026-09-18). NOT this fork's default —
+    /// 58 tools advertised (measured 2026-09-18). NOT this fork's default —
     /// `--toolset` defaults to `interop`; baseline is opt-in via IRIS_TOOLSET/--toolset.
     /// Note this is already a pruned router: the 59 tools the `#[tool_router]` macro
     /// registers minus the 4 merged-only ones. Was 54 of 58 before iris_execute_method.
     Baseline,
-    /// 53 tools advertised (measured 2026-09-18). Baseline minus the 4 NOT_IMPLEMENTED
+    /// 54 tools advertised (measured 2026-09-18). Baseline minus the 4 NOT_IMPLEMENTED
     /// stubs (skill_propose, skill_optimize, skill_share, skill_community_install).
     /// No merged dispatchers. Not this fork's default.
     Nostub,
-    /// 49 tools advertised (measured 2026-09-18). Nostub (53) minus 8 — the 4 debug_*
+    /// 50 tools advertised (measured 2026-09-19). Nostub (54) minus 8 — the 4 debug_*
     /// folded into iris_debug, the 3 container tools folded into iris_containers, and
     /// agent_info dropped outright — plus the 4 merged-only tools iris_debug,
-    /// iris_containers, iris_admin, iris_get_log. 53 - 8 + 4 = 49.
+    /// iris_containers, iris_admin, iris_get_log. 54 - 8 + 4 = 50.
     /// Not this fork's default.
     Merged,
-    /// 28 tools advertised (measured 2026-09-18) — exactly `INTEROP_TOOLS`. THIS FORK'S
+    /// 29 tools advertised (measured 2026-09-19) — exactly `INTEROP_TOOLS`. THIS FORK'S
     /// DEFAULT: `--toolset` carries `default_value = "interop"` (see
     /// crates/iris-agentic-dev-bin/src/cmd/mcp.rs). Keeps only the tools the iris-interop
     /// skills actually exercise; everything else (skill_*/kb_*/agent_*/generate_*/
@@ -435,6 +436,12 @@ pub const INTEROP_TOOLS: &[&str] = &[
     // repeating fields people convert first (PID:3, PID:5, OBX:5).
     "hl7_schema_list",
     "hl7_schema_inspect",
+    // #214: the day's exercise ends in an external PostgreSQL table, so "how many rows are in
+    // public.menus?" is the operational question all day — and no tool could answer it. The
+    // fallback was PGPASSWORD on the command line (32 psql invocations across 5 of 14 students),
+    // which puts the credential in the transcript and in shell history, and verifies outside the
+    // trace so the row cannot be correlated with the session that produced it.
+    "iris_gateway_query",
 ];
 
 pub const ERR_NO_TESTS_FOUND: &str = "NO_TESTS_FOUND";
@@ -1870,8 +1877,11 @@ impl<'de> serde::Deserialize<'de> for GetLogParams {
 
 /// Issue #78: the keys iris_get_log tolerates without acting on them.
 ///
-/// Not leniency for its own sake. `namespace` is advertised by 13 of the 28 tools in
+/// Not leniency for its own sake. `namespace` is advertised by 26 of the 29 tools in
 /// this fork's default (interop) profile — the only key that spans tool families — and
+/// (this said "13 of the 28"; measured 2026-09-19 by counting tools whose advertised
+/// `inputSchema.properties` carries `namespace`, the figure is 26. The old number was
+/// wrong, not merely stale by one tool, so it is corrected rather than incremented.)
 /// the agent harness sends it on nearly every call, including the correct index call in
 /// the issue's own repro. It cannot mean anything here: the log store is a single
 /// process-global ring buffer (`log_store::LogStore`) with no namespace dimension, so
@@ -4179,6 +4189,11 @@ pub(crate) fn mutating_call(tool: &str, args: &serde_json::Value) -> Option<&'st
         // through os_str_expr rather than spliced.
         | "hl7_schema_list"
         | "hl7_schema_inspect"
+        // Read-only by construction and by enforcement: the statement is screened, the JDBC
+        // connection is opened with SetReadOnly(1), and the gateway credential belongs to a
+        // role that should hold SELECT-only grants. The screen alone would not be enough — the
+        // target speaks a foreign SQL dialect — which is why the connection is the guarantee.
+        | "iris_gateway_query"
         | "iris_table_info" => None,
         _ => None,
     }
@@ -4321,6 +4336,7 @@ pub(crate) const CLASSIFIED_TOOLS: &[&str] = &[
     "iris_doc",
     "iris_execute",
     "iris_execute_method",
+    "iris_gateway_query",
     "hl7_schema_inspect",
     "hl7_schema_list",
     "iris_get_log",
@@ -7822,6 +7838,19 @@ Methods:
     }
 
     #[tool(
+        description = "Run a read-only SELECT on an EXTERNAL database through a configured IRIS SQL Gateway connection, and return the rows with the remote schema's own column names and types. Takes the connection NAME (e.g. \"PG_COCINA\") — never a host, user, or password: the credential stays in the IRIS gateway definition, so it never reaches the transcript or shell history the way `PGPASSWORD=... psql` does, and the read stays inside the interop trace where it can be correlated with the session that produced the row. `query` is in the EXTERNAL database's dialect, not IRIS SQL. Mutating statements are refused and never sent, and the connection is opened read-only. Default 100 rows, maximum 1000; a truncated result says so. Use iris_query for tables inside IRIS — this tool is only for destinations reached over a SQL Gateway."
+    )]
+    async fn iris_gateway_query(
+        &self,
+        Parameters(p): Parameters<gateway::GatewayQueryParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let iris = self.get_iris_reloaded().await?;
+        let result = gateway::handle_gateway_query(&iris, self.http_client(), p).await;
+        self.record_call("iris_gateway_query", Self::call_ok(&result));
+        result
+    }
+
+    #[tool(
         description = "List the HL7 schema categories this instance has (e.g. 2.1 through 2.8.1, plus any custom category), with whether each is a standard schema and what it is based on. Call this first to learn the exact category string hl7_schema_inspect wants. Requires IRIS for Health or HealthShare — a plain IRIS has no HL7 schemas and the tool says so rather than returning an empty list. namespace: optional — defaults to the connection namespace (IRIS_NAMESPACE)."
     )]
     async fn hl7_schema_list(
@@ -9339,7 +9368,7 @@ fn wildcard_listing_filter(pattern: &str) -> Option<&str> {
 /// authors, and refuses only whole-library trees and whole-namespace expansions.
 ///
 /// Deliberately no `force`/`confirm` escape hatch: that would widen the advertised schema
-/// of a tool in the locked 28-tool interop profile, and a caller who genuinely wants 500+
+/// of a tool in the locked 29-tool interop profile, and a caller who genuinely wants 500+
 /// classes can name the subpackages.
 const WILDCARD_EXPANSION_CAP: usize = 500;
 

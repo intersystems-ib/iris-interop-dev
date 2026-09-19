@@ -178,12 +178,22 @@ fn tools_list_returns_interop_profile() {
         .expect("no tools array");
     let names: Vec<_> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
-    // Interop profile (fork default): exactly 24. The old range here allowed for the write
+    // Interop profile (fork default): exactly 29. The old range here allowed for the write
     // gate removing two tools on a read-only connection — #114 stopped it doing that, so the
     // slack was vestigial and would have hidden a tool going missing.
+    //
+    // #214 shipped with this count stale and only the dispatched CI run found it. The reason is
+    // NOT that the test is #[ignore]d — it is not. It self-skips on an empty IRIS_HOST with an
+    // early return, and the required gate deliberately runs `env -u IRIS_HOST`, so under the
+    // gate this function returns before asserting anything and reports `ok`.
+    //
+    // Measured 2026-09-19: 8 non-#[ignore]d tests in this workspace self-skip that way, so the
+    // gate's pass count includes 8 tests that asserted nothing — `e2e_all_tools_respond` among
+    // them. A skip that reports `ok` is indistinguishable from a pass, which is why the CI
+    // dispatch (where IRIS_HOST IS set) is the only thing that actually exercises this.
     assert!(
-        names.len() == 28,
-        "expected the interop profile (28 tools), got {}: {:?}",
+        names.len() == 29,
+        "expected the interop profile (29 tools), got {}: {:?}",
         names.len(),
         names
     );
@@ -1498,4 +1508,159 @@ fn table_info_reports_the_stream_global() {
             "EnsLib.HL7.Message neither resolved nor produced an explicit miss: {r}"
         ),
     }
+}
+
+/// #214: read an EXTERNAL PostgreSQL table through an IRIS SQL Gateway connection.
+///
+/// The issue's operational question is "how many rows are in `public.menus`?", and its cost is
+/// that answering it meant `PGPASSWORD=... psql` — 32 invocations across 5 of 14 students — which
+/// puts the credential in the transcript and in shell history, and verifies outside the interop
+/// trace. This tool takes a connection NAME and no credential.
+///
+/// The rig is `e2e/gateway/docker-compose.yaml` (PostgreSQL 17 joined to the network that hosts
+/// the dev IRIS) plus a `PG_COCINA_E2E` SQL Gateway connection pointing at a SELECT-only role.
+/// Where the rig is absent the tool must say so in a way that names the fix — so that branch
+/// asserts too, rather than returning and calling itself a pass.
+#[test]
+#[ignore = "requires live IRIS"]
+fn gateway_query_reads_the_external_postgres_table() {
+    let iris_host = std::env::var("IRIS_HOST").unwrap_or_default();
+    if iris_host.is_empty() {
+        return;
+    }
+    let ask = |args: serde_json::Value| -> serde_json::Value {
+        let responses = mcp_exchange(&[
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
+            serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"iris_gateway_query","arguments":args}}),
+        ]);
+        parse_tool_text(&find_response(&responses, 2).expect("no tool response"))
+    };
+
+    // A mutating statement must be refused BEFORE any connection is touched. This holds whether
+    // or not the rig is present, so it is asserted first and unconditionally.
+    let refused = ask(serde_json::json!({
+        "connection": "PG_COCINA_E2E",
+        "query": "INSERT INTO public.menus (paciente_id) VALUES (9)",
+        "namespace": "%SYS",
+    }));
+    assert_eq!(
+        refused["error_code"], "SQL_NOT_READ_ONLY",
+        "a write must be refused before the database is reached: {refused}"
+    );
+    let refused_msg = refused["error"].as_str().unwrap_or_default().to_string();
+    assert!(
+        refused_msg.contains("Nothing was sent"),
+        "the refusal must say nothing was sent: {refused}"
+    );
+
+    // A PostgreSQL-specific mutator that the shared IRIS screen does not know.
+    let copy = ask(serde_json::json!({
+        "connection": "PG_COCINA_E2E",
+        "query": "COPY public.menus FROM '/tmp/evil.csv'",
+        "namespace": "%SYS",
+    }));
+    assert_eq!(
+        copy["error_code"], "SQL_NOT_READ_ONLY",
+        "COPY is a Postgres mutator the IRIS keyword list does not carry: {copy}"
+    );
+
+    let r = ask(serde_json::json!({
+        "connection": "PG_COCINA_E2E",
+        "query": "SELECT id_menu, paciente_id, descripcion, calorias FROM public.menus ORDER BY id_menu",
+        "namespace": "%SYS",
+    }));
+
+    // Where the rig is not deployed the tool must name the fix. This branch is asserted, not
+    // skipped: a helpful refusal is the contract when the connection is absent.
+    if r["error_code"] == "GATEWAY_CONNECTION_NOT_DEFINED" {
+        let msg = r["error"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("PG_COCINA_E2E") && msg.contains("SQL Gateway Connections"),
+            "the not-defined message must name the connection and where to define it: {r}"
+        );
+        assert!(
+            msg.contains("never accepts a credential"),
+            "the refusal must say the tool takes no credential: {r}"
+        );
+        eprintln!("gateway rig absent; asserted the refusal contract instead");
+        return;
+    }
+
+    // ok_json puts the payload at the TOP level; only iris_table_info nests a `result` key.
+    let res = &r;
+    assert_eq!(r["success"], true, "{r}");
+    assert_eq!(res["connection"], "PG_COCINA_E2E", "{r}");
+
+    // The remote schema's OWN column names and types, which is what makes the answer usable.
+    let cols = res["columns"].as_array().expect("columns array");
+    assert_eq!(cols.len(), 4, "{r}");
+    assert_eq!(cols[0]["name"], "id_menu", "{r}");
+    assert_eq!(cols[2]["name"], "descripcion", "{r}");
+    assert_eq!(
+        cols[2]["type_name"], "text",
+        "the EXTERNAL type name, not an IRIS type: {r}"
+    );
+
+    // The question #214 says no tool could answer.
+    assert_eq!(res["row_count"], 5, "public.menus has 5 seeded rows: {r}");
+    let rows = res["rows"].as_array().expect("rows array");
+    assert_eq!(rows.len(), 5, "{r}");
+
+    // UTF-8 must survive IRIS -> JDBC -> Postgres and back. os_str_expr splices non-ASCII as
+    // $CHAR, so this is the path that would break silently if that went wrong.
+    let joined = rows
+        .iter()
+        .map(|row| row.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        joined.contains("Puré de patata"),
+        "accented external text must round-trip: {joined}"
+    );
+    assert!(
+        joined.contains("calabacín"),
+        "accented external text must round-trip: {joined}"
+    );
+
+    // It reads the table it was ASKED for. pacientes has 3 rows where menus has 5, so a tool
+    // returning "whatever the connection offers first" cannot pass both assertions.
+    let p = ask(serde_json::json!({
+        "connection": "PG_COCINA_E2E",
+        "query": "SELECT count(*) FROM public.pacientes",
+        "namespace": "%SYS",
+    }));
+    assert_eq!(p["success"], true, "{p}");
+    assert_eq!(
+        p["rows"][0][0], "3",
+        "pacientes has 3 rows, menus has 5: {p}"
+    );
+
+    // max_rows truncates and SAYS it truncated. A silent cap would read as "that is all there is".
+    let capped = ask(serde_json::json!({
+        "connection": "PG_COCINA_E2E",
+        "query": "SELECT id_menu FROM public.menus ORDER BY id_menu",
+        "max_rows": 2,
+        "namespace": "%SYS",
+    }));
+    assert_eq!(capped["row_count"], 2, "{capped}");
+    assert_eq!(capped["truncated"], true, "{capped}");
+    assert!(
+        capped["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("truncated"),
+        "a truncated result must say so: {capped}"
+    );
+
+    // An undefined connection names the fix rather than failing opaquely.
+    let missing = ask(serde_json::json!({
+        "connection": "NO_SUCH_GATEWAY_CONN_ZZZ",
+        "query": "SELECT 1",
+        "namespace": "%SYS",
+    }));
+    assert_eq!(
+        missing["error_code"], "GATEWAY_CONNECTION_NOT_DEFINED",
+        "{missing}"
+    );
 }
