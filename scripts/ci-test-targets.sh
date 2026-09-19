@@ -32,6 +32,13 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 #   `iris session` path this repo's house rules forbid everywhere else — worth fixing, but
 #   rewriting an excluded e2e target was out of scope for #95. Run it by hand when
 #   touching container discovery.
+#
+#   #225: it is excluded from THIS script's output, but it is no longer unrun. Being absent
+#   here meant it ran in no job at all once both the gate and the e2e job started deriving
+#   their targets from this script (#240) — so a one-off failure on 2026-09-17 could never be
+#   confirmed or refuted, and "it has not recurred" said nothing. It now runs weekly in
+#   .github/workflows/docker-discovery.yml, off the critical path. Keep this entry: the reason
+#   above still holds for the gate.
 EXCLUDED=( docker_discovery_e2e )
 
 # python3 rather than jq: both are on ubuntu-latest, but contributors run this locally too
