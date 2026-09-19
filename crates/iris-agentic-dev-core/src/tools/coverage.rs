@@ -462,12 +462,31 @@ mod tests {
 
     /// It must not clobber a monitor someone else started — the monitor is instance-wide and
     /// exclusive, so a blind Start would either fail or interfere.
+    ///
+    /// A MUTATION SURVIVED an earlier version of this test, which asserted only that the string
+    /// "COVERAGE_REFUSED" appeared before ".Start(". Changing the condition to `if 0` leaves both
+    /// strings exactly where they were, so a guard that never fires passed. Position is not a
+    /// predicate: assert the CONDITION.
     #[test]
     fn an_already_running_monitor_is_refused_before_starting() {
         let p = build_program(&req("T", &["A*"], &[]));
+        assert!(
+            p.contains("set tStart=##class(%Monitor.System.LineByLine).GetRoutineCount()"),
+            "must ask whether a monitor is running: {p}"
+        );
+        assert!(
+            p.contains("if tStart>0 {"),
+            "must branch on that count, not on a constant: {p}"
+        );
         let guard = p.find("COVERAGE_REFUSED").expect("must guard");
         let start = p.find(").Start(").expect("must start");
         assert!(guard < start, "the guard must precede Start: {p}");
+        // and it must actually stop, not just report
+        let quit = p[guard..start].find("quit");
+        assert!(
+            quit.is_some(),
+            "the guard must quit before reaching Start: {p}"
+        );
     }
 
     /// Results must be fetched with the names the monitor reports, because `ResultExecute` matches
