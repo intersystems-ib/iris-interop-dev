@@ -11022,6 +11022,130 @@ mod compile_envelope_tests {
 }
 
 #[cfg(test)]
+mod prop_collision_enrich_tests {
+    //! #263 proposal 2 on the OTHER tool. `compile_envelope_tests` covers `compile_failure`, which is
+    //! sync and cannot run the lookup; this covers `compile_failure_enriched`, which is what
+    //! `iris_compile` actually calls.
+    //!
+    //! Written because wiring two paths and testing one is the exact shape of the mistake #265 had
+    //! to fix: the untested sibling looks MORE trustworthy, not less, once its twin is green.
+    use super::{compile_failure_enriched, IrisConnection};
+    use crate::iris::connection::DiscoverySource;
+    use wiremock::matchers::{body_string_contains, method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const PROP_COLLISION: &str = "ERROR <EnsSearchTable>PropCollision: SearchTable property \
+         collision: Property 'PatientFirstName' in class 'HOSPITAL.Search.HL7' cannot override \
+         the definition from class 'Hospital.SearchTable.PatientFirstName'";
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// Mount the registration lookup (and optionally the class probe), then run the real wrapper.
+    async fn enriched(
+        first_error: &str,
+        registration_rows: Option<serde_json::Value>,
+    ) -> serde_json::Value {
+        let server = MockServer::start().await;
+        if let Some(rows) = registration_rows {
+            Mock::given(method("POST"))
+                .and(path_regex(r".*/action/query.*"))
+                .and(body_string_contains("SearchTableProp"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"result": {"content": rows}})),
+                )
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .and(path_regex(r".*/action/query.*"))
+            .and(body_string_contains("CompiledClass"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"result": {"content": []}})),
+            )
+            .mount(&server)
+            .await;
+        let iris = IrisConnection::new(
+            server.uri(),
+            "HOSPITAL",
+            "_SYSTEM",
+            "SYS",
+            DiscoverySource::EnvVar,
+        );
+        let client = reqwest::Client::new();
+        let r = compile_failure_enriched(
+            "HOSPITAL.Search.HL7.cls",
+            serde_json::json!({
+                "success": false,
+                "errors": [{"severity":"error","text": first_error}],
+                "console": [first_error],
+            }),
+            &iris,
+            &client,
+            "HOSPITAL",
+        )
+        .await
+        .unwrap();
+        match &r.content[0].raw {
+            rmcp::model::RawContent::Text(t) => serde_json::from_str(&t.text).unwrap(),
+            _ => panic!("expected text content"),
+        }
+    }
+
+    #[test]
+    fn iris_compile_also_gets_the_delete_id_and_a_hint_that_names_it() {
+        rt().block_on(async {
+            let v = enriched(
+                PROP_COLLISION,
+                Some(serde_json::json!([{
+                    "ID": "EnsLib.HL7.SearchTable||PatientFirstName",
+                    "Name": "PatientFirstName",
+                    "PropId": 5,
+                    "ClassExtent": "EnsLib.HL7.SearchTable",
+                    "ClassDerivation": "Hospital.SearchTable.PatientFirstName~EnsLib.HL7.SearchTable",
+                }])),
+            )
+            .await;
+            assert_eq!(
+                v["stale_registration"]["delete_id"],
+                "EnsLib.HL7.SearchTable||PatientFirstName",
+                "{v}"
+            );
+            assert_eq!(v["stale_registration"]["accused_class_exists"], false, "{v}");
+            let h = v["hint"].as_str().unwrap_or_default();
+            assert!(h.contains("ALREADY ON THIS PAYLOAD"), "{v}");
+            assert!(
+                h.contains("EnsLib.HL7.SearchTable||PatientFirstName"),
+                "{v}"
+            );
+        });
+    }
+
+    /// POSITIVE CONTROL: an ordinary compile error makes NO lookup and carries no field. If the
+    /// wrapper queried on every failure it would add a round trip to every broken compile.
+    #[test]
+    fn an_ordinary_compile_error_adds_no_field_and_no_query() {
+        rt().block_on(async {
+            let v = enriched("ERROR #1026: Invalid command", None).await;
+            assert!(v["stale_registration"].is_null(), "{v}");
+            assert!(
+                v["hint"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("cascades of the first"),
+                "{v}"
+            );
+        });
+    }
+}
+
+#[cfg(test)]
 mod class_run_code_tests {
     use super::build_class_test_run_code;
 
