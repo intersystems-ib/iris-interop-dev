@@ -210,6 +210,80 @@ pub const TIMEOUT_HINT: &str =
      timeout=<seconds> — it is a parameter of this tool and defaults to 30. For a long unit \
      test use iris_test, which has its own timeout, rather than raising this one.";
 
+/// #263: the `PropCollision` diagnosis, shared because a branch in [`builtin_hint`] alone is
+/// **inert on most compile paths**.
+///
+/// `fail_with` inserts the built-in hint and then lets the payload's own `extra` overwrite it, and
+/// the compile paths all set `hint` before they get there:
+///
+/// * `iris_compile` (`compile_failure`) sets one on EVERY call — `hint_5559` or a hardcoded copy
+///   of the generic text — so the built-in hint never survives, in any case.
+/// * `note_error_undercount` overwrites `hint` unconditionally whenever IRIS's own error count
+///   exceeds what was parsed out of the console, on both tools.
+///
+/// So the branch is applied again, as the last word, via [`apply_prop_collision_hint`]. Keyed on
+/// the MESSAGE rather than the envelope code: the same collision surfaces under more than one.
+pub fn prop_collision_hint(msg: &str) -> Option<String> {
+    if !msg.contains("PropCollision") {
+        return None;
+    }
+    // A SearchTable property is registered in Ens_Config.SearchTableProp keyed by EXTENT, and that
+    // row SURVIVES deleting or renaming the class that created it. Measured 2026-09-18 and recorded
+    // in the skills repo's own CI helper (`deregister_search_tables`): rename a SearchTable and the
+    // next compile fails naming the old class, which is already gone.
+    //
+    // Observed cost of not saying so: one model spent 29 tool calls — 36% of its whole run — and
+    // wrote `Kill ^%Dictionary(...)`, `Set ^SYS("Compile","Names",...)` and `Kill ^oddDEF(...)`
+    // into a working namespace before renaming its own property to escape a phantom. Another model
+    // fixed the same error in 2 calls with one SELECT and one %DeleteId. The difference is knowing
+    // which table holds the registration.
+    Some(
+        "A SearchTable property name is registered BY EXTENT in Ens_Config.SearchTableProp, \
+         not in %Dictionary — and that row SURVIVES deleting or renaming the class that \
+         created it. That is why this error can name a class which no longer exists: looking \
+         it up in %Dictionary.CompiledClass will correctly return nothing, and that absence \
+         is not the problem. Find the stale row: SELECT ID, Name, PropId, ClassExtent, \
+         ClassDerivation FROM Ens_Config.SearchTableProp WHERE Name = '<prop>'. The ID that \
+         comes back IS the argument to delete with — it is already '<ClassExtent>||<Name>', \
+         assembled, and that extent owns the registration and is NOT necessarily the class \
+         named in the error. Pass it straight through: Do \
+         ##class(Ens.Config.SearchTableProp).%DeleteId(\"<the ID from that SELECT>\") — \
+         or DELETE FROM Ens_Config.SearchTableProp WHERE ClassDerivation LIKE \
+         '<oldclass>~%'. Then recompile. Do NOT rename your property, do NOT delete the \
+         class again, and do NOT touch ^%Dictionary, ^oddDEF or ^SYS(\"Compile\") — none of \
+         those clears the registration, and writing to them damages the namespace."
+            .into(),
+    )
+}
+
+/// #263: put the `PropCollision` diagnosis on a compile payload as the LAST word, after every
+/// other hint-setter has had its turn.
+///
+/// The undercount FACTS are never dropped — `errors_incomplete`, `errors_detected_by_iris` and
+/// `errors_reported` stay exactly as they were. Only the hint TEXT yields, and when the error list
+/// really is incomplete this re-states that, so the caller still knows to read the full console.
+///
+/// Returns whether it fired, so a caller can assert on it.
+pub fn apply_prop_collision_hint(payload: &mut serde_json::Value, msg: &str) -> bool {
+    let Some(h) = prop_collision_hint(msg) else {
+        return false;
+    };
+    let Some(obj) = payload.as_object_mut() else {
+        return false;
+    };
+    let incomplete = obj.get("errors_incomplete") == Some(&serde_json::Value::Bool(true));
+    let text = if incomplete {
+        format!(
+            "{h} SEPARATELY: the recovered error list is INCOMPLETE — IRIS counted more errors \
+             than were parsed out of the console, so read the raw console too."
+        )
+    } else {
+        h
+    };
+    obj.insert("hint".into(), serde_json::Value::String(text));
+    true
+}
+
 fn builtin_hint(code: &str, msg: &str) -> Option<String> {
     if msg.contains("ErrProductionNotShutdownCleanly") {
         return Some(
@@ -263,35 +337,8 @@ fn builtin_hint(code: &str, msg: &str) -> Option<String> {
     // #263: BEFORE the generic COMPILE_ERROR branch, because for this one error the generic
     // advice is actively wrong. It says "read that error" — and the error names a class that no
     // longer exists anywhere, so reading it leads nowhere.
-    //
-    // A SearchTable property is registered in Ens_Config.SearchTableProp keyed by EXTENT, and
-    // that row SURVIVES deleting or renaming the class that created it. Measured 2026-09-18 and
-    // recorded in the skills repo's own CI helper (`deregister_search_tables`): rename a
-    // SearchTable and the next compile fails naming the old class, which is already gone.
-    //
-    // Observed cost of not saying so: one model spent 29 tool calls — 36% of its whole run —
-    // and wrote `Kill ^%Dictionary(...)`, `Set ^SYS("Compile","Names",...)` and
-    // `Kill ^oddDEF(...)` into a working namespace before renaming its own property to escape a
-    // phantom. Another model fixed the same error in 2 calls with one SELECT and one %DeleteId.
-    // The difference is knowing which table holds the registration.
-    if msg.contains("PropCollision") {
-        return Some(
-            "A SearchTable property name is registered BY EXTENT in Ens_Config.SearchTableProp, \
-             not in %Dictionary — and that row SURVIVES deleting or renaming the class that \
-             created it. That is why this error can name a class which no longer exists: looking \
-             it up in %Dictionary.CompiledClass will correctly return nothing, and that absence \
-             is not the problem. Find the stale row: SELECT ID, Name, PropId, ClassExtent, \
-             ClassDerivation FROM Ens_Config.SearchTableProp WHERE Name = '<prop>'. The ID that \
-             comes back IS the argument to delete with — it is already '<ClassExtent>||<Name>', \
-             assembled, and that extent owns the registration and is NOT necessarily the class \
-             named in the error. Pass it straight through: Do \
-             ##class(Ens.Config.SearchTableProp).%DeleteId(\"<the ID from that SELECT>\") — \
-             or DELETE FROM Ens_Config.SearchTableProp WHERE ClassDerivation LIKE \
-             '<oldclass>~%'. Then recompile. Do NOT rename your property, do NOT delete the \
-             class again, and do NOT touch ^%Dictionary, ^oddDEF or ^SYS(\"Compile\") — none of \
-             those clears the registration, and writing to them damages the namespace."
-                .into(),
-        );
+    if let Some(h) = prop_collision_hint(msg) {
+        return Some(h);
     }
     if code == "COMPILE_ERROR" {
         return Some(

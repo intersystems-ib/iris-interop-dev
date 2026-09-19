@@ -981,6 +981,9 @@ async fn do_write(
                 "compile_console",
             );
             note_compile_time_methods(&mut payload, &generators);
+            // #263: AFTER note_error_undercount, which overwrites `hint` unconditionally when
+            // IRIS's count beats the parsed list. Its facts are kept; only the text yields.
+            crate::tools::envelope::apply_prop_collision_hint(&mut payload, &first);
             return crate::tools::envelope::fail_with("COMPILE_ERROR", &first, payload);
         }
         let mut payload = serde_json::json!({
