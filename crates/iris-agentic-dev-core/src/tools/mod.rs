@@ -4307,7 +4307,13 @@ pub(crate) fn mutating_call(tool: &str, args: &serde_json::Value) -> Option<&'st
         "iris_credential_manage" => Some("change credentials"),
 
         // Mode/action-aware: the read half must keep working.
-        "iris_doc" => matches!(action, "put" | "delete").then_some("write a document"),
+        // DERIVED from DocMode::is_write rather than a second `matches!` on the mode strings. The
+        // duplicate was a live hazard: a mode added to the enum and dispatched, but missing from the
+        // gate's list, would be an UNGATED WRITE — and the gate is the only thing standing between a
+        // read-only connection and a document being overwritten.
+        "iris_doc" => crate::tools::doc::DocMode::parse(action)
+            .is_some_and(|m| m.is_write())
+            .then_some("write a document"),
         "iris_lookup_manage" => {
             matches!(action, "set" | "delete").then_some("change a lookup table")
         }
@@ -13112,6 +13118,64 @@ mod write_gate_tests {
                 "no argument may downgrade iris_coverage to read-only: {probe}"
             );
         }
+    }
+
+    /// THE test this change exists for: the write gate's verdict for `iris_doc` must equal
+    /// `DocMode::is_write()` for EVERY mode, in both directions.
+    ///
+    /// Before, the gate carried its own `matches!(action, "put" | "delete")`. A mode added to the enum
+    /// and dispatched, but forgotten in that list, would be an UNGATED WRITE — a document overwritten
+    /// on a connection the operator marked read-only, with nothing refusing it. The gate now derives
+    /// from `DocMode`, and this asserts the two cannot disagree.
+    ///
+    /// It iterates `DocMode::ALL`, so a new mode is covered the moment it exists — no list to update
+    /// here, which is the whole point.
+    #[test]
+    fn the_gate_agrees_with_doc_mode_for_every_mode() {
+        use crate::tools::doc::DocMode;
+        assert!(!DocMode::ALL.is_empty(), "precondition: there are modes");
+        let mut writes = 0;
+        for m in DocMode::ALL {
+            let gated = call("iris_doc", serde_json::json!({"mode": m.as_str()})).is_some();
+            assert_eq!(
+                gated,
+                m.is_write(),
+                "iris_doc mode='{}' : gate says {} but DocMode::is_write says {} — a write that is \
+                 not gated, or a read that is",
+                m.as_str(),
+                gated,
+                m.is_write()
+            );
+            if m.is_write() {
+                writes += 1;
+            }
+        }
+        // CONTROL: if no mode were a write, the loop above would pass vacuously.
+        assert!(writes > 0, "no iris_doc mode is classified as a write");
+    }
+
+    /// The gate reads `mode` OR `action`; `iris_doc` advertises `mode` but accepts `action` as an
+    /// alias, so both spellings must gate identically. A caller using the alias must not slip past.
+    #[test]
+    fn the_doc_gate_treats_the_action_alias_the_same() {
+        for key in ["mode", "action"] {
+            assert!(
+                call("iris_doc", serde_json::json!({key: "put"})).is_some(),
+                "put via '{key}' must be gated"
+            );
+            assert!(
+                call("iris_doc", serde_json::json!({key: "get"})).is_none(),
+                "get via '{key}' must not be"
+            );
+        }
+    }
+
+    /// An unknown mode is NOT a write. It fails in the handler naming the valid set; reporting it as a
+    /// blocked write would send the caller to the write-gate remediation for a typo.
+    #[test]
+    fn an_unknown_doc_mode_is_not_treated_as_a_write() {
+        assert!(call("iris_doc", serde_json::json!({"mode": "putt"})).is_none());
+        assert!(call("iris_doc", serde_json::json!({})).is_none());
     }
 
     /// A tool added to the interop profile must be classified deliberately, not inherit
