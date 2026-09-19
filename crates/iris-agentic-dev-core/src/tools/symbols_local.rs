@@ -1367,9 +1367,9 @@ mod all_member_kinds_tests {
     /// Lines are in the comment so the line assertions below are checkable by eye.
     ///
     /// ```text
-    ///  4 Parameter    6 Property     8 Relationship  10 Index      12 ForeignKey
-    /// 14 Method      19 ClassMethod 24 ClientMethod  29 Query      34 Trigger
-    /// 39 Projection  41 XData       46 Storage
+    ///  4 Parameter    6 Property     8 Relationship  10 Index      12 Index(PairIdx)
+    /// 14 ForeignKey  16 Method      21 ClassMethod   26 ClientMethod  31 Query
+    /// 36 Trigger     41 Projection  43 XData         48 Storage
     /// ```
     const EVERY: &str = r#"Class Demo.Every.Member Extends (%Persistent, %XML.Adaptor)
 {
@@ -1381,6 +1381,8 @@ Property Name As %String;
 Relationship Items As Demo.Item [ Cardinality = many, Inverse = Parent ];
 
 Index NameIdx On Name [ Unique ];
+
+Index PairIdx On (Name, ItemId);
 
 ForeignKey FKItem(ItemId) References Demo.Item(IdKey);
 
@@ -1524,11 +1526,21 @@ Storage Default
 
     /// An index reports WHAT is indexed; that is the only thing that distinguishes two indexes whose
     /// names are `Idx1` and `Idx2`.
+    /// A MUTATION SURVIVED the first version of this test: reporting only
+    /// `cols.into_iter().next()` — the FIRST column — passed, because the fixture's only index
+    /// covered ONE column. A single-element case cannot test a join. `PairIdx` exists solely to make
+    /// that mutation fail, and the grammar was checked to confirm it really emits one `column_name`
+    /// child per column for the parenthesised form.
     #[test]
     fn an_index_reports_the_columns_it_covers() {
         assert_eq!(
             get("Demo.Every.Member.NameIdx").type_name.as_deref(),
             Some("Name")
+        );
+        assert_eq!(
+            get("Demo.Every.Member.PairIdx").type_name.as_deref(),
+            Some("Name,ItemId"),
+            "a multi-column index must report EVERY column, in source order"
         );
     }
 
@@ -1592,12 +1604,13 @@ Storage Default
         for (name, line) in [
             ("Demo.Every.Member.Items", 8),
             ("Demo.Every.Member.NameIdx", 10),
-            ("Demo.Every.Member.FKItem", 12),
-            ("Demo.Every.Member.onload", 24),
-            ("Demo.Every.Member.ListAll", 29),
-            ("Demo.Every.Member.AfterIns", 34),
-            ("Demo.Every.Member.Proj", 39),
-            ("Demo.Every.Member.Default", 46),
+            ("Demo.Every.Member.PairIdx", 12),
+            ("Demo.Every.Member.FKItem", 14),
+            ("Demo.Every.Member.onload", 26),
+            ("Demo.Every.Member.ListAll", 31),
+            ("Demo.Every.Member.AfterIns", 36),
+            ("Demo.Every.Member.Proj", 41),
+            ("Demo.Every.Member.Default", 48),
         ] {
             assert_eq!(get(name).line, Some(line), "{name}");
         }
