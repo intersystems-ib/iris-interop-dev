@@ -11830,10 +11830,10 @@ mod tool_annotation_tests {
     #[test]
     fn the_read_only_split_is_pinned_per_toolset() {
         for (label, ts, total, ro_expected) in [
-            ("interop", Toolset::Interop, 30_usize, 8_usize),
-            ("nostub", Toolset::Nostub, 55, 33),
-            ("merged", Toolset::Merged, 51, 28),
-            ("baseline", Toolset::Baseline, 59, 37),
+            ("interop", Toolset::Interop, 31_usize, 9_usize),
+            ("nostub", Toolset::Nostub, 56, 34),
+            ("merged", Toolset::Merged, 52, 29),
+            ("baseline", Toolset::Baseline, 60, 38),
         ] {
             let t = IrisTools::new_with_toolset(None, ts).expect("build");
             let all = t.advertised_tools();
