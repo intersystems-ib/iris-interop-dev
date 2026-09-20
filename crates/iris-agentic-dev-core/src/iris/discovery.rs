@@ -769,6 +769,43 @@ async fn discover_via_vscode_settings() -> Option<IrisConnection> {
 mod tests {
     use super::*;
 
+    /// ANTI-DRIFT GUARD for the test below.
+    ///
+    /// That test returns early when `IRIS_DISCOVERY_TEST_CONTAINER` is unset, and a test that
+    /// returns early reports `... ok`. The variable was set in NO workflow, so the guard for the
+    /// bollard 0.21 migration never executed while reporting as a pass — measured in CI run
+    /// 35502654196, where the test's own "Skipping: …" line sits directly above its `ok`.
+    ///
+    /// `#[ignore]` would at least have printed "ignored", which reads as absence of coverage. `ok`
+    /// reads as coverage. #240 fixed ignored tests that ran in no job; this is the same failure one
+    /// level in, and nothing was watching for it — so this watches.
+    ///
+    /// It fails rather than skips when the workflow cannot be read: a guard that opts out when it
+    /// cannot check is the defect it exists to catch.
+    #[test]
+    fn ci_sets_the_variable_the_docker_discovery_guard_needs() {
+        let ci =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows/ci.yml");
+        let text = std::fs::read_to_string(&ci).unwrap_or_else(|e| {
+            panic!(
+                "cannot read {} ({e}) — this guard must not pass by being unable to look",
+                ci.display()
+            )
+        });
+        // The control: the file really is the CI workflow, so a match below means something.
+        assert!(
+            text.contains("e2e-tests"),
+            "{} does not look like the CI workflow",
+            ci.display()
+        );
+        assert!(
+            text.contains("IRIS_DISCOVERY_TEST_CONTAINER:"),
+            "the e2e job no longer sets IRIS_DISCOVERY_TEST_CONTAINER, so \
+             discover_via_docker_named_finds_running_container is back to returning early and \
+             reporting `ok` without exercising the bollard path it guards"
+        );
+    }
+
     /// Live guard for the bollard 0.21 migration (issue #23): the parts bollard
     /// touches are list_containers + name match + port map. Any running container
     /// named by IRIS_DISCOVERY_TEST_CONTAINER must NOT come back NotFound —
