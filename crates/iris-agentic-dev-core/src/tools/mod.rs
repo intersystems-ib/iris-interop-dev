@@ -11352,7 +11352,9 @@ mod advertised_mode_tests {
         // would also make a `contains` loop vacuous if the list were ever empty.
         assert!(desc.len() > 100, "description looks unread: {desc:?}");
         assert!(!DocMode::ALL.is_empty(), "precondition: there are modes");
+        let mut checked = 0usize;
         for m in DocMode::ALL {
+            checked += 1;
             // As a MODE VALUE, not merely as a substring. A MUTATION SURVIVED a bare `contains`:
             // `delete_lines` also appears in the prose about `expect`, so renaming the mode form left
             // the other occurrence and the assertion held. `mode='x'` is how a caller learns x is a
@@ -11365,6 +11367,14 @@ mod advertised_mode_tests {
                 m.as_str()
             );
         }
+        // A MUTATION SURVIVED without this: pointing the loop at an empty slice made it assert nothing
+        // while the `ALL.is_empty()` precondition above still held — it checks ALL, not what was
+        // actually iterated. Counting is what ties the two together.
+        assert_eq!(
+            checked,
+            DocMode::ALL.len(),
+            "the loop did not visit every mode — a vacuous check proves nothing"
+        );
     }
 
     /// The two facts that make a positional edit usable rather than dangerous must be advertised, not
