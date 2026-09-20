@@ -52,7 +52,8 @@ fn run_iris_dev_mcp_capture_stderr(container_name: &str, extra_env: &[(&str, &st
     let _ = stdin.flush();
     drop(stdin); // close stdin so child knows we're done writing
 
-    // Read stderr in a thread with a 5-second timeout
+    // Read stderr in a thread. The thread sends only at EOF, and the child holds stderr open
+    // until it exits, so the deadline below is really "how long may the child take to finish".
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     std::thread::spawn(move || {
         let reader = BufReader::new(stderr);
@@ -69,13 +70,73 @@ fn run_iris_dev_mcp_capture_stderr(container_name: &str, extra_env: &[(&str, &st
         let _ = tx.send(output);
     });
 
-    let output = rx
-        .recv_timeout(std::time::Duration::from_secs(5))
-        .unwrap_or_default();
+    // #225: this was `.recv_timeout(5s).unwrap_or_default()`, and BOTH halves were wrong.
+    //
+    // The deadline was measured on an idle machine. Under a full `cargo test --workspace` run this
+    // target takes about twice as long as it does alone — 102.72s against 51.46s — so a child that
+    // is merely slow trips a 5-second wait even though its output is perfectly good.
+    //
+    // `unwrap_or_default()` then turned that into an EMPTY STRING, which is the worse half:
+    //
+    //   * a `contains(...)` assertion failed reporting "expected X, got:" with an empty body,
+    //     blaming the message under test for what was actually a deadline;
+    //   * `test_auth_401_single_warn` asserts `count <= 1`, and an empty capture SATISFIES that —
+    //     so the one test covering 401 de-duplication passed while proving nothing, every time the
+    //     deadline fired. A silent timeout that reads as a pass is worse than a flake.
+    //
+    // Kill first, then take what the reader actually read: killing the child closes stderr, the
+    // reader hits EOF and reports. A capture that still never arrives is a panic naming the
+    // deadline, never an empty string.
+    let output = match rx.recv_timeout(capture_deadline()) {
+        Ok(o) => o,
+        Err(_) => {
+            let _ = child.kill();
+            rx.recv_timeout(DRAIN_GRACE).unwrap_or_else(|e| {
+                panic!(
+                    "capturing stderr from `{} mcp` never completed: {e}. The reader thread did \
+                     not report even after the child was killed, so this is not the slow-child \
+                     case that {:?} covers.",
+                    bin.display(),
+                    capture_deadline(),
+                )
+            })
+        }
+    };
 
     let _ = child.kill();
     let _ = child.wait();
     output
+}
+
+/// How long the capture may take. Overridable because the right value depends on machine load, and
+/// the 5 seconds this replaced had only ever been measured on an idle machine (#225).
+fn capture_deadline() -> std::time::Duration {
+    const DEFAULT_SECS: u64 = 30;
+    std::time::Duration::from_secs(
+        std::env::var("IRIS_E2E_CAPTURE_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_SECS),
+    )
+}
+
+/// Grace period for the reader to report AFTER the child has been killed. Short on purpose: stderr
+/// is closed by the kill, so EOF is immediate unless something is genuinely wrong.
+const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether a capture proves anything at all.
+///
+/// The guard exists because `test_auth_401_single_warn`'s assertion is `count <= 1`, which an empty
+/// capture satisfies. Any test whose assertion can be satisfied by the ABSENCE of output has to
+/// establish that output arrived before it counts anything.
+fn captured_something(stderr: &str) -> bool {
+    !stderr.trim().is_empty()
+}
+
+/// Lines mentioning a 401. Shared by the live test and its unit tests below, so the two cannot
+/// disagree about what is being counted.
+fn count_401_lines(stderr: &str) -> usize {
+    stderr.lines().filter(|l| l.contains("401")).count()
 }
 
 /// Start a fresh Docker container and return its name.
@@ -227,8 +288,16 @@ fn test_auth_401_single_warn() {
     let stderr = run_iris_dev_mcp_capture_stderr("e2e-nopassword", &[]);
     println!("stderr: {}", stderr);
 
-    // Count lines containing "401"
-    let warn_401_count = stderr.lines().filter(|l| l.contains("401")).count();
+    // The positive control, without which this whole test is vacuous: `count <= 1` below is
+    // satisfied by an empty capture, so a count of 0 must mean "the real output had no 401 line",
+    // never "there was no output" (#225).
+    assert!(
+        captured_something(&stderr),
+        "captured no stderr at all, so the 401 assertions below would pass without testing \
+         anything. Raise IRIS_E2E_CAPTURE_SECS if this machine is slow."
+    );
+
+    let warn_401_count = count_401_lines(&stderr);
     assert!(
         warn_401_count <= 1,
         "expected at most 1 line mentioning 401, got {}:\n{}",
@@ -349,4 +418,61 @@ fn test_all_enterprise_images() {
         "irishealth enterprise: expected Atelier-not-responding message, got:\n{}",
         stderr2
     );
+}
+
+/// Unit tests for the capture guards. These need no Docker and no container, which is the point:
+/// the defect in #225 was in how a capture was TURNED INTO a verdict, and that is testable without
+/// reproducing the slow machine that exposed it.
+#[cfg(test)]
+mod capture_guard_tests {
+    use super::*;
+
+    /// Why the guard exists, as a test. `test_auth_401_single_warn` asserts `count <= 1`; an empty
+    /// capture yields 0, which satisfies it. So emptiness has to be rejected BEFORE counting, or
+    /// the test reports a pass having examined nothing.
+    #[test]
+    fn an_empty_capture_would_satisfy_the_401_assertion() {
+        assert_eq!(
+            count_401_lines(""),
+            0,
+            "nothing to count in an empty capture"
+        );
+        assert!(
+            count_401_lines("") <= 1,
+            "this is the real test's assertion, and emptiness meets it"
+        );
+        assert!(
+            !captured_something(""),
+            "so the guard must reject an empty capture"
+        );
+    }
+
+    /// Whitespace is not output either — a child that emitted only a newline proves no more than
+    /// one that emitted nothing.
+    #[test]
+    fn whitespace_only_is_not_a_capture() {
+        assert!(!captured_something("   \n  \t \n"));
+        assert!(captured_something("warn: got HTTP 401 from Atelier"));
+    }
+
+    /// The assertion must still be able to FAIL, or guarding it changes nothing: two 401 lines
+    /// exceed the limit the live test allows.
+    #[test]
+    fn a_duplicated_401_warn_exceeds_the_limit() {
+        let two = "warn: HTTP 401 unauthorized\nwarn: HTTP 401 unauthorized again\n";
+        assert!(captured_something(two), "control: this capture is real");
+        assert_eq!(count_401_lines(two), 2);
+        assert!(
+            count_401_lines(two) > 1,
+            "the de-duplication failure the live test exists to catch"
+        );
+    }
+
+    /// Only the mentioning lines count, not every line of a real capture.
+    #[test]
+    fn unrelated_lines_are_not_counted() {
+        let mixed = "info: discovery starting\nwarn: HTTP 401 unauthorized\ninfo: done\n";
+        assert_eq!(count_401_lines(mixed), 1);
+        assert!(captured_something(mixed));
+    }
 }
