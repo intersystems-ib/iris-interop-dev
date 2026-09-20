@@ -273,6 +273,50 @@ mod tests {
          strategies \r\nto those offered by the standard SearchTable structure. Note that the \
          <class>Ens.SearchTableBase</class> subclass is the usual starting point.</p>";
 
+    /// A SECOND real description, verbatim from `Ens.CustomSearchTable.%BMEBuilt` on the same
+    /// instance. It carries tag variants the first fixture does not: `<var>` and an UPPERCASE
+    /// `<CLASS>`. Found by actually running the tool's own method query and reading what came back,
+    /// rather than assuming the markup looked like the first sample.
+    const REAL_VAR: &str = "On return, <var>bmeName</var> contains the name of the bitmap extent \
+         index for this class.\r\n<p>Returns <CLASS>%Boolean</CLASS> TRUE is the bitmap extent has \
+         been built, FALSE if not.";
+
+    /// Tag matching must be case-AGNOSTIC: `<CLASS>` appears upper-cased in real descriptions, and a
+    /// stripper keyed on lowercase tag names would leave it in the output.
+    #[test]
+    fn uppercase_and_var_tags_are_stripped_too() {
+        let out = strip_markup(REAL_VAR);
+        assert!(!out.contains('<') && !out.contains('>'), "{out}");
+        // the CONTENT of both tags survives — it is the useful part
+        assert!(out.contains("bmeName"), "{out}");
+        assert!(out.contains("%Boolean"), "{out}");
+        // CRLF gone, no double spaces left behind by the removed tags
+        assert!(!out.contains('\r') && !out.contains('\n'), "{out}");
+        assert!(!out.contains("  "), "double space: {out}");
+    }
+
+    /// The method query's aliases, verified LIVE against IRIS for Health 2026.1: the rows come back
+    /// with columns named exactly `Class`, `Name`, `Description` — which is what `hits_from_rows`
+    /// reads. A mis-aliased column would be invisible (`Null` reads as "no documentation"), the same
+    /// failure class as #273, so the contract is pinned here as well as checked by hand.
+    #[test]
+    fn the_method_query_aliases_match_what_the_shaper_reads() {
+        let sql = method_sql("index", "Ens.CustomSearchTable", 2);
+        for alias in ["parent AS Class", "Name", "Description"] {
+            assert!(sql.contains(alias), "missing {alias}: {sql}");
+        }
+        // and a row shaped like the live response maps cleanly
+        let rows = vec![serde_json::json!({
+            "Class": "Ens.CustomSearchTable", "Name": "%BMEBuilt", "Description": REAL_VAR
+        })];
+        let hits = hits_from_rows(&rows, true, "index", 240);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].class, "Ens.CustomSearchTable");
+        assert_eq!(hits[0].method.as_deref(), Some("%BMEBuilt"));
+        assert!(hits[0].doc.contains("bmeName"), "{:?}", hits[0]);
+        assert!(!hits[0].doc.contains('<'), "{:?}", hits[0]);
+    }
+
     // ── validation ──────────────────────────────────────────────────────────────────────────
 
     #[test]
