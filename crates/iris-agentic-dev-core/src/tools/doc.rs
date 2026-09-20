@@ -621,7 +621,7 @@ async fn handle_line_edit(
         // The read failed. Return its envelope verbatim — it already names the real cause.
         return Ok(got);
     }
-    if payload["truncated"] == serde_json::Value::Bool(true) {
+    if read_was_truncated(&payload) {
         return err_json(
             "READ_TRUNCATED",
             &format!(
@@ -678,6 +678,20 @@ async fn handle_line_edit(
     out["mode"] = serde_json::Value::String(mode_name.to_string());
     out["line_edit"] = serde_json::to_value(&summary).unwrap_or(serde_json::Value::Null);
     ok_json(out)
+}
+
+/// Whether a `handle_get` payload came back paginated.
+///
+/// UNREACHABLE by construction on the line-edit path, because the read forces `max_bytes: 0` and
+/// `offset: 0` — and `a_caller_supplied_max_bytes_cannot_cause_a_truncated_write` is the test that keeps
+/// that forcing in place. This is the second line of defence: if the forcing is ever removed, the guard
+/// turns a silent document truncation into a refusal.
+///
+/// A mutation removing the `if` therefore SURVIVES the handler tests and always will — nothing the mock
+/// can return makes a forced-full read truncated. Its logic is tested directly instead, and that
+/// asymmetry is stated rather than papered over.
+fn read_was_truncated(payload: &serde_json::Value) -> bool {
+    payload["truncated"] == serde_json::Value::Bool(true)
 }
 
 /// The JSON a handler put in its `CallToolResult`, for composing one handler out of another.
@@ -2620,6 +2634,150 @@ mod line_edit_mode_tests {
                 );
             }
         });
+    }
+
+    /// A FAILED READ must return the read's own envelope and write NOTHING.
+    ///
+    /// A MUTATION SURVIVED without this: deleting the `success != true` check passed, because every mock
+    /// made the read succeed. The handler would then have edited whatever `content` an error payload
+    /// happened to carry — most likely nothing — and PUT it, replacing the document with an empty one.
+    #[test]
+    fn a_failed_read_returns_its_own_envelope_and_writes_nothing() {
+        rt().block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path_regex(r".*/doc/.*"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path_regex(r".*/doc/.*"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+                .mount(&server)
+                .await;
+            let iris = IrisConnection::new(
+                server.uri(),
+                "APP",
+                "_SYSTEM",
+                "SYS",
+                DiscoverySource::EnvVar,
+            );
+            let client = reqwest::Client::new();
+            let store = crate::elicitation::ElicitationStore::default();
+            let cache = crate::elicitation::CheckoutCache::default();
+            let mut p = params("insert_lines");
+            p.at = Some(1);
+            p.lines = Some(vec!["x".into()]);
+            let r = handle_iris_doc(&iris, &client, p, &store, &cache)
+                .await
+                .unwrap();
+            let v = match &r.content[0].raw {
+                rmcp::model::RawContent::Text(t) => {
+                    serde_json::from_str::<serde_json::Value>(&t.text).unwrap()
+                }
+                _ => panic!("text"),
+            };
+            assert_eq!(v["success"], false, "{v}");
+            assert!(
+                v["line_edit"].is_null(),
+                "a failed read must not report an edit: {v}"
+            );
+            let puts = server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|q| q.method.as_str() == "PUT")
+                .count();
+            assert_eq!(puts, 0, "nothing may be written after a failed read");
+        });
+    }
+
+    /// A FAILED WRITE must return the write's envelope UNCHANGED — with its compile errors, and with no
+    /// `line_edit` summary.
+    ///
+    /// A MUTATION SURVIVED without this too: removing the `write_result_succeeded` check passed, because
+    /// every mock made the compile succeed. Attaching a summary to a failed write tells the caller the
+    /// edit landed when it did not, which is worse than a bare failure.
+    #[test]
+    fn a_failed_write_keeps_its_own_envelope_and_reports_no_edit() {
+        rt().block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path_regex(r".*/doc/.*"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "result": {"content": doc().split('\n').collect::<Vec<_>>()}
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path_regex(r".*/doc/.*"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+                .mount(&server)
+                .await;
+            // the compile REJECTS the class
+            Mock::given(method("POST"))
+                .and(path_regex(r".*/action/compile.*"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "status": {"errors": [{"error": "ERROR #1026: Invalid command"}]},
+                    "console": ["ERROR #1026: Invalid command"]
+                })))
+                .mount(&server)
+                .await;
+            let iris = IrisConnection::new(
+                server.uri(),
+                "APP",
+                "_SYSTEM",
+                "SYS",
+                DiscoverySource::EnvVar,
+            );
+            let client = reqwest::Client::new();
+            let store = crate::elicitation::ElicitationStore::default();
+            let cache = crate::elicitation::CheckoutCache::default();
+            let mut p = params("insert_lines");
+            p.at = Some(1);
+            p.lines = Some(vec!["// oops".into()]);
+            p.compile = true;
+            let r = handle_iris_doc(&iris, &client, p, &store, &cache)
+                .await
+                .unwrap();
+            let v = match &r.content[0].raw {
+                rmcp::model::RawContent::Text(t) => {
+                    serde_json::from_str::<serde_json::Value>(&t.text).unwrap()
+                }
+                _ => panic!("text"),
+            };
+            assert_eq!(v["error_code"], "COMPILE_ERROR", "{v}");
+            assert!(
+                v["line_edit"].is_null(),
+                "a failed write must not claim the edit landed: {v}"
+            );
+            assert!(
+                v["compile_errors"].is_array(),
+                "the compile diagnostics must survive: {v}"
+            );
+        });
+    }
+
+    /// The truncation guard's LOGIC, tested directly.
+    ///
+    /// The integration path cannot produce a truncated read — it forces `max_bytes: 0`, and
+    /// `a_caller_supplied_max_bytes_cannot_cause_a_truncated_write` keeps that forcing. So a mutation
+    /// removing the `if` survives the handler tests and always will; what is testable is the predicate,
+    /// and it matters because the guard is what saves the document if the forcing is ever dropped.
+    #[test]
+    fn the_truncation_predicate_only_fires_on_a_truncated_payload() {
+        assert!(read_was_truncated(
+            &serde_json::json!({"success": true, "truncated": true})
+        ));
+        assert!(!read_was_truncated(
+            &serde_json::json!({"success": true, "content": "x"})
+        ));
+        // not a string "true", and not merely present
+        assert!(!read_was_truncated(
+            &serde_json::json!({"truncated": "true"})
+        ));
+        assert!(!read_was_truncated(&serde_json::json!({})));
     }
 
     #[test]
