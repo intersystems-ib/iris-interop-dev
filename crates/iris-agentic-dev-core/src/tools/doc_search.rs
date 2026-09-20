@@ -262,6 +262,44 @@ pub fn hits_from_rows(
         .collect()
 }
 
+/// Tool parameters.
+#[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
+pub struct DocSearchParams {
+    /// The text to look for in the documentation. At least 3 characters.
+    #[serde(alias = "query", alias = "text")]
+    pub term: String,
+    /// `classes` (default), `methods`, or `both`. `methods` and `both` REQUIRE `within`.
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// A class or package prefix to search inside, e.g. `Ens` or `EnsLib.HL7`. Optional for classes,
+    /// REQUIRED for methods.
+    #[serde(default, alias = "package", alias = "class")]
+    pub within: Option<String>,
+    /// Maximum hits. Defaults to 20, capped at 100 — a documentation search is for orienting, and a
+    /// hundred snippets is no longer that.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// IRIS namespace. OMIT to use the connection's configured namespace.
+    #[serde(default)]
+    pub namespace: Option<String>,
+}
+
+/// Default and cap for `limit`.
+pub const DEFAULT_LIMIT: usize = 20;
+pub const MAX_LIMIT: usize = 100;
+
+/// Clamp the requested limit. 0 means "unset", not "no rows" — a caller passing 0 wants the default,
+/// and returning nothing for it would look like an empty result set.
+pub fn clamp_limit(requested: Option<usize>) -> usize {
+    match requested {
+        None | Some(0) => DEFAULT_LIMIT,
+        Some(n) => n.min(MAX_LIMIT),
+    }
+}
+
+/// Width of the snippet window, in characters.
+pub const SNIPPET_WIDTH: usize = 240;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,6 +356,15 @@ mod tests {
     }
 
     // ── validation ──────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn the_limit_is_clamped_and_zero_means_default() {
+        assert_eq!(clamp_limit(None), DEFAULT_LIMIT);
+        // 0 means "unset", NOT "no rows" — returning nothing for it would look like an empty result.
+        assert_eq!(clamp_limit(Some(0)), DEFAULT_LIMIT);
+        assert_eq!(clamp_limit(Some(5)), 5);
+        assert_eq!(clamp_limit(Some(10_000)), MAX_LIMIT);
+    }
 
     #[test]
     fn a_usable_class_search_passes_without_a_scope() {
