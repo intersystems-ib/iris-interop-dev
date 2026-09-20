@@ -160,7 +160,19 @@ fn list_build(items: &[String]) -> String {
 pub fn build_program(req: &CoverageRequest) -> String {
     let routines = list_build(&req.routines);
     let metrics = list_build(&metric_list(req));
-    let spec = crate::objectscript::os_str_expr(req.test_spec.trim());
+    // #290: this used to emit `RunTest(<spec>, "/noload/nodelete")` directly, and `RunTest` takes a
+    // SUITE DIRECTORY under ^UnitTestRoot — never a class name. Given the class name the tool's own
+    // description tells you to pass ("exactly as iris_test takes it"), RunTest walked the empty
+    // directory that spec pre-creates, ran nothing, and reported "All PASSED" — so coverage came back
+    // 0 hits of 0 lines with success:true. Measured on IRIS 2026.1: class name -> 0/0 and "All
+    // PASSED"; the same fixture via a real suite directory -> 16.67%, lines 6 and 7 of CovDemo.Calc.1.
+    //
+    // That is #66 verbatim, one tool over. `iris_test` was fixed for it and `iris_coverage`, written
+    // later, reintroduced it. So the dispatch is no longer duplicated here: `build_class_test_run_code`
+    // is THE spelling of "run this %UnitTest thing", and both tools now share it. A TestProduction
+    // goes through its own Run(), a TestCase through DebugRunTestCase, a package prefix expands, and
+    // only a genuine suite spec falls through to RunTest.
+    let run = crate::tools::build_class_test_run_code(req.test_spec.trim(), "/noload/nodelete", "");
     format!(
         r#"set $ZTRAP=""
 set tStart=##class(%Monitor.System.LineByLine).GetRoutineCount()
@@ -175,7 +187,7 @@ if '$SYSTEM.Status.IsOK(tSC) {{
 }}
 set tRunErr=""
 try {{
-  do ##class(%UnitTest.Manager).RunTest({spec},"/noload/nodelete")
+{run}
 }} catch ex {{
   set tRunErr=ex.DisplayString()
 }}
@@ -527,6 +539,55 @@ mod tests {
         assert!(
             p.contains(r#"$LISTBUILD("RtnLine","Time")"#),
             "metrics must be a list, RtnLine first: {p}"
+        );
+    }
+
+    /// #290: the run must go through THE shared %UnitTest dispatch, not a bare `RunTest`.
+    ///
+    /// `RunTest` takes a suite DIRECTORY under `^UnitTestRoot`. Handed the class name this tool's own
+    /// description prescribes, it walked the empty directory the spec pre-creates, ran nothing, and
+    /// reported "All PASSED" — so coverage answered 0 hits of 0 lines with `success: true`. That is
+    /// #66, one tool over: `iris_test` was fixed for it and this was written afterwards with the
+    /// naive call.
+    #[test]
+    fn the_run_goes_through_the_shared_unittest_dispatch() {
+        let p = build_program(&req("MyApp.Tests", &["MyApp.BS.Foo*"], &[]));
+        // A compiled %UnitTest.TestCase must reach DebugRunTestCase. Without this the class-name
+        // case silently measures nothing.
+        assert!(
+            p.contains("DebugRunTestCase"),
+            "a compiled test class must be dispatched, not handed to RunTest: {p}"
+        );
+        // And the discrimination that chooses it — a TestProduction runs through its own Run().
+        assert!(
+            p.contains("PrimarySuper") && p.contains("%UnitTest.TestProduction"),
+            "the class/suite discrimination must be present: {p}"
+        );
+    }
+
+    /// The dispatch is SHARED, not copied. If these two ever diverge the class-name case can break
+    /// in one tool and not the other, which is exactly how #290 happened.
+    #[test]
+    fn the_dispatch_is_the_same_string_iris_test_uses() {
+        let p = build_program(&req("MyApp.Tests", &["A*"], &[]));
+        let shared = crate::tools::build_class_test_run_code("MyApp.Tests", "/noload/nodelete", "");
+        assert!(
+            p.contains(&shared),
+            "the program must embed build_class_test_run_code verbatim: {p}"
+        );
+    }
+
+    /// Ordering is the whole measurement: the test has to run INSIDE the monitor window. A run that
+    /// happens before `Start` or after `Pause` reports zero hits and no error.
+    #[test]
+    fn the_run_happens_between_start_and_pause() {
+        let p = build_program(&req("MyApp.Tests", &["A*"], &[]));
+        let start = p.find(".Start(").expect("Start present");
+        let run = p.find("DebugRunTestCase").expect("dispatch present");
+        let pause = p.find(".Pause()").expect("Pause present");
+        assert!(
+            start < run && run < pause,
+            "the run must sit inside the monitor window (start={start}, run={run}, pause={pause})"
         );
     }
 
