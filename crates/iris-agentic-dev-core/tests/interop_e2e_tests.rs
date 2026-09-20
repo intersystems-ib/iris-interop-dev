@@ -508,9 +508,17 @@ fn test_lookup_crud() {
             "{key} is still readable after delete, so the import round-trip below would pass \
              without importing anything: {g}"
         );
-        assert_eq!(
-            g["error_code"], "KEY_NOT_FOUND",
-            "expected KEY_NOT_FOUND for the deleted {key}, got: {g}"
+        // MEASURED against live IRIS, not reasoned: once the LAST key is deleted the table reports
+        // TABLE_NOT_FOUND, not KEY_NOT_FOUND. `^Ens.LookupTable(table)` is a global subtree, so
+        // removing its final subscript removes the table node itself and `$DATA` goes to 0. Both
+        // codes mean the same thing here — the value is not readable — and which one arrives depends
+        // on how many keys are left, so accepting only one of them made this assertion wrong on the
+        // first CI run.
+        let code = g["error_code"].as_str().unwrap_or_default();
+        assert!(
+            code == "KEY_NOT_FOUND" || code == "TABLE_NOT_FOUND",
+            "expected the deleted {key} to be unreadable (KEY_NOT_FOUND, or TABLE_NOT_FOUND once \
+             the last key went with the table), got: {g}"
         );
     }
 
