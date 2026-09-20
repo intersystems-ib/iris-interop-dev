@@ -11282,6 +11282,78 @@ mod tool_annotation_tests {
         }
     }
 
+    /// Every advertised interop tool must appear in the README's Tools section.
+    ///
+    /// The README said "23-tool interop profile" and its Tools section listed exactly 23 — correct
+    /// when written. The profile had since grown to 30, so SEVEN tools were shipped and advertised
+    /// with no user-facing documentation at all: hl7_schema_list, hl7_schema_inspect, iris_coverage,
+    /// iris_execute_method, iris_gateway_query, iris_macro, iris_symbols_local. The count and the
+    /// list rotted together, which is why fixing the number alone would have been the wrong repair.
+    ///
+    /// The counts are gone from the prose rather than corrected: a number in prose has no way to stay
+    /// true, and every one in this repo has been wrong at some point. This test replaces them — the
+    /// LIST is now the asserted thing, and it cannot drift without failing here.
+    ///
+    /// Fails rather than skips when the README cannot be read: a guard that opts out when it cannot
+    /// check is not a guard.
+    #[test]
+    fn every_interop_tool_appears_in_the_readme() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../README.md");
+        let readme = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "cannot read {} ({e}) — this guard must not pass by being unable to look",
+                path.display()
+            )
+        });
+        const HEADING: &str = "## Tools (interop profile)";
+        let start = readme.find(HEADING).unwrap_or_else(|| {
+            panic!("README has no `{HEADING}` section — if it was renamed, update this test")
+        });
+        let rest = &readme[start + HEADING.len()..];
+        let section = match rest.find("\n## ") {
+            Some(end) => &rest[..end],
+            None => rest,
+        };
+        // The control: the section really lists tools, so a match below means something.
+        let documented: std::collections::HashSet<&str> = section
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|s| {
+                !s.is_empty()
+                    && s.chars()
+                        .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit())
+            })
+            .collect();
+        assert!(
+            documented.len() >= 20,
+            "only {} backticked names found in the Tools section — the parse looks broken, so a \
+             clean result below would mean nothing",
+            documented.len()
+        );
+
+        let t = IrisTools::new_with_toolset(None, Toolset::Interop).expect("build");
+        let advertised: Vec<String> = t
+            .advertised_tools()
+            .iter()
+            .map(|x| x.name.to_string())
+            .collect();
+        assert!(
+            !advertised.is_empty(),
+            "precondition: the profile is non-empty"
+        );
+        let missing: Vec<&String> = advertised
+            .iter()
+            .filter(|n| !documented.contains(n.as_str()))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "advertised but undocumented in the README's Tools section: {missing:?}. A tool a user \
+             cannot discover is a tool that does not exist for them — add it there, in the group it \
+             belongs to."
+        );
+    }
+
     /// Both polarities actually occur — otherwise the derivation could be a constant and every test
     /// above would still pass. `iris_execute` writes; `check_config` does not.
     #[test]
