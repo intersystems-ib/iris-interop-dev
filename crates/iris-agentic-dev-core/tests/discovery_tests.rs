@@ -8,15 +8,112 @@ use iris_agentic_dev_core::iris::discovery::{discover_iris, probe_atelier, IrisD
 
 // ── probe_atelier ────────────────────────────────────────────────────────────
 
-/// A reachable IRIS endpoint returns Some(IrisConnection).
+/// A port that is not IRIS returns None.
+///
+/// This was named `probe_atelier_returns_connection_on_iris_response` and documented as "a
+/// reachable IRIS endpoint returns Some(IrisConnection)" — while asserting only `is_none()` on port
+/// 9999. A `probe_atelier` that returned None for EVERYTHING passed it. Its comment also said "since
+/// we don't have wiremock yet"; wiremock has been a dev-dependency for some time, so the positive
+/// half is tested below and this one now claims only what it checks.
 #[tokio::test]
-async fn probe_atelier_returns_connection_on_iris_response() {
-    // This test uses a mock HTTP server. Since we don't have wiremock yet,
-    // it tests against a real running IRIS on localhost:52773 if available,
-    // otherwise asserts that probing a non-IRIS endpoint returns None.
+async fn probe_atelier_returns_none_for_a_non_iris_port() {
     let result = probe_atelier("127.0.0.1", 9999, "_SYSTEM", "SYS", "USER", 100).await;
-    // Port 9999 is not IRIS — must return None
     assert!(result.is_none(), "Non-IRIS port should return None");
+}
+
+/// Serve an Atelier root descriptor and hand back (host, port) for `probe_atelier`.
+async fn atelier_root(body: serde_json::Value, status: u16) -> wiremock::MockServer {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/api/atelier/"))
+        .respond_with(wiremock::ResponseTemplate::new(status).set_body_json(body))
+        .mount(&server)
+        .await;
+    server
+}
+
+fn host_port(server: &wiremock::MockServer) -> (String, u16) {
+    let addr = server.address();
+    (addr.ip().to_string(), addr.port())
+}
+
+fn iris_root(version: &str, api: u64) -> serde_json::Value {
+    serde_json::json!({"result": {"content": {"version": version, "api": api}}})
+}
+
+/// THE POSITIVE HALF, which had no coverage: a root descriptor that fingerprints as IRIS yields a
+/// connection, and the fields taken off that descriptor are the ones the caller relies on.
+#[tokio::test]
+async fn probe_atelier_returns_a_connection_when_the_root_fingerprints_as_iris() {
+    let server = atelier_root(iris_root("IRIS for UNIX 2026.1", 8), 200).await;
+    let (host, port) = host_port(&server);
+    let conn = probe_atelier(&host, port, "_SYSTEM", "SYS", "APP", 2000)
+        .await
+        .expect("a root descriptor naming IRIS must yield a connection");
+    assert_eq!(conn.version.as_deref(), Some("IRIS for UNIX 2026.1"));
+    assert_eq!(conn.base_url, format!("http://{host}:{port}"));
+    assert_eq!(conn.namespace, "APP");
+}
+
+/// The fingerprint is the WHOLE point: a 200 with a descriptor that does not name IRIS must not be
+/// adopted. Without this, "returns Some on 200" would pass and the probe would claim any web server.
+#[tokio::test]
+async fn probe_atelier_rejects_a_root_that_does_not_name_iris() {
+    let server = atelier_root(iris_root("Cache for Windows 2018.1", 2), 200).await;
+    let (host, port) = host_port(&server);
+    assert!(
+        probe_atelier(&host, port, "_SYSTEM", "SYS", "USER", 2000)
+            .await
+            .is_none(),
+        "a 200 from something that is not IRIS must not be adopted"
+    );
+}
+
+/// A descriptor with no `version` at all is not IRIS either — `.as_str()` on a missing field.
+#[tokio::test]
+async fn probe_atelier_rejects_a_root_with_no_version() {
+    let server = atelier_root(serde_json::json!({"result": {"content": {"api": 8}}}), 200).await;
+    let (host, port) = host_port(&server);
+    assert!(probe_atelier(&host, port, "_SYSTEM", "SYS", "USER", 2000)
+        .await
+        .is_none());
+}
+
+/// 401 and 5xx are refusals, not adoptions. 401 has its own branch (#21, the OS-auth container), so
+/// it is worth asserting separately from the generic non-success path.
+#[tokio::test]
+async fn probe_atelier_rejects_401_and_5xx() {
+    for status in [401_u16, 500] {
+        let server = atelier_root(iris_root("IRIS for UNIX 2026.1", 8), status).await;
+        let (host, port) = host_port(&server);
+        assert!(
+            probe_atelier(&host, port, "_SYSTEM", "SYS", "USER", 2000)
+                .await
+                .is_none(),
+            "HTTP {status} must not yield a connection even with an IRIS-looking body"
+        );
+    }
+}
+
+/// The `api` level decides which Atelier URL shape every later request uses, so the mapping is part
+/// of the contract: >=8 is V8, >=2 is V2, anything else V1.
+#[tokio::test]
+async fn probe_atelier_maps_the_api_level_to_an_atelier_version() {
+    use iris_agentic_dev_core::iris::connection::AtelierVersion;
+    for (api, want) in [
+        (8_u64, AtelierVersion::V8),
+        (9, AtelierVersion::V8),
+        (2, AtelierVersion::V2),
+        (7, AtelierVersion::V2),
+        (1, AtelierVersion::V1),
+    ] {
+        let server = atelier_root(iris_root("IRIS for UNIX 2026.1", api), 200).await;
+        let (host, port) = host_port(&server);
+        let conn = probe_atelier(&host, port, "_SYSTEM", "SYS", "USER", 2000)
+            .await
+            .expect("fingerprints as IRIS");
+        assert_eq!(conn.atelier_version, want, "api {api} mapped wrongly");
+    }
 }
 
 /// probe_atelier respects the timeout — 100ms must not block longer than 250ms.
