@@ -11454,6 +11454,55 @@ mod tool_annotation_tests {
         );
     }
 
+    /// The tool-level ratchet, which is what `the_set_of_files_calling_the_generator_is_pinned`
+    /// cannot do: pin the read-only/read-write SPLIT per toolset, so a tool quietly dropped from
+    /// `GENERATOR_WRITE_TOOLS` raises the read-only count and fails here.
+    ///
+    /// Measured before and after the #282 fix, on this tool set:
+    ///
+    /// | toolset  | total | RO before | RO after |
+    /// |----------|-------|-----------|----------|
+    /// | interop  |    30 |        17 |        6 |
+    /// | nostub   |    55 |        43 |       31 |
+    /// | merged   |    51 |        38 |       26 |
+    /// | baseline |    59 |        47 |       35 |
+    ///
+    /// interop moves by 11 rather than 12 because `resolve_dynamic_dispatch` is not in its
+    /// keep-list. The `interop` row's before-figures are corroborated independently: the
+    /// v0.25.0 release handshake advertised 30 tools with 17 `readOnlyHint=true`.
+    ///
+    /// A LEGITIMATE new tool changes these numbers. Re-record deliberately, having checked which
+    /// side it belongs on — never to make a red go away.
+    #[test]
+    fn the_read_only_split_is_pinned_per_toolset() {
+        for (label, ts, total, ro_expected) in [
+            ("interop", Toolset::Interop, 30_usize, 6_usize),
+            ("nostub", Toolset::Nostub, 55, 31),
+            ("merged", Toolset::Merged, 51, 26),
+            ("baseline", Toolset::Baseline, 59, 35),
+        ] {
+            let t = IrisTools::new_with_toolset(None, ts).expect("build");
+            let all = t.advertised_tools();
+            assert_eq!(
+                all.len(),
+                total,
+                "{label} advertises {} tools, expected {total} — if a tool was added or removed, \
+                 re-record this row and the read-only figure with it",
+                all.len()
+            );
+            let ro = all
+                .iter()
+                .filter(|x| x.annotations.as_ref().and_then(|a| a.read_only_hint) == Some(true))
+                .count();
+            assert_eq!(
+                ro, ro_expected,
+                "{label} advertises {ro} tools as readOnlyHint:true, expected {ro_expected}. A \
+                 tool dropped from GENERATOR_WRITE_TOOLS or newly exempted from mutating_call \
+                 shows up here."
+            );
+        }
+    }
+
     /// Both polarities actually occur — otherwise the derivation could be a constant and every test
     /// above would still pass. `iris_execute` writes; `check_config` does not.
     #[test]
