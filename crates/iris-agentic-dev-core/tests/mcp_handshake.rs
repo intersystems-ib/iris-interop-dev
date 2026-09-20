@@ -343,7 +343,18 @@ fn pruned_tool_is_rejected_at_dispatch_not_merely_unlisted() {
         .arg("mcp")
         .arg("--toolset")
         .arg("interop")
-        .env("IRIS_WEB_PORT", "9") // no IRIS: the rejection must precede any connection use
+        // #298: IRIS_HOST as well as the port, and the pair matters. `IRIS_WEB_PORT` alone never
+        // triggers the env-var leg of the discovery cascade — that branch is entered only when
+        // IRIS_HOST is set — so the server fell through to auto-discovery and adopted whatever IRIS
+        // was reachable on the machine. Measured before this change: `check_config` reported
+        // `connected:true, connection_source:"auto_discovered", port:8080`. This test's premise is
+        // that the rejection happens BEFORE any connection use, and it could not show that while
+        // holding a working connection.
+        //
+        // 127.0.0.1:9 (discard) rather than an unroutable address: both produce a disconnected
+        // server, but TEST-NET-1 waits on a TCP timeout — measured 2036ms against 221ms here.
+        .env("IRIS_HOST", "127.0.0.1")
+        .env("IRIS_WEB_PORT", "9")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -402,9 +413,26 @@ fn pruned_tool_is_rejected_at_dispatch_not_merely_unlisted() {
         r#"{"name":"check_config","arguments":{}}"#,
     );
     let ok = read_jsonrpc(&mut reader);
-    assert!(
-        ok.get("result").is_some(),
-        "check_config is in the interop keep-list and must still dispatch: {ok}"
+    let ok_result = ok.get("result").unwrap_or_else(|| {
+        panic!("check_config is in the interop keep-list and must still dispatch: {ok}")
+    });
+
+    // Pin the premise this test rests on, rather than trusting the env vars above to deliver it.
+    // 127.0.0.1:9 is refused on every machine, so this cannot false-fail — and if IRIS_HOST is ever
+    // dropped from the spawn, auto-discovery adopts a reachable instance and this fires. That is not
+    // hypothetical: it is what the spawn did before #298.
+    let cfg: serde_json::Value = serde_json::from_str(
+        ok_result["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("check_config returned no text payload: {ok}")),
+    )
+    .expect("check_config payload is JSON");
+    assert_eq!(
+        cfg["connected"],
+        serde_json::json!(false),
+        "this test asserts the pruning rejection precedes any CONNECTION USE, so the server must \
+         not hold a working connection. connection_source={:?}: {cfg}",
+        cfg["connection_source"]
     );
 
     // An unknown name is a different fact from a pruned one, and gets a different code.
