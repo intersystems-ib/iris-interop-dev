@@ -347,6 +347,18 @@ jobs:
           IRIS_PASSWORD: ${{ env.IRIS_PASSWORD }}
           IRIS_NAMESPACE: USER
           IRIS_CONTAINER: iris-e2e
+          # discover_via_docker_named_finds_running_container is the live guard for the bollard 0.21
+          # migration (#23): it asserts a running container named by this variable does not come back
+          # NotFound. The variable was set in NO workflow, so the test returned early and reported
+          # `... ok` -- measured in run 35502654196, where the test line and its own
+          # "Skipping: IRIS_DISCOVERY_TEST_CONTAINER not set" both appear. That is worse than
+          # `#[ignore]`: an ignored test is visibly not coverage, while `ok` reads as coverage. #240
+          # fixed the case where ignored tests ran in no job; this is the same failure one level in,
+          # where the test runs and self-skips.
+          #
+          # This job already has a running container named iris-e2e, which is exactly the input the
+          # test wants, so point it there and the guard finally executes.
+          IRIS_DISCOVERY_TEST_CONTAINER: iris-e2e
 
   cross-compile-check:
     runs-on: ubuntu-latest
