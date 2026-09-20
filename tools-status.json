@@ -22,110 +22,14 @@
   },
   "tools": [
     {
-      "tool": "iris_execute",
-      "unit": "connection::build_exec_class_no_objectgenerator_uses_runuser",
-      "e2e": "test_e2e::e2e_execute_* (14)",
-      "status": "OK"
-    },
-    {
-      "tool": "iris_query",
-      "unit": "sql_lint::tests::*",
-      "e2e": "test_e2e::e2e_query_* (15)",
-      "status": "OK"
-    },
-    {
-      "tool": "iris_test",
-      "unit": "test_iris_test_http (12)",
-      "e2e": "test_iris_test_e2e::test_e2e_us1/us2/us3",
-      "status": "OK"
-    },
-    {
-      "tool": "iris_doc",
-      "unit": "test_doc_params (6)",
-      "e2e": "live MCP pagination check (max_bytes -> truncated/next_offset)",
-      "status": "OK"
-    },
-    {
-      "tool": "iris_compile",
-      "unit": "test_compile_params + tools::docname_expansion_tests (21) + tools::console_diag_tests (9)",
-      "e2e": "test_compile_cmd / test_e2e",
-      "status": "OK"
-    },
-    {
-      "tool": "iris_interop_query",
-      "unit": "interop_unit_tests::interop_logs/queues/message_search",
-      "e2e": "interop_e2e_tests::interop_logs/queues + tools_list (licensed interop ns)",
-      "status": "OK"
-    },
-    {
-      "tool": "iris_production",
-      "unit": "interop_unit_tests::interop_production_*",
-      "e2e": "interop_e2e_tests::interop_production_status/test_production_autostart/item (licensed)",
-      "status": "OK"
-    },
-    {
-      "tool": "iris_lookup_manage",
-      "unit": "interop_unit_tests (via execute_via_generator, A2)",
-      "e2e": "interop_e2e_tests::test_lookup_crud (licensed interop ns)",
-      "status": "OK"
-    },
-    {
-      "tool": "iris_credential_manage",
-      "unit": "interop_unit_tests (via execute_via_generator, A2)",
-      "e2e": "interop_e2e_tests::test_credential_crud (licensed interop ns)",
-      "status": "OK"
-    },
-    {
-      "tool": "iris_table_info",
-      "unit": null,
-      "e2e": "exercised by iris_query table-not-found hint path",
-      "status": "profile-only"
-    },
-    {
-      "tool": "iris_symbols",
-      "unit": null,
-      "e2e": null,
-      "status": "profile-only"
-    },
-    {
-      "tool": "docs_introspect",
-      "unit": null,
-      "e2e": null,
-      "status": "profile-only"
-    },
-    {
       "tool": "check_config",
       "unit": "test_connection_fixes",
       "e2e": null,
       "status": "profile-only"
     },
     {
-      "tool": "iris_get_log",
-      "unit": "tools::get_log_params_tests (34) + schema_normalization_tests::get_log_* (3) + schema_normalization_tests::the_advertised_schema_does_not_ship_the_rust_struct_name + log_store_tests::test_get_paginated_* (5)",
-      "e2e": null,
-      "status": "unit-ok"
-    },
-    {
-      "tool": "iris_debug",
+      "tool": "docs_introspect",
       "unit": null,
-      "e2e": null,
-      "status": "profile-only"
-    },
-    {
-      "tool": "iris_production_item",
-      "unit": null,
-      "e2e": null,
-      "status": "profile-only"
-    },
-    {
-      "tool": "iris_lookup_transfer",
-      "unit": null,
-      "e2e": null,
-      "status": "profile-only"
-    },
-    {
-      "tool": "iris_credential_list",
-      "unit": "interop_unit_tests",
       "e2e": null,
       "status": "profile-only"
     },
@@ -142,10 +46,16 @@
       "status": "profile-only"
     },
     {
-      "tool": "iris_message_body",
-      "unit": "interop_unit_tests::message_body_is_blocked_under_the_default_policy + redact_hl7v2_* (3)",
-      "e2e": null,
-      "status": "unit-ok"
+      "tool": "hl7_schema_inspect",
+      "unit": "tools::hl7_schema::tests::* (13)",
+      "e2e": "interop_e2e_tests::hl7_schema_inspect_names_repeating_fields",
+      "status": "OK"
+    },
+    {
+      "tool": "hl7_schema_list",
+      "unit": "tools::hl7_schema::tests::categories_parse_with_the_standard_flag",
+      "e2e": "interop_e2e_tests::hl7_schema_list_returns_this_instances_categories",
+      "status": "OK"
     },
     {
       "tool": "iris_business_rule_info",
@@ -154,7 +64,129 @@
       "status": "unit-ok"
     },
     {
+      "tool": "iris_compile",
+      "unit": "test_compile_params + tools::docname_expansion_tests (21) + tools::console_diag_tests (9)",
+      "e2e": "test_compile_cmd / test_e2e",
+      "status": "OK"
+    },
+    {
+      "tool": "iris_coverage",
+      "status": "unit-ok",
+      "unit": "tools::coverage::tests (26) \u2014 validate/build_program/parse_output/report_json",
+      "e2e": null,
+      "note": "#24 item 064. No e2e: %Monitor.System.LineByLine is instance-wide and exclusive, so a live run needs an instance to itself \u2014 see #291 for the end-to-end verification done by hand."
+    },
+    {
+      "tool": "iris_credential_list",
+      "unit": "interop_unit_tests",
+      "e2e": null,
+      "status": "profile-only"
+    },
+    {
+      "tool": "iris_credential_manage",
+      "unit": "interop_unit_tests (via execute_via_generator, A2)",
+      "e2e": "interop_e2e_tests::test_credential_crud (licensed interop ns)",
+      "status": "OK"
+    },
+    {
+      "tool": "iris_debug",
+      "unit": null,
+      "e2e": null,
+      "status": "profile-only"
+    },
+    {
+      "tool": "iris_doc",
+      "unit": "test_doc_params (6)",
+      "e2e": "live MCP pagination check (max_bytes -> truncated/next_offset)",
+      "status": "OK"
+    },
+    {
+      "tool": "iris_doc_search",
+      "status": "unit-ok",
+      "unit": "tools::doc_search::tests (24) \u2014 validate/class_sql/method_sql/strip_markup/snippet",
+      "e2e": null,
+      "note": "#24 item 065. Advertised-surface coverage only, via mcp_handshake's tools/list assertions."
+    },
+    {
+      "tool": "iris_execute",
+      "unit": "connection::build_exec_class_no_objectgenerator_uses_runuser",
+      "e2e": "test_e2e::e2e_execute_* (14)",
+      "status": "OK"
+    },
+    {
+      "tool": "iris_execute_method",
+      "unit": "tools::execute_method::* (21)",
+      "e2e": "mcp_handshake::mcp_server_tools_list_returns_interop_profile (pinned by name)",
+      "status": "OK"
+    },
+    {
+      "tool": "iris_gateway_query",
+      "unit": "tools::gateway::tests::* (13)",
+      "e2e": "interop_e2e_tests::gateway_query_reads_the_external_postgres_table",
+      "status": "OK"
+    },
+    {
+      "tool": "iris_get_log",
+      "unit": "tools::get_log_params_tests (34) + schema_normalization_tests::get_log_* (3) + schema_normalization_tests::the_advertised_schema_does_not_ship_the_rust_struct_name + log_store_tests::test_get_paginated_* (5)",
+      "e2e": null,
+      "status": "unit-ok"
+    },
+    {
+      "tool": "iris_interop_query",
+      "unit": "interop_unit_tests::interop_logs/queues/message_search",
+      "e2e": "interop_e2e_tests::interop_logs/queues + tools_list (licensed interop ns)",
+      "status": "OK"
+    },
+    {
+      "tool": "iris_lookup_manage",
+      "unit": "interop_unit_tests (via execute_via_generator, A2)",
+      "e2e": "interop_e2e_tests::test_lookup_crud (licensed interop ns)",
+      "status": "OK"
+    },
+    {
+      "tool": "iris_lookup_transfer",
+      "unit": null,
+      "e2e": null,
+      "status": "profile-only"
+    },
+    {
+      "tool": "iris_macro",
+      "unit": "tools::info::macro_action_tests::* (12)",
+      "e2e": "interop_e2e_tests::macro_includes_are_derived_from_the_document",
+      "status": "OK"
+    },
+    {
+      "tool": "iris_message_body",
+      "unit": "interop_unit_tests::message_body_is_blocked_under_the_default_policy + redact_hl7v2_* (3)",
+      "e2e": null,
+      "status": "unit-ok"
+    },
+    {
+      "tool": "iris_production",
+      "unit": "interop_unit_tests::interop_production_*",
+      "e2e": "interop_e2e_tests::interop_production_status/test_production_autostart/item (licensed)",
+      "status": "OK"
+    },
+    {
       "tool": "iris_production_diff",
+      "unit": null,
+      "e2e": null,
+      "status": "profile-only"
+    },
+    {
+      "tool": "iris_production_item",
+      "unit": null,
+      "e2e": null,
+      "status": "profile-only"
+    },
+    {
+      "tool": "iris_query",
+      "unit": "sql_lint::tests::*",
+      "e2e": "test_e2e::e2e_query_* (15)",
+      "status": "OK"
+    },
+    {
+      "tool": "iris_symbols",
       "unit": null,
       "e2e": null,
       "status": "profile-only"
@@ -166,33 +198,15 @@
       "status": "OK"
     },
     {
-      "tool": "iris_execute_method",
-      "unit": "tools::execute_method::* (21)",
-      "e2e": "mcp_handshake::mcp_server_tools_list_returns_interop_profile (pinned by name)",
-      "status": "OK"
+      "tool": "iris_table_info",
+      "unit": null,
+      "e2e": "exercised by iris_query table-not-found hint path",
+      "status": "profile-only"
     },
     {
-      "tool": "iris_macro",
-      "unit": "tools::info::macro_action_tests::* (12)",
-      "e2e": "interop_e2e_tests::macro_includes_are_derived_from_the_document",
-      "status": "OK"
-    },
-    {
-      "tool": "hl7_schema_list",
-      "unit": "tools::hl7_schema::tests::categories_parse_with_the_standard_flag",
-      "e2e": "interop_e2e_tests::hl7_schema_list_returns_this_instances_categories",
-      "status": "OK"
-    },
-    {
-      "tool": "hl7_schema_inspect",
-      "unit": "tools::hl7_schema::tests::* (13)",
-      "e2e": "interop_e2e_tests::hl7_schema_inspect_names_repeating_fields",
-      "status": "OK"
-    },
-    {
-      "tool": "iris_gateway_query",
-      "unit": "tools::gateway::tests::* (13)",
-      "e2e": "interop_e2e_tests::gateway_query_reads_the_external_postgres_table",
+      "tool": "iris_test",
+      "unit": "test_iris_test_http (12)",
+      "e2e": "test_iris_test_e2e::test_e2e_us1/us2/us3",
       "status": "OK"
     }
   ]
