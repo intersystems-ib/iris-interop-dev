@@ -2479,6 +2479,13 @@ fn e2e_introspect_method_return_type_present() {
     let methods = result["methods"].as_array().cloned().unwrap_or_default();
     // Same shape: `success: true` with zero methods passes while asserting nothing about ReturnType.
     // Ens.Director is a class with methods, so an empty list means the introspection did not work.
+    //
+    // NOT MUTATION-VERIFIED, unlike its two siblings. Pointing this test at a class that does not
+    // exist is caught one line earlier by `success == true` (measured: left Bool(false)), so that
+    // mutation never reaches this guard. The case it does cover — a class that EXISTS while the
+    // method query comes back empty — needs a fixture nothing in CI provides. Kept because that is a
+    // real shape in this codebase (see #290, where a tool reported success while running nothing),
+    // but do not read it as a checked assertion.
     assert!(
         !methods.is_empty(),
         "docs_introspect returned no methods for Ens.Director, so the ReturnType assertion below \
