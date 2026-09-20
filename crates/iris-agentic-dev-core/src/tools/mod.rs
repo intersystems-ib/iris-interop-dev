@@ -11353,10 +11353,15 @@ mod advertised_mode_tests {
         assert!(desc.len() > 100, "description looks unread: {desc:?}");
         assert!(!DocMode::ALL.is_empty(), "precondition: there are modes");
         for m in DocMode::ALL {
+            // As a MODE VALUE, not merely as a substring. A MUTATION SURVIVED a bare `contains`:
+            // `delete_lines` also appears in the prose about `expect`, so renaming the mode form left
+            // the other occurrence and the assertion held. `mode='x'` is how a caller learns x is a
+            // value it may pass.
+            let advertised = format!("mode='{}'", m.as_str());
             assert!(
-                desc.contains(m.as_str()),
-                "mode '{}' is dispatchable but NOT named in iris_doc's description, so no caller can \
-                 discover it. Description: {desc}",
+                desc.contains(&advertised),
+                "iris_doc dispatches mode '{}' but the description never offers `{advertised}`, so no \
+                 caller can discover it. Description: {desc}",
                 m.as_str()
             );
         }
