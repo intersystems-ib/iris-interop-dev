@@ -17663,13 +17663,30 @@ mod undefined_across_calls_tests {
         }
     }
 
-    /// A longer identifier that merely ENDS with the name is not an assignment of it.
+    /// A longer identifier that CONTAINS the name is not an assignment of it.
+    ///
+    /// A MUTATION SURVIVED the first version: the fixture was `Set myotherSomeUndefinedVarX=1`, which
+    /// contains `SomeUndefinedVar` with a CAPITAL S and therefore never matched `someUndefinedVar` at
+    /// all — so removing the word-boundary check changed nothing. The fixture has to contain the name
+    /// EXACTLY, prefixed by an identifier character, or the guard is never reached.
     #[test]
     fn a_longer_identifier_is_not_the_same_variable() {
+        // contains "someUndefinedVar" verbatim, preceded by an identifier char
         assert!(
-            !super::code_assigns_name("Set myotherSomeUndefinedVarX=1", "someUndefinedVar"),
-            "substring of a different identifier"
+            !super::code_assigns_name("Set xsomeUndefinedVar=1", "someUndefinedVar"),
+            "prefixed by an identifier char — a different variable"
         );
+        // and a trailing char is fine as a DIFFERENT name only when the = follows the longer one
+        assert!(
+            !super::code_assigns_name("Set someUndefinedVarX=1", "someUndefinedVar"),
+            "the = belongs to the longer identifier, not to this name"
+        );
+        // CONTROL: the exact name, on its own, IS an assignment — otherwise the two above would pass
+        // even if the function never returned true.
+        assert!(super::code_assigns_name(
+            "Set someUndefinedVar=1",
+            "someUndefinedVar"
+        ));
     }
 
     /// A GLOBAL persists across calls. Blaming process isolation for an undefined global is wrong in
