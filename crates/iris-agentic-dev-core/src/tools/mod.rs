@@ -316,6 +316,7 @@ pub mod gateway;
 pub mod hl7_schema;
 pub mod info;
 pub mod interop;
+pub mod line_edit;
 pub mod log_store;
 pub mod prop_collision;
 pub mod scm;
