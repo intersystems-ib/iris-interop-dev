@@ -11282,6 +11282,46 @@ mod tool_annotation_tests {
         }
     }
 
+    /// `iris_info`'s description must advertise every `what` value the tool accepts.
+    ///
+    /// `what` is the one enum-ish parameter with no `#[schemars(extend("enum" = …))]` — the other
+    /// eight declare theirs, so the schema rejects a bad value before dispatch. For `what` the
+    /// DESCRIPTION is the only thing a caller can read, which makes it load-bearing rather than
+    /// documentation. A value that works but is not advertised does not exist for a model, and that
+    /// has happened here before: the two new `iris_doc` modes shipped absent from their own
+    /// description.
+    ///
+    /// Reads the description through `advertised_tools()` rather than by string-searching mod.rs.
+    /// A test in this file once did the latter and matched the literal inside its own `find` call.
+    #[test]
+    fn iris_info_advertises_every_what_value_it_accepts() {
+        let t = IrisTools::new_with_toolset(None, Toolset::Baseline).expect("build");
+        let tools = t.advertised_tools();
+        let info = tools
+            .iter()
+            .find(|x| x.name == "iris_info")
+            .expect("iris_info is advertised in the baseline profile");
+        let desc = info
+            .description
+            .as_ref()
+            .map(|d| d.to_string())
+            .expect("iris_info has a description");
+        // The control: the description really talks about `what`, so a match below means something.
+        assert!(
+            desc.contains("what="),
+            "iris_info's description does not mention what= at all: {desc}"
+        );
+        let missing: Vec<&&str> = crate::tools::info::INFO_WHAT
+            .iter()
+            .filter(|v| !desc.contains(&format!("what={v}")))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "iris_info accepts these `what` values but does not advertise them: {missing:?} — a \
+             value a caller cannot discover does not exist for them"
+        );
+    }
+
     /// Both polarities actually occur — otherwise the derivation could be a constant and every test
     /// above would still pass. `iris_execute` writes; `check_config` does not.
     #[test]

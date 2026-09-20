@@ -24,6 +24,29 @@ fn default_limit() -> usize {
 
 // ── iris_info ────────────────────────────────────────────────────────────────
 
+/// The values `iris_info`'s `what` accepts.
+///
+/// This list used to exist three times — the field's doc comment, the tool description, and the
+/// "Unknown what=" error — with nothing tying them together. Unlike the other eight enum parameters,
+/// `what` carries no `#[schemars(extend("enum" = …))]`, so the schema does not constrain it and the
+/// description is all a caller has to go on. That shape has already cost this repo twice: the two new
+/// `iris_doc` modes shipped absent from their own description, and the README's tool list drifted by
+/// seven entries (#294).
+///
+/// The error text is now generated from here, and the test below pins the description against it. The
+/// match arms themselves are NOT checked — that would need a live call per value — so adding a value
+/// here without an arm still reaches the `other` branch. Stated so this is not read as more than it is.
+pub(crate) const INFO_WHAT: &[&str] = &[
+    "documents",
+    "modified",
+    "namespace",
+    "metadata",
+    "jobs",
+    "csp_apps",
+    "csp_debug",
+    "sa_schema",
+];
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct InfoParams {
     /// What to fetch: documents, modified, namespace, metadata, jobs, csp_apps, csp_debug, sa_schema
@@ -60,7 +83,7 @@ pub async fn handle_iris_info(
         }
         "modified" => iris.versioned_ns_url(ns, "/modified/0"),
         "namespace" => iris.versioned_ns_url(ns, ""), // namespace metadata endpoint
-        "metadata" => iris.atelier_url("/"), // root endpoint returns server metadata
+        "metadata" => iris.atelier_url("/"),          // root endpoint returns server metadata
         "jobs" => iris.versioned_ns_url(ns, "/jobs"),
         "csp_apps" => iris.versioned_ns_url(ns, "/cspapps"),
         "csp_debug" => iris.versioned_ns_url(ns, "/cspdebugid"),
@@ -68,7 +91,12 @@ pub async fn handle_iris_info(
             let name = p.name.as_deref().unwrap_or("");
             iris.versioned_ns_url(ns, &format!("/saschema/{}", urlencoding::encode(name)))
         }
-        other => return err_json("INVALID_PARAM", &format!("Unknown what='{}'. Use: documents, modified, namespace, metadata, jobs, csp_apps, csp_debug, sa_schema", other)),
+        other => {
+            return err_json(
+                "INVALID_PARAM",
+                &format!("Unknown what='{}'. Use: {}", other, INFO_WHAT.join(", ")),
+            )
+        }
     };
 
     let resp = match client
