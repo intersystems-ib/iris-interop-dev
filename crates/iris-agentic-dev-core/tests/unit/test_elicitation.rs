@@ -1,6 +1,6 @@
 //! T007-T008: Unit tests for ElicitationStore.
 
-use iris_agentic_dev_core::elicitation::{ElicitationAction, ElicitationStore};
+use iris_agentic_dev_core::elicitation::{ElicitationAction, ElicitationStore, LookupResult};
 use std::time::Instant;
 
 #[test]
@@ -13,7 +13,10 @@ fn elicitation_state_roundtrip() {
         None,
         "USER",
     );
-    let entry = store.lookup(&id).expect("should find unexpired entry");
+    let entry = store
+        .lookup(&id)
+        .found()
+        .expect("should find unexpired entry");
     assert_eq!(entry.document, "MyApp.Patient.cls");
     assert_eq!(entry.namespace, "USER");
     assert_eq!(entry.content.as_deref(), Some("class content"));
@@ -21,7 +24,7 @@ fn elicitation_state_roundtrip() {
 }
 
 #[test]
-fn elicitation_state_expires() {
+fn elicitation_state_cleared() {
     let store = ElicitationStore::new();
     // Insert with a past expiry by inserting normally then manually expiring via clear+reinsert trick
     // Since we can't set expiry directly, we test that clear works and missing id returns None
@@ -34,13 +37,17 @@ fn elicitation_state_expires() {
     );
     store.clear(&id);
     assert!(
-        store.lookup(&id).is_none(),
-        "cleared entry should return None"
+        matches!(store.lookup(&id), LookupResult::NotFound),
+        "a cleared entry is gone, not expired — the store cannot report an expiry for an entry it \
+         no longer holds"
     );
 }
 
 #[test]
 fn elicitation_missing_id_returns_none() {
     let store = ElicitationStore::new();
-    assert!(store.lookup("nonexistent-id-12345").is_none());
+    assert!(matches!(
+        store.lookup("nonexistent-id-12345"),
+        LookupResult::NotFound
+    ));
 }

@@ -18,8 +18,8 @@ fn test_sweep_removes_expired_entries() {
     );
 
     // Entries should be present initially
-    assert!(store.lookup(&id1).is_some(), "id1 should be present");
-    assert!(store.lookup(&id2).is_some(), "id2 should be present");
+    assert!(store.lookup(&id1).is_found(), "id1 should be present");
+    assert!(store.lookup(&id2).is_found(), "id2 should be present");
 
     // sweep() on non-expired entries removes nothing
     let removed = store.sweep();
