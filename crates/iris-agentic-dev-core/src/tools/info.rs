@@ -24,6 +24,29 @@ fn default_limit() -> usize {
 
 // ── iris_info ────────────────────────────────────────────────────────────────
 
+/// The values `iris_info`'s `what` accepts.
+///
+/// This list used to exist three times — the field's doc comment, the tool description, and the
+/// "Unknown what=" error — with nothing tying them together. Unlike the other eight enum parameters,
+/// `what` carries no `#[schemars(extend("enum" = …))]`, so the schema does not constrain it and the
+/// description is all a caller has to go on. That shape has already cost this repo twice: the two new
+/// `iris_doc` modes shipped absent from their own description, and the README's tool list drifted by
+/// seven entries (#294).
+///
+/// The error text is now generated from here, and the test below pins the description against it. The
+/// match arms themselves are NOT checked — that would need a live call per value — so adding a value
+/// here without an arm still reaches the `other` branch. Stated so this is not read as more than it is.
+pub(crate) const INFO_WHAT: &[&str] = &[
+    "documents",
+    "modified",
+    "namespace",
+    "metadata",
+    "jobs",
+    "csp_apps",
+    "csp_debug",
+    "sa_schema",
+];
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct InfoParams {
     /// What to fetch: documents, modified, namespace, metadata, jobs, csp_apps, csp_debug, sa_schema
@@ -60,7 +83,7 @@ pub async fn handle_iris_info(
         }
         "modified" => iris.versioned_ns_url(ns, "/modified/0"),
         "namespace" => iris.versioned_ns_url(ns, ""), // namespace metadata endpoint
-        "metadata" => iris.atelier_url("/"), // root endpoint returns server metadata
+        "metadata" => iris.atelier_url("/"),          // root endpoint returns server metadata
         "jobs" => iris.versioned_ns_url(ns, "/jobs"),
         "csp_apps" => iris.versioned_ns_url(ns, "/cspapps"),
         "csp_debug" => iris.versioned_ns_url(ns, "/cspdebugid"),
@@ -68,7 +91,12 @@ pub async fn handle_iris_info(
             let name = p.name.as_deref().unwrap_or("");
             iris.versioned_ns_url(ns, &format!("/saschema/{}", urlencoding::encode(name)))
         }
-        other => return err_json("INVALID_PARAM", &format!("Unknown what='{}'. Use: documents, modified, namespace, metadata, jobs, csp_apps, csp_debug, sa_schema", other)),
+        other => {
+            return err_json(
+                "INVALID_PARAM",
+                &format!("Unknown what='{}'. Use: {}", other, INFO_WHAT.join(", ")),
+            )
+        }
     };
 
     let resp = match client
@@ -1676,6 +1704,55 @@ mod macro_action_tests {
         assert!(
             !n.contains("with includes "),
             "must not claim includes were sent: {n}"
+        );
+    }
+}
+
+/// #296: `iris_info`'s description is the only place a caller can learn the `what` values, since
+/// `what` carries no schema enum. Lives here, beside INFO_WHAT, rather than in `mod.rs`: three
+/// branches were inserting guards before one shared anchor there and any two of them conflicted.
+#[cfg(test)]
+mod iris_info_what_guard {
+    use super::INFO_WHAT;
+
+    /// `iris_info`'s description must advertise every `what` value the tool accepts.
+    ///
+    /// `what` is the one enum-ish parameter with no `#[schemars(extend("enum" = …))]` — the other
+    /// eight declare theirs, so the schema rejects a bad value before dispatch. For `what` the
+    /// DESCRIPTION is the only thing a caller can read, which makes it load-bearing rather than
+    /// documentation. A value that works but is not advertised does not exist for a model, and that
+    /// has happened here before: the two new `iris_doc` modes shipped absent from their own
+    /// description.
+    ///
+    /// Reads the description through `advertised_tools()` rather than by string-searching mod.rs.
+    /// A test in this file once did the latter and matched the literal inside its own `find` call.
+    #[test]
+    fn iris_info_advertises_every_what_value_it_accepts() {
+        let t = crate::tools::IrisTools::new_with_toolset(None, crate::tools::Toolset::Baseline)
+            .expect("build");
+        let tools = t.advertised_tools();
+        let info = tools
+            .iter()
+            .find(|x| x.name == "iris_info")
+            .expect("iris_info is advertised in the baseline profile");
+        let desc = info
+            .description
+            .as_ref()
+            .map(|d| d.to_string())
+            .expect("iris_info has a description");
+        // The control: the description really talks about `what`, so a match below means something.
+        assert!(
+            desc.contains("what="),
+            "iris_info's description does not mention what= at all: {desc}"
+        );
+        let missing: Vec<&&str> = INFO_WHAT
+            .iter()
+            .filter(|v| !desc.contains(&format!("what={v}")))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "iris_info accepts these `what` values but does not advertise them: {missing:?} — a \
+         value a caller cannot discover does not exist for them"
         );
     }
 }
