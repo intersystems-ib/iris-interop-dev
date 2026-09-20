@@ -86,7 +86,15 @@ fn mcp_server_starts_and_responds_to_initialize() {
     let mut child = Command::new(&bin)
         .arg("mcp")
         // Disable IRIS discovery for handshake tests — we only test MCP protocol, not tools
-        .env("IRIS_WEB_PORT", "9") // Port 9 (discard) — instant ECONNREFUSED, no DNS lookup
+        // #298: IRIS_HOST as well, and the pair is what matters — IRIS_WEB_PORT alone never enters
+        // the env-var leg of the discovery cascade (it is guarded by IRIS_HOST), so the server fell
+        // through to auto-discovery and adopted whatever IRIS was reachable. Measured: connected:true,
+        // connection_source:"auto_discovered", port 8080. These assertions are about protocol shape and
+        // passed either way, but the same code was exercising a connected server locally and a
+        // disconnected one on a bare runner. 127.0.0.1:9 keeps the instant refusal this port was chosen
+        // for; an unroutable address costs 2036ms against 221ms.
+        .env("IRIS_HOST", "127.0.0.1")
+        .env("IRIS_WEB_PORT", "9")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -224,6 +232,8 @@ fn every_tool_advertises_the_parameters_it_reads() {
 
     let mut child = Command::new(&bin)
         .arg("mcp")
+        // #298: IRIS_HOST pins the env-var leg so discovery cannot adopt a real instance.
+        .env("IRIS_HOST", "127.0.0.1")
         .env("IRIS_WEB_PORT", "9")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -463,7 +473,9 @@ fn mcp_server_tools_list_returns_interop_profile() {
     let mut child = Command::new(&bin)
         .arg("mcp")
         // Disable IRIS discovery for handshake tests — we only test MCP protocol, not tools
-        .env("IRIS_WEB_PORT", "9") // Port 9 (discard) — instant ECONNREFUSED, no DNS lookup
+        // #298: IRIS_HOST pins the env-var leg so discovery cannot adopt a real instance.
+        .env("IRIS_HOST", "127.0.0.1")
+        .env("IRIS_WEB_PORT", "9")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -982,6 +994,8 @@ fn log_file_is_written_when_requested_and_absent_otherwise() {
     let run = |log_env: Option<&std::path::Path>| {
         let mut cmd = Command::new(&bin);
         cmd.arg("mcp")
+            // #298: IRIS_HOST pins the env-var leg so discovery cannot adopt a real instance.
+            .env("IRIS_HOST", "127.0.0.1")
             .env("IRIS_WEB_PORT", "9")
             .env("IRIS_PASSWORD", "shouldnotappear")
             .stdin(Stdio::piped())
@@ -1051,6 +1065,8 @@ fn an_unwritable_log_path_does_not_stop_the_server() {
     }
     let mut child = Command::new(&bin)
         .arg("mcp")
+        // #298: IRIS_HOST pins the env-var leg so discovery cannot adopt a real instance.
+        .env("IRIS_HOST", "127.0.0.1")
         .env("IRIS_WEB_PORT", "9")
         .env("IRIS_LOG_FILE", "/nonexistent-dir-for-test/x.log")
         .stdin(Stdio::piped())
