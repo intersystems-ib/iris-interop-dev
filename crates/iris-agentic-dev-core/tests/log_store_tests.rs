@@ -573,3 +573,62 @@ fn test_read_inline_threshold_zero_returns_default() {
     assert_eq!(read_inline_threshold("IRIS_INLINE_TEST_ZERO", 20), 20);
     std::env::remove_var("IRIS_INLINE_TEST_ZERO");
 }
+
+// ── #301: a poisoned lock must not silently drop the entry ───────────────────
+
+/// `apply_truncation` used `if let Ok(..) = store.lock()`, so on a POISONED mutex it skipped the
+/// store and then set `truncated: true` and a `log_id` anyway — an id for an entry that was never
+/// written, which `iris_get_log` can only answer `LOG_NOT_FOUND` to. The overflow was gone.
+///
+/// The lock is an `Arc<Mutex<_>>` shared by every tool call for the process lifetime, so one panic
+/// anywhere holding it degraded every later truncation for as long as the server ran.
+///
+/// Poisoned exactly the way a panicking tool would: panic while holding the guard. Same shape as
+/// `skills_tools`' own poison test, which pins the sibling decision (#99).
+#[test]
+fn a_poisoned_lock_still_stores_the_entry_it_hands_out_an_id_for() {
+    let store = std::sync::Arc::new(std::sync::Mutex::new(LogStore::new(10, 5)));
+
+    let h = std::sync::Arc::clone(&store);
+    let _ = std::thread::spawn(move || {
+        let _guard = h.lock().unwrap();
+        panic!("a tool panicked while holding the log store");
+    })
+    .join();
+    // The control: without this the test would pass on an unpoisoned mutex and prove nothing.
+    assert!(
+        store.lock().is_err(),
+        "the mutex must really be poisoned for this test to mean anything"
+    );
+
+    let mut result = serde_json::json!({
+        "success": true,
+        "items": (0..10).map(serde_json::Value::from).collect::<Vec<_>>(),
+    });
+    apply_truncation(&mut result, "items", 3, false, &store, "iris_query");
+
+    // The response advertises truncation and an id …
+    assert_eq!(result["truncated"], serde_json::json!(true), "{result}");
+    let id = result["log_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no log_id was issued: {result}"))
+        .to_string();
+    assert_eq!(result["total_count"], serde_json::json!(10), "{result}");
+
+    // … so the id must resolve. This is the assertion the old code failed.
+    let got = store.lock().unwrap_or_else(|e| e.into_inner()).get(&id);
+    match got {
+        GetResult::Found(v) => {
+            let arr = v.as_array().expect("the full result is the item array");
+            assert_eq!(
+                arr.len(),
+                10,
+                "the id resolved but the entry is not the full set: {v}"
+            );
+        }
+        other => panic!(
+            "log_id {id} was advertised but does not resolve ({other:?}) — the overflow was dropped \
+             while the caller was handed a receipt for it"
+        ),
+    }
+}
