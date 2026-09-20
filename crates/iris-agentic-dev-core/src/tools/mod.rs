@@ -334,22 +334,22 @@ pub use scm::ScmParams;
 /// Read from `IRIS_TOOLSET` env var or `--toolset` CLI flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Toolset {
-    /// 59 tools advertised (measured 2026-09-19). NOT this fork's default —
+    /// 60 tools advertised (measured 2026-09-20). NOT this fork's default —
     /// `--toolset` defaults to `interop`; baseline is opt-in via IRIS_TOOLSET/--toolset.
     /// Note this is already a pruned router: the 59 tools the `#[tool_router]` macro
     /// registers minus the 4 merged-only ones. Was 54 of 58 before iris_execute_method.
     Baseline,
-    /// 55 tools advertised (measured 2026-09-19). Baseline minus the 4 NOT_IMPLEMENTED
+    /// 56 tools advertised (measured 2026-09-20). Baseline minus the 4 NOT_IMPLEMENTED
     /// stubs (skill_propose, skill_optimize, skill_share, skill_community_install).
     /// No merged dispatchers. Not this fork's default.
     Nostub,
-    /// 51 tools advertised (measured 2026-09-19). Nostub (55) minus 8 — the 4 debug_*
+    /// 52 tools advertised (measured 2026-09-20). Nostub (56) minus 8 — the 4 debug_*
     /// folded into iris_debug, the 3 container tools folded into iris_containers, and
     /// agent_info dropped outright — plus the 4 merged-only tools iris_debug,
     /// iris_containers, iris_admin, iris_get_log. 54 - 8 + 4 = 50.
     /// Not this fork's default.
     Merged,
-    /// 30 tools advertised (measured 2026-09-19) — exactly `INTEROP_TOOLS`. THIS FORK'S
+    /// 31 tools advertised (measured 2026-09-20) — exactly `INTEROP_TOOLS`. THIS FORK'S
     /// DEFAULT: `--toolset` carries `default_value = "interop"` (see
     /// crates/iris-agentic-dev-bin/src/cmd/mcp.rs). Keeps only the tools the iris-interop
     /// skills actually exercise; everything else (skill_*/kb_*/agent_*/generate_*/
@@ -400,6 +400,7 @@ pub const INTEROP_TOOLS: &[&str] = &[
     // diagnostics / introspection
     "iris_symbols",
     "docs_introspect",
+    "iris_doc_search",
     "check_config",
     "iris_get_log",
     "iris_debug",
@@ -1884,14 +1885,15 @@ impl<'de> serde::Deserialize<'de> for GetLogParams {
 
 /// Issue #78: the keys iris_get_log tolerates without acting on them.
 ///
-/// Not leniency for its own sake. `namespace` is advertised by 27 of the 30 tools in
+/// Not leniency for its own sake. `namespace` is advertised by 28 of the 31 tools in
 /// this fork's default (interop) profile — the only key that spans tool families — and
 /// (this said "13 of the 28"; measured 2026-09-19 by counting tools whose advertised
 /// `inputSchema.properties` carries `namespace`, the figure was 26 of 29. The old number
 /// was wrong, not merely stale by one tool, so it was corrected rather than incremented.
 /// Re-MEASURED the same way on 2026-09-19 after iris_coverage was added: 27 of 30. The
 /// increment happens to be right here, but it was measured rather than assumed — assuming
-/// is what produced the wrong figure the first time.)
+/// is what produced the wrong figure the first time. Re-measured the same way on 2026-09-20 after
+/// iris_doc_search: 28 of 31.)
 /// the agent harness sends it on nearly every call, including the correct index call in
 /// the issue's own repro. It cannot mean anything here: the log store is a single
 /// process-global ring buffer (`log_store::LogStore`) with no namespace dimension, so
@@ -4281,6 +4283,16 @@ fn annotate_tool(tool: &mut rmcp::model::Tool) {
     tool.annotations = Some(ann);
 }
 
+/// The scope name echoed back, so a caller sees what was actually searched rather than what it typed
+/// (an omitted scope becomes `classes`, and silently echoing "" would hide that).
+fn scope_str_for(s: crate::tools::doc_search::DocScope) -> &'static str {
+    match s {
+        crate::tools::doc_search::DocScope::Classes => "classes",
+        crate::tools::doc_search::DocScope::Methods => "methods",
+        crate::tools::doc_search::DocScope::Both => "both",
+    }
+}
+
 pub(crate) fn mutating_call(tool: &str, args: &serde_json::Value) -> Option<&'static str> {
     // The discriminator, whatever this tool calls it.
     let action = args
@@ -4503,6 +4515,7 @@ fn args_of(request: &rmcp::model::CallToolRequestParams) -> serde_json::Value {
 pub(crate) const CLASSIFIED_TOOLS: &[&str] = &[
     "check_config",
     "docs_introspect",
+    "iris_doc_search",
     "extract_message_map_routing",
     "find_subclass_implementations",
     "iris_business_rule_info",
@@ -6163,6 +6176,109 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
             "failed_tests_total": failed_tests_total,
             "failed_tests_truncated": failed_tests_truncated,
         }))
+    }
+
+    #[tool(
+        description = "Search the DOCUMENTATION stored in the connected IRIS instance — the class and method descriptions in %Dictionary, which is where IRIS keeps the same prose the online docs render. Use it to find WHICH class does something when you do not know the name yet; use docs_introspect once you do. `term` is matched case-insensitively against the description text. scope='classes' (the default) searches class documentation and is cheap. scope='methods' or 'both' REQUIRES `within` — a class or package prefix such as 'Ens' or 'EnsLib.HL7' — because %Dictionary.CompiledMethod holds 3.4 MILLION rows and an unscoped search costs about 6 seconds when the term matches nothing; scoped to a package it is 0.1 seconds. Results are snippets around the match with the documentation markup stripped. This searches the INSTANCE, not the internet: it finds nothing about products or versions the instance does not have installed. namespace: optional — defaults to the connection namespace."
+    )]
+    async fn iris_doc_search(
+        &self,
+        Parameters(p): Parameters<doc_search::DocSearchParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let iris = self.get_iris_reloaded().await?;
+        let client = self.http_client();
+        let namespace =
+            crate::tools::interop::resolve_namespace(p.namespace.as_deref(), Some(&iris));
+
+        let scope_str = p.scope.clone().unwrap_or_default();
+        let Some(scope) = doc_search::DocScope::parse(&scope_str) else {
+            self.record_call("iris_doc_search", false);
+            let bad = doc_search::SearchError::BadScope(scope_str);
+            return envelope::fail(bad.code(), &bad.message());
+        };
+        if let Err(bad) = doc_search::validate(&p.term, scope, p.within.as_deref()) {
+            self.record_call("iris_doc_search", false);
+            return envelope::fail(bad.code(), &bad.message());
+        }
+        let limit = doc_search::clamp_limit(p.limit);
+        let width = doc_search::SNIPPET_WIDTH;
+
+        let mut classes = Vec::new();
+        let mut methods = Vec::new();
+        // Classes first: cheap in every case, and the answer to "which class does X" more often than a
+        // method description is.
+        if matches!(
+            scope,
+            doc_search::DocScope::Classes | doc_search::DocScope::Both
+        ) {
+            let sql = doc_search::class_sql(&p.term, p.within.as_deref(), limit);
+            match iris.query(&sql, vec![], &namespace, client).await {
+                Err(e) => {
+                    self.record_call("iris_doc_search", false);
+                    return envelope::transport_fail("iris_doc_search", &e.to_string());
+                }
+                Ok(v) => {
+                    let rows = v["result"]["content"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default();
+                    classes = doc_search::hits_from_rows(&rows, false, &p.term, width);
+                }
+            }
+        }
+        if scope.needs_scope() {
+            // `validate` has already refused an absent or blank `within`, so this cannot run unscoped.
+            let within = p.within.as_deref().unwrap_or_default();
+            let sql = doc_search::method_sql(&p.term, within, limit);
+            match iris.query(&sql, vec![], &namespace, client).await {
+                Err(e) => {
+                    self.record_call("iris_doc_search", false);
+                    return envelope::transport_fail("iris_doc_search", &e.to_string());
+                }
+                Ok(v) => {
+                    let rows = v["result"]["content"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default();
+                    methods = doc_search::hits_from_rows(&rows, true, &p.term, width);
+                }
+            }
+        }
+
+        let total = classes.len() + methods.len();
+        self.record_call("iris_doc_search", true);
+        let mut out = serde_json::json!({
+            "success": true,
+            "namespace": namespace,
+            "term": p.term,
+            "scope": scope_str_for(scope),
+            "classes": classes,
+            "methods": methods,
+            "count": total,
+        });
+        // A real zero is a real answer, but it is also the point at which a caller needs to know what
+        // was and was NOT searched — otherwise "nothing found" reads as "nothing exists".
+        if total == 0 {
+            out["hint"] = serde_json::Value::String(format!(
+                "No documentation in this instance mentions '{}'{}. This searched %Dictionary \
+                 descriptions, not the internet — a term that only appears in narrative guides, or in \
+                 a product this instance does not have installed, will not be here.{}",
+                p.term,
+                match p.within.as_deref().map(str::trim).filter(|w| !w.is_empty()) {
+                    Some(w) => format!(" under '{w}'"),
+                    None => String::new(),
+                },
+                match scope {
+                    doc_search::DocScope::Classes =>
+                        " Only CLASS documentation was searched; pass scope='methods' with `within` to \
+                         search method documentation too.",
+                    _ => "",
+                }
+            ));
+        }
+        Ok(CallToolResult::success(vec![Content::text(
+            out.to_string(),
+        )]))
     }
 
     #[tool(
@@ -11295,6 +11411,39 @@ mod tool_annotation_tests {
         assert!(
             !tool_can_mutate("docs_introspect"),
             "control: another reader"
+        );
+    }
+
+    /// #24/065: the new documentation search reads and nothing else, and it must be advertised that
+    /// way — a client that prompts before a read-only lookup is a client nobody uses.
+    ///
+    /// Nothing in this test sets the annotation: #271 DERIVES it from `mutating_call`, which returns
+    /// None for this tool because it has no write arm. That is the derivation paying off — the only
+    /// work a new read-only tool needs is its CLASSIFIED_TOOLS entry, which
+    /// `every_interop_tool_is_classified` already forces.
+    #[test]
+    fn the_documentation_search_is_advertised_read_only() {
+        let t = IrisTools::new_with_toolset(None, Toolset::Interop).expect("build");
+        let tool = t
+            .advertised_tools()
+            .into_iter()
+            .find(|x| x.name == "iris_doc_search")
+            .expect("iris_doc_search is in the interop profile");
+        assert_eq!(
+            tool.annotations.as_ref().and_then(|a| a.read_only_hint),
+            Some(true),
+            "a documentation search must not be advertised as a write"
+        );
+        // CONTROL: the derivation is not simply saying true for everything — a writer beside it.
+        let doc = t
+            .advertised_tools()
+            .into_iter()
+            .find(|x| x.name == "iris_doc")
+            .expect("iris_doc");
+        assert_eq!(
+            doc.annotations.as_ref().and_then(|a| a.read_only_hint),
+            Some(false),
+            "iris_doc writes, so the two must differ"
         );
     }
 
