@@ -94,14 +94,48 @@ fn os_quote(s: &str) -> String {
 }
 
 /// Parse "code|msg" output from SCM xecute helpers. Returns (action_code, msg).
-fn parse_action_msg(out: &str) -> (u8, &str) {
+/// What the first line of a `UserAction` / `AfterUserAction` response actually said.
+///
+/// #302: this returned `(u8, &str)` with `…parse::<u8>().ok().unwrap_or(0)`, and **0 is the success
+/// code** — the branch that reports `{"success": true}` and invalidates the cached checkout. So any
+/// output IRIS produced that is not a number was read as "the action completed":
+///
+/// | input | old verdict |
+/// |---|---|
+/// | `"<PROTECT>"` | success |
+/// | `"ERROR #5865: Cannot save item, it is locked by another user"` | success |
+/// | `"NOTICE: … is currently checked out by user 'alice'"` | success |
+/// | `"SCM_UNAVAILABLE_TYPO"` | success — the guard above is an EXACT match on one sentinel |
+///
+/// The message was lost too: `splitn('|')` finds no pipe in any of those, so `msg` came back empty and
+/// IRIS's explanation was discarded rather than merely ignored.
+///
+/// `Empty` is kept separate from `Code(0, _)` on purpose. The call sites still treat it as code 0,
+/// because whether a provider legitimately returns nothing on success is not answerable from this tree
+/// — `test_parse_action_msg_empty_string` pins the behaviour but its name records the input, not an
+/// intent. That half of #302 is left for someone with a provider to test against. Non-numeric output
+/// has no such ambiguity and is now a failure.
+#[derive(Debug, PartialEq)]
+enum ActionMsg<'a> {
+    /// A numeric action code and its message. 0 means "no confirmation dialog needed".
+    Code(u8, &'a str),
+    /// No output at all.
+    Empty,
+    /// Output that is not an action code — IRIS error text, a provider NOTICE, a `<PROTECT>`.
+    Unparseable(&'a str),
+}
+
+fn parse_action_msg(out: &str) -> ActionMsg<'_> {
+    if out.trim().is_empty() {
+        return ActionMsg::Empty;
+    }
     let mut parts = out.splitn(2, '|');
-    let code = parts
-        .next()
-        .and_then(|s| s.trim().parse::<u8>().ok())
-        .unwrap_or(0);
+    let head = parts.next().unwrap_or("").trim();
     let msg = parts.next().map(str::trim).unwrap_or("");
-    (code, msg)
+    match head.parse::<u8>() {
+        Ok(code) => ActionMsg::Code(code, msg),
+        Err(_) => ActionMsg::Unparseable(out.trim()),
+    }
 }
 
 pub async fn handle_iris_source_control(
@@ -278,7 +312,14 @@ pub async fn handle_iris_source_control(
                     "Source control session could not be initialized",
                 );
             }
-            let (action_code, msg) = parse_action_msg(out);
+            let (action_code, msg) = match parse_action_msg(out) {
+                ActionMsg::Code(c, m) => (c, m),
+                // #302: empty stays code 0, unchanged — that half is undecided, see the parser.
+                ActionMsg::Empty => (0, ""),
+                // Not a code: IRIS said something, and it was being read as success while the text
+                // was thrown away. Surface it, classified by the existing IRIS-error classifier.
+                ActionMsg::Unparseable(raw) => return err_json(scm_error_code(raw), raw),
+            };
 
             if action_code == 0 {
                 // action=0 means UserAction wants no confirmation dialog — but the checkout
@@ -345,7 +386,14 @@ pub async fn handle_iris_source_control(
                     "Source control session could not be initialized",
                 );
             }
-            let (action_code, msg) = parse_action_msg(out);
+            let (action_code, msg) = match parse_action_msg(out) {
+                ActionMsg::Code(c, m) => (c, m),
+                // #302: empty stays code 0, unchanged — that half is undecided, see the parser.
+                ActionMsg::Empty => (0, ""),
+                // Not a code: IRIS said something, and it was being read as success while the text
+                // was thrown away. Surface it, classified by the existing IRIS-error classifier.
+                ActionMsg::Unparseable(raw) => return err_json(scm_error_code(raw), raw),
+            };
 
             match action_code {
                 0 => {
@@ -694,34 +742,84 @@ mod tests {
     // ── parse_action_msg ─────────────────────────────────────────────────────
     #[test]
     fn test_parse_action_msg_code_and_msg() {
-        let (code, msg) = parse_action_msg("1|Please enter comment");
-        assert_eq!(code, 1);
-        assert_eq!(msg, "Please enter comment");
+        assert_eq!(
+            parse_action_msg("1|Please enter comment"),
+            ActionMsg::Code(1, "Please enter comment")
+        );
     }
     #[test]
     fn test_parse_action_msg_zero_ok() {
-        let (code, msg) = parse_action_msg("0|");
-        assert_eq!(code, 0);
-        assert_eq!(msg, "");
+        assert_eq!(parse_action_msg("0|"), ActionMsg::Code(0, ""));
     }
     #[test]
     fn test_parse_action_msg_no_pipe() {
-        let (code, msg) = parse_action_msg("0");
-        assert_eq!(code, 0);
-        assert_eq!(msg, "");
+        assert_eq!(parse_action_msg("0"), ActionMsg::Code(0, ""));
     }
     #[test]
     fn test_parse_action_msg_message_with_pipes() {
         // Only splits on first pipe
-        let (code, msg) = parse_action_msg("1|msg with | pipe");
-        assert_eq!(code, 1);
-        assert_eq!(msg, "msg with | pipe");
+        assert_eq!(
+            parse_action_msg("1|msg with | pipe"),
+            ActionMsg::Code(1, "msg with | pipe")
+        );
     }
     #[test]
     fn test_parse_action_msg_type_7() {
-        let (code, msg) = parse_action_msg("7|Enter value:");
-        assert_eq!(code, 7);
-        assert_eq!(msg, "Enter value:");
+        assert_eq!(
+            parse_action_msg("7|Enter value:"),
+            ActionMsg::Code(7, "Enter value:")
+        );
+    }
+
+    /// #302: the defect. Every one of these was read as code 0 — the success branch, which reports
+    /// `{"success": true}` AND invalidates the cached checkout — while the message was discarded,
+    /// because `splitn('|')` finds no pipe in any of them.
+    ///
+    /// Neither input is invented: `ERROR #5865` is quoted in this file's own comment on the CheckOut
+    /// path, and the `NOTICE: … checked out by user '…'` form is why `parse_checked_out_by` exists.
+    #[test]
+    fn iris_output_that_is_not_a_code_is_not_success() {
+        for raw in [
+            "<PROTECT>",
+            "ERROR #5865: Cannot save item, it is locked by another user",
+            "NOTICE: MyApp.Patient.cls is currently checked out by user 'alice'",
+            // The guard ahead of the parser is an EXACT match on one sentinel, so a near-miss of it
+            // used to reach the success branch too.
+            "SCM_UNAVAILABLE_TYPO",
+        ] {
+            match parse_action_msg(raw) {
+                ActionMsg::Unparseable(got) => assert_eq!(
+                    got, raw,
+                    "the raw text must survive — it is the only thing that says what IRIS objected to"
+                ),
+                other => panic!("{raw:?} was read as {other:?}, which the caller treats as success"),
+            }
+        }
+    }
+
+    /// The control: a real code must still parse, or the test above would pass on a parser that calls
+    /// everything unparseable and breaks every dialog.
+    #[test]
+    fn a_real_action_code_still_parses_after_the_302_change() {
+        assert_eq!(parse_action_msg("0"), ActionMsg::Code(0, ""));
+        assert_eq!(
+            parse_action_msg("1|Please enter comment"),
+            ActionMsg::Code(1, "Please enter comment")
+        );
+        assert_eq!(
+            parse_action_msg("7|Enter value:"),
+            ActionMsg::Code(7, "Enter value:")
+        );
+    }
+
+    /// Empty is its own answer now, distinct from `Code(0, _)`. The callers still map it to 0, so
+    /// behaviour is unchanged — but the decision recorded on #302 can be made here without touching
+    /// either call site.
+    #[test]
+    fn empty_output_is_distinguishable_from_a_zero_code() {
+        assert_eq!(parse_action_msg(""), ActionMsg::Empty);
+        assert_eq!(parse_action_msg("   "), ActionMsg::Empty);
+        assert_ne!(parse_action_msg(""), ActionMsg::Code(0, ""));
     }
 
     // ── user_action_code ──────────────────────────────────────────────────────
@@ -1260,16 +1358,17 @@ mod tests {
     // ── parse_action_msg edge cases ───────────────────────────────────────────
     #[test]
     fn test_parse_action_msg_empty_string() {
-        let (code, msg) = parse_action_msg("");
-        assert_eq!(code, 0);
-        assert_eq!(msg, "");
+        // Still treated as code 0 by the callers — #302 leaves that half undecided — but the
+        // parser now says WHICH it was, so the decision can be made without touching call sites.
+        assert_eq!(parse_action_msg(""), ActionMsg::Empty);
     }
 
     #[test]
     fn test_parse_action_msg_whitespace_trimmed() {
-        let (code, msg) = parse_action_msg("  1  |  some msg  ");
-        assert_eq!(code, 1);
-        assert_eq!(msg, "some msg");
+        assert_eq!(
+            parse_action_msg("  1  |  some msg  "),
+            ActionMsg::Code(1, "some msg")
+        );
     }
 
     // ── ScmAction ─────────────────────────────────────────────────────────────
