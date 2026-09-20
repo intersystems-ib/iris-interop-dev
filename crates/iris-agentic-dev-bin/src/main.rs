@@ -33,9 +33,9 @@ enum Commands {
     Mcp(cmd::mcp::McpCommand),
     /// Compile ObjectScript .cls files on IRIS
     Compile(cmd::compile::CompileCommand),
-    /// Initialize a .iris-dev.toml workspace config
+    /// Initialize a .iris-agentic-dev.toml workspace config
     Init(cmd::init::InitCommand),
-    /// Install packages from iris-dev.toml
+    /// Install packages from iris-agentic-dev.toml
     Install(cmd::install::InstallCommand),
     // #86: any other leading token is a plugin invocation — `iris-interop-dev <name> [args…]`
     // execs `iris-agentic-dev-<name>` from PATH. Declaring this variant is what turns on clap's
@@ -170,5 +170,71 @@ async fn main() -> Result<()> {
             eprintln!("Run `iris-interop-dev --help` for usage.");
             std::process::exit(1);
         }
+    }
+}
+
+/// The help text names files the commands actually use.
+///
+/// Both of these were wrong, and a user reads them before anything else:
+///
+/// * `init --help` said "Initialize a .iris-dev.toml workspace config" while `init` writes
+///   `.iris-agentic-dev.toml`. `.iris-dev.toml` is not a typo — it is the LEGACY name
+///   `workspace_config` still falls back to, whose own log line says "consider renaming to
+///   .iris-agentic-dev.toml". So the first line of the help pointed at the deprecated file while the
+///   `--force` flag two lines below named the current one. One help screen, two answers.
+/// * `install --help` said "Install packages from iris-dev.toml". `install` reads
+///   `iris-agentic-dev.toml` and its own error text says so, so the documented filename was one the
+///   command would never open.
+#[cfg(test)]
+mod help_text_names_the_real_file {
+    use super::*;
+
+    fn about_of(name: &str) -> String {
+        Cli::command()
+            .get_subcommands()
+            .find(|c| c.get_name() == name)
+            .unwrap_or_else(|| panic!("no `{name}` subcommand — did it get renamed?"))
+            .get_about()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| panic!("`{name}` has no about text"))
+    }
+
+    #[test]
+    fn init_help_names_the_file_init_writes() {
+        let about = about_of("init");
+        // The control: the about text really names a file, so the check below means something.
+        assert!(
+            about.contains(".toml"),
+            "init about names no file: {about:?}"
+        );
+        assert!(
+            about.contains(".iris-agentic-dev.toml"),
+            "init writes .iris-agentic-dev.toml but its help says {about:?}"
+        );
+    }
+
+    /// The legacy name must not be what a new user is told to create. It stays SUPPORTED — this is
+    /// about what the help advertises, not about dropping the fallback.
+    #[test]
+    fn init_help_does_not_advertise_the_legacy_name() {
+        let about = about_of("init");
+        let without_current = about.replace(".iris-agentic-dev.toml", "");
+        assert!(
+            !without_current.contains(".iris-dev.toml"),
+            "init help advertises the legacy .iris-dev.toml: {about:?}"
+        );
+    }
+
+    #[test]
+    fn install_help_names_the_manifest_install_reads() {
+        let about = about_of("install");
+        assert!(
+            about.contains(".toml"),
+            "install about names no file: {about:?}"
+        );
+        assert!(
+            about.contains("iris-agentic-dev.toml"),
+            "install reads iris-agentic-dev.toml but its help says {about:?}"
+        );
     }
 }
