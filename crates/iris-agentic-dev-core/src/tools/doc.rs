@@ -2682,6 +2682,14 @@ mod line_edit_mode_tests {
                 v["line_edit"].is_null(),
                 "a failed read must not report an edit: {v}"
             );
+            // The caller must get the READ's own envelope, which names the real cause (the missing
+            // document / namespace), NOT this handler's generic fallback. Both refuse and both write
+            // nothing, so only the error_code distinguishes them — and a mutation deleting the
+            // success check falls through to READ_UNREADABLE and would otherwise pass.
+            assert_ne!(
+                v["error_code"], "READ_UNREADABLE",
+                "the read's own diagnosis must survive, not be replaced by a generic one: {v}"
+            );
             let puts = server
                 .received_requests()
                 .await
