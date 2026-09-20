@@ -275,7 +275,8 @@ run, via `%Monitor.System.LineByLine`).
 classes/methods), `iris_table_info` (real projected table + columns), `check_config` (active connection
 state), `find_subclass_implementations` (who overrides a method), `iris_debug` (map a .INT offset back
 to source, error logs), `iris_symbols_local` (parse a `.cls` on disk — no IRIS round trip),
-`iris_macro` (expand a macro / read an include).
+`iris_macro` (expand a macro / read an include), `iris_doc_search` (full-text search of the class
+documentation on this instance).
 
 **Interoperability** — `iris_production` (start/stop/update/status/recover/autostart),
 `iris_production_item` (item get/set settings), `iris_interop_query` (logs, queues, message
