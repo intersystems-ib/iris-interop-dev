@@ -216,23 +216,69 @@ pub struct GatewayResult {
     pub truncated: bool,
 }
 
-/// `Some(message)` when the generator reported a failure rather than a result set.
-pub fn parse_gateway_error(out: &str) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_str(out.trim()).ok()?;
+/// What the generator's output said about a gateway call — three outcomes, not two.
+///
+/// This was `Option<String>`: `Some(msg)` for a failure, `None` for anything else. The `None` arm
+/// covered two unrelated facts, because the function opens with
+/// `serde_json::from_str(..).ok()?` — so output that is **not JSON at all** returned `None`, which
+/// reads as "no failure reported".
+///
+/// At the query site that was harmless: `parse_gateway_json` runs next and rejects non-JSON with
+/// `GATEWAY_BAD_OUTPUT`. At the **connection-test** site it was the only check, and the test program
+/// carries no `$ZTRAP` or `try`, so an IRIS-side exception escapes as raw text. Measured:
+///
+/// | connection-test output | old verdict |
+/// |---|---|
+/// | `"<CLASS DOES NOT EXIST> *%SYSTEM.SQLGateway"` | no error — proceed |
+/// | `"ERROR #5002: ObjectScript error: <UNDEFINED>"` | no error — proceed |
+/// | `""` | no error — proceed |
+///
+/// So the test silently passed and the stated guarantee — *"asked first so that 'not defined' and 'the
+/// database refused the query' are different answers rather than one opaque failure"* — did not hold.
+/// The module already knew non-JSON happens: `parse_gateway_json("not json").is_err()` is an existing
+/// test. Only this parser assumed it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum GatewayVerdict {
+    /// `ok:1` — the call reported success.
+    Reported,
+    /// `ok:0`, or a missing `ok`, with whatever message came with it.
+    Failed(String),
+    /// Not JSON: the program died before writing its object, so there is NO verdict to read.
+    NoVerdict(String),
+}
+
+/// Read the generator's output as a verdict about the gateway call.
+pub fn parse_gateway_verdict(out: &str) -> GatewayVerdict {
+    let trimmed = out.trim();
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return GatewayVerdict::NoVerdict(trimmed.chars().take(400).collect());
+    };
     let ok = v.get("ok").and_then(|o| o.as_i64()).unwrap_or(0);
     if ok == 1 {
-        return None;
+        return GatewayVerdict::Reported;
     }
     let msg = v
         .get("error")
         .and_then(|e| e.as_str())
         .unwrap_or("the gateway call failed and reported no message")
         .trim();
-    Some(if msg.is_empty() {
+    GatewayVerdict::Failed(if msg.is_empty() {
         "the gateway call failed and reported no message".to_string()
     } else {
         msg.to_string()
     })
+}
+
+/// `Some(message)` when the generator reported a failure rather than a result set.
+///
+/// Kept for the QUERY path, where a `None` on non-JSON is caught immediately afterwards by
+/// `parse_gateway_json`. Do not use it for a check that has no second stage — see
+/// [`GatewayVerdict`].
+pub fn parse_gateway_error(out: &str) -> Option<String> {
+    match parse_gateway_verdict(out) {
+        GatewayVerdict::Failed(m) => Some(m),
+        _ => None,
+    }
 }
 
 /// Parse the generator's JSON into a result set.
@@ -332,6 +378,61 @@ pub fn rejected_sql_message(keyword: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The connection test's only check used to be "did it report a failure", and non-JSON answered
+    /// no. So an IRIS-side exception in a program with no $ZTRAP silently passed the test, and the
+    /// guarantee it exists for — telling "connection not defined" apart from "the database refused the
+    /// query" — quietly did not hold.
+    #[test]
+    fn output_that_is_not_json_is_no_verdict_not_a_pass() {
+        for raw in [
+            "<CLASS DOES NOT EXIST> *%SYSTEM.SQLGateway",
+            "ERROR #5002: ObjectScript error: <UNDEFINED>",
+            "",
+            "   ",
+        ] {
+            match parse_gateway_verdict(raw) {
+                GatewayVerdict::NoVerdict(got) => {
+                    assert_eq!(
+                        got,
+                        raw.trim(),
+                        "the raw text must survive: it is the only diagnosis"
+                    )
+                }
+                other => panic!("{raw:?} read as {other:?} — the caller treats that as testable"),
+            }
+        }
+    }
+
+    /// The control: real verdicts must still be read, or the test above would pass on a parser that
+    /// calls everything a non-verdict and breaks every gateway query.
+    #[test]
+    fn real_verdicts_are_still_read() {
+        assert_eq!(
+            parse_gateway_verdict(r#"{"ok":1,"columns":[],"rows":[]}"#),
+            GatewayVerdict::Reported
+        );
+        assert_eq!(
+            parse_gateway_verdict(r#"{"ok":0,"error":"refused"}"#),
+            GatewayVerdict::Failed("refused".to_string())
+        );
+        // A missing `ok` stays a failure, as before — that case already had a test.
+        assert!(matches!(
+            parse_gateway_verdict(r#"{"columns":[]}"#),
+            GatewayVerdict::Failed(_)
+        ));
+    }
+
+    /// The old helper keeps its exact contract for the query path, where `parse_gateway_json` catches
+    /// non-JSON immediately afterwards.
+    #[test]
+    fn parse_gateway_error_still_reports_none_for_non_json() {
+        assert!(parse_gateway_error("<CLASS DOES NOT EXIST>").is_none());
+        assert_eq!(
+            parse_gateway_error(r#"{"ok":0,"error":"refused"}"#),
+            Some("refused".to_string())
+        );
+    }
 
     #[test]
     fn a_plain_select_passes() {
@@ -598,6 +699,24 @@ pub async fn handle_gateway_query(
             return crate::tools::envelope::transport_fail("handle_gateway_query", &e.to_string())
         }
     };
+    // The connection test has no second stage behind it, so "found no failure" must not be the same
+    // answer as "could not tell". Without this, an IRIS-side exception in the test program — which
+    // carries no $ZTRAP — escaped as raw text, read as no-error, and the query ran anyway.
+    if let GatewayVerdict::NoVerdict(raw) = parse_gateway_verdict(&test_out) {
+        return crate::tools::envelope::fail_with(
+            "GATEWAY_BAD_OUTPUT",
+            &format!(
+                "the SQL Gateway connection test for '{connection}' returned output that is not a \
+                 verdict, so whether the connection works is unknown and no query was sent. IRIS \
+                 wrote: {raw}"
+            ),
+            serde_json::json!({
+                "connection": connection,
+                "namespace": namespace,
+                "iris_output": raw,
+            }),
+        );
+    }
     if let Some(msg) = parse_gateway_error(&test_out) {
         let not_defined = msg.to_lowercase().contains("not defined");
         return crate::tools::envelope::fail_with(
