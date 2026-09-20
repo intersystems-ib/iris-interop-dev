@@ -3328,6 +3328,17 @@ async fn enrich_abort(
         }
     }
 
+    // #24/071: "variables disappearing between calls". Each iris_execute call runs in its OWN IRIS
+    // process against a fresh temp class, so nothing a previous call set survives — and the bare
+    // <UNDEFINED> says none of that. Appended to the per-line hint rather than replacing it: the line
+    // number is still the most useful fact, this explains WHY that line has nothing to read.
+    if let Some(explanation) = undefined_across_calls_hint(frame.signal, abort, submitted) {
+        if !hint.is_empty() {
+            hint.push(' ');
+        }
+        hint.push_str(&explanation);
+    }
+
     if abort_wants_member_list(frame.signal) {
         if let (Some(member), Some(class)) = (frame.member, frame.class) {
             let (members, member_kind) =
@@ -3967,6 +3978,149 @@ pub struct AbortFrame<'a> {
     pub line: Option<usize>,
     pub member: Option<&'a str>,
     pub class: Option<&'a str>,
+}
+
+/// The name an `<UNDEFINED>` trap reports — the last token of the abort line.
+///
+/// `ERROR: <UNDEFINED> 9 RunUser+2^IrisDevTmp.Run50f5f84f0e5a.1 someUndefinedVar`
+///
+/// Measured against a live IRIS 2026.1 rather than assumed; the name is last, after the frame.
+pub fn undefined_symbol_name(abort: &str) -> Option<&str> {
+    let close = abort.find('>')?;
+    let last = abort[close + 1..].split_whitespace().last()?;
+    // The FRAME is the last token when no name was reported. A frame is `Label+N^Routine` — it has a
+    // caret with something before it. A GLOBAL also contains a caret but STARTS with it, so testing
+    // `contains('^')` alone rejects `^myGlobal` as if it were a frame. Measured: it did.
+    let is_frame = last.contains('^') && !last.starts_with('^');
+    (!is_frame).then_some(last)
+}
+
+/// Whether an assignment keyword appears before `idx` on this (lowercased) line.
+///
+/// `set` / `s` / `for` / `f`, as whole words. Without this, `if x=1` reads as an assignment of `x`.
+fn has_assign_keyword_before(lower_line: &str, idx: usize) -> bool {
+    let head = &lower_line[..idx.min(lower_line.len())];
+    for kw in ["set", "for", "s", "f"] {
+        let mut from = 0;
+        while let Some(i) = head[from..].find(kw) {
+            let start = from + i;
+            let end = start + kw.len();
+            let before_boundary = start == 0
+                || !head[..start]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '%');
+            let after_boundary = head[end..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_whitespace());
+            if before_boundary && after_boundary {
+                return true;
+            }
+            from = end;
+        }
+    }
+    false
+}
+
+/// Whether the submitted code ASSIGNS `name` anywhere.
+///
+/// Not "mentions" — the line that trapped necessarily mentions it, so a containment test would
+/// suppress the explanation in every real case. Measured: it did, on the first attempt.
+///
+/// Recognises the forms that actually define a local:
+/// * `Set x=…`, `Set x("k")=…`, and the continuation `Set a=1,x=2` — all of which put `=` after the
+///   name (with an optional subscript between);
+/// * `New x` and `Read x`, which define without `=`.
+///
+/// A form this misses makes the explanation fire when it should not, so the wording says only what is
+/// checked — that nothing here ASSIGNS it — rather than asserting the variable was never set.
+pub fn code_assigns_name(submitted: &str, name: &str) -> bool {
+    for line in submitted.lines() {
+        // `New x` / `Read x` — keyword then the name.
+        let lower = line.to_ascii_lowercase();
+        for kw in ["new ", "read "] {
+            let mut from = 0;
+            while let Some(i) = lower[from..].find(kw) {
+                let after = from + i + kw.len();
+                if line[after..].trim_start().starts_with(name) {
+                    return true;
+                }
+                from = after;
+            }
+        }
+        // name [ (...) ] [spaces] '=' — covers Set, the comma continuation, and For.
+        let mut from = 0;
+        while let Some(i) = line[from..].find(name) {
+            let start = from + i;
+            let end = start + name.len();
+            // A word boundary before, or the name is a suffix of a longer identifier.
+            let before_ok = start == 0
+                || !line[..start]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '%');
+            let mut rest = line[end..].trim_start();
+            if rest.starts_with('(') {
+                if let Some(close) = rest.find(')') {
+                    rest = rest[close + 1..].trim_start();
+                }
+            }
+            // `name=` alone is AMBIGUOUS: in `if someUndefinedVar=1 { }` the `=` is a COMPARISON.
+            // Measured — that case was wrongly reported as an assignment. So an assignment keyword
+            // must appear earlier on the line: Set/For (or their abbreviations), which also covers the
+            // comma continuation `Set a=1,x=2` because `set` still precedes `x`.
+            if before_ok
+                && rest.starts_with('=')
+                && !rest.starts_with("==")
+                && has_assign_keyword_before(&lower, start)
+            {
+                return true;
+            }
+            from = end;
+        }
+    }
+    false
+}
+
+/// Explain that variables do not survive between `iris_execute` calls — but ONLY when that is
+/// actually the situation.
+///
+/// Three conditions, each of which stops this from being a plausible-looking wrong answer:
+///
+/// * the signal is `<UNDEFINED>`;
+/// * the name is NOT a global. `^myGlobal` persists perfectly well across calls, so blaming
+///   process isolation for an undefined global would send the reader in the wrong direction
+///   entirely — the cause there is that nothing ever set it;
+/// * the name does not appear anywhere in the submitted code. If it does, the variable IS set in
+///   this call and the bug is local flow (a `Set` inside an `If` that did not run), which the
+///   per-line hint already points at. Claiming a lost previous call there would be wrong.
+pub fn undefined_across_calls_hint(signal: &str, abort: &str, submitted: &str) -> Option<String> {
+    if signal != "UNDEFINED" {
+        return None;
+    }
+    let name = undefined_symbol_name(abort)?;
+    // A global persists; process isolation is not why it is undefined.
+    if name.starts_with('^') {
+        return None;
+    }
+    // Strip any subscript so `myVar("x")` is matched against the code as `myVar`.
+    let bare = name.split('(').next().unwrap_or(name);
+    if bare.is_empty() {
+        return None;
+    }
+    // ASSIGNED in this call means the cause is local flow (a Set inside an If that did not run), which
+    // the per-line hint already points at. Only "mentioned" is useless here: the line that trapped
+    // mentions it by definition.
+    if code_assigns_name(submitted, bare) {
+        return None;
+    }
+    Some(format!(
+        "Nothing in the code you sent ASSIGNS `{bare}`. Each iris_execute call runs in its OWN IRIS \
+         process against a freshly compiled temp class, so anything a PREVIOUS call set is already \
+         gone — there is no session carrying variables between calls. Send the whole sequence in ONE \
+         call, or Set it here. (A `^global` would have persisted; a local will not.)"
+    ))
 }
 
 /// The routine reference carried by an abort frame — `initAdapterJG+2^EnsLib.JavaGateway.Common.1`,
@@ -17420,5 +17574,175 @@ mod abort_tests {
                  the cause, not a scoreboard describing a run that did not happen"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod undefined_across_calls_tests {
+    //! #24/071: the "variables disappearing between calls" confusion. The item proposed a `%ctx`
+    //! carrier; this instead explains the isolation, for the reasons recorded on the issue. What is
+    //! tested here is that the explanation fires ONLY when it is true — a hint that over-fires sends
+    //! the reader somewhere wrong, which is worse than the bare trap it replaces.
+    use super::{undefined_across_calls_hint, undefined_symbol_name};
+
+    /// The real abort line, measured on IRIS for Health 2026.1 via iris_execute.
+    const ABORT: &str =
+        "ERROR: <UNDEFINED> 9 RunUser+2^IrisDevTmp.Run50f5f84f0e5a.1 someUndefinedVar";
+
+    #[test]
+    fn the_name_is_the_last_token_of_the_real_abort_line() {
+        assert_eq!(undefined_symbol_name(ABORT), Some("someUndefinedVar"));
+    }
+
+    /// When no name is reported the frame is the last token — that is not a name.
+    #[test]
+    fn a_frame_without_a_name_yields_none() {
+        assert_eq!(
+            undefined_symbol_name("ERROR: <UNDEFINED> 9 RunUser+2^IrisDevTmp.Run1.1"),
+            None
+        );
+    }
+
+    #[test]
+    fn it_fires_for_a_local_the_code_never_sets() {
+        let h = undefined_across_calls_hint("UNDEFINED", ABORT, "write someUndefinedVar,!")
+            .expect("should explain");
+        assert!(h.contains("OWN"), "{h}");
+        assert!(h.contains("PREVIOUS call"), "{h}");
+        assert!(h.contains("ONE call"), "must say what to do instead: {h}");
+    }
+
+    /// THE OVER-FIRE GUARD. If the name IS in the submitted code, the variable is set in THIS call and
+    /// the bug is local flow — a `Set` inside an `If` that did not run. Blaming a lost previous call
+    /// would send the reader to rewrite a sequence that is already in one call.
+    /// THE OVER-FIRE GUARD, and the distinction that makes it work at all.
+    ///
+    /// My first version asked whether the code MENTIONED the name. The line that trapped mentions it by
+    /// definition, so the explanation was suppressed in every real case — the test that caught it is
+    /// `it_fires_for_a_local_the_code_never_sets`, whose code is just `write someUndefinedVar,!`. The
+    /// question is whether the code ASSIGNS it.
+    #[test]
+    fn it_stays_silent_when_the_code_does_assign_the_name() {
+        let code = "If 0 { Set someUndefinedVar = 1 }\nwrite someUndefinedVar,!";
+        assert_eq!(
+            undefined_across_calls_hint("UNDEFINED", ABORT, code),
+            None,
+            "assigned in this call — local flow, not process isolation"
+        );
+    }
+
+    /// The assignment forms that actually define a local, each recognised.
+    #[test]
+    fn the_assignment_forms_are_recognised() {
+        for code in [
+            "Set someUndefinedVar=1",
+            "set someUndefinedVar = 1",
+            "Set a=1,someUndefinedVar=2",
+            "Set someUndefinedVar(\"k\")=1",
+            "For someUndefinedVar=1:1:3 { }",
+            "New someUndefinedVar",
+            "Read someUndefinedVar",
+        ] {
+            assert!(
+                super::code_assigns_name(code, "someUndefinedVar"),
+                "not recognised as an assignment: {code}"
+            );
+        }
+    }
+
+    /// And forms that are NOT assignments must not suppress the explanation.
+    #[test]
+    fn reading_the_name_is_not_an_assignment() {
+        for code in [
+            "write someUndefinedVar,!",
+            "if someUndefinedVar=1 { }",
+            "Set x=someUndefinedVar",
+        ] {
+            assert!(
+                !super::code_assigns_name(code, "someUndefinedVar"),
+                "wrongly treated as an assignment: {code}"
+            );
+        }
+    }
+
+    /// A longer identifier that CONTAINS the name is not an assignment of it.
+    ///
+    /// A MUTATION SURVIVED the first version: the fixture was `Set myotherSomeUndefinedVarX=1`, which
+    /// contains `SomeUndefinedVar` with a CAPITAL S and therefore never matched `someUndefinedVar` at
+    /// all — so removing the word-boundary check changed nothing. The fixture has to contain the name
+    /// EXACTLY, prefixed by an identifier character, or the guard is never reached.
+    #[test]
+    fn a_longer_identifier_is_not_the_same_variable() {
+        // contains "someUndefinedVar" verbatim, preceded by an identifier char
+        assert!(
+            !super::code_assigns_name("Set xsomeUndefinedVar=1", "someUndefinedVar"),
+            "prefixed by an identifier char — a different variable"
+        );
+        // and a trailing char is fine as a DIFFERENT name only when the = follows the longer one
+        assert!(
+            !super::code_assigns_name("Set someUndefinedVarX=1", "someUndefinedVar"),
+            "the = belongs to the longer identifier, not to this name"
+        );
+        // CONTROL: the exact name, on its own, IS an assignment — otherwise the two above would pass
+        // even if the function never returned true.
+        assert!(super::code_assigns_name(
+            "Set someUndefinedVar=1",
+            "someUndefinedVar"
+        ));
+    }
+
+    /// A GLOBAL persists across calls. Blaming process isolation for an undefined global is wrong in
+    /// the most misleading direction — the cause there is that nothing ever set it.
+    #[test]
+    fn it_stays_silent_for_a_global() {
+        let abort = "ERROR: <UNDEFINED> 9 RunUser+2^IrisDevTmp.Run1.1 ^myGlobal";
+        assert_eq!(undefined_symbol_name(abort), Some("^myGlobal"));
+        assert_eq!(
+            undefined_across_calls_hint("UNDEFINED", abort, "write ^myGlobal,!"),
+            None
+        );
+        // and even when the code does not mention it at all
+        assert_eq!(
+            undefined_across_calls_hint("UNDEFINED", abort, "write 1,!"),
+            None,
+            "a global is not affected by process isolation"
+        );
+    }
+
+    /// Only for UNDEFINED. Another signal with the same shape must not collect this explanation.
+    #[test]
+    fn it_stays_silent_for_another_signal() {
+        for sig in ["PROPERTY DOES NOT EXIST", "METHOD DOES NOT EXIST", "SYNTAX"] {
+            assert_eq!(
+                undefined_across_calls_hint(sig, ABORT, "write x,!"),
+                None,
+                "{sig} is not about variable persistence"
+            );
+        }
+    }
+
+    /// A subscripted local is matched on its BARE name, so `myVar("k")` undefined while the code
+    /// writes `myVar(1)` is recognised as present.
+    #[test]
+    fn a_subscripted_local_is_matched_on_its_bare_name() {
+        let abort = "ERROR: <UNDEFINED> 9 RunUser+2^IrisDevTmp.Run1.1 myVar(\"k\")";
+        assert_eq!(
+            undefined_across_calls_hint("UNDEFINED", abort, "Set myVar(1) = 2"),
+            None,
+            "the name is present, just a different subscript — local flow, not isolation"
+        );
+        let h = undefined_across_calls_hint("UNDEFINED", abort, "write 1,!").expect("fires");
+        assert!(
+            h.contains("`myVar`"),
+            "the bare name, not the subscript: {h}"
+        );
+    }
+
+    /// CONTROL: both outcomes are reachable. If the function were constant, the silence tests above
+    /// would all pass on their own.
+    #[test]
+    fn both_outcomes_are_reachable() {
+        assert!(undefined_across_calls_hint("UNDEFINED", ABORT, "write 1,!").is_some());
+        assert!(undefined_across_calls_hint("SYNTAX", ABORT, "write 1,!").is_none());
     }
 }
