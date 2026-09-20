@@ -11407,6 +11407,12 @@ mod tool_annotation_tests {
     /// list can gain a generator call in a NEW read-only handler and this test stays green. It
     /// catches the cheap regression (a fresh file), not every violation of the rule it is named
     /// after.
+    ///
+    /// MEASURED: dropping `iris_table_info` from `GENERATOR_WRITE_TOOLS` leaves this test green.
+    /// That case is caught by `the_read_only_split_is_pinned_per_toolset` instead, which pins the
+    /// per-toolset read-only count — the same mutation fails there. The two are complementary and
+    /// neither alone is sufficient: this one catches a new call site, that one catches a
+    /// misclassified tool.
     #[test]
     fn the_set_of_files_calling_the_generator_is_pinned() {
         const EXPECTED: &[&str] = &[
