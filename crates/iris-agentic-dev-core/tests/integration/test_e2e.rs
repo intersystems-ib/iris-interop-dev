@@ -2302,6 +2302,14 @@ fn e2e_symbols_returns_name_field() {
         }),
     );
     let symbols = result["symbols"].as_array().cloned().unwrap_or_default();
+    // Without this the test is vacuous: an empty `symbols` skips the loop and reports a pass, and
+    // `unwrap_or_default()` turns an ABSENT key into an empty array too. The name of this test claims
+    // symbols come back with a Name field, so it has to establish that symbols came back at all.
+    assert!(
+        !symbols.is_empty(),
+        "iris_symbols returned no symbols for Ens.Director, so the per-symbol assertions below \
+         would pass without examining anything: {result}"
+    );
     for sym in &symbols {
         assert!(
             sym["Name"].is_string(),
@@ -2469,6 +2477,20 @@ fn e2e_introspect_method_return_type_present() {
     );
     assert_eq!(result["success"], true);
     let methods = result["methods"].as_array().cloned().unwrap_or_default();
+    // Same shape: `success: true` with zero methods passes while asserting nothing about ReturnType.
+    // Ens.Director is a class with methods, so an empty list means the introspection did not work.
+    //
+    // NOT MUTATION-VERIFIED, unlike its two siblings. Pointing this test at a class that does not
+    // exist is caught one line earlier by `success == true` (measured: left Bool(false)), so that
+    // mutation never reaches this guard. The case it does cover — a class that EXISTS while the
+    // method query comes back empty — needs a fixture nothing in CI provides. Kept because that is a
+    // real shape in this codebase (see #290, where a tool reported success while running nothing),
+    // but do not read it as a checked assertion.
+    assert!(
+        !methods.is_empty(),
+        "docs_introspect returned no methods for Ens.Director, so the ReturnType assertion below \
+         never runs: {result}"
+    );
     for m in &methods {
         // ReturnType may be empty (void methods) but field must exist
         assert!(
@@ -3070,6 +3092,12 @@ fn e2e_query_where_like_filter() {
     );
     assert_eq!(result["success"], true, "LIKE filter: {}", result);
     let rows = result["rows"].as_array().cloned().unwrap_or_default();
+    // `success: true` with zero rows would leave the LIKE filter untested — the assertion in the
+    // loop is the whole point of the test, and an empty result satisfies it by never running.
+    assert!(
+        !rows.is_empty(),
+        "no rows matched LIKE 'Ens.%', so the filter assertion below never runs: {result}"
+    );
     for row in &rows {
         let name = row["Name"].as_str().unwrap_or("");
         assert!(
