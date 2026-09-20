@@ -8,7 +8,7 @@ Works with IRIS installed natively on Windows or Linux, and with Docker. Require
 
 > **What this is.** `iris-interop-dev` is the **streamlined, interoperability-focused fork** of the
 > community [`intersystems-community/iris-agentic-dev`](https://github.com/intersystems-community/iris-agentic-dev)
-> MCP server. It exposes a locked **23-tool interop profile**, ships as a **single binary (no Python)**,
+> MCP server. It exposes a **locked interop profile**, ships as a **single binary (no Python)**,
 > and uses a **distinct MCP server name (`iris-interop-dev`)** so it can be installed alongside the
 > original. **Tool names are identical**, so the [`intersystems-ib/iris-interop-skills`](https://github.com/intersystems-ib/iris-interop-skills)
 > plugin works with either server. It is the binary baked into the *"De Prompt a Producción"* workshop VM.
@@ -147,7 +147,9 @@ Whatever the client:
   the active toolset from a cached snapshot — no IRIS round-trip — so it answers even when IRIS is
   down, which makes it the right first call to tell "MCP not registered" from "IRIS unreachable".
 - **`IRIS_TOOLSET` selects the tool surface** (`--toolset` also works). This fork defaults to
-  `interop` — the 23 tools below. `baseline` exposes everything the binary carries (54 on 0.8.3).
+  `interop` — the tools listed under [Tools](#tools-interop-profile). `baseline` exposes everything
+  the binary carries. Neither count is written here on purpose: both have been wrong before, and
+  `tools/list` on your own build is the only answer that cannot go stale.
 - **`IRIS_LOG_FILE=<path>` is how a session's traces survive it.** An MCP client keeps the server's
   stderr to itself, so without this there is nothing to read after a failed run.
 - **A running client keeps the binary it started with.** After installing a new release, restart the
@@ -233,7 +235,7 @@ server — run the ISC Web Gateway container alongside IRIS and point `web_port`
 | `IRIS_PASSWORD` | `SYS` | IRIS password |
 | `IRIS_NAMESPACE` | `USER` | Default namespace |
 | `IRIS_CONTAINER` | _(empty)_ | Docker container name — required for Docker-dependent tools |
-| `IRIS_TOOLSET` | `interop` | Tool surface: `interop` (23 tools) or `baseline` (full upstream surface). Same as `--toolset` |
+| `IRIS_TOOLSET` | `interop` | Tool surface: `interop` (the locked profile) or `baseline` (full upstream surface). Same as `--toolset` |
 | `IRIS_LOG_FILE` | _(empty)_ | Mirror server traces to this file — the only trace that outlives an MCP session |
 | `IRIS_DISCOVERY_TIMEOUT_MS` | `2000` | How long startup waits for IRIS discovery before serving. Missing this window is not fatal — the connection is adopted whenever the probe finishes — so raise it only if you would rather `initialize` block than serve unconnected |
 | `IRIS_ALLOW_PROD` | _(unset)_ | Allow MUTATING calls on a connection that is not write-allowed (Live system mode, or a production-looking namespace). Reads are never blocked, so this is only needed to write. Set to `1` deliberately |
@@ -265,12 +267,15 @@ Most tools work over the Atelier REST API against any IRIS instance; Docker-only
 
 **Code & data** — `iris_doc` (read/write/delete documents), `iris_compile` (compile, errors with line
 numbers), `iris_execute` (run ObjectScript), `iris_query` (SQL → JSON rows), `iris_test` (run
-`%UnitTest`, structured pass/fail), `iris_get_log` (fetch a truncated result by `log_id`).
+`%UnitTest`, structured pass/fail), `iris_get_log` (fetch a truncated result by `log_id`),
+`iris_execute_method` (invoke a ClassMethod by name), `iris_coverage` (line coverage of a `%UnitTest`
+run, via `%Monitor.System.LineByLine`).
 
 **Introspection** — `docs_introspect` (methods/properties/XData/superclasses), `iris_symbols` (search
 classes/methods), `iris_table_info` (real projected table + columns), `check_config` (active connection
 state), `find_subclass_implementations` (who overrides a method), `iris_debug` (map a .INT offset back
-to source, error logs).
+to source, error logs), `iris_symbols_local` (parse a `.cls` on disk — no IRIS round trip),
+`iris_macro` (expand a macro / read an include).
 
 **Interoperability** — `iris_production` (start/stop/update/status/recover/autostart),
 `iris_production_item` (item get/set settings), `iris_interop_query` (logs, queues, message
@@ -279,7 +284,12 @@ archive/trace), `iris_message_body` (read a message body — string/stream conta
 `iris_business_rule_info` (list/describe routing rules), `iris_production_diff` (running config vs
 committed source), `extract_message_map_routing` (message-map targets of a business process),
 `iris_lookup_manage` / `iris_lookup_transfer` (lookup tables), `iris_credential_list` /
-`iris_credential_manage` (SSL/credentials).
+`iris_credential_manage` (SSL/credentials), `hl7_schema_list` / `hl7_schema_inspect` (the HL7 v2
+schemas this instance actually carries, and their segments/fields — both refuse with
+`HL7_NOT_AVAILABLE` on a stock IRIS that has none).
+
+**External data** — `iris_gateway_query` (read through a configured SQL Gateway connection to a
+foreign database).
 
 ---
 
