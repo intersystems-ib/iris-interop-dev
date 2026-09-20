@@ -4261,6 +4261,53 @@ pub(crate) fn tool_can_mutate(tool: &str) -> bool {
         .any(|p| mutating_call(tool, p).is_some())
 }
 
+/// Tools whose handler reaches [`crate::iris::IrisConnection::execute_via_generator`], which PUTs
+/// a class document and compiles it (`flags=cuk`) in the target namespace before deleting it.
+///
+/// That is a modification, and the tree already says so at the one site where it was noticed:
+/// `mutating_call`'s `iris_debug` arm reads "source_map is the one iris_debug action that writes —
+/// it goes through execute_via_generator, which PUTs and compiles a scratch class". The delete is
+/// best-effort, so a process that dies between compile and delete leaves `IrisDevTmp.Run<id>`
+/// behind. None of these can honestly advertise `readOnlyHint = true`: the spec meaning is "does
+/// not modify its environment", and a client auto-approves on it.
+///
+/// #282: these are deliberately NOT added to `mutating_call`. The write gate's philosophy is that
+/// reading is never blocked, and from the caller's point of view every tool here IS a read —
+/// gating them would refuse legitimate reads on a Live instance. So the annotation and the gate
+/// disagree here ON PURPOSE, and the disagreement is the honest direction: advertise the write,
+/// still allow the read. Whether the gate should also refuse them is #282's open question; this
+/// list does not decide it.
+/// Built by enumerating EVERY `execute_via_generator` call site and mapping each to its owning
+/// handler. Taking the first hit per file gives five of these and silently drops the rest —
+/// `dict.rs`, `interop.rs` and `info.rs` each host several.
+const GENERATOR_WRITE_TOOLS: &[&str] = &[
+    "extract_message_map_routing",
+    "find_subclass_implementations",
+    "hl7_schema_inspect",
+    "hl7_schema_list",
+    "iris_business_rule_info",
+    // Error path only, via the `ensure_interop_namespace` preflight: the "this namespace has no
+    // interop" branch calls `list_interop_namespaces`, which needs $NAMESPACE switching and so
+    // goes through the generator. A tool that writes only when it fails still writes.
+    "iris_credential_list",
+    "iris_gateway_query",
+    "iris_interop_query",
+    "iris_message_body",
+    "iris_production_diff",
+    // iris_gateway_query and iris_table_info each already carry an explicit `=> None` arm in
+    // `mutating_call`, reasoned about the REMOTE database being opened SetReadOnly(1) with
+    // SELECT-only grants. That reasoning is correct and does not reach the local scratch class,
+    // which is why both looked settled.
+    "iris_table_info",
+    "resolve_dynamic_dispatch",
+];
+
+/// Whether `tool` writes a scratch class as a side effect of answering. See
+/// [`GENERATOR_WRITE_TOOLS`] for why this is separate from `tool_can_mutate`.
+pub(crate) fn tool_writes_via_generator(tool: &str) -> bool {
+    GENERATOR_WRITE_TOOLS.contains(&tool)
+}
+
 /// Attach `readOnlyHint` to one advertised tool.
 ///
 /// ONLY `readOnlyHint` is set, deliberately:
@@ -4274,7 +4321,7 @@ pub(crate) fn tool_can_mutate(tool: &str) -> bool {
 /// An annotation that over-claims is worse than an absent one: absent means "unknown, ask", and a
 /// wrong `readOnlyHint: true` means "do not ask" for a tool that writes.
 fn annotate_tool(tool: &mut rmcp::model::Tool) {
-    let read_only = !tool_can_mutate(&tool.name);
+    let read_only = !tool_can_mutate(&tool.name) && !tool_writes_via_generator(&tool.name);
     let mut ann = tool.annotations.clone().unwrap_or_default();
     ann.read_only_hint = Some(read_only);
     tool.annotations = Some(ann);
@@ -11280,6 +11327,131 @@ mod tool_annotation_tests {
                 }
             }
         }
+    }
+
+    /// #282: a tool that PUTs and compiles a scratch class must not advertise `readOnlyHint:true`,
+    /// whatever the write gate decides to allow. Through `advertised_tools()` — the annotation a
+    /// client actually receives — for every toolset.
+    #[test]
+    fn no_generator_write_tool_is_advertised_read_only() {
+        for ts in [
+            Toolset::Interop,
+            Toolset::Merged,
+            Toolset::Nostub,
+            Toolset::Baseline,
+        ] {
+            let t = IrisTools::new_with_toolset(None, ts).expect("build");
+            let all = t.advertised_tools();
+            // The precondition that makes the loop mean something: without it, a toolset that
+            // advertises none of these would pass by vacuity.
+            let present: Vec<&str> = GENERATOR_WRITE_TOOLS
+                .iter()
+                .copied()
+                .filter(|g| all.iter().any(|x| x.name == *g))
+                .collect();
+            assert!(
+                present.len() >= 2,
+                "{ts:?} advertises only {present:?} of the generator-write tools — too few for \
+                 this test to prove anything"
+            );
+            for tool in &all {
+                if tool_writes_via_generator(&tool.name) {
+                    assert_eq!(
+                        tool.annotations.as_ref().and_then(|a| a.read_only_hint),
+                        Some(false),
+                        "{} PUTs and compiles a scratch class but is advertised read-only in \
+                         {ts:?} — a client would auto-approve the write",
+                        tool.name
+                    );
+                }
+            }
+        }
+    }
+
+    /// The derivation must not have become a constant: reclassifying twelve tools is exactly the
+    /// change that could flip everything to RW and still pass the test above.
+    #[test]
+    fn reclassifying_did_not_make_every_tool_a_writer() {
+        let t = IrisTools::new_with_toolset(None, Toolset::Interop).expect("build");
+        let all = t.advertised_tools();
+        let ro = all
+            .iter()
+            .filter(|x| {
+                x.annotations
+                    .as_ref()
+                    .and_then(|a| a.read_only_hint)
+                    .unwrap_or(false)
+            })
+            .count();
+        assert!(
+            ro >= 5,
+            "only {ro} tools are advertised read-only — the derivation looks constant"
+        );
+        // And a named reader stays a reader. `check_config` neither mutates nor uses the generator.
+        assert!(
+            !tool_writes_via_generator("check_config"),
+            "control: check_config does not go through the generator"
+        );
+        assert!(
+            tool_writes_via_generator("iris_gateway_query"),
+            "control: iris_gateway_query does"
+        );
+    }
+
+    /// RATCHET. `GENERATOR_WRITE_TOOLS` is a hand-maintained list, and the truth it tracks lives in
+    /// each handler's call to `execute_via_generator` — the two can drift silently, which is how
+    /// this gap opened. So pin the set of FILES that hold such a call: a new one fails the build and
+    /// forces whoever added it to classify the tools in that file.
+    ///
+    /// WHAT THIS GUARDS, narrowly: the set of files, not the set of tools. A file already on the
+    /// list can gain a generator call in a NEW read-only handler and this test stays green. It
+    /// catches the cheap regression (a fresh file), not every violation of the rule it is named
+    /// after.
+    #[test]
+    fn the_set_of_files_calling_the_generator_is_pinned() {
+        const EXPECTED: &[&str] = &[
+            "admin.rs",
+            "dict.rs",
+            "doc.rs",
+            "execute_method.rs",
+            "gateway.rs",
+            "hl7_schema.rs",
+            "info.rs",
+            "interop.rs",
+            "mod.rs",
+            "scm.rs",
+        ];
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tools");
+        let mut found: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("read src/tools") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|x| x.to_str()) != Some("rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).expect("read source file");
+            if src.contains(".execute_via_generator(") {
+                found.push(
+                    path.file_name()
+                        .expect("file name")
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+        }
+        found.sort();
+        assert!(
+            !found.is_empty(),
+            "found no generator call sites at all — did the directory move? \
+             (looked in {})",
+            dir.display()
+        );
+        assert_eq!(
+            found, EXPECTED,
+            "the set of files calling execute_via_generator changed. A file that gained one holds \
+             a handler that PUTs and compiles a scratch class: classify its tools in \
+             GENERATOR_WRITE_TOOLS (or confirm they are already gated by mutating_call), then \
+             update EXPECTED here."
+        );
     }
 
     /// Both polarities actually occur — otherwise the derivation could be a constant and every test
