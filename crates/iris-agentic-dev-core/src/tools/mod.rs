@@ -5159,17 +5159,27 @@ impl IrisTools {
         matches!(result, Ok(r) if r.is_error != Some(true))
     }
 
+    /// Record one tool call in the rolling history `agent_stats` / `agent_history` read.
+    ///
+    /// The lock is RECOVERED, not skipped. This was `if let Ok(mut h) = self.history.lock()`, which
+    /// on a poisoned mutex silently dropped the entry — and the two readers of this same mutex were
+    /// already fixed to recover from exactly that: `session_call_count` (#99, "a mutex poisoned by an
+    /// unrelated panic reported '0 calls' about a deque that still holds every entry") and
+    /// `agent_history` (#89). So after one panic anywhere holding this lock, the readers kept
+    /// answering while the history quietly stopped growing.
+    ///
+    /// That is worse than the zero #99 fixed. A zero is visibly wrong; a count that is real but
+    /// frozen looks right, and `agent_stats` would under-report for the rest of the process.
     fn record_call(&self, tool: &str, success: bool) {
-        if let Ok(mut h) = self.history.lock() {
-            if h.len() == 50 {
-                h.pop_front();
-            }
-            h.push_back(ToolCallEntry {
-                tool: tool.to_string(),
-                success,
-                timestamp: std::time::Instant::now(),
-            });
+        let mut h = self.history.lock().unwrap_or_else(|e| e.into_inner());
+        if h.len() == 50 {
+            h.pop_front();
         }
+        h.push_back(ToolCallEntry {
+            tool: tool.to_string(),
+            success,
+            timestamp: std::time::Instant::now(),
+        });
     }
 
     #[tool(
@@ -18196,5 +18206,56 @@ mod undefined_across_calls_tests {
     fn both_outcomes_are_reachable() {
         assert!(undefined_across_calls_hint("UNDEFINED", ABORT, "write 1,!").is_some());
         assert!(undefined_across_calls_hint("SYNTAX", ABORT, "write 1,!").is_none());
+    }
+}
+
+/// The writer of the call history must survive a poisoned lock, because both readers already do.
+///
+/// Its own module at the end of the file: mod.rs is 18k lines and several branches insert test blocks
+/// before shared doc-comment anchors, which conflicts on merge. Verified against the four open PRs that
+/// none touches this region.
+#[cfg(test)]
+mod record_call_survives_a_poisoned_history {
+    use super::*;
+
+    /// `record_call` used `if let Ok(..)`, so a poisoned mutex dropped the entry silently — while
+    /// `session_call_count` (#99) and `agent_history` (#89) were both fixed to RECOVER from that same
+    /// poison. The readers kept answering and the history quietly stopped growing, which is worse than
+    /// the zero #99 fixed: a frozen count looks right.
+    #[test]
+    fn a_poisoned_history_still_records_the_call() {
+        let t = IrisTools::new_with_toolset(None, Toolset::Interop).expect("build");
+        t.record_call("iris_query", true);
+        assert_eq!(
+            t.history.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            1,
+            "control: recording works before the mutex is poisoned"
+        );
+
+        // Poison it the way a panicking tool would: panic while holding the guard.
+        let h = std::sync::Arc::clone(&t.history);
+        let _ = std::thread::spawn(move || {
+            let _guard = h.lock().unwrap();
+            panic!("a tool panicked while holding the call history");
+        })
+        .join();
+        assert!(
+            t.history.lock().is_err(),
+            "the mutex must really be poisoned or this test proves nothing"
+        );
+
+        t.record_call("iris_compile", false);
+        let guard = t.history.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            guard.len(),
+            2,
+            "the call after the poison was dropped — agent_stats would under-report for the rest of \
+             the process while still looking plausible"
+        );
+        assert_eq!(
+            guard.back().map(|e| e.tool.as_str()),
+            Some("iris_compile"),
+            "the recorded entry must be the one just made"
+        );
     }
 }
