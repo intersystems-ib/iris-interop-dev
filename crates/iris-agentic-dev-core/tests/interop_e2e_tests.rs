@@ -477,14 +477,49 @@ fn test_lookup_crud() {
     let xml = ex["xml"].as_str().unwrap_or("");
     assert!(!xml.is_empty(), "export must return the XML");
 
-    // delete keys
+    // Delete the keys. The response used to be DISCARDED here, which made everything after it
+    // vacuous: the round-trip assertions below compare each value against what the SET step wrote,
+    // so a delete that silently failed left them passing while the import proved nothing. This test
+    // guards #6 (import failed 7/7 with <SYNTAX>), and it could have gone green with import still
+    // broken.
     for key in &["Key1", "Key2", "Key3"] {
         let responses = mcp_exchange(&[
             serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
             serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
             serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"iris_lookup_manage","arguments":{"action":"delete","table":table,"key":key,"namespace":ns}}}),
         ]);
-        let _ = find_response(&responses, 2);
+        let d = parse_tool_text(&find_response(&responses, 2).expect("no delete response"));
+        assert_eq!(d["success"], true, "delete {key} failed: {d}");
+    }
+
+    // THE PRECONDITION, and the reason the round-trip below means anything: the keys really are
+    // gone. `iris_lookup_manage action=get` answers KEY_NOT_FOUND for a key that is absent, so a
+    // later get returning the original value can only be the import's work.
+    for key in &["Key1", "Key2", "Key3"] {
+        let responses = mcp_exchange(&[
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
+            serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"iris_lookup_manage","arguments":{"action":"get","table":table,"key":key,"namespace":ns}}}),
+        ]);
+        let g =
+            parse_tool_text(&find_response(&responses, 2).expect("no post-delete get response"));
+        assert_eq!(
+            g["success"], false,
+            "{key} is still readable after delete, so the import round-trip below would pass \
+             without importing anything: {g}"
+        );
+        // MEASURED against live IRIS, not reasoned: once the LAST key is deleted the table reports
+        // TABLE_NOT_FOUND, not KEY_NOT_FOUND. `^Ens.LookupTable(table)` is a global subtree, so
+        // removing its final subscript removes the table node itself and `$DATA` goes to 0. Both
+        // codes mean the same thing here — the value is not readable — and which one arrives depends
+        // on how many keys are left, so accepting only one of them made this assertion wrong on the
+        // first CI run.
+        let code = g["error_code"].as_str().unwrap_or_default();
+        assert!(
+            code == "KEY_NOT_FOUND" || code == "TABLE_NOT_FOUND",
+            "expected the deleted {key} to be unreadable (KEY_NOT_FOUND, or TABLE_NOT_FOUND once \
+             the last key went with the table), got: {g}"
+        );
     }
 
     // import and verify round-trip — issue #6: this failed 7/7 with <SYNTAX>
