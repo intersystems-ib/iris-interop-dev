@@ -267,21 +267,49 @@ static INTEROP_NS_CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::
 /// `$EXTRACT(tNs)'="%"` skips system namespaces; `Continue` is deliberately
 /// avoided — it must be the last command on its line, which a one-line For
 /// body cannot honor.
+/// The probe for "this namespace has Interoperability". ONE spelling, used by the pre-flight and
+/// by the hint that lists the alternatives, so the two cannot disagree about what
+/// interop-enabled means.
+const INTEROP_PROBE_SQL: &str =
+    "SELECT COUNT(*) AS n FROM %Dictionary.CompiledClass WHERE Name = 'Ens.Director'";
+
+/// Which namespaces on this instance have Interoperability, for the "you are in the wrong
+/// namespace" hint.
+///
+/// #282: this used to run `%SYS.Namespace.ListAll` through `execute_via_generator`, which PUTs and
+/// compiles a scratch class. That made `iris_interop_query` and `iris_credential_list` write on a
+/// failure path — including on a Live instance, where the write gate exists to prevent exactly
+/// that — while both advertised `readOnlyHint = true`. Diagnosing a mistake must not modify the
+/// instance. Both halves are now reads: the Atelier root descriptor lists the namespaces, and the
+/// same SELECT the pre-flight uses answers the per-namespace question.
+///
+/// The list reflects ACCESSIBILITY, not raw existence — `accessible_namespaces` is filtered to
+/// what these credentials can reach — which is why the hint says "visible to these credentials".
+/// The generator version filtered the same way in practice, silently swallowing a failed
+/// `Set $NAMESPACE`, but claimed to list the instance.
+///
+/// Costs one round trip per namespace instead of one in total. That is acceptable here and
+/// nowhere else: this runs only after the pre-flight has already decided the answer is "no
+/// interop in this namespace", so it is a diagnostic on a path that has already failed.
 async fn list_interop_namespaces(
     iris: &IrisConnection,
-    ns: &str,
     client: &reqwest::Client,
 ) -> Option<String> {
-    const CODE: &str = r#"Set tSaved=$NAMESPACE,tOut=""
-Try { Do ##class(%SYS.Namespace).ListAll(.arr) } Catch ex {}
-Set tNs="" For { Set tNs=$ORDER(arr(tNs)) Quit:tNs=""  If $EXTRACT(tNs)'="%" { Try { Set $NAMESPACE=tNs If ##class(%Dictionary.CompiledClass).%ExistsId("Ens.Director") { Set tOut=tOut_$SELECT(tOut="":"",1:",")_tNs } } Catch ex {} } }
-Set $NAMESPACE=tSaved
-Write tOut"#;
-    iris.execute_via_generator(CODE, ns, client)
-        .await
-        .ok()
-        .map(|out| out.trim().to_string())
-        .filter(|out| !out.is_empty())
+    let candidates = iris.accessible_namespaces(client).await?;
+    let mut found: Vec<String> = Vec::new();
+    for cand in candidates {
+        // `%`-prefixed namespaces are system namespaces and never interop targets. Skipped
+        // before the query so a probe failure there cannot be mistaken for a real answer.
+        if cand.starts_with('%') {
+            continue;
+        }
+        if let Ok(resp) = iris.query(INTEROP_PROBE_SQL, vec![], &cand, client).await {
+            if resp["result"]["content"][0]["n"].as_i64().unwrap_or(0) >= 1 {
+                found.push(cand);
+            }
+        }
+    }
+    (!found.is_empty()).then(|| found.join(","))
 }
 
 /// Issue #5: fail fast and self-describing when the target namespace has no
@@ -301,14 +329,7 @@ pub async fn ensure_interop_namespace(
         return None;
     }
     let client = IrisConnection::http_client().ok()?;
-    let probe = iris
-        .query(
-            "SELECT COUNT(*) AS n FROM %Dictionary.CompiledClass WHERE Name = 'Ens.Director'",
-            vec![],
-            ns,
-            &client,
-        )
-        .await;
+    let probe = iris.query(INTEROP_PROBE_SQL, vec![], ns, &client).await;
     let n = match &probe {
         Ok(resp) => resp["result"]["content"][0]["n"].as_i64()?,
         // #102: ONE arm, NINE tools. This pre-flight already runs ahead of iris_production,
@@ -327,11 +348,11 @@ pub async fn ensure_interop_namespace(
         }
         return None;
     }
-    let available = list_interop_namespaces(iris, ns, &client).await;
+    let available = list_interop_namespaces(iris, &client).await;
     let hint = match &available {
         Some(list) => format!(
-            "Pass namespace= one of the interop-enabled namespaces on this instance: {list}. \
-             Omitting namespace targets the connection namespace '{}'.",
+            "Pass namespace= one of the interop-enabled namespaces visible to these \
+             credentials: {list}. Omitting namespace targets the connection namespace '{}'.",
             iris.namespace
         ),
         None => format!(
@@ -4770,6 +4791,99 @@ mod interop_preflight_tests {
             rmcp::model::RawContent::Text(t) => Some(serde_json::from_str(&t.text).unwrap()),
             _ => panic!("expected text content"),
         }
+    }
+
+    fn n_rows(n: i64) -> ResponseTemplate {
+        ResponseTemplate::new(200)
+            .set_body_json(serde_json::json!({"result": {"content": [{"n": n}]}}))
+    }
+
+    /// #282: the "you are in the wrong namespace" hint must NOT write.
+    ///
+    /// It used to list the instance's interop namespaces by PUTting and compiling a scratch class
+    /// through `execute_via_generator`, which made `iris_interop_query` and `iris_credential_list`
+    /// write on a failure path — on a Live instance too, where the write gate exists to stop
+    /// exactly that — while both advertised `readOnlyHint = true`.
+    ///
+    /// Asserts three things, because the hint being right is not the same as the hint being a
+    /// read: the list is correct, `%SYS` is skipped, and the server saw no write of any kind.
+    #[test]
+    fn the_wrong_namespace_hint_is_built_without_writing() {
+        rt().block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/api/atelier/$"))
+                .respond_with(root(&["APP", "USER", "%SYS", "HSCUSTOM"]))
+                .mount(&server)
+                .await;
+            for (ns, n) in [("APP", 1), ("USER", 0), ("HSCUSTOM", 1)] {
+                Mock::given(method("POST"))
+                    .and(path_regex(format!(r".*/{ns}/action/query$")))
+                    .respond_with(n_rows(n))
+                    .mount(&server)
+                    .await;
+            }
+            let iris = IrisConnection::new(
+                server.uri(),
+                "APP",
+                "_SYSTEM",
+                "SYS",
+                DiscoverySource::EnvVar,
+            );
+            let r = ensure_interop_namespace(&iris, "USER")
+                .await
+                .expect("USER has no interop, so the pre-flight must answer")
+                .unwrap();
+            let v: serde_json::Value = match &r.content[0].raw {
+                rmcp::model::RawContent::Text(t) => serde_json::from_str(&t.text).unwrap(),
+                _ => panic!("expected text content"),
+            };
+            assert_eq!(v["error_code"], "NAMESPACE_NOT_INTEROP", "{v}");
+            assert_eq!(
+                v["interop_namespaces"],
+                serde_json::json!(["APP", "HSCUSTOM"]),
+                "the hint must name the namespaces that DO have interop: {v}"
+            );
+            assert!(
+                v["hint"]
+                    .as_str()
+                    .unwrap()
+                    .contains("visible to these credentials"),
+                "the list is accessibility-filtered and must say so: {v}"
+            );
+
+            let seen = server.received_requests().await.expect("recorded requests");
+            // The control: the loop really ran. Without this, "no writes" would also be true of a
+            // lister that made no requests at all.
+            let queried: Vec<String> = seen
+                .iter()
+                .filter(|r| r.method == wiremock::http::Method::POST)
+                .map(|r| r.url.path().to_string())
+                .collect();
+            assert!(
+                queried.iter().any(|p| p.contains("/APP/action/query"))
+                    && queried.iter().any(|p| p.contains("/HSCUSTOM/action/query")),
+                "both interop namespaces must have been probed, saw {queried:?}"
+            );
+            assert!(
+                !queried.iter().any(|p| p.contains("SYS")),
+                "%SYS is a system namespace and must be skipped, saw {queried:?}"
+            );
+            // The assertion this test exists for.
+            for r in &seen {
+                assert_ne!(
+                    r.method,
+                    wiremock::http::Method::PUT,
+                    "diagnosing a wrong namespace PUT a document to {}",
+                    r.url
+                );
+                assert!(
+                    !r.url.path().contains("/action/compile"),
+                    "diagnosing a wrong namespace compiled something at {}",
+                    r.url
+                );
+            }
+        });
     }
 
     /// The lever: the probe's own 404 now names the namespace, and this pre-flight runs ahead
