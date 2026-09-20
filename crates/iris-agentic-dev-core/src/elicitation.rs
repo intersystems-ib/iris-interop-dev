@@ -104,6 +104,37 @@ impl CheckoutCache {
     }
 }
 
+/// What a [`ElicitationStore::lookup`] found — three outcomes, not two.
+///
+/// `Expired` and `NotFound` are different facts and the caller must be able to say which: one means
+/// "you were too slow", the other means "that id was never here" (a typo, or a restart — the store is
+/// in-memory and is rebuilt empty on every server start). Reporting the first for the second sends the
+/// reader to the wrong remedy.
+#[derive(Debug)]
+pub enum LookupResult {
+    Found(PendingElicitation),
+    /// The entry existed and its 5-minute window has passed. It has been removed.
+    Expired,
+    /// No entry with that id, in this process, ever.
+    NotFound,
+}
+
+impl LookupResult {
+    /// The entry, if there was a live one. For call sites that genuinely do not need to tell the two
+    /// miss cases apart — a test asserting presence, say. Production paths should match instead, so
+    /// the distinction reaches the user.
+    pub fn found(self) -> Option<PendingElicitation> {
+        match self {
+            LookupResult::Found(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    pub fn is_found(&self) -> bool {
+        matches!(self, LookupResult::Found(_))
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct ElicitationStore(Arc<Mutex<HashMap<String, PendingElicitation>>>);
 
@@ -135,15 +166,29 @@ impl ElicitationStore {
         id
     }
 
-    /// Look up a pending elicitation by id. Returns None if expired or missing.
-    pub fn lookup(&self, id: &str) -> Option<PendingElicitation> {
+    /// Look up a pending elicitation by id.
+    ///
+    /// #305: this returned `Option`, which collapsed three different facts — the id expired, the id
+    /// never existed, or the entry was lost when the server restarted. Both callers then answered
+    /// `ELICITATION_EXPIRED` for all of them, a claim about elapsed time that is false for two of the
+    /// three, and one that tells the user to retry faster when that is not the remedy. The messages
+    /// even hedged — "expired or not found" — while the code asserted it knew.
+    ///
+    /// `log_store::get` already refuses to do this, with the note "Does NOT evict — preserves
+    /// LOG_EXPIRED vs LOG_NOT_FOUND distinction". Same repo, same shape of state; this now matches it.
+    pub fn lookup(&self, id: &str) -> LookupResult {
         let mut store = self.0.lock().unwrap();
-        let entry = store.get(id)?;
-        if Instant::now() > entry.expires_at {
-            store.remove(id);
-            return None;
+        match store.get(id) {
+            None => LookupResult::NotFound,
+            Some(entry) => {
+                if Instant::now() > entry.expires_at {
+                    store.remove(id);
+                    LookupResult::Expired
+                } else {
+                    LookupResult::Found(entry.clone())
+                }
+            }
         }
-        Some(entry.clone())
     }
 
     /// Remove a pending elicitation.
@@ -189,7 +234,7 @@ mod tests {
             None,
             "USER",
         );
-        let pending = store.lookup(&id).expect("should find it");
+        let pending = store.lookup(&id).found().expect("should find it");
         assert_eq!(pending.document, "Foo.cls");
         assert_eq!(pending.namespace, "USER");
         assert_eq!(pending.content.as_deref(), Some("content"));
@@ -198,7 +243,10 @@ mod tests {
     #[test]
     fn test_lookup_missing_returns_none() {
         let store = ElicitationStore::new();
-        assert!(store.lookup("nonexistent-id").is_none());
+        assert!(matches!(
+            store.lookup("nonexistent-id"),
+            LookupResult::NotFound
+        ));
     }
 
     #[test]
@@ -212,7 +260,7 @@ mod tests {
             "USER",
         );
         store.clear(&id);
-        assert!(store.lookup(&id).is_none());
+        assert!(!store.lookup(&id).is_found());
     }
 
     #[test]
@@ -239,7 +287,7 @@ mod tests {
             Some("CheckIn".into()),
             "MYNS",
         );
-        let p = store.lookup(&id).unwrap();
+        let p = store.lookup(&id).found().unwrap();
         assert!(matches!(p.action, ElicitationAction::ScmExecute));
         assert_eq!(p.scm_action_id.as_deref(), Some("CheckIn"));
         assert_eq!(p.namespace, "MYNS");
@@ -383,7 +431,7 @@ mod tests {
         };
         store.0.lock().unwrap().insert(id.clone(), entry);
         // Lookup should return None and remove the entry
-        assert!(store.lookup(&id).is_none());
+        assert!(matches!(store.lookup(&id), LookupResult::Expired));
         // Entry should be removed from the store
         assert!(store.0.lock().unwrap().get(&id).is_none());
     }
@@ -411,8 +459,10 @@ mod tests {
         let removed = store.sweep();
         assert_eq!(removed, 1, "should have removed exactly 1 expired entry");
         // Expired entry gone, fresh entry still there
-        assert!(store.lookup(&expired_id).is_none());
-        assert!(store.lookup(&fresh_id).is_some());
+        // NotFound, not Expired: sweep() REMOVED the entry, so its expiry is no longer knowable.
+        // The two are different facts and this is the one that is true after a sweep.
+        assert!(matches!(store.lookup(&expired_id), LookupResult::NotFound));
+        assert!(store.lookup(&fresh_id).is_found());
     }
 
     // ── CheckoutCache ─────────────────────────────────────────────────────────

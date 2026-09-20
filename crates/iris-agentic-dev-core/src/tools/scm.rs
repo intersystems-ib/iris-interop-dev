@@ -130,11 +130,22 @@ pub async fn handle_iris_source_control(
 
     // Handle elicitation resume
     if let (Some(eid), Some(answer)) = (&p.elicitation_id, &p.answer) {
-        let Some(pending) = elicitation_store.lookup(eid) else {
-            return err_json(
+        // #305: expired and never-existed are different facts and the caller can act on the
+        // difference — retry the dialog, versus check the id you sent.
+        let pending = match elicitation_store.lookup(eid) {
+            crate::elicitation::LookupResult::Found(p) => p,
+            crate::elicitation::LookupResult::Expired => return err_json(
                 "ELICITATION_EXPIRED",
-                "Elicitation session expired or not found",
-            );
+                "This elicitation has expired — they are held for 5 minutes. Re-run the action \
+                     to get a new dialog.",
+            ),
+            crate::elicitation::LookupResult::NotFound => {
+                return err_json(
+                    "ELICITATION_NOT_FOUND",
+                    "No elicitation with that id. Check the `elicitation_id` you sent; note the \
+                     store is in-memory, so a server restart discards pending dialogs.",
+                )
+            }
         };
         elicitation_store.clear(eid);
         let action_id = pending.scm_action_id.as_deref().unwrap_or("");

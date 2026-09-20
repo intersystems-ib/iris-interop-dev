@@ -714,7 +714,10 @@ async fn handle_put(
 
     // Elicitation resume — user answered a prior SCM dialog
     if let (Some(eid), Some(answer)) = (&p.elicitation_id, &p.elicitation_answer) {
-        if let Some(pending) = elicitation_store.lookup(eid) {
+        // #305: ONE lookup, matched once. Calling it twice would misreport: the first call removes
+        // an expired entry, so the second sees NotFound and the user is told the id never existed.
+        let looked_up = elicitation_store.lookup(eid);
+        if let crate::elicitation::LookupResult::Found(pending) = looked_up {
             elicitation_store.clear(eid);
             if answer.to_lowercase() != "yes" {
                 return crate::tools::envelope::fail("WRITE_ABORTED", "User declined checkout");
@@ -759,10 +762,20 @@ async fn handle_put(
             )
             .await;
         }
-        return err_json(
-            "ELICITATION_EXPIRED",
-            "Elicitation session expired or not found",
-        );
+        // Not found: say WHICH miss it was — the remedies differ. `looked_up` was consumed by the
+        // `if let` above only on the Found arm, so this is the same single lookup, not a second one.
+        return match looked_up {
+            crate::elicitation::LookupResult::Expired => err_json(
+                "ELICITATION_EXPIRED",
+                "This elicitation has expired — they are held for 5 minutes. Re-run the write to \
+                 get a new dialog.",
+            ),
+            _ => err_json(
+                "ELICITATION_NOT_FOUND",
+                "No elicitation with that id. Check the `elicitation_id` you sent; note the store \
+                 is in-memory, so a server restart discards pending dialogs.",
+            ),
+        };
     }
 
     let name = match require_name(&p, "put") {
