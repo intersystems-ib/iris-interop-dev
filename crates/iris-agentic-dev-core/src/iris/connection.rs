@@ -146,6 +146,21 @@ pub enum AtelierVersion {
 }
 
 impl AtelierVersion {
+    /// The `api` level from the Atelier root descriptor, mapped to the URL shape every later request
+    /// uses.
+    ///
+    /// #288: this match existed THREE times — twice in `discovery.rs` and once in
+    /// [`IrisConnection::probe`] — and all three have to agree or a connection addresses the wrong
+    /// endpoints. Absent, null or unparseable means V1: the oldest shape, and the safe assumption
+    /// for a server that did not say.
+    pub(crate) fn from_api_level(api: Option<u64>) -> Self {
+        match api {
+            Some(v) if v >= 8 => Self::V8,
+            Some(v) if v >= 2 => Self::V2,
+            _ => Self::V1,
+        }
+    }
+
     pub fn version_str(&self) -> &'static str {
         match self {
             AtelierVersion::V8 => "v8",
@@ -339,12 +354,13 @@ impl IrisConnection {
                 if let Ok(body) = resp.json::<serde_json::Value>().await {
                     tracing::debug!("Atelier root response: {}", body);
                     let content = &body["result"]["content"];
+                    // NOTE: deliberately NOT `fingerprint_atelier_root`. That helper refuses a
+                    // descriptor whose version does not name IRIS, which is right when DECIDING
+                    // whether to adopt a connection. `probe` runs against a connection the user
+                    // configured explicitly: its job is to record what the server reports, not to
+                    // veto it. Only the api mapping is shared (#288).
                     self.version = content["version"].as_str().map(|v| v.to_string());
-                    self.atelier_version = match content["api"].as_u64() {
-                        Some(v) if v >= 8 => AtelierVersion::V8,
-                        Some(v) if v >= 2 => AtelierVersion::V2,
-                        _ => AtelierVersion::V1,
-                    };
+                    self.atelier_version = AtelierVersion::from_api_level(content["api"].as_u64());
                 }
             } else {
                 tracing::debug!("Atelier root probe got HTTP {}", status);
@@ -1394,5 +1410,31 @@ mod atelier_http_error_tests {
         // A byte-wise cut inside a multi-byte sequence would panic.
         assert_eq!(truncate_body("  héllo  ", 3), "hél");
         assert_eq!(truncate_body("", 500), "");
+    }
+}
+
+/// #288: the api-level mapping had three copies and no test. It decides the URL shape every later
+/// request uses, so a disagreement between copies meant a connection addressing the wrong endpoints.
+#[cfg(test)]
+mod atelier_version_from_api_level_tests {
+    use super::AtelierVersion;
+
+    #[test]
+    fn the_boundaries_are_where_the_shape_changes() {
+        // Boundaries, because an off-by-one here is the whole failure mode: 8 and 2 are the first
+        // levels of their shape, 7 and 1 the last of the one below.
+        assert_eq!(AtelierVersion::from_api_level(Some(9)), AtelierVersion::V8);
+        assert_eq!(AtelierVersion::from_api_level(Some(8)), AtelierVersion::V8);
+        assert_eq!(AtelierVersion::from_api_level(Some(7)), AtelierVersion::V2);
+        assert_eq!(AtelierVersion::from_api_level(Some(2)), AtelierVersion::V2);
+        assert_eq!(AtelierVersion::from_api_level(Some(1)), AtelierVersion::V1);
+        assert_eq!(AtelierVersion::from_api_level(Some(0)), AtelierVersion::V1);
+    }
+
+    /// A server that did not report an api level gets the OLDEST shape, not the newest. Guessing V8
+    /// for a silent server would address endpoints it does not serve.
+    #[test]
+    fn a_missing_api_level_is_v1_not_v8() {
+        assert_eq!(AtelierVersion::from_api_level(None), AtelierVersion::V1);
     }
 }

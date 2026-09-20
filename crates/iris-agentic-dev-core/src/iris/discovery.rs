@@ -87,6 +87,38 @@ pub enum IrisDiscovery {
     Explained,
 }
 
+/// The Atelier root fingerprint: does this descriptor belong to IRIS, and which api shape does it
+/// speak?
+///
+/// #288: this decision existed twice, once in [`probe_atelier_with_client`] and once in
+/// [`probe_atelier_for_container`], in byte-identical copies that could diverge silently. Measured
+/// before the extraction: replacing the filter with `.filter(|_v| true)` in the first copy failed a
+/// test, and the IDENTICAL change to the second changed nothing — the Docker path could stop
+/// fingerprinting altogether with the suite green.
+///
+/// Only the part that is genuinely common lives here. What each caller does with `None` differs and
+/// stays at the call site: the localhost probe returns `None`, the container probe reports
+/// `FoundUnhealthy(AtelierNotResponding)`. So do the base_url, the `DiscoverySource` and the
+/// superserver port.
+///
+/// The version must NAME IRIS. That is what makes this a fingerprint rather than a parse: any web
+/// server can answer 200 on `/api/atelier/`, and adopting one that is not IRIS is how a probe claims
+/// a connection it cannot use. `IrisConnection::probe` deliberately does NOT use this — see the note
+/// there.
+pub(crate) fn fingerprint_atelier_root(
+    body: &serde_json::Value,
+) -> Option<(String, crate::iris::connection::AtelierVersion)> {
+    let content = &body["result"]["content"];
+    let version = content["version"]
+        .as_str()
+        .filter(|v| v.to_uppercase().contains("IRIS"))
+        .map(|v| v.to_string())?;
+    Some((
+        version,
+        crate::iris::connection::AtelierVersion::from_api_level(content["api"].as_u64()),
+    ))
+}
+
 /// Inner probe using a pre-built HTTP client. Avoids creating a new client per probe (Bug 24).
 async fn probe_atelier_with_client(
     client: &reqwest::Client,
@@ -129,12 +161,7 @@ async fn probe_atelier_with_client(
     }
 
     let body: serde_json::Value = resp.json().await.ok()?;
-    let content = &body["result"]["content"];
-
-    let version = content["version"]
-        .as_str()
-        .filter(|v| v.to_uppercase().contains("IRIS"))
-        .map(|v| v.to_string())?;
+    let (version, atelier_version) = fingerprint_atelier_root(&body)?;
 
     let mut conn = IrisConnection::new(
         base_url,
@@ -144,11 +171,7 @@ async fn probe_atelier_with_client(
         DiscoverySource::LocalhostScan { port },
     );
     conn.version = Some(version);
-    conn.atelier_version = match content["api"].as_u64() {
-        Some(v) if v >= 8 => crate::iris::connection::AtelierVersion::V8,
-        Some(v) if v >= 2 => crate::iris::connection::AtelierVersion::V2,
-        _ => crate::iris::connection::AtelierVersion::V1,
-    };
+    conn.atelier_version = atelier_version;
     Some(conn)
 }
 
@@ -498,13 +521,8 @@ async fn probe_atelier_for_container(
         }
     };
 
-    let content = &body["result"]["content"];
-    let version = match content["version"]
-        .as_str()
-        .filter(|v| v.to_uppercase().contains("IRIS"))
-        .map(|v| v.to_string())
-    {
-        Some(v) => v,
+    let (version, atelier_version) = match fingerprint_atelier_root(&body) {
+        Some(pair) => pair,
         None => return DiscoveryResult::FoundUnhealthy(FailureMode::AtelierNotResponding { port }),
     };
 
@@ -519,11 +537,7 @@ async fn probe_atelier_for_container(
         },
     );
     conn.version = Some(version);
-    conn.atelier_version = match content["api"].as_u64() {
-        Some(v) if v >= 8 => crate::iris::connection::AtelierVersion::V8,
-        Some(v) if v >= 2 => crate::iris::connection::AtelierVersion::V2,
-        _ => crate::iris::connection::AtelierVersion::V1,
-    };
+    conn.atelier_version = atelier_version;
     conn.port_superserver = port_ss;
     DiscoveryResult::Connected(conn)
 }
@@ -775,5 +789,82 @@ mod tests {
             }
             other => eprintln!("container '{target}' found: {other:?}"),
         }
+    }
+}
+
+/// #288: the fingerprint had two byte-identical copies and only one was covered — the mutation that
+/// killed a test in one changed nothing in the other. Now there is one, and these are its tests.
+#[cfg(test)]
+mod fingerprint_atelier_root_tests {
+    use super::fingerprint_atelier_root;
+    use crate::iris::connection::AtelierVersion;
+
+    fn root(version: serde_json::Value, api: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"result": {"content": {"version": version, "api": api}}})
+    }
+
+    #[test]
+    fn a_descriptor_naming_iris_is_adopted_with_its_api_shape() {
+        let (v, a) = fingerprint_atelier_root(&root("IRIS for UNIX 2026.1".into(), 8.into()))
+            .expect("names IRIS");
+        assert_eq!(v, "IRIS for UNIX 2026.1");
+        assert_eq!(a, AtelierVersion::V8);
+    }
+
+    /// The match is on the UPPERCASED version, so case is not part of the fingerprint.
+    #[test]
+    fn the_fingerprint_is_case_insensitive() {
+        for v in ["iris for unix", "Iris", "InterSystems IRIS"] {
+            assert!(
+                fingerprint_atelier_root(&root(v.into(), 8.into())).is_some(),
+                "{v:?} names IRIS"
+            );
+        }
+    }
+
+    /// The reason this is a fingerprint and not a parse: any web server can answer 200 on
+    /// /api/atelier/, and adopting one that is not IRIS claims a connection that cannot be used.
+    #[test]
+    fn a_descriptor_that_does_not_name_iris_is_refused() {
+        assert!(
+            fingerprint_atelier_root(&root("Cache for Windows 2018.1".into(), 2.into())).is_none()
+        );
+        assert!(fingerprint_atelier_root(&root("nginx/1.25".into(), 8.into())).is_none());
+    }
+
+    /// Absent, null, or not a string — none of these name IRIS, and each arrives from a real server
+    /// that answered 200 with something else.
+    #[test]
+    fn a_missing_or_non_string_version_is_refused() {
+        assert!(
+            fingerprint_atelier_root(&serde_json::json!({"result": {"content": {"api": 8}}}))
+                .is_none()
+        );
+        assert!(fingerprint_atelier_root(&root(serde_json::Value::Null, 8.into())).is_none());
+        assert!(fingerprint_atelier_root(&root(2026.into(), 8.into())).is_none());
+        assert!(fingerprint_atelier_root(&serde_json::json!({})).is_none());
+    }
+
+    /// The api level rides along, including the silent-server default.
+    #[test]
+    fn the_api_shape_comes_from_the_same_descriptor() {
+        let cases = [
+            (8u64, AtelierVersion::V8),
+            (2, AtelierVersion::V2),
+            (1, AtelierVersion::V1),
+        ];
+        for (api, want) in cases {
+            let (_, a) = fingerprint_atelier_root(&root("IRIS".into(), api.into())).expect("IRIS");
+            assert_eq!(a, want, "api {api}");
+        }
+        let (_, a) = fingerprint_atelier_root(
+            &serde_json::json!({"result": {"content": {"version": "IRIS"}}}),
+        )
+        .expect("IRIS with no api level");
+        assert_eq!(
+            a,
+            AtelierVersion::V1,
+            "a silent server gets the oldest shape"
+        );
     }
 }
