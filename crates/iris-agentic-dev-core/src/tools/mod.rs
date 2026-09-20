@@ -4286,12 +4286,12 @@ const GENERATOR_WRITE_TOOLS: &[&str] = &[
     "hl7_schema_inspect",
     "hl7_schema_list",
     "iris_business_rule_info",
-    // Error path only, via the `ensure_interop_namespace` preflight: the "this namespace has no
-    // interop" branch calls `list_interop_namespaces`, which needs $NAMESPACE switching and so
-    // goes through the generator. A tool that writes only when it fails still writes.
-    "iris_credential_list",
+    // iris_credential_list and iris_interop_query were here too. They reached the generator ONLY
+    // through the `ensure_interop_namespace` preflight, whose hint used to list the instance's
+    // interop namespaces via a scratch class. That lister is now two reads (#282), so both are
+    // honestly read-only again and are deliberately absent from this list. Removing the write beat
+    // relabelling it: diagnosing a mistake must not modify the instance.
     "iris_gateway_query",
-    "iris_interop_query",
     "iris_message_body",
     "iris_production_diff",
     // iris_gateway_query and iris_table_info each already carry an explicit `=> None` arm in
@@ -11466,26 +11466,31 @@ mod tool_annotation_tests {
     ///
     /// Measured before and after the #282 fix, on this tool set:
     ///
-    /// | toolset  | total | RO before | RO after |
-    /// |----------|-------|-----------|----------|
-    /// | interop  |    30 |        17 |        6 |
-    /// | nostub   |    55 |        43 |       31 |
-    /// | merged   |    51 |        38 |       26 |
-    /// | baseline |    59 |        47 |       35 |
+    /// | toolset  | total | RO before | RO relabelled | RO now |
+    /// |----------|-------|-----------|---------------|--------|
+    /// | interop  |    30 |        17 |             6 |      8 |
+    /// | nostub   |    55 |        43 |            31 |     33 |
+    /// | merged   |    51 |        38 |            26 |     28 |
+    /// | baseline |    59 |        47 |            35 |     37 |
     ///
-    /// interop moves by 11 rather than 12 because `resolve_dynamic_dispatch` is not in its
-    /// keep-list. The `interop` row's before-figures are corroborated independently: the
-    /// v0.25.0 release handshake advertised 30 tools with 17 `readOnlyHint=true`.
+    /// "RO relabelled" is the figure after twelve tools were reclassified as writers; "RO now" is
+    /// after the `ensure_interop_namespace` hint stopped writing, which gave `iris_interop_query`
+    /// and `iris_credential_list` back their honest read-only status (+2 in every toolset).
+    ///
+    /// interop moved by 11 rather than 12 at the relabelling step because
+    /// `resolve_dynamic_dispatch` is not in its keep-list. The `interop` row's before-figure is
+    /// corroborated independently: the v0.25.0 release handshake advertised 30 tools with 17
+    /// `readOnlyHint=true`.
     ///
     /// A LEGITIMATE new tool changes these numbers. Re-record deliberately, having checked which
     /// side it belongs on — never to make a red go away.
     #[test]
     fn the_read_only_split_is_pinned_per_toolset() {
         for (label, ts, total, ro_expected) in [
-            ("interop", Toolset::Interop, 30_usize, 6_usize),
-            ("nostub", Toolset::Nostub, 55, 31),
-            ("merged", Toolset::Merged, 51, 26),
-            ("baseline", Toolset::Baseline, 59, 35),
+            ("interop", Toolset::Interop, 30_usize, 8_usize),
+            ("nostub", Toolset::Nostub, 55, 33),
+            ("merged", Toolset::Merged, 51, 28),
+            ("baseline", Toolset::Baseline, 59, 37),
         ] {
             let t = IrisTools::new_with_toolset(None, ts).expect("build");
             let all = t.advertised_tools();
