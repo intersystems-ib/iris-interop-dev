@@ -309,6 +309,7 @@ pub mod concurrency;
 pub mod coverage;
 pub mod dict;
 pub mod doc;
+pub mod doc_search;
 pub mod envelope;
 pub mod execute_method;
 pub mod formal_spec;
