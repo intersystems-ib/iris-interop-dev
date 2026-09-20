@@ -6477,7 +6477,7 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
     }
 
     #[tool(
-        description = "Read, write, delete, or check an IRIS document. mode='get' fetches source, mode='put' writes (with automatic SCM checkout if needed), mode='delete' removes, mode='head' checks existence. name needs the Atelier type suffix — 'MyApp.Patient.cls', not 'MyApp.Patient' (put adds it for you when the content starts with `Class <name>` or `ROUTINE <name>`). Supports batch ops via 'names' array and elicitation_id/elicitation_answer for SCM dialog resumption. For large source, paginate get with max_bytes + offset (response includes next_offset), or prefer docs_introspect for signatures/structure instead of full source. With compile=true, compile_errors is cross-checked against IRIS's own `Detected N errors` tally — `errors_incomplete: true` means the list is a SUBSET and `compile_console` holds the rest. No Python required."
+        description = "Read, write, delete, or check an IRIS document. mode='get' fetches source, mode='put' writes (with automatic SCM checkout if needed), mode='delete' removes, mode='head' checks existence. POSITIONAL EDITS instead of a full re-upload: mode='insert_lines' inserts `lines` BEFORE the 1-based line `at` (at = one past the last line appends), and mode='delete_lines' removes `count` lines (default 1) starting at `at`. Both READ the document, edit it and write it back, so they are write-gated exactly like put. `expect` is the text you believe is currently at `at`: REQUIRED for delete_lines and refused on mismatch, because your line numbers came from an earlier read and a delete on the wrong line destroys content — optional for insert_lines, which loses nothing if misplaced. One operation per call: after an edit the lines below it have shifted, and the response returns the new count in `line_edit.lines_after` so you can place the next one. name needs the Atelier type suffix — 'MyApp.Patient.cls', not 'MyApp.Patient' (put adds it for you when the content starts with `Class <name>` or `ROUTINE <name>`). Supports batch ops via 'names' array and elicitation_id/elicitation_answer for SCM dialog resumption. For large source, paginate get with max_bytes + offset (response includes next_offset), or prefer docs_introspect for signatures/structure instead of full source. With compile=true, compile_errors is cross-checked against IRIS's own `Detected N errors` tally — `errors_incomplete: true` means the list is a SUBSET and `compile_console` holds the rest. No Python required."
     )]
     async fn iris_doc(
         &self,
@@ -11121,6 +11121,62 @@ mod schema_normalization_tests {
         assert!(
             !DOCKER_REQUIRED_HINT.to_lowercase().contains("docker run"),
             "DOCKER_REQUIRED hint must not suggest 'docker run' (guides non-Docker users)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod advertised_mode_tests {
+    //! #24: every `DocMode` must be NAMED in the tool description a client actually reads.
+    //!
+    //! `insert_lines` and `delete_lines` were implemented, dispatched, gated and tested — and absent
+    //! from the advertised description, which makes them undiscoverable. A mode no model can find is
+    //! inert however well it works. The mode list had three sources of truth: the enum, the
+    //! unknown-mode error (already derived, #274), and this hardcoded prose. This is the guard for the
+    //! third.
+    use super::*;
+
+    #[test]
+    fn every_doc_mode_is_named_in_the_advertised_description() {
+        use crate::tools::doc::DocMode;
+        let t = IrisTools::new_with_toolset(None, Toolset::Interop).expect("build");
+        let iris_doc = t
+            .advertised_tools()
+            .into_iter()
+            .find(|x| x.name == "iris_doc")
+            .expect("iris_doc is in the interop profile");
+        let desc = iris_doc.description.clone().unwrap_or_default().to_string();
+        // CONTROL: the description was actually read. An empty one would satisfy nothing below but
+        // would also make a `contains` loop vacuous if the list were ever empty.
+        assert!(desc.len() > 100, "description looks unread: {desc:?}");
+        assert!(!DocMode::ALL.is_empty(), "precondition: there are modes");
+        for m in DocMode::ALL {
+            assert!(
+                desc.contains(m.as_str()),
+                "mode '{}' is dispatchable but NOT named in iris_doc's description, so no caller can \
+                 discover it. Description: {desc}",
+                m.as_str()
+            );
+        }
+    }
+
+    /// The two facts that make a positional edit usable rather than dangerous must be advertised, not
+    /// just enforced: that `at` is 1-based, and that `expect` is required for a delete. A caller who
+    /// learns the second only from a refusal has already guessed once.
+    #[test]
+    fn the_description_states_the_two_rules_a_caller_cannot_guess() {
+        let t = IrisTools::new_with_toolset(None, Toolset::Interop).expect("build");
+        let desc = t
+            .advertised_tools()
+            .into_iter()
+            .find(|x| x.name == "iris_doc")
+            .and_then(|x| x.description.clone())
+            .unwrap_or_default()
+            .to_string();
+        assert!(desc.contains("1-based"), "{desc}");
+        assert!(
+            desc.contains("REQUIRED for delete_lines"),
+            "the expect requirement must be advertised: {desc}"
         );
     }
 }
