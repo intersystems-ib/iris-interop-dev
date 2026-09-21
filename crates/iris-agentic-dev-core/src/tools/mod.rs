@@ -5114,14 +5114,25 @@ impl IrisTools {
         let cfg = crate::iris::workspace_config::load_workspace_config(config_file_str.as_deref());
 
         let conn_result = match cfg {
-            None => {
-                // File parse error or missing — set error in state, keep old connection
+            // #312: this arm used to cover BOTH "could not be parsed" and "the file is gone", and
+            // reported the parse message for both. Three outcomes now, each with its own state.
+            Err(e) => {
                 let mut conn = self.connection.lock().unwrap();
-                conn.config_parse_error =
-                    Some("Config file changed but could not be parsed".to_string());
+                conn.config_parse_error = Some(e.message());
                 return;
             }
-            Some(cfg) => {
+            Ok(None) => {
+                // The file was deleted between the change notification and this read. Not a parse
+                // error, and not a reason to invent one — keep the old connection and say so.
+                let mut conn = self.connection.lock().unwrap();
+                conn.config_parse_error = Some(
+                    "The workspace config file was removed after it changed; keeping the previous \
+                     connection. Re-create it, or restart to fall back to the environment."
+                        .to_string(),
+                );
+                return;
+            }
+            Ok(Some(cfg)) => {
                 crate::iris::workspace_config::workspace_config_to_connection(&cfg, "USER")
             }
         };
@@ -7036,8 +7047,22 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
         let workspace_config_json = {
             let ws_path = p.workspace_root.as_deref();
             match crate::iris::workspace_config::load_workspace_config(ws_path) {
-                None => serde_json::Value::Null,
-                Some(ref cfg) => {
+                // #312: an unusable config used to render as `null` here, i.e. identical to "there
+                // is no config file". check_config is the tool a user reaches for precisely when the
+                // connection is not what they expected, so this was the worst place to hide it.
+                Err(e) => serde_json::json!({
+                    "found": true,
+                    "usable": false,
+                    "path": e.path.display().to_string(),
+                    "problem": match e.problem {
+                        crate::iris::workspace_config::ConfigProblem::Unreadable => "unreadable",
+                        crate::iris::workspace_config::ConfigProblem::Unparseable => "unparseable",
+                    },
+                    "detail": e.detail,
+                    "hint": e.message(),
+                }),
+                Ok(None) => serde_json::Value::Null,
+                Ok(Some(ref cfg)) => {
                     let container_name = cfg.container.as_deref().unwrap_or("");
                     let running = !container_name.is_empty()
                         && containers

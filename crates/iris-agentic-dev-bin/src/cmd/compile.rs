@@ -59,11 +59,16 @@ impl CompileCommand {
 
         // Load .iris-agentic-dev.toml — takes precedence over env vars but not CLI flags (FR-006, FR-007).
         let ws_path = std::env::var("OBJECTSCRIPT_WORKSPACE").ok();
+        // #312: a config file that exists and cannot be used is fatal here. Continuing would fall
+        // back to IRIS_HOST/auto-discovery — a DIFFERENT instance than the one the file names — and
+        // `compile` writes, so the failure mode is a class landing in the wrong namespace with
+        // nothing printed at the moment the choice was made.
         let explicit = iris_agentic_dev_core::iris::workspace_config::apply_workspace_config(
             explicit,
             ws_path.as_deref(),
             &self.namespace,
-        );
+        )
+        .map_err(|e| anyhow::anyhow!("{}", e.message()))?;
 
         let iris = match discover_iris(explicit).await {
             IrisDiscovery::Found(c) => c,

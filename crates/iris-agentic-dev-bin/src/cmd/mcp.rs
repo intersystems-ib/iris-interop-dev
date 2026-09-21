@@ -122,12 +122,17 @@ impl McpCommand {
         }
         // _with_path returns the loaded config path so it can be recorded in
         // ConnectionState at startup (not just after hot-reload). Issue #21 / upstream #82.
+        // #312: refuse to START rather than serve against a different instance. Every write tool in
+        // this server would otherwise target whatever auto-discovery finds, while the user believes
+        // the file they wrote is in effect. An explicit --host still bypasses the file entirely, so
+        // this is not a dead end.
         let (explicit, startup_config_path) =
             iris_agentic_dev_core::iris::workspace_config::apply_workspace_config_with_path(
                 explicit,
                 Some(&self.workspace),
                 &self.namespace,
-            );
+            )
+            .map_err(|e| anyhow::anyhow!("{}", e.message()))?;
 
         // #110: the same description a LATER re-probe must target. `discover_iris` consumes
         // its argument, and the CLI-flag / workspace-config connection is not reconstructible
