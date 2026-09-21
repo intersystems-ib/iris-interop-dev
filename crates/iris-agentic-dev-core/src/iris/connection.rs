@@ -897,6 +897,22 @@ impl IrisConnection {
         flags: &str,
         client: &reqwest::Client,
     ) -> anyhow::Result<CompileResult> {
+        self.compile_documents(std::slice::from_ref(&doc_name), namespace, flags, client)
+            .await
+    }
+
+    /// #313: compile SEVERAL documents in one request, which is the shape /action/compile has
+    /// always taken — the singular form above was posting a one-element array. The CLI needs the
+    /// plural to compile an expanded wildcard the way `iris_compile` does: one request, so the
+    /// compiler sees the whole set and resolves dependencies between them, rather than N requests
+    /// whose order decides whether a dependent compiles.
+    pub async fn compile_documents(
+        &self,
+        doc_names: &[&str],
+        namespace: &str,
+        flags: &str,
+        client: &reqwest::Client,
+    ) -> anyhow::Result<CompileResult> {
         let compile_url = self.versioned_ns_url(
             namespace,
             &format!("/action/compile?flags={}", urlencoding::encode(flags)),
@@ -904,7 +920,7 @@ impl IrisConnection {
         let resp = client
             .post(&compile_url)
             .basic_auth(&self.username, Some(&self.password))
-            .json(&serde_json::json!([doc_name]))
+            .json(&serde_json::json!(doc_names))
             .send()
             .await?;
         if !resp.status().is_success() {

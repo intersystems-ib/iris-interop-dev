@@ -5,6 +5,7 @@ use iris_agentic_dev_core::iris::{
     connection::{DiscoverySource, IrisConnection},
     discovery::{discover_iris, IrisDiscovery},
 };
+use iris_agentic_dev_core::tools::wildcard;
 
 #[derive(Args)]
 pub struct CompileCommand {
@@ -81,7 +82,13 @@ impl CompileCommand {
         let target = self.target.as_deref().unwrap_or(".");
 
         // ── .cls file: upload via Atelier PUT then compile via /action/compile ──
-        if target.ends_with(".cls") {
+        //
+        // #313: a target carrying `*` is a PATTERN, never a path, and the suffix test used to win.
+        // `MyApp.*.cls` is a spelling `iris_compile` documents and accepts, and here it was read as
+        // a filename: `reading MyApp.*.cls: No such file or directory`. The scope rule and the cap
+        // could not fire on it, because the branch that applies them was never reached — a guard
+        // made unreachable by a sibling condition, not by anything wrong with the guard.
+        if target.ends_with(".cls") && !target.contains('*') {
             let cls_text =
                 std::fs::read_to_string(target).with_context(|| format!("reading {}", target))?;
             let cls_name = cls_text
@@ -164,6 +171,105 @@ impl CompileCommand {
                 output_result(&result, &self.format);
                 std::process::exit(1);
             }
+        } else if doc_name.contains('*') {
+            // #313: the same guards `iris_compile` applies, from the same code. Before this the
+            // pattern went straight to /action/compile with no scope rule, no cap and no count.
+            // What that actually did was only ever inferred; measured against a live instance:
+            // Atelier expands it SERVER-SIDE, so the compile happened — and a pattern matching
+            // NOTHING came back with `errors: []` and "Compilation finished successfully", i.e.
+            // a typo'd package reported as a successful compile, exit code 0.
+            let targets =
+                match wildcard::expand_compile_wildcard(&iris, &client, &self.namespace, &doc_name)
+                    .await
+                {
+                    Ok(wildcard::ExpandedTargets::Unqualified) => {
+                        fail(
+                            &self.format,
+                            "SCOPE_REQUIRED",
+                            &format!(
+                            "target '{doc_name}' has nothing before its first '*', so it names no \
+                             package and would select on the tail alone — in namespace {} that is \
+                             up to every class the namespace holds, compiled in one request. \
+                             Qualify it with a package: 'MyApp.*', 'MyApp.Sub.*.cls', or name a \
+                             single document. Nothing was compiled.",
+                            self.namespace
+                        ),
+                            target,
+                            &self.namespace,
+                        );
+                    }
+                    Ok(wildcard::ExpandedTargets::TooBroad { matched }) => {
+                        fail(
+                            &self.format,
+                            "TOO_BROAD",
+                            &format!(
+                            "target '{doc_name}' matches {matched} documents in namespace {} — \
+                             more than the {} one wildcard compile may queue. Nothing was \
+                             compiled. Name a narrower package (add the next level: 'Pkg.Sub.*') \
+                             or compile the documents one at a time.",
+                            self.namespace,
+                            wildcard::WILDCARD_EXPANSION_CAP
+                        ),
+                            target,
+                            &self.namespace,
+                        );
+                    }
+                    Ok(wildcard::ExpandedTargets::Expanded {
+                        targets, scanned, ..
+                    }) => {
+                        if targets.is_empty() {
+                            // The one the old code could not report at all: Atelier answers a
+                            // no-match wildcard with success, so the CLI printed success and
+                            // exited 0 for a typo.
+                            fail(
+                                &self.format,
+                                "NOT_FOUND",
+                                &format!(
+                                "no CLS document matches '{doc_name}' in namespace {} ({scanned} \
+                                 name(s) scanned). Nothing was compiled. The listing covers \
+                                 CLASSES only, so a .mac/.int/.inc routine is never matched by a \
+                                 wildcard — compile one by its exact name. Hidden and generated \
+                                 classes are also absent from it, and are not compiled by a \
+                                 wildcard even when the pattern is passed straight to IRIS.",
+                                self.namespace
+                            ),
+                                target,
+                                &self.namespace,
+                            );
+                        }
+                        targets
+                    }
+                    Err(unavailable) => {
+                        fail(
+                            &self.format,
+                            "LISTING_UNAVAILABLE",
+                            &format!(
+                            "could not read the class listing for namespace {}, so the wildcard \
+                             '{doc_name}' could not be expanded: {}. Nothing was compiled — the \
+                             cap and the scope rule cannot be applied without it. Compile a \
+                             single document by its exact name, which needs no listing. Listing \
+                             URL: {}",
+                            self.namespace, unavailable.detail, unavailable.url
+                        ),
+                            target,
+                            &self.namespace,
+                        );
+                    }
+                };
+            let refs: Vec<&str> = targets.iter().map(String::as_str).collect();
+            let compile_result = iris
+                .compile_documents(&refs, &self.namespace, &self.flags, &client)
+                .await
+                .context("compile request failed")?;
+            let mut result = compile_result_to_json(&compile_result, target, &self.namespace);
+            // The count the pass-through could never report. A wildcard that compiled 1 document
+            // when you expected 40 is the case this exists to make visible.
+            result["expanded"] = serde_json::json!(targets.len());
+            result["targets"] = serde_json::json!(targets);
+            output_result(&result, &self.format);
+            if !compile_result.success() {
+                std::process::exit(1);
+            }
         } else {
             let compile_result = iris
                 .compile_document(&doc_name, &self.namespace, &self.flags, &client)
@@ -177,6 +283,21 @@ impl CompileCommand {
         }
         Ok(())
     }
+}
+
+/// #313: render a refusal the way the tool's envelope does — an `error_code` a script can branch
+/// on, and a message that says what was NOT done. Exits 1; nothing has been compiled at any call
+/// site that reaches here.
+fn fail(format: &str, code: &str, message: &str, target: &str, namespace: &str) -> ! {
+    let result = serde_json::json!({
+        "success": false,
+        "error_code": code,
+        "error": message,
+        "target": target,
+        "namespace": namespace,
+    });
+    output_result(&result, format);
+    std::process::exit(1);
 }
 
 fn compile_result_to_json(r: &CompileResult, target: &str, namespace: &str) -> serde_json::Value {
@@ -205,7 +326,18 @@ fn output_result(result: &serde_json::Value, format: &str) {
     if format == "json" {
         println!("{}", result);
     } else if result["success"] == true {
-        println!("✓ Compiled: {}", result["target"].as_str().unwrap_or(""));
+        // #313: the count belongs in TEXT mode too — it is the default format, and a wildcard that
+        // compiled 1 document when you expected 40 is the case the expansion exists to make
+        // visible. Absent for a literal target, which has nothing to count.
+        match result["expanded"].as_u64() {
+            Some(n) => println!(
+                "✓ Compiled: {} ({} document{})",
+                result["target"].as_str().unwrap_or(""),
+                n,
+                if n == 1 { "" } else { "s" }
+            ),
+            None => println!("✓ Compiled: {}", result["target"].as_str().unwrap_or("")),
+        }
     } else {
         eprintln!(
             "✗ Error [{}]: {}",

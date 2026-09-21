@@ -327,6 +327,7 @@ pub mod sql_lint;
 pub mod sql_mode;
 pub mod symbols_local;
 pub mod unittest_result;
+pub mod wildcard;
 
 pub use doc::{DocMode, IrisDocParams};
 pub use scm::ScmParams;
@@ -5330,122 +5331,64 @@ impl IrisTools {
             }
         }
 
-        // Expand wildcards: resolve "MyApp.*" / "MyApp.*.cls" to matching document names.
-        // Bug 8: use namespace (not iris.namespace) and the correct /docnames/CLS endpoint.
-        // Issue #88: `result.content` elements are OBJECTS on this build, not bare strings —
-        // see `docnames_in_body`. `scanned` is carried so a NOT_FOUND can distinguish "the
-        // pattern matched nothing" from "the listing itself came back empty".
+        // #313: the guarded expansion moved to `tools::wildcard` so the CLI's `compile` reaches
+        // the SAME scope rule, cap and miss-detection. It had none of them, and what the CLI
+        // actually did was only ever inferred here — measured now against a live instance:
+        // Atelier expands `Pkg.*` SERVER-SIDE, so the CLI really did compile the package,
+        // uncapped and uncounted, and answered a pattern that matched NOTHING with
+        // `{"status":{"errors":[]}}` and "Compilation finished successfully".
         let mut scanned = 0usize;
-        // #94: whether the listing was narrowed server-side, and with what. Hoisted out of
-        // the wildcard arm because the NOT_FOUND message below MUST branch on it: once the
-        // listing is filtered, `scanned` counts CANDIDATES, not the namespace.
         let mut listing_narrowed = false;
-        let mut listing_filter_used: Option<&str> = None;
+        let mut listing_filter_used: Option<String> = None;
         let targets: Vec<String> = if p.target.contains('*') {
-            // #88: an unqualified pattern is refused BEFORE the listing is fetched — there
-            // is no expansion to inspect, and no reason to pull 10k names to say so.
-            if wildcard_target_is_unqualified(&p.target) {
-                return unqualified_wildcard_error(&p.target, &namespace);
-            }
-            let list_url = iris.versioned_ns_url(&namespace, "/docnames/CLS");
-            // #94: narrow the listing SERVER-SIDE. `?filter=X` becomes `Name Like '%X%'`
-            // inside the query GetDocNames already runs, so the response is a SUPERSET of
-            // what the client regex selects — see `wildcard_listing_filter`. 1,696,950
-            // bytes -> ~2,066; a wildcard compile 331 ms -> ~45 ms.
-            //
-            // DELIBERATELY NO CACHE, and do not add one. What is left after narrowing is
-            // ~38 ms of server-side index walk that no filter can avoid; a perfect cache
-            // would buy back ~33 ms. In-process invalidation cannot see another MCP process,
-            // a human saving a class in VS Code / Studio / the Portal, an ImportDir or IPM
-            // install, a mapping change, or generated dependents — and any of those inside
-            // the TTL makes `Pkg.*` skip a class while still reporting success:true. That is
-            // the exact failure mode this issue series exists to eliminate; 33 ms does not
-            // buy it. `e2e_compile_wildcard_package` is the regression test.
-            let listing_filter = wildcard_listing_filter(&p.target);
-            let mut fetch_url = match listing_filter {
-                Some(f) => format!("{list_url}?filter={}", urlencoding::encode(f)),
-                None => list_url.clone(),
-            };
-            listing_filter_used = listing_filter;
-            listing_narrowed = listing_filter.is_some();
-            let mut listing = client
-                .get(&fetch_url)
-                .basic_auth(&iris.username, Some(&iris.password))
-                .send()
-                .await;
-            // An Atelier build that rejects the parameter must degrade to exactly today's
-            // behaviour, not to a new failure: retry once, unfiltered.
-            if listing_narrowed && !matches!(&listing, Ok(r) if r.status().is_success()) {
-                fetch_url = list_url.clone();
-                listing_narrowed = false;
-                listing_filter_used = None;
-                listing = client
-                    .get(&fetch_url)
-                    .basic_auth(&iris.username, Some(&iris.password))
-                    .send()
-                    .await;
-            }
-            match listing {
-                Ok(resp) if resp.status().is_success() => {
-                    let body: serde_json::Value = resp.json().await.unwrap_or_default();
-                    // One pass over the listing, not two: `scanned` and the expansion read
-                    // the same Vec (15810 elements on the dev instance).
-                    let names = docnames_in_body(&body);
-                    scanned = names.len();
-                    match expand_wildcard_target(&names, &p.target) {
-                        // Unreachable — the guard above already returned — but the outcome
-                        // is the pure function's to own, not this call site's.
-                        WildcardExpansion::Unqualified => {
-                            return unqualified_wildcard_error(&p.target, &namespace)
-                        }
-                        WildcardExpansion::TooBroad { matched } => {
-                            return too_broad_wildcard_error(&p.target, &namespace, matched)
-                        }
-                        WildcardExpansion::Matched(t) => t,
-                    }
+            match wildcard::expand_compile_wildcard(&iris, client, &namespace, &p.target).await {
+                Ok(wildcard::ExpandedTargets::Unqualified) => {
+                    return unqualified_wildcard_error(&p.target, &namespace)
                 }
-                // #88 follow-up: when the listing is unavailable there is NOTHING to expand
-                // against, so the cap and the scope rule cannot be applied. Falling back to
-                // the raw pattern used to hand `Pkg.*` straight to /action/compile with no
-                // expansion, no count and no cap — the guard silently off exactly when the
-                // instance is unhealthy. A wildcard therefore fails here instead of guessing.
-                other => {
-                    // #93: a 404 here used to become LISTING_UNAVAILABLE, which never said
-                    // the namespace does not exist and never named the ones that do — the
-                    // 404 body is zero bytes, so only a second question can tell them apart.
-                    if let Ok(resp) = &other {
-                        if resp.status().as_u16() == 404 {
-                            if let Some(e) = interop::namespace_missing_error(
-                                &iris,
-                                client,
-                                &namespace,
-                                &fetch_url,
-                                "Nothing was compiled.",
-                            )
-                            .await
-                            {
-                                return e;
-                            }
+                Ok(wildcard::ExpandedTargets::TooBroad { matched }) => {
+                    return too_broad_wildcard_error(&p.target, &namespace, matched)
+                }
+                Ok(wildcard::ExpandedTargets::Expanded {
+                    targets,
+                    scanned: n,
+                    narrowed,
+                    filter,
+                }) => {
+                    scanned = n;
+                    listing_narrowed = narrowed;
+                    listing_filter_used = filter;
+                    targets
+                }
+                Err(unavailable) => {
+                    // #93: a 404 here used to become LISTING_UNAVAILABLE, which never said the
+                    // namespace does not exist and never named the ones that do — the 404 body
+                    // is zero bytes, so only a second question can tell them apart.
+                    if unavailable.status == Some(404) {
+                        if let Some(err) = interop::namespace_missing_error(
+                            &iris,
+                            client,
+                            &namespace,
+                            &unavailable.url,
+                            "Nothing was compiled.",
+                        )
+                        .await
+                        {
+                            return err;
                         }
                     }
-                    let detail = match other {
-                        Ok(resp) => format!("HTTP {}", resp.status().as_u16()),
-                        Err(e) => e.to_string(),
-                    };
                     return crate::tools::envelope::fail_with(
                         "LISTING_UNAVAILABLE",
                         &format!(
-                            "Could not read the class listing for namespace {namespace}, so \
-                             the wildcard '{}' could not be expanded: {detail}. Nothing was \
-                             compiled.",
-                            p.target
+                            "Could not read the class listing for namespace {namespace}, so the \
+                             wildcard '{}' could not be expanded: {}. Nothing was compiled.",
+                            p.target, unavailable.detail
                         ),
                         serde_json::json!({
                             "pattern": p.target,
                             "namespace": namespace,
                             // #94: the URL actually requested, so the caller can reproduce it.
-                            "listing_url": fetch_url,
-                            "listing_filter": listing_filter_used,
+                            "listing_url": unavailable.url,
+                            "listing_filter": unavailable.filter,
                             "hint": "Compile a single document by its exact name, which needs \
                                      no listing. If the namespace is wrong, iris_query can \
                                      confirm it exists.",
@@ -5490,7 +5433,7 @@ impl IrisTools {
             return compile_not_found_error(
                 &p.target,
                 &namespace,
-                listing_filter_used,
+                listing_filter_used.as_deref(),
                 listing_narrowed,
                 scanned,
                 cross,
@@ -9995,7 +9938,7 @@ fn wildcard_listing_filter(pattern: &str) -> Option<&str> {
 /// Deliberately no `force`/`confirm` escape hatch: that would widen the advertised schema
 /// of a tool in the locked 29-tool interop profile, and a caller who genuinely wants 500+
 /// classes can name the subpackages.
-const WILDCARD_EXPANSION_CAP: usize = 500;
+pub const WILDCARD_EXPANSION_CAP: usize = 500;
 
 /// Issue #88: what a wildcard compile target expanded to. The two refusals are outcomes,
 /// not errors, so the guard is a pure function the unit tests can drive with no IRIS.
