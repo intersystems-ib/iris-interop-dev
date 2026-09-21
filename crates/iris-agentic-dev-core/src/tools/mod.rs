@@ -6333,9 +6333,13 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                 full_result: full,
                 total_count: total as usize,
             };
-            if let Ok(mut s) = self.log_store.lock() {
-                s.store(entry);
-            }
+            // #301: same as log_store::apply_truncation — a poisoned lock must not silently drop
+            // the entry while `id` is returned to the caller regardless. #233 measured that callers
+            // act on this id: 23 of 77 red runs were immediately followed by iris_get_log.
+            self.log_store
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .store(entry);
             id
         };
 

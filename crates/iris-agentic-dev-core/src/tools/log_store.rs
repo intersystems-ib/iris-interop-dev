@@ -37,6 +37,7 @@ pub struct LogSummary {
 
 // ── GetResult ────────────────────────────────────────────────────────────────
 
+#[derive(Debug)]
 pub enum GetResult {
     Found(Value),
     NotFound,
@@ -300,9 +301,17 @@ pub fn apply_truncation(
         full_result: Value::Array(items),
         total_count: total,
     };
-    if let Ok(mut s) = store.lock() {
-        s.store(entry);
-    }
+    // #301: `if let Ok(..)` here silently skipped the store on a POISONED mutex, and the three
+    // lines below then handed the caller a `log_id` for an entry that was never written — the
+    // overflow gone, `iris_get_log` answering LOG_NOT_FOUND for an id this function issued.
+    //
+    // Recover instead, which is what this repo already decided twice: `session_call_count`
+    // (#99 — "a mutex poisoned by an unrelated panic reported '0 calls' about a deque that still
+    // holds every entry") and `FileSink`, on the argument that losing a log line must never take
+    // the server down. The lock is an Arc<Mutex<_>> shared by every tool call for the process
+    // lifetime, so one panic anywhere that holds it degraded every later truncation, silently,
+    // for as long as the server ran.
+    store.lock().unwrap_or_else(|e| e.into_inner()).store(entry);
 
     result["truncated"] = Value::Bool(true);
     result["log_id"] = Value::String(id);
