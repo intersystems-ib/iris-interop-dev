@@ -47,7 +47,10 @@ PASS="${IRIS_PASSWORD:-SYS}"
 
 START=$(date +%s%N 2>/dev/null || echo 0)
 
-RESPONSE=$(curl --max-time 3 -s \
+# ONE request, capturing body and status together. This used to make two identical POSTs — one for
+# the body, one for the status code — so a working connection compiled the document twice and the
+# reported time covered only the first.
+HTTP_BODY_AND_CODE=$(curl --max-time 3 -s -w $'\n%{http_code}' \
     -X POST \
     -u "${USER}:${PASS}" \
     -H "Content-Type: application/json" \
@@ -56,18 +59,25 @@ RESPONSE=$(curl --max-time 3 -s \
     echo "IRIS not connected — set IRIS_HOST, IRIS_WEB_PORT, IRIS_USERNAME, IRIS_PASSWORD"
     exit 0
 }
-
-HTTP_CODE=$(curl --max-time 3 -s -o /dev/null -w "%{http_code}" \
-    -u "${USER}:${PASS}" \
-    "${BASE_URL}/${NS}/action/compile" \
-    -X POST \
-    -H "Content-Type: application/json" \
-    -d "[\"${DOC_NAME}\"]" 2>/dev/null) || HTTP_CODE="000"
-
-BODY="$RESPONSE"
+HTTP_CODE="${HTTP_BODY_AND_CODE##*$'\n'}"
+BODY="${HTTP_BODY_AND_CODE%$'\n'*}"
 
 if [[ "$HTTP_CODE" == "000" || -z "$HTTP_CODE" ]]; then
     echo "IRIS not connected — set IRIS_HOST, IRIS_WEB_PORT, IRIS_USERNAME, IRIS_PASSWORD"
+    exit 0
+fi
+
+# The status must be 2xx before the body is read as a compile result. This check used to reject only
+# "000", so a 401 or 404 fell through to the parse below — and since Atelier answers those with a
+# ZERO-BYTE body, the error list came back empty and the hook reported "Compiled OK" for a request
+# IRIS had refused at the door. Measured against a live instance with a wrong password: HTTP 401,
+# 0-byte body, verdict "Compiled ... OK".
+if [[ ! "$HTTP_CODE" =~ ^2[0-9][0-9]$ ]]; then
+    echo "Compile NOT attempted for ${CLASS_NAME}: IRIS answered HTTP ${HTTP_CODE}."
+    case "$HTTP_CODE" in
+        401|403) echo "  Credentials rejected — check IRIS_USERNAME / IRIS_PASSWORD." ;;
+        404) echo "  Not found — check IRIS_NAMESPACE (${NS}) and IRIS_WEB_PREFIX." ;;
+    esac
     exit 0
 fi
 
@@ -77,6 +87,16 @@ if [[ "$START" != "0" && "$END" != "0" ]]; then
     ELAPSED_S=$(awk "BEGIN {printf \"%.1f\", $ELAPSED_MS / 1000}")
 else
     ELAPSED_S="?"
+fi
+
+# A body that is not JSON means the outcome is UNKNOWN, not clean. `jq` failing here used to be
+# hidden by `2>/dev/null` and `|| true`, leaving ERRORS empty — indistinguishable from a successful
+# compile.
+if ! printf '%s' "$BODY" | jq -e . >/dev/null 2>&1; then
+    echo "Compile result for ${CLASS_NAME} could not be read: IRIS returned HTTP ${HTTP_CODE} with a"
+    echo "  body that is not JSON, so whether it compiled is unknown. First 200 bytes:"
+    printf '%s' "$BODY" | head -c 200 | sed 's/^/    /'
+    exit 0
 fi
 
 ERRORS=$(printf '%s' "$BODY" | jq -r '
