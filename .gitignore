@@ -42,6 +42,11 @@ run_benchmark.py
 *.pptx
 *.cls
 *.md
+# ...but the repo's own docs are not scratch files. The blanket *.md above silently swallowed
+# CLAUDE.md when it was added (#310): git add -A skipped it without a word, and only the diff
+# not matching the commit message revealed it. The 124 tracked .md files survive only because
+# ignore rules do not apply to already-tracked paths — any NEW doc needs an exception or a -f.
+!CLAUDE.md
 Bench/
 EvalDemo/
 EvalDemo.*
