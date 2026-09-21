@@ -1,6 +1,6 @@
 {
-  "_comment": "Per-tool validation gate for the iris-interop-dev (interop-profile) fork. A tool is 'OK' only when its named unit AND e2e tests exist and pass. scripts/validate-tools.sh checks this. Statuses: OK = unit+e2e green; unit-ok = unit green, e2e pending (needs interop-enabled namespace); profile-only = present in the 23-tool interop profile (verified by mcp_handshake) but no dedicated behaviour test yet. Both execution transports (HTTP/Atelier REST and Docker-exec) are validated by transport_e2e.",
-  "profile": "interop (23 tools, default)",
+  "_comment": "Per-tool validation gate for the iris-interop-dev (interop-profile) fork. A tool is 'OK' only when its named unit AND e2e tests exist and pass. scripts/validate-tools.sh checks this. Statuses: OK = unit+e2e green; unit-ok = unit green, e2e pending (needs interop-enabled namespace); profile-only = present in the interop profile (verified by mcp_handshake) but no dedicated behaviour test yet. The advertised tool count is deliberately NOT restated in this file: it said 23 while INTEROP_TOOLS held 31 and nothing failed, because no code reads these two strings. scripts/validate-tools.sh prints the real count from INTEROP_TOOLS on every run and now rejects a restated one here; test_toolset pins it. Both execution transports (HTTP/Atelier REST and Docker-exec) are validated by transport_e2e.",
+  "profile": "interop (default)",
   "transports": {
     "http_atelier_rest": {
       "test": "transport_e2e::http_transport_executes_and_captures_output",

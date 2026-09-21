@@ -28,6 +28,19 @@ for k, tr in m["transports"].items():
     print(f"transport:{k:23} {tr['status']:12} {tr['test']}")
     if tr["status"] == "OK" and not tr.get("test"):
         bad += 1
+# ── no restated count: a number here rots silently, because nothing reads these strings ──
+# Measured: `profile` said "interop (23 tools, default)" and `_comment` said "the 23-tool interop
+# profile" while INTEROP_TOOLS held 31. Both were wrong by eight and no gate noticed — the drift
+# check below compares NAMES, and no code reads either string. The real count is computed and
+# printed further down from INTEROP_TOOLS, which is the only copy that cannot lag.
+for field in ("_comment", "profile"):
+    restated = re.search(r"\b\d+[- ]tools?\b", m.get(field, ""), re.I)
+    if restated:
+        print(f"GATE FAILED: {field} restates a tool count ({restated.group(0)!r}). Remove the "
+              "number — this gate prints the real one from INTEROP_TOOLS on every run, and a "
+              "hand-written copy here has already been wrong by eight.")
+        bad += 1
+
 # ── drift check: every advertised interop tool must appear in the manifest ────────
 src = open(sys.argv[2]).read()
 km = re.search(r"INTEROP_TOOLS[^=]*=\s*&?\[(.*?)\];", src, re.S)
@@ -64,7 +77,10 @@ print()
 print(f"{ok} tools OK (unit+e2e green), {unitok} unit-ok (e2e pending interop ns), "
       f"{len(m['tools'])} total. Transports HTTP+docker validated.")
 if bad:
-    print(f"GATE FAILED: {bad} 'OK' entr{'y' if bad==1 else 'ies'} missing a unit or e2e test.")
+    # The reasons are printed above, each naming itself. This line must NOT restate one of them:
+    # it counted every kind of problem while claiming they were all missing unit/e2e tests, so a
+    # restated-count failure was reported as a missing test.
+    print(f"GATE FAILED: {bad} problem{'' if bad==1 else 's'} above.")
     sys.exit(1)
 print("GATE OK: every 'OK' tool names a unit AND an e2e test.")
 PY
