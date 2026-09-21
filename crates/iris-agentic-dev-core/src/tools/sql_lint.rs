@@ -224,8 +224,9 @@ instead of guessing Ens_Config.SearchTableProp.",
 /// Targets the dominant Round-4 waste shapes — ~60% of iris_execute calls were introspection
 /// or ad-hoc SQL the typed tools answer in one round-trip, plus the load-from-file anti-pattern.
 /// Priority: filesystem-load (worst, host-coupling) > production/catalog config > class
-/// dictionary introspection > bare SELECT. Returns None for legitimate side-effecting ObjectScript
-/// (object %New/%Save, production control, globals, etc.).
+/// dictionary introspection > hand-rolled Ens.* interop config/control (#330) > bare SELECT.
+/// Returns None for legitimate side-effecting ObjectScript (object %New/%Save, globals,
+/// message objects, etc.).
 /// #206: `targeted_table_hint` reads the text of a SQL QUERY. Handing it a block of
 /// ObjectScript makes a substring match ("SQLCONNECTION") claim the caller queried a table
 /// they never queried. A `##class(...)` reference must never receive a table hint.
@@ -277,12 +278,62 @@ Host-independent and the supported path.",
     if u.contains("%DICTIONARY.") {
         return Some(
             "Introspect classes with typed tools, not %Dictionary SQL: docs_introspect(class_name=...) \
-for methods/properties, iris_symbols(pattern=...) to find classes, iris_table_info(schema=...) for \
+for methods/properties, iris_symbols(pattern=...) to find classes, iris_table_info(table=...) for \
 projected tables. One typed call, no guessing at catalog table/column names.",
         );
     }
 
-    // 4. A bare SELECT, or %SQL.Statement used only to READ rows — that's iris_query's job.
+    // 4. Interoperability config/control hand-rolled through the Ens.* classes (#330). The
+    //    typed tools cover this whole family and no arm here named one, so the call shape this
+    //    redirect was most likely to meet — production control — fell through silently.
+    //    WORDED AS ADVICE ON PURPOSE: the match is a substring of the uppercased code, so an arm
+    //    also fires on a comment or a string literal that merely mentions the class. A false
+    //    positive must read as a suggestion, never as a claim about what the caller did. Parsing
+    //    ObjectScript to tell the two apart is not worth it for a non-blocking hint.
+    //
+    //    MATCHED ON IDENTIFIER BOUNDARIES, not a bare substring test. The first version used the
+    //    plain substring form, and an adversarial pass ran it: `##class(Cocina.Ens.DirectoryWatcher)`
+    //    fired the Director arm and `Ens.Config.ItemSettings` fired the item arm, because both
+    //    names merely START with a pattern. `contains_word` (above) requires a non-identifier byte
+    //    on each side, and `.` is not an identifier byte, so `ENS.DIRECTOR` still matches
+    //    `##class(Ens.Director).StartProduction(..)` while `ENS.DIRECTORYWATCHER` no longer does.
+    //    The in-file control for this was `Ens.StringRequest`, which rules out a DIFFERENT
+    //    package and could never have caught either case — see the boundary tests in
+    //    tests/execute_redirect_hint_interop.rs.
+    if contains_word(&u, "ENS.CONFIG.CREDENTIALS") {
+        return Some(
+            "If you are managing credentials through Ens.Config.Credentials here, \
+iris_credential_manage(action=create|update|delete, id=..., username=..., password=...) is the \
+typed path, and iris_credential_list names the IDs and usernames that exist (never passwords). \
+It keeps the secret out of the ObjectScript you send, and it is write-gated on Live instances.",
+        );
+    }
+    if contains_word(&u, "ENS.CONFIG.ITEM") || contains_word(&u, "ENS.CONFIG.PRODUCTION") {
+        return Some(
+            "If you are building or editing production config through Ens.Config.Item / \
+Ens.Config.Production here, iris_production_item does it in one typed call: action=add \
+(item=..., class_name=..., optional settings=...), action=remove, action=enable, action=disable, \
+action=get_settings, action=set_settings. Prefix a settings key with 'Adapter.' to target the \
+adapter rather than the Host, and add/set_settings apply the change live via \
+Ens.Director.UpdateProduction when that production is running (set_settings takes apply=false to \
+batch), so there is no separate update step to remember.",
+        );
+    }
+    if contains_word(&u, "ENS.DIRECTOR") {
+        return Some(
+            "If you are driving a production through Ens.Director here, iris_production does the \
+same job typed: action=start for StartProduction (production=\"Pkg.Production\"), action=stop \
+for StopProduction, action=status for GetProductionStatus, action=update for UpdateProduction, \
+action=recover for RecoverProduction, action=restart to recycle a single config item. \
+EnableConfigItem is iris_production_item(action=enable or action=disable, \
+item=\"<config item>\"). Each returns the production state as a typed result — a %Status handed \
+back to iris_execute is invisible unless you write it out yourself. Ens.Director methods outside \
+that set (CreateBusinessService, SetItemStatus, IsProductionRunning and friends) have no typed \
+equivalent, so calling them here is the right move; only the six above are covered.",
+        );
+    }
+
+    // 5. A bare SELECT, or %SQL.Statement used only to READ rows — that's iris_query's job.
     //    Excludes writes (INSERT/UPDATE/DELETE/MERGE/CALL) which iris_query blocks by design.
     let is_write = u.contains("INSERT ")
         || u.contains("UPDATE ")
@@ -602,17 +653,26 @@ mod tests {
             .contains("iris_production"));
     }
 
+    /// #330 CHANGED THIS TEST'S PREMISE. It used to assert that
+    /// `##class(Ens.Director).StartProduction(...)` produced no redirect, and filed that under
+    /// "legit ObjectScript" — but iris_production is exactly the typed tool for it, and the
+    /// silence was the gap #330 closes, not a property worth guarding. That snippet now gets
+    /// the production redirect; the assertion for it lives in
+    /// tests/execute_redirect_hint_interop.rs. What remains here is ObjectScript no typed tool
+    /// replaces: an object save, a global, a writing %SQL.Statement.
     #[test]
     fn execute_redirect_silent_on_legit_objectscript() {
-        // object save, production control, globals, a writing %SQL.Statement — no redirect
         assert!(
             execute_redirect_hint("set o=##class(Cocina.MSG.MenuRequest).%New() do o.%Save()")
                 .is_none()
         );
+        // An interop MESSAGE class is not interop CONFIG: the new arms must not degrade into
+        // "any class whose name starts with Ens.".
         assert!(execute_redirect_hint(
-            "set sc=##class(Ens.Director).StartProduction(\"Cocina.Production\")"
+            "set msg=##class(Ens.StringRequest).%New() set msg.StringValue=\"x\" do msg.%Save()"
         )
         .is_none());
+        assert!(execute_redirect_hint("set ^Cocina.Menu(1)=\"soup\"").is_none());
         assert!(execute_redirect_hint("write $ZVERSION,!").is_none());
         assert!(execute_redirect_hint(
             "set rs=##class(%SQL.Statement).%ExecDirect(,\"INSERT INTO public.menus VALUES (?)\",1)"
