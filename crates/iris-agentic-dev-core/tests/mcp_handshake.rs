@@ -150,8 +150,13 @@ fn mcp_server_starts_and_responds_to_initialize() {
 /// instances, so a blocked read is the expensive failure, not the safe one.
 ///
 /// `IRIS_NAMESPACE=PROD` makes `is_write_allowed()` false without needing a Live instance.
-/// No IRIS is reachable here (port 9), which is the point: the gate decides before any
-/// connection is used, so the refusal and the pass-through are both observable offline.
+/// No IRIS is reachable here, which is the point: the gate decides before any connection is
+/// used, so the refusal and the pass-through are both observable offline.
+///
+/// #304: that sentence used to say "(port 9)" and was WRONG — port 9 alone never enters the
+/// env-var leg of discovery, so this spawn adopted a reachable instance. The pin below is what
+/// makes the sentence true. It also makes the premise independent of the instance: see the note
+/// at the spawn.
 #[test]
 fn a_write_disallowed_connection_still_lists_every_tool() {
     let bin = iris_dev_bin();
@@ -162,6 +167,15 @@ fn a_write_disallowed_connection_still_lists_every_tool() {
 
     let mut child = Command::new(&bin)
         .arg("mcp")
+        // #304: pinned for the same reason as `discovery_waits_for_iris`, and this test needed it
+        // more. Its premise is that writes are DISALLOWED, which `is_write_allowed()` decides from
+        // IRIS_ALLOW_PROD, `system_mode` and the namespace — no network. But `system_mode` is
+        // fetched from the instance by `detect_system_mode`, which reads `^%SYS("SystemMode")`. So
+        // while this spawn adopted a live instance, the premise depended on what THAT instance
+        // reported: "Development" or "Test" makes `is_write_allowed()` true, and this test would
+        // still pass, because every assertion here is about the tool list. Unreachable host ->
+        // system_mode stays Unknown -> PROD namespace -> writes disallowed, by construction.
+        .env("IRIS_HOST", "127.0.0.1")
         .env("IRIS_WEB_PORT", "9")
         .env("IRIS_NAMESPACE", "PROD")
         .env_remove("IRIS_ALLOW_PROD")
@@ -810,6 +824,17 @@ fn discovery_waits_for_iris() {
 
     let mut child = Command::new(&bin)
         .arg("mcp")
+        // #304: `IRIS_WEB_PORT=9` alone does NOT make this hermetic. The env-var leg of the
+        // discovery cascade is guarded by IRIS_HOST, so port 9 by itself is never read and the
+        // server adopted whatever IRIS was reachable on the machine — measured in #298 as
+        // `connected:true, connection_source:"auto_discovered", port:8080`. The assertion below
+        // says "even without IRIS connection"; that was false until this pin.
+        //
+        // Pinning does not defeat this test's subject. What it asserts is a LATENCY bound plus a
+        // non-empty tool list — that the server does not block on discovery — and an unreachable
+        // host exercises exactly that, deterministically. 127.0.0.1 rather than a TEST-NET-1
+        // address because a refused connection is ~221ms against 2036ms for one that must time out.
+        .env("IRIS_HOST", "127.0.0.1")
         .env("IRIS_WEB_PORT", "9") // instant fail — tests that server doesn't hang
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
