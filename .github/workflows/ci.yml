@@ -146,6 +146,12 @@ jobs:
       # behaviour of the two documented usages, so the header's warning cannot quietly go stale.
       - name: "iris-up readiness verdict (#317)"
         run: bash scripts/test-iris-up.sh
+
+      # Same reason, for the compile-on-save hook: its failure only reproduces against a real
+      # instance in a particular state (a 401 with Atelier's zero-byte body), so the verdict logic is
+      # driven with synthetic responses here. curl is stubbed on PATH, so no network is involved.
+      - name: Compile-hook verdict logic
+        run: bash scripts/test-compile-hook.sh
       # The workflows themselves were unlinted until now. actionlint caught 7 shellcheck
       # findings on first run, and — more usefully — it is the only thing that would have told us
       # whether a NEW workflow file is even valid before it reaches the default branch.
