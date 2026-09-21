@@ -108,6 +108,15 @@ jobs:
       # `bash scripts/...` rather than `scripts/...`: the file's mode bit is then not
       # load-bearing. A checkout that loses +x gets a working gate instead of one that
       # depends on the guard above to notice `Permission denied`.
+      # The per-tool validation gate ran in NO workflow — only from scripts/test-all.sh, which a
+      # human has to invoke. So tools-status.json drifted to 29 entries against INTEROP_TOOLS' 31
+      # and nothing said so. Same shape as the bollard guard that reported `ok` having never run:
+      # a check that executes nowhere is not a check. It is read-only and takes well under a second.
+      #
+      # `bash scripts/...` for the same reason as below: the mode bit is then not load-bearing.
+      - name: Per-tool validation gate (tools-status.json vs INTEROP_TOOLS)
+        run: bash scripts/validate-tools.sh
+
       - name: Full offline test gate (required)
         run: |
           TARGETS=$(bash scripts/ci-test-targets.sh)

@@ -348,7 +348,12 @@ pub enum Toolset {
     /// 52 tools advertised (measured 2026-09-20). Nostub (56) minus 8 — the 4 debug_*
     /// folded into iris_debug, the 3 container tools folded into iris_containers, and
     /// agent_info dropped outright — plus the 4 merged-only tools iris_debug,
-    /// iris_containers, iris_admin, iris_get_log. 54 - 8 + 4 = 50.
+    /// iris_containers, iris_admin, iris_get_log.
+    ///
+    /// The arithmetic is NOT restated here any more. It read `54 - 8 + 4 = 50` — a stale base and
+    /// a result contradicting this comment's own headline of 52 — because the base grows every time
+    /// a tool joins the router and a frozen copy of it cannot follow. `test_merged_tool_count`
+    /// executes the derivation against the live Nostub count instead.
     /// Not this fork's default.
     Merged,
     /// 31 tools advertised (measured 2026-09-20) — exactly `INTEROP_TOOLS`. THIS FORK'S
@@ -9950,7 +9955,8 @@ fn wildcard_listing_filter(pattern: &str) -> Option<&str> {
 /// authors, and refuses only whole-library trees and whole-namespace expansions.
 ///
 /// Deliberately no `force`/`confirm` escape hatch: that would widen the advertised schema
-/// of a tool in the locked 29-tool interop profile, and a caller who genuinely wants 500+
+/// of a tool in the locked interop profile (`INTEROP_TOOLS`; this said 29 when it held 31), and
+/// a caller who genuinely wants 500+
 /// classes can name the subpackages.
 pub const WILDCARD_EXPANSION_CAP: usize = 500;
 
