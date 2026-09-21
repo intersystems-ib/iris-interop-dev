@@ -30,6 +30,18 @@ fn scm_error_code(msg: &str) -> &'static str {
 /// Menu prefix used for source control actions.
 pub const SCM_MENU: &str = "%SourceMenu";
 
+/// #302: returned when a `UserAction` snippet produced no output at all.
+///
+/// Distinct from `SCM_UNAVAILABLE` (the SCM session could not start) and from `SCM_ERROR` (IRIS
+/// said something and it was not a code). This one means IRIS said *nothing*, which the generated
+/// snippet cannot do if it ran — so the outcome of the action is genuinely unknown.
+const SCM_NO_OUTPUT: &str = "SCM_NO_OUTPUT";
+
+const EMPTY_OUTPUT_MSG: &str =
+    "The source control action produced no output. The generated snippet \
+     always writes an action code, so an empty response means it never ran and the outcome of the \
+     action is unknown. Check the document's checkout state before retrying.";
+
 /// SCM menu actions as reported by %Studio.SourceControl.Interface:MenuItems.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ScmAction {
@@ -110,11 +122,21 @@ fn os_quote(s: &str) -> String {
 /// The message was lost too: `splitn('|')` finds no pipe in any of those, so `msg` came back empty and
 /// IRIS's explanation was discarded rather than merely ignored.
 ///
-/// `Empty` is kept separate from `Code(0, _)` on purpose. The call sites still treat it as code 0,
-/// because whether a provider legitimately returns nothing on success is not answerable from this tree
-/// — `test_parse_action_msg_empty_string` pins the behaviour but its name records the input, not an
-/// intent. That half of #302 is left for someone with a provider to test against. Non-numeric output
-/// has no such ambiguity and is now a failure.
+/// `Empty` is kept separate from `Code(0, _)`, and since #302's second half it is a FAILURE at both
+/// call sites rather than a synonym for code 0.
+///
+/// The question "does a provider legitimately return nothing on success?" looked unanswerable from
+/// this tree. It is answerable — from the snippet we ourselves generate. `user_action_code` sets
+/// `action=0` and ends with an unconditional `write action_"|"_...`, so it always emits at least
+/// `0|`. No first line means the write never executed.
+///
+/// **The opposite is true one layer down, which is why this looked ambiguous.**
+/// `after_user_action_code` ends with `write $system.Status.GetErrorText(sc)`, and GetErrorText
+/// returns the EMPTY STRING for a success status — so on the AfterUserAction path empty IS success,
+/// and the `if !aout.is_empty()` check at the CheckOut call site is correct as written. The two
+/// generators have opposite conventions and both flow through `.lines().next()`.
+/// `the_two_generators_disagree_about_empty` pins that, so this fix is not "propagated" onto a call
+/// site where it would be wrong.
 #[derive(Debug, PartialEq)]
 enum ActionMsg<'a> {
     /// A numeric action code and its message. 0 means "no confirmation dialog needed".
@@ -135,6 +157,41 @@ fn parse_action_msg(out: &str) -> ActionMsg<'_> {
     match head.parse::<u8>() {
         Ok(code) => ActionMsg::Code(code, msg),
         Err(_) => ActionMsg::Unparseable(out.trim()),
+    }
+}
+
+/// Decide what the first line of a `UserAction` response means, for both call sites.
+///
+/// `Ok((action_code, msg))` means the action reported a real code. `Err((error_code, detail))` is the
+/// envelope the caller must return instead — the caller does nothing but hand it to `err_json`.
+///
+/// **Why this is a function.** Both the `checkout` and the `execute` arm used to carry an identical
+/// 15-line copy of this decision. That duplication is the shape #302's first half already got wrong
+/// once: a repair applied to one copy leaves the other looking more trustworthy than it is. It also
+/// made the decision untestable — the mapping sat inside an async handler behind an HTTP round trip,
+/// so a mutation that reverted `Empty` to success passed the whole suite. That surviving mutant is
+/// what produced this extraction.
+///
+/// The three outcomes, and why none of them is success:
+///
+/// * `SCM_UNAVAILABLE` — the sentinel the snippet writes when the SCM session could not start.
+/// * `Empty` — no output at all. `user_action_code` sets `action=0` and ends with an unconditional
+///   `write action_"|"_...`, so a snippet that RAN always emits at least `0|`. Empty therefore means
+///   the write never executed and the outcome is unknown (#302, second half).
+/// * `Unparseable` — IRIS said something that is not a code: `<PROTECT>`, `ERROR #5865`, a provider
+///   `NOTICE`. Classified by the existing IRIS-error classifier, with the raw text preserved because
+///   it is the only thing that says what IRIS objected to (#302, first half).
+fn user_action_outcome(out: &str) -> Result<(u8, &str), (&'static str, &str)> {
+    if out == "SCM_UNAVAILABLE" {
+        return Err((
+            "SCM_UNAVAILABLE",
+            "Source control session could not be initialized",
+        ));
+    }
+    match parse_action_msg(out) {
+        ActionMsg::Code(c, m) => Ok((c, m)),
+        ActionMsg::Empty => Err((SCM_NO_OUTPUT, EMPTY_OUTPUT_MSG)),
+        ActionMsg::Unparseable(raw) => Err((scm_error_code(raw), raw)),
     }
 }
 
@@ -317,19 +374,9 @@ pub async fn handle_iris_source_control(
                 Err(e) => return err_json(scm_error_code(&e.to_string()), &e.to_string()),
             };
             let out = raw.lines().next().unwrap_or("").trim();
-            if out == "SCM_UNAVAILABLE" {
-                return err_json(
-                    "SCM_UNAVAILABLE",
-                    "Source control session could not be initialized",
-                );
-            }
-            let (action_code, msg) = match parse_action_msg(out) {
-                ActionMsg::Code(c, m) => (c, m),
-                // #302: empty stays code 0, unchanged — that half is undecided, see the parser.
-                ActionMsg::Empty => (0, ""),
-                // Not a code: IRIS said something, and it was being read as success while the text
-                // was thrown away. Surface it, classified by the existing IRIS-error classifier.
-                ActionMsg::Unparseable(raw) => return err_json(scm_error_code(raw), raw),
+            let (action_code, msg) = match user_action_outcome(out) {
+                Ok(v) => v,
+                Err((code, detail)) => return err_json(code, detail),
             };
 
             if action_code == 0 {
@@ -391,19 +438,9 @@ pub async fn handle_iris_source_control(
                 Err(e) => return err_json(scm_error_code(&e.to_string()), &e.to_string()),
             };
             let out = raw.lines().next().unwrap_or("").trim();
-            if out == "SCM_UNAVAILABLE" {
-                return err_json(
-                    "SCM_UNAVAILABLE",
-                    "Source control session could not be initialized",
-                );
-            }
-            let (action_code, msg) = match parse_action_msg(out) {
-                ActionMsg::Code(c, m) => (c, m),
-                // #302: empty stays code 0, unchanged — that half is undecided, see the parser.
-                ActionMsg::Empty => (0, ""),
-                // Not a code: IRIS said something, and it was being read as success while the text
-                // was thrown away. Surface it, classified by the existing IRIS-error classifier.
-                ActionMsg::Unparseable(raw) => return err_json(scm_error_code(raw), raw),
+            let (action_code, msg) = match user_action_outcome(out) {
+                Ok(v) => v,
+                Err((code, detail)) => return err_json(code, detail),
             };
 
             match action_code {
@@ -823,14 +860,110 @@ mod tests {
         );
     }
 
-    /// Empty is its own answer now, distinct from `Code(0, _)`. The callers still map it to 0, so
-    /// behaviour is unchanged — but the decision recorded on #302 can be made here without touching
-    /// either call site.
+    /// Empty is its own answer, distinct from `Code(0, _)` — and since #302's second half the call
+    /// sites treat it as a failure rather than as code 0.
     #[test]
     fn empty_output_is_distinguishable_from_a_zero_code() {
         assert_eq!(parse_action_msg(""), ActionMsg::Empty);
         assert_eq!(parse_action_msg("   "), ActionMsg::Empty);
         assert_ne!(parse_action_msg(""), ActionMsg::Code(0, ""));
+    }
+
+    /// THE assertion #302's second half was missing.
+    ///
+    /// Written because a mutation reverting BOTH call sites to `ActionMsg::Empty => (0, "")` — the
+    /// original defect, verbatim — passed the entire suite. Everything that existed tested the
+    /// parser (`parse_action_msg`) or the generated ObjectScript; nothing tested the decision the
+    /// call sites actually make. The gap was in the wiring, which is the layer that survives most
+    /// mutations.
+    ///
+    /// Code 0 is the SUCCESS branch: in the checkout arm it runs AfterUserAction and then calls
+    /// `checkout_cache.mark`, caching a false "editable" state so a following `iris_doc` write skips
+    /// its probe. So "empty maps to 0" is not a cosmetic mislabel — it asserts a checkout happened.
+    #[test]
+    fn empty_user_action_output_is_refused_not_reported_as_code_zero() {
+        for raw in ["", "   ", "\n", "\t \n"] {
+            match user_action_outcome(raw) {
+                Err((code, _)) => assert_eq!(
+                    code, SCM_NO_OUTPUT,
+                    "{raw:?} must be refused as SCM_NO_OUTPUT"
+                ),
+                Ok((c, m)) => panic!(
+                    "{raw:?} was accepted as code {c} (msg {m:?}). Code 0 is the success branch — \
+                     it marks the checkout cache as editable for an action that never ran."
+                ),
+            }
+        }
+    }
+
+    /// The control for the test above: a real code must still come back as `Ok`, or the refusal
+    /// could be implemented by refusing everything, which would break every dialog.
+    #[test]
+    fn a_real_code_still_reaches_the_caller_as_ok() {
+        assert_eq!(user_action_outcome("0"), Ok((0, "")));
+        assert_eq!(
+            user_action_outcome("1|Please enter comment"),
+            Ok((1, "Please enter comment"))
+        );
+        assert_eq!(
+            user_action_outcome("7|Enter value:"),
+            Ok((7, "Enter value:"))
+        );
+    }
+
+    /// The other two `Err` arms still route where they did, so the extraction changed no behaviour
+    /// beyond the `Empty` decision.
+    #[test]
+    fn the_unavailable_sentinel_and_unparseable_text_keep_their_codes() {
+        assert_eq!(
+            user_action_outcome("SCM_UNAVAILABLE").map_err(|(c, _)| c),
+            Err("SCM_UNAVAILABLE")
+        );
+        let (code, detail) = user_action_outcome("ERROR #5865: Cannot save item").unwrap_err();
+        assert_ne!(code, SCM_NO_OUTPUT, "IRIS text is not the no-output case");
+        assert_eq!(
+            detail, "ERROR #5865: Cannot save item",
+            "the raw text must survive — it is the only thing that says what IRIS objected to"
+        );
+    }
+
+    /// The evidence for #302's second half, and the guard against "fixing" the wrong layer.
+    ///
+    /// The two generated snippets end in writes with OPPOSITE conventions:
+    ///
+    ///   * `user_action_code`       -> `write action_"|"_...`  — unconditional, so it ALWAYS emits
+    ///     at least `0|`. Empty output means the write never ran.
+    ///   * `after_user_action_code` -> `write $system.Status.GetErrorText(sc)` — which is the EMPTY
+    ///     STRING on success. Empty output there is the normal, successful case.
+    ///
+    /// Both reach the caller through `.lines().next()`, so they look identical at the call site.
+    /// That is why "is empty legitimate?" read as unanswerable: it has two different answers. This
+    /// test fails if either generator's final write changes, which is exactly when the reasoning
+    /// behind `ActionMsg::Empty => err_json(...)` would stop holding.
+    #[test]
+    fn the_two_generators_disagree_about_empty() {
+        let user = user_action_code("%CheckOut", "MyApp.Patient.cls", "u", "p");
+        assert!(
+            user.contains("write action_"),
+            "UserAction must end in an unconditional write of the action code — the whole argument \
+             for treating empty as a failure rests on it. Got: {user}"
+        );
+        assert!(
+            user.contains("set action=0"),
+            "action must be initialised, or an empty write would be possible on success"
+        );
+
+        let after = after_user_action_code("%CheckOut", "MyApp.Patient.cls", "yes", "u", "p");
+        assert!(
+            after.contains("GetErrorText"),
+            "AfterUserAction writes the error text, which is EMPTY on success — do not propagate \
+             the empty-is-failure rule onto this path. Got: {after}"
+        );
+        assert!(
+            !after.contains("write action_"),
+            "if AfterUserAction ever starts writing an action code, the asymmetry this test \
+             documents is gone and the CheckOut path's `!aout.is_empty()` needs revisiting"
+        );
     }
 
     // ── user_action_code ──────────────────────────────────────────────────────
@@ -1369,8 +1502,7 @@ mod tests {
     // ── parse_action_msg edge cases ───────────────────────────────────────────
     #[test]
     fn test_parse_action_msg_empty_string() {
-        // Still treated as code 0 by the callers — #302 leaves that half undecided — but the
-        // parser now says WHICH it was, so the decision can be made without touching call sites.
+        // The callers now refuse on this rather than reading it as code 0 (#302, second half).
         assert_eq!(parse_action_msg(""), ActionMsg::Empty);
     }
 
