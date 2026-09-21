@@ -325,6 +325,10 @@ iris-interop-dev --version               # Print version
 Issues and pull requests welcome — file bugs at the
 [Issues tab](https://github.com/intersystems-ib/iris-interop-dev/issues).
 
+**Read [`CLAUDE.md`](CLAUDE.md) first.** It documents the one defect class this codebase produces more
+than any other — a failure answered with a fact that looks like an answer — the constructs that cause
+it, the repair that works, and how to run the gate without getting a false green from it.
+
 This is an interop-focused fork of the community
 [`intersystems-community/iris-agentic-dev`](https://github.com/intersystems-community/iris-agentic-dev);
 upstream fixes to the shared codebase flow from there. The repositories in `intersystems-ib` are
