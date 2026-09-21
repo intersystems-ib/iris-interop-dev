@@ -879,13 +879,20 @@ fn test_doc_guards_storage_name_and_mode() {
         find_response(&responses, 2).expect("no response")
     };
 
-    // 1. PUT of a class carrying an explicit Storage block → refused by default.
+    // 1. #331: PUT of a class carrying an explicit Storage block SUCCEEDS and the block is kept.
+    //    This step asserted `isError == true` — the refusal — and that assertion outlived the
+    //    inversion of the ones below it, so CI's e2e job caught a half-updated test. Worth the
+    //    scar tissue in a comment: this target self-skips without IRIS (require_iris! does an early
+    //    return and prints "ok"), so the local gate could not have found it.
     let with_storage = "Class IrisDevE2E.StorageGuard Extends %Persistent\n{\nProperty P As %String;\n\nStorage Default\n{\n<Data name=\"D\">\n<Value name=\"1\"><Value>P</Value></Value>\n</Data>\n<DataLocation>^IrisDevE2E.SGD</DataLocation>\n}\n}\n";
     let frame = exchange(
         serde_json::json!({"mode":"put","name":"IrisDevE2E.StorageGuard.cls","content":with_storage,"compile":false}),
         "iris_doc",
     );
-    assert_eq!(frame["result"]["isError"], true, "{frame}");
+    assert_ne!(
+        frame["result"]["isError"], true,
+        "a put carrying a Storage block must no longer be an error frame (#331): {frame}"
+    );
     let v = parse_tool_text(&frame);
     // #331: a put carrying a Storage block now SUCCEEDS and the block is preserved. This used to
     // assert the refusal, then assert that the opt-in stripped the block and wrote anyway — the two
