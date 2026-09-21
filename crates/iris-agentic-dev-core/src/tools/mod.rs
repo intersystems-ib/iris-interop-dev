@@ -319,6 +319,7 @@ pub mod info;
 pub mod interop;
 pub mod line_edit;
 pub mod log_store;
+pub mod near_miss;
 pub mod prop_collision;
 pub mod scm;
 pub mod search;
@@ -2881,13 +2882,33 @@ async fn class_presence(
 /// Names one segment away from `class_name`, so the caller's next call is a correction
 /// rather than another guess — the #62 treatment `iris_test` already gives NO_TESTS_FOUND.
 /// Searches the parent package, which is where a typo's real class almost always lives.
-/// Returns `(suggestions, classes_in_package)`.
+/// Returns `(suggestions, classes_in_package)`, where the count is `None` when the lookup FAILED.
+///
+/// # Why there are two suggesters, and which to reach for
+///
+/// `tools::near_miss` does the same job for `iris_doc` and is NOT a duplicate of this one. The
+/// difference is the source, and it is load-bearing:
+///
+/// * **This one reads `%Dictionary.CompiledClass` over SQL.** It therefore sees only COMPILED
+///   classes, and it inherits the dictionary's measured stale direction — a class written AND
+///   compiled earlier in this same MCP process stays invisible to it until a later process. That
+///   is documented at three other sites in this crate. For `docs_introspect`, whose subject is a
+///   compiled class's members, that is the right source: a class the dictionary cannot see is one
+///   introspection cannot read either, so the blind spots coincide.
+/// * **`near_miss` reads the Atelier `/docnames` listing.** It sees documents regardless of compile
+///   state and is not subject to that lag, which is what `iris_doc` needs — its NOT_FOUND fires on
+///   a document that may never have been compiled, and answering "no near misses" for a file the
+///   caller wrote a moment ago is the failure mode the suggestion exists to prevent.
+///
+/// Collapsing them onto one source would hand one of the two callers the wrong blind spot. Keep
+/// both, and keep this note: two functions with the same shape and no stated reason read as an
+/// accident someone will later "clean up".
 async fn near_miss_classes(
     iris: &IrisConnection,
     client: &reqwest::Client,
     namespace: &str,
     class_name: &str,
-) -> (Vec<String>, usize) {
+) -> (Vec<String>, Option<usize>) {
     let prefix = match class_name.rfind('.') {
         Some(i) => &class_name[..=i],
         None => class_name,
@@ -2903,8 +2924,15 @@ async fn near_miss_classes(
     {
         Ok(v) => v,
         Err(e) => {
+            // #329: this returned `(vec![], 0)` — an empty suggestion list with a count of zero,
+            // which the caller cannot tell apart from "the package is empty". So a 401 or a closed
+            // port rendered as "nothing similar exists": the negative-fact shape (#310) sitting
+            // inside the helper whose job is to answer a not-found usefully.
+            //
+            // `None` rather than a sentinel: a magic count leaks into every consumer that forgets
+            // to check it, and `classes_in_package: 18446744073709551615` is its own bug report.
             tracing::debug!("near-miss lookup failed for {class_name}: {e}");
-            return (vec![], 0);
+            return (vec![], None);
         }
     };
     let all: Vec<String> = body["result"]["content"]
@@ -2916,7 +2944,7 @@ async fn near_miss_classes(
                 .collect()
         })
         .unwrap_or_default();
-    (rank_near_misses(class_name, &all), all.len())
+    (rank_near_misses(class_name, &all), Some(all.len()))
 }
 
 /// Which of `candidates` are plausibly the class the caller MEANT.
@@ -2979,13 +3007,18 @@ fn class_not_found_error(
     class_name: &str,
     namespace: &str,
     candidates: &[String],
-    in_package: usize,
+    // `None` means the package lookup itself FAILED (#329) — NOT that the package is empty. The
+    // two used to be the same value, so a 401 rendered as "nothing similar exists".
+    in_package: Option<usize>,
     requested: Option<&str>,
 ) -> Result<CallToolResult, McpError> {
     let mut extra = serde_json::json!({
         "class_name": class_name,
         "namespace": namespace,
+        // null, not 0, when the lookup failed: 0 is a fact about the package and null is the
+        // absence of one.
         "classes_in_package": in_package,
+        "package_lookup_failed": in_package.is_none(),
     });
     // #157: when the name was expanded, the caller asked about `%Foo` and is being told
     // `%Library.Foo` is absent. Name both, or the answer is about a string they never sent.
@@ -3020,15 +3053,20 @@ fn class_not_found_error(
              class-dictionary probe. Did you mean: {}? Nothing was introspected.",
             candidates.join(", ")
         )
-    } else if in_package > 0 {
-        // The package is real and the class is not — worth saying, because it rules out
-        // "wrong namespace" without listing every class in it.
-        format!(
-            "{absent} Its package does exist here and holds {in_package} compiled class(es), \
-             none of them a near match."
-        )
     } else {
-        absent
+        // #329: THREE outcomes, where there used to be two. `None` is a failed lookup and must not
+        // borrow the wording of an empty package — that is the whole defect this issue is about.
+        match in_package {
+            None => format!(
+                "{absent} The package listing could not be read, so this is NOT evidence that \
+                 nothing similar exists — see classes_in_package: null."
+            ),
+            Some(n) if n > 0 => format!(
+                "{absent} Its package does exist here and holds {n} compiled class(es), none of \
+                 them a near match."
+            ),
+            Some(_) => absent,
+        }
     };
     // #242: the hint now names the ONE population the probe is blind to, because that caller
     // is the one this envelope misleads. An agent that just wrote a class and is told it "does
@@ -14008,10 +14046,133 @@ mod near_miss_tests {
         }
     }
 
+    /// #329 WIRING. The envelope test below drives `class_not_found_error` directly, which leaves
+    /// the thing that PRODUCES the `None` untested — and a mutation reverting
+    /// `near_miss_classes`' error arm to `(vec![], Some(0))` survived the whole suite because of
+    /// it. Helper covered, wiring not: the third time that shape has surfaced in this repo.
+    ///
+    /// So this drives the real function against a server that fails the query, and asserts the
+    /// count is `None`. The control underneath it is a server that ANSWERS, so "return None
+    /// always" cannot pass.
+    #[test]
+    fn near_miss_classes_reports_a_failed_lookup_as_none_not_zero() {
+        use crate::iris::connection::DiscoverySource;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            // 1. The server refuses. Atelier answers 401 with a ZERO-BYTE body, which is the shape
+            //    that made this indistinguishable from an empty package in the first place.
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(401))
+                .mount(&server)
+                .await;
+            let conn = IrisConnection::new(
+                server.uri(),
+                "APP",
+                "_SYSTEM",
+                "SYS",
+                DiscoverySource::EnvVar,
+            );
+            let client = IrisConnection::http_client().unwrap();
+            let (cands, in_package) =
+                near_miss_classes(&conn, &client, "APP", "Pkg.MSG.Census").await;
+            assert!(cands.is_empty(), "a failed query cannot yield candidates");
+            assert!(
+                in_package.is_none(),
+                "a query that FAILED must be None, not Some(0): Some(0) is a fact about the \
+                 package and renders as 'none of them a near match' about a listing never read"
+            );
+
+            // 2. CONTROL: a server that answers with an empty result set must give Some(0), or an
+            //    implementation returning None unconditionally would pass the assertion above.
+            let ok_server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"result": {"content": []}})),
+                )
+                .mount(&ok_server)
+                .await;
+            let ok_conn = IrisConnection::new(
+                ok_server.uri(),
+                "APP",
+                "_SYSTEM",
+                "SYS",
+                DiscoverySource::EnvVar,
+            );
+            let (_, empty_pkg) =
+                near_miss_classes(&ok_conn, &client, "APP", "Pkg.MSG.Census").await;
+            assert_eq!(
+                empty_pkg,
+                Some(0),
+                "a server that ANSWERED with no rows is an empty package — a real finding, and it \
+                 must stay distinguishable from the failure above"
+            );
+        });
+    }
+
+    /// #329: a FAILED package lookup must not borrow the wording of an empty package.
+    ///
+    /// `near_miss_classes` used to answer a 401 or a closed port with `(vec![], 0)` — byte-identical
+    /// to "the package exists and is empty" — so the envelope said "none of them a near match" about
+    /// a listing it never read. That is the negative-fact shape (#310) inside the helper whose job is
+    /// to answer a not-found usefully.
+    #[test]
+    fn a_failed_package_lookup_is_not_reported_as_an_empty_package() {
+        let r = class_not_found_error("A.Baz", "APP", &v(&[]), None, None).unwrap();
+        let text = match &r.content[0].raw {
+            rmcp::model::RawContent::Text(t) => t.text.clone(),
+            _ => panic!("expected text"),
+        };
+        let j: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(
+            j["classes_in_package"],
+            serde_json::Value::Null,
+            "a lookup that failed must be null, not 0 — 0 is a fact about the package: {text}"
+        );
+        assert_eq!(
+            j["package_lookup_failed"],
+            serde_json::json!(true),
+            "{text}"
+        );
+        let msg = j["error"].as_str().unwrap_or("");
+        assert!(
+            msg.contains("NOT evidence"),
+            "the message must say plainly that it could not look: {msg}"
+        );
+        assert!(
+            !msg.contains("none of them a near match"),
+            "that phrasing claims a listing was read and found nothing similar: {msg}"
+        );
+
+        // CONTROL: a genuinely empty package must still say so, or the assertion above would pass on
+        // an implementation that reports "could not look" for everything.
+        let empty = class_not_found_error("A.Baz", "APP", &v(&[]), Some(0), None).unwrap();
+        let etext = match &empty.content[0].raw {
+            rmcp::model::RawContent::Text(t) => t.text.clone(),
+            _ => panic!("expected text"),
+        };
+        let ej: serde_json::Value = serde_json::from_str(&etext).unwrap();
+        assert_eq!(ej["classes_in_package"], serde_json::json!(0), "{etext}");
+        assert_eq!(
+            ej["package_lookup_failed"],
+            serde_json::json!(false),
+            "{etext}"
+        );
+        assert!(
+            !ej["error"].as_str().unwrap_or("").contains("NOT evidence"),
+            "an empty package is a real finding and must not claim the lookup failed: {etext}"
+        );
+    }
+
     /// The envelope must never read as "exists and is empty", with or without candidates.
     #[test]
     fn the_envelope_says_absent_not_empty() {
-        for (candidates, in_package) in [(v(&[]), 0usize), (v(&["A.Bar"]), 4usize)] {
+        for (candidates, in_package) in [(v(&[]), Some(0usize)), (v(&["A.Bar"]), Some(4usize))] {
             let r = class_not_found_error("A.Baz", "APP", &candidates, in_package, None).unwrap();
             let text = match &r.content[0].raw {
                 rmcp::model::RawContent::Text(t) => t.text.clone(),
