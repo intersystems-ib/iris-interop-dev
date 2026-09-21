@@ -130,6 +130,13 @@ jobs:
       # Runs in the ordinary `test` job so it cannot rot unnoticed until the next release.
       - name: "release-asset guard logic (#224)"
         run: bash scripts/test-verify-release-assets.sh
+      # #317: iris-up.sh exited 0 after a boot that never happened, then printed the export lines
+      # anyway. With the 80x3s default the failure took four minutes to observe, which is why it
+      # went unobserved; the bounds are overridable now so the failure path runs in milliseconds.
+      # 14 cases, controls at both ends (a good boot must still export). Also pins the per-shell
+      # behaviour of the two documented usages, so the header's warning cannot quietly go stale.
+      - name: "iris-up readiness verdict (#317)"
+        run: bash scripts/test-iris-up.sh
       # The workflows themselves were unlinted until now. actionlint caught 7 shellcheck
       # findings on first run, and — more usefully — it is the only thing that would have told us
       # whether a NEW workflow file is even valid before it reaches the default branch.
