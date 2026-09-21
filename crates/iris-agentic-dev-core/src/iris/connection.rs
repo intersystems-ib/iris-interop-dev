@@ -483,12 +483,7 @@ impl IrisConnection {
             }
             Err(_) => String::new(),
         };
-        match mode.as_str() {
-            "Live" => SystemMode::Live,
-            "Development" => SystemMode::Development,
-            "Test" => SystemMode::Test,
-            _ => SystemMode::Unknown,
-        }
+        system_mode_from_global(&mode)
     }
 
     /// Execute ObjectScript code via the write-compile-query cycle (pure HTTP, no docker).
@@ -993,8 +988,52 @@ impl IrisConnection {
     }
 }
 
+/// Map a raw `^%SYS("SystemMode")` value onto a [`SystemMode`].
+///
+/// Split out of `detect_system_mode` so the mapping is testable without an HTTP mock: #320 lived
+/// entirely in these string comparisons, and nothing could assert on them while they were buried
+/// inside an async request.
+///
+/// **#320 — why this uppercases.** IRIS documents the SystemMode values in UPPER CASE (`LIVE`,
+/// `TEST`, `DEVELOPMENT`, `FAILOVER`), so the title-case literals this used to match — `"Live"`,
+/// `"Development"`, `"Test"` — were the one spelling a real instance is least likely to report. A
+/// production instance whose global reads `"LIVE"` therefore fell through to [`SystemMode::Unknown`],
+/// and `Unknown` defers to [`is_production_namespace`] below — so writes were **allowed on a live
+/// system** unless its namespace happened to be spelled `PROD`/`PRODUCTION`/`LIVE`/`PRD`. A live
+/// instance serving namespace `APP` was writable.
+///
+/// The asymmetry is the whole bug: `is_production_namespace` has always uppercased before comparing,
+/// and `is_production_namespace_case_insensitive` asserts that it does. One half of the same
+/// decision knew that casing varies in the field and the other half did not. Both normalisations now
+/// sit here together, so a future reader cannot fix one without seeing the other.
+fn system_mode_from_global(raw: &str) -> SystemMode {
+    match raw.trim().to_uppercase().as_str() {
+        "LIVE" => SystemMode::Live,
+        "DEVELOPMENT" => SystemMode::Development,
+        "TEST" => SystemMode::Test,
+        // Deliberately PERMISSIVE, and deliberately not split any further.
+        //
+        // Anything we do not recognise — a wording no one documented (`"DEV ENVIRONMENT"` is a real
+        // observed value), or an empty string because the query failed — lands here and falls back
+        // to the namespace heuristic rather than refusing to write. A throwaway container usually
+        // has no SystemMode set at all, so failing closed on an unrecognised mode would break the
+        // common case to protect an uncommon one.
+        //
+        // That means an UNREADABLE mode is currently indistinguishable from an UNRECOGNISED one,
+        // which is the negative-fact shape catalogued in #310 and is a known, accepted residual
+        // here: the namespace heuristic still refuses a production-looking namespace either way.
+        // `FAILOVER` is a documented fourth value that lands in this arm and stays writable; a
+        // mirror failover member is not a throwaway container, so blocking it is worth doing, but
+        // it is an addition rather than a normalisation and is left to its own change.
+        _ => SystemMode::Unknown,
+    }
+}
+
 /// Returns true if the namespace name looks like a production namespace.
 /// Used as fallback when SystemMode is Unknown (community edition or unconfigured).
+///
+/// See [`system_mode_from_global`] above: this function's case-insensitivity is the behaviour that
+/// the mode match was missing.
 fn is_production_namespace(ns: &str) -> bool {
     let upper = ns.to_uppercase();
     matches!(upper.as_str(), "PROD" | "PRODUCTION" | "LIVE" | "PRD")
@@ -1240,6 +1279,91 @@ mod system_mode_tests {
         assert!(!conn("LIVE", SystemMode::Unknown).is_write_allowed());
         assert!(!conn("PROD", SystemMode::Live).is_write_allowed());
         assert!(conn("DEV", SystemMode::Development).is_write_allowed());
+    }
+
+    // ── #320: SystemMode mapping ──────────────────────────────────────────────
+
+    /// THE security property, and the one that was false before #320.
+    ///
+    /// IRIS documents the value as `LIVE`. The old match compared against `"Live"`, so a live
+    /// instance became `Unknown`, and `Unknown` asks only whether the NAMESPACE looks like
+    /// production. Namespace `APP` does not — so this returned `true` and the write gate opened on a
+    /// production system. Nothing else in the chain would have caught it.
+    #[test]
+    fn an_uppercase_live_instance_refuses_writes_even_in_an_innocent_namespace() {
+        std::env::remove_var("IRIS_ALLOW_PROD");
+        // Every casing, not just the documented one: with `"LIVE"` alone this assertion survives a
+        // mutation that drops the `.to_uppercase()` while leaving the arms uppercase, which is
+        // exactly the normalisation the fix consists of.
+        for raw in ["LIVE", "Live", "live", "LiVe"] {
+            for ns in ["APP", "USER", "MYAPP", "INTEROP"] {
+                let c = conn(ns, system_mode_from_global(raw));
+                assert!(
+                    !c.is_write_allowed(),
+                    "namespace {ns} on a {raw:?} instance must refuse writes; before #320 this was \
+                     allowed, because the mode did not match the literal \"Live\" and fell through \
+                     to Unknown, where only the namespace NAME is consulted"
+                );
+            }
+        }
+    }
+
+    /// The casings a real instance might report. `"Live"` is included so the fix is a superset of the
+    /// old behaviour rather than a replacement of it.
+    #[test]
+    fn live_is_recognised_in_every_casing() {
+        for raw in ["LIVE", "Live", "live", "lIvE", "  LIVE  "] {
+            assert_eq!(
+                system_mode_from_global(raw),
+                SystemMode::Live,
+                "{raw:?} must be recognised as Live"
+            );
+        }
+    }
+
+    /// The control: the other two documented values must still map, or the test above would pass on
+    /// a function that answers `Live` for everything and locks every instance out of writing.
+    #[test]
+    fn the_other_documented_modes_still_map_and_are_writable() {
+        std::env::remove_var("IRIS_ALLOW_PROD");
+        for raw in ["DEVELOPMENT", "Development", "development"] {
+            assert_eq!(
+                system_mode_from_global(raw),
+                SystemMode::Development,
+                "{raw:?}"
+            );
+        }
+        for raw in ["TEST", "Test", "test"] {
+            assert_eq!(system_mode_from_global(raw), SystemMode::Test, "{raw:?}");
+        }
+        assert!(conn("APP", system_mode_from_global("DEVELOPMENT")).is_write_allowed());
+        assert!(conn("APP", system_mode_from_global("TEST")).is_write_allowed());
+    }
+
+    /// Pins the decision recorded on #320: an unrecognised mode stays PERMISSIVE. A throwaway
+    /// container often reports a wording nobody documented, or nothing at all, and refusing to write
+    /// to it would break the common case. The namespace heuristic remains the backstop — which is
+    /// why this test asserts BOTH directions, not just the permissive one.
+    #[test]
+    fn an_unrecognised_mode_stays_permissive_but_keeps_the_namespace_backstop() {
+        std::env::remove_var("IRIS_ALLOW_PROD");
+        for raw in ["DEV ENVIRONMENT", "FAILOVER", "", "   ", "whatever"] {
+            assert_eq!(
+                system_mode_from_global(raw),
+                SystemMode::Unknown,
+                "{raw:?} must be Unknown"
+            );
+            assert!(
+                conn("APP", system_mode_from_global(raw)).is_write_allowed(),
+                "{raw:?} in a harmless namespace must stay writable — a docker throwaway rarely \
+                 sets SystemMode at all"
+            );
+            assert!(
+                !conn("PROD", system_mode_from_global(raw)).is_write_allowed(),
+                "{raw:?} must still be refused in a production-NAMED namespace — dropping that \
+                 backstop was never part of the #320 decision"
+            );
+        }
     }
 
     #[test]
