@@ -166,18 +166,28 @@ jobs:
           set -euo pipefail
           # The official binary, version-pinned, rather than a third-party wrapper action. This
           # repo just un-floated softprops/action-gh-release for supply-chain reasons (#224), and
-          # adding a 51-star third-party action to lint four files would trade that back.
+          # adding a 51-star third-party action to lint a handful of files would trade that back.
           VER=1.7.12
           curl -sSLo actionlint.tgz \
             "https://github.com/rhysd/actionlint/releases/download/v${VER}/actionlint_${VER}_linux_amd64.tar.gz"
           tar -xzf actionlint.tgz actionlint
           ./actionlint --version
           # A linter that found nothing because it linted nothing is the failure mode to avoid,
-          # so the file count is asserted before trusting a clean exit.
+          # so the glob is asserted non-empty before a clean exit is trusted — and the files are
+          # PRINTED, so "what was linted" is visible rather than inferred from a count.
+          #
+          # #315: this used to require `-ge 4`. Deleting interop-fork.yml — a workflow that could
+          # never run — legitimately left 3, and the gate went red for a correct change. A
+          # hardcoded population is the same rot as a count in prose: it was true when written and
+          # nothing re-derives it. The failure mode it actually guards against is an EMPTY glob, so
+          # that is what it now checks. The judgement of "implausibly few" belongs where it can be
+          # mutation-tested: `tests/workflows_are_reachable.rs` owns MIN_WORKFLOWS, and it also
+          # asserts every workflow is dispatchable, which a count never could.
           n=$(find .github/workflows -maxdepth 1 -name '*.yml' -type f | wc -l | tr -d ' ')
-          echo "linting $n workflow file(s)"
-          if [ "$n" -lt 4 ]; then
-            echo "::error::expected at least 4 workflow files, found $n - actionlint would pass by linting almost nothing"
+          echo "linting $n workflow file(s):"
+          find .github/workflows -maxdepth 1 -name '*.yml' -type f | sort
+          if [ "$n" -lt 1 ]; then
+            echo "::error::no workflow files matched - actionlint would pass by linting nothing"
             exit 1
           fi
           ./actionlint .github/workflows/*.yml
