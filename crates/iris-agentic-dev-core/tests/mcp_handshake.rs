@@ -1,6 +1,8 @@
 //! T023: MCP handshake integration test.
 //! Spawns the `iris-interop-dev mcp` binary, sends JSON-RPC initialize + tools/list,
-//! asserts the 20-tool interop profile is returned and the response is timely.
+//! asserts the interop profile is returned in full and the response is timely. The profile's
+//! size is stated once, in `mcp_server_tools_list_returns_interop_profile`'s assertion — this
+//! line said 20 while that assertion said 31.
 //!
 //! Tests written FIRST — must fail until T015–T022 are implemented.
 #![allow(dead_code, clippy::zombie_processes)]
@@ -461,7 +463,8 @@ fn pruned_tool_is_rejected_at_dispatch_not_merely_unlisted() {
     child.kill().ok();
 }
 
-/// tools/list returns exactly the 20-tool interop profile (this fork's default toolset).
+/// tools/list returns exactly the interop profile (this fork's default toolset), whose size is
+/// asserted below against `INTEROP_TOOLS` rather than restated here — this line said 20.
 #[test]
 fn mcp_server_tools_list_returns_interop_profile() {
     let bin = iris_dev_bin();

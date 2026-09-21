@@ -213,9 +213,19 @@ fn test_merged_excludes_original_interop_production_tools() {
     }
 }
 
-/// Merged must advertise exactly 51 tools (measured 2026-09-19; 55 - 8 + 4).
-/// Renamed: the old `test_merged_tool_count_is_23` contradicted its own assertion (33),
-/// and both numbers came from a hardcoded list that had drifted away from the router.
+/// Merged must advertise exactly 52 tools, and must stay Nostub - 8 + 4.
+///
+/// The count is stated ONCE, in the assertion. This comment used to open with "exactly 51 tools
+/// (measured 2026-09-19; 55 - 8 + 4)" two lines above an assertion of 52 — so a reader who
+/// trusted the comment would have "corrected" the passing assertion and broken the build. It is
+/// the second time this exact test carried a number contradicting its own assert: the rename
+/// recorded below fixed `test_merged_tool_count_is_23` (which asserted 33), and the replacement
+/// comment then rotted the same way, because 54 -> 55 -> 56 as tools joined the router while
+/// three frozen copies of the base stayed behind.
+///
+/// So the derivation is now RUN rather than written down. Nostub is read live, which is what makes
+/// the relation survive the next tool: both counts move together and 8-folded-away + 4-merged-only
+/// is the part that is actually being asserted.
 #[test]
 fn test_merged_tool_count() {
     let tools = IrisTools::new_with_toolset(None, Toolset::Merged).expect("IrisTools::new");
@@ -223,6 +233,20 @@ fn test_merged_tool_count() {
     assert_eq!(
         count, 52,
         "Merged toolset must advertise exactly 52 tools, got {}",
+        count
+    );
+    // The derivation, executed. 8 folded away (4 debug_*, 3 container, agent_info) and 4
+    // merged-only dispatchers added. A tool added to the router moves both sides.
+    let nostub = IrisTools::new_with_toolset(None, Toolset::Nostub)
+        .expect("IrisTools::new")
+        .registered_tool_names()
+        .len();
+    assert_eq!(
+        count,
+        nostub - 8 + 4,
+        "Merged must be Nostub ({}) minus the 8 folded-away tools plus the 4 merged-only ones, \
+         got {}",
+        nostub,
         count
     );
     // iris_get_log must be registered in Merged (027-progressive-disclosure)

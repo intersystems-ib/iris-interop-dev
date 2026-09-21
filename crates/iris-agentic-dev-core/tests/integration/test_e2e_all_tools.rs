@@ -1,4 +1,10 @@
-//! T079: E2E test — all 29 tools respond without INTERNAL_ERROR.
+//! T079: E2E test — a SUBSET of tools respond without INTERNAL_ERROR.
+//!
+//! The target name and this line both used to promise all 29 (then 31) tools. It calls three —
+//! iris_execute, iris_query, iris_info — under the `baseline` toolset. What it really pins is
+//! that tools/list is non-empty, that no tool name contains a dot (Bedrock/VS Code), and that
+//! those three dispatch without an INTERNAL_ERROR. Per-tool coverage lives in tools-status.json,
+//! which scripts/validate-tools.sh checks against INTEROP_TOOLS.
 //! T080: Steve's web prefix scenario.
 //! Run: IRIS_HOST=localhost IRIS_WEB_PORT=52780 IRIS_USERNAME=SuperUser IRIS_PASSWORD=SYS cargo test --test test_e2e_all_tools
 #![allow(dead_code, clippy::zombie_processes)]

@@ -53,7 +53,10 @@ print("\n".join(sorted(names)))
 # ── ANTI-DRIFT GUARD ──────────────────────────────────────────────────────────────
 # A renamed or deleted target must not sit in EXCLUDED unnoticed, silently opting a
 # target that no longer exists out of a gate it was never in. Same role test_toolset
-# plays for the 54/50/46/23 tool counts.
+# plays for the per-toolset tool counts — which are asserted there, not copied here. The four
+# numbers this line used to name (54/50/46/23) were ALL stale, and the replacement deltas
+# written in their place were wrong too on the first try. That is the argument for naming the
+# test instead of the numbers: `cargo test --test test_toolset` prints the current four.
 #
 # `${EXCLUDED[@]+"${EXCLUDED[@]}"}` rather than plain `"${EXCLUDED[@]}"`: under `set -u`,
 # bash 3.2 — stock /bin/bash on macOS, the box this script deliberately caters to — treats
