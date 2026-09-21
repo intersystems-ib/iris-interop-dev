@@ -61,8 +61,8 @@ fn test_load_returns_none_when_no_file() {
     let _g = env_guard();
     let result = load_workspace_config(Some("/nonexistent/path/that/cannot/exist"));
     assert!(
-        result.is_none(),
-        "should return None when file does not exist"
+        matches!(result, Ok(None)),
+        "an ABSENT config must be Ok(None): the defaults apply, and that is legitimate (#312)"
     );
 }
 
@@ -71,7 +71,9 @@ fn test_load_parses_container_field() {
     let _g = env_guard();
     let dir = tempfile::TempDir::new().unwrap();
     write_toml(&dir, r#"container = "test-iris""#);
-    let cfg = load_workspace_config(Some(dir.path().to_str().unwrap())).unwrap();
+    let cfg = load_workspace_config(Some(dir.path().to_str().unwrap()))
+        .expect("valid config must not be an error (#312)")
+        .expect("valid config must not read as absent");
     assert_eq!(cfg.container.as_deref(), Some("test-iris"));
 }
 
@@ -90,7 +92,9 @@ username = "myuser"
 password = "mypass"
 "#,
     );
-    let cfg = load_workspace_config(Some(dir.path().to_str().unwrap())).unwrap();
+    let cfg = load_workspace_config(Some(dir.path().to_str().unwrap()))
+        .expect("valid config must not be an error (#312)")
+        .expect("valid config must not read as absent");
     assert_eq!(cfg.container.as_deref(), Some("all-iris"));
     assert_eq!(cfg.namespace.as_deref(), Some("MYNS"));
     assert_eq!(cfg.host.as_deref(), Some("myhost"));
@@ -100,14 +104,24 @@ password = "mypass"
 }
 
 #[test]
-fn test_load_returns_none_on_syntax_error() {
+fn test_load_refuses_a_syntax_error_instead_of_reporting_no_config() {
     let _g = env_guard();
     let dir = tempfile::TempDir::new().unwrap();
     write_toml(&dir, "this is not valid toml = = = !!!");
     let result = load_workspace_config(Some(dir.path().to_str().unwrap()));
+
+    // #312: this test used to assert `result.is_none()` with the message "should return None on
+    // parse error, not panic". That is the DEFECT, pinned as intended behaviour — which is a large
+    // part of why it survived: anyone fixing it had to argue with a green test.
+    //
+    // "not panic" was the right instinct and is still satisfied. The mistake was the only
+    // alternative considered being None, which is the same value returned when there is no config
+    // file at all. The caller then falls through to IRIS_HOST/auto-discovery — a DIFFERENT instance
+    // than the file names — silently.
+    let err = result.expect_err("a malformed config must not read as 'there is no config'");
     assert!(
-        result.is_none(),
-        "should return None on parse error, not panic"
+        !err.detail.is_empty(),
+        "the TOML error must survive: it names the offending line"
     );
 }
 
@@ -117,7 +131,10 @@ fn test_load_uses_cwd_when_workspace_none() {
     // Call with None from a temp dir that has no .iris-dev.toml
     let dir = tempfile::TempDir::new().unwrap();
     let result = load_workspace_config(Some(dir.path().to_str().unwrap()));
-    assert!(result.is_none());
+    assert!(
+        matches!(result, Ok(None)),
+        "no file present -> Ok(None) (#312)"
+    );
 }
 
 #[test]
@@ -322,7 +339,9 @@ web_port = 80
 web_prefix = "irisaicore"
 "#,
     );
-    let cfg = load_workspace_config(Some(dir.path().to_str().unwrap())).unwrap();
+    let cfg = load_workspace_config(Some(dir.path().to_str().unwrap()))
+        .expect("valid config must not be an error (#312)")
+        .expect("valid config must not read as absent");
     assert_eq!(cfg.web_prefix.as_deref(), Some("irisaicore"));
 }
 
@@ -440,7 +459,9 @@ web_port = 443
 scheme = "https"
 "#,
     );
-    let cfg = load_workspace_config(Some(dir.path().to_str().unwrap())).unwrap();
+    let cfg = load_workspace_config(Some(dir.path().to_str().unwrap()))
+        .expect("valid config must not be an error (#312)")
+        .expect("valid config must not read as absent");
     assert_eq!(cfg.scheme.as_deref(), Some("https"));
 }
 
