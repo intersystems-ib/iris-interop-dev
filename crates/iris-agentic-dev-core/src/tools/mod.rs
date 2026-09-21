@@ -10669,8 +10669,10 @@ pub fn detected_error_count<'a>(console: impl IntoIterator<Item = &'a str>) -> O
 /// `content` is the class source when the caller has it — `iris_doc(mode=put)` still holds it,
 /// so that path can NAME the offending members. `iris_compile` compiles a document already on
 /// the server with no source in scope, so it gets the message-level variant. That path is also
-/// the one carrying the Storage-block cause (#5559 on a Storage XML block), which on the put
-/// path is already intercepted earlier as STORAGE_STRIP_BLOCKED.
+/// #331: this used to say the Storage-block cause was "already intercepted earlier as
+/// STORAGE_STRIP_BLOCKED" on the put path. That interception is gone — nothing strips Storage any
+/// more, because the parser accepts it — so this hint is now reachable from BOTH paths, and its
+/// Storage advice had to stop telling the caller to delete the block.
 ///
 /// Same shape as the #16006 interception in doc.rs, and the same reason: name the remedy rather
 /// than sending the caller hunting for a problem that does not exist.
@@ -10688,10 +10690,12 @@ pub fn hint_5559(first_error: &str, content: Option<&str>) -> Option<(String, Ve
     );
     if offenders.is_empty() {
         hint.push_str(
-            "Check every Property/Method/ClassMethod/Parameter name for `_`. The other cause is \
-             an explicit Storage block, whose XML this UDL parser rejects: remove it and let \
-             IRIS regenerate it. Count your braces LAST — if compile_console says one error, \
-             there is no cascade to prune.",
+            "Check every Property/Method/ClassMethod/Parameter name for `_`. Count your braces \
+             LAST — if compile_console says one error, there is no cascade to prune. Do NOT delete \
+             a Storage block to make this go away (#331): measured on 2025.3 and 2026.1, the parser \
+             ACCEPTS a class carrying one and preserves it across compile, and a generated block \
+             records slot assignments IRIS keeps across properties added, deleted and renamed — \
+             regenerating it re-packs those slots and silently re-maps every stored row.",
         );
     } else {
         hint.push_str(&format!(
@@ -12975,9 +12979,10 @@ mod hint_5559_tests {
         assert!(offenders.is_empty(), "{offenders:?}");
     }
 
-    /// iris_compile has no source in scope: the message-level variant, and it must carry the
-    /// OTHER cause (an explicit Storage block), because that is the path which reaches #5559
-    /// with a Storage XML block — on the put path that is intercepted as STORAGE_STRIP_BLOCKED.
+    /// iris_compile has no source in scope: the message-level variant, and it must still name the
+    /// other cause. #331 changed what it is allowed to SAY about it — nothing strips Storage any
+    /// more, so this hint is reachable from the put path too, and the old text told the caller to
+    /// delete the block.
     #[test]
     fn without_source_it_still_names_both_causes() {
         let (hint, offenders) = hint_5559(ERR, None).unwrap();
@@ -12991,6 +12996,35 @@ mod hint_5559_tests {
             hint.contains("Count your braces LAST"),
             "the ordering is the whole point: {hint}"
         );
+    }
+
+    /// #331: the hint must not tell anyone to delete a Storage block. Measured on 2025.3 and 2026.1
+    /// the parser accepts one, and a generated block records slot assignments IRIS keeps across
+    /// properties added, deleted and renamed — regenerating re-packs them and silently re-maps every
+    /// stored row. This assertion exists because the destructive instruction previously lived in TWO
+    /// places and removing it from `doc.rs` alone would have left this copy reachable.
+    #[test]
+    fn the_5559_hint_never_advises_deleting_a_storage_block() {
+        for content in [
+            None,
+            Some("Class A.B Extends %Persistent\n{\nProperty bad_name As %String;\n}"),
+        ] {
+            let (hint, _) = hint_5559(ERR, content).expect("#5559 must still be recognised");
+            let lower = hint.to_lowercase();
+            for lie in [
+                "remove it and let iris regenerate",
+                "delete the storage block",
+                "remove the storage block",
+                "let iris regenerate it",
+            ] {
+                assert!(
+                    !lower.contains(lie),
+                    "the hint says {lie:?}, which is the data-layout loss #331 exists to stop \
+                     (content present: {}). Hint: {hint}",
+                    content.is_some()
+                );
+            }
+        }
     }
 
     /// Every OTHER compile error must keep the generic handling — this is not a catch-all.

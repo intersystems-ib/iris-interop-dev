@@ -376,10 +376,11 @@ fn e2e_symbols_plain_substring_no_regression() {
 // ── iris_doc ──────────────────────────────────────────────────────────────────
 
 #[test]
-fn e2e_doc_put_with_storage_block_requires_opt_in() {
+fn e2e_doc_put_preserves_a_storage_block_through_a_round_trip() {
     require_iris!();
-    // I-3: the UDL write path strips Storage blocks, so a put that would silently
-    // discard one is refused unless the caller opts in (issue #18, upstream #88).
+    // #331: the UDL write path used to strip Storage blocks and then refuse rather than discard a
+    // layout silently. It no longer strips — the parser accepts the block — so this asserts the
+    // round trip that the refusal made impossible.
     let cls_with_storage = r#"Class Test022.StorageTest Extends %Persistent {
 Property Name As %String;
 Storage Default
@@ -396,53 +397,55 @@ Storage Default
 }
 }"#;
 
-    let blocked = call_tool(
+    // #331: THE ROUND TRIP, which is what was missing and why the loop survived.
+    //
+    // This block used to assert the opposite: that a put carrying a Storage block is REFUSED with
+    // STORAGE_STRIP_BLOCKED, and that passing allow_storage_regeneration strips it and succeeds.
+    // Both behaviours are gone. Measured on writable 2025.3 and 2026.1 instances, IRIS accepts a
+    // class carrying a generated Storage block (PUT 201/200, compile 200, zero errors) and preserves
+    // it — so the strip removed something the server wanted, and the refusal fired because the strip
+    // had happened. `iris_doc(get)` returns the generated block, so every get -> edit -> put of a
+    // compiled %Persistent class hit it.
+    let written = call_tool(
         "iris_doc",
         serde_json::json!({"mode":"put","name":"Test022.StorageTest.cls",
             "content": cls_with_storage, "namespace":"USER"}),
     );
     assert_eq!(
-        blocked["success"], false,
-        "put that would strip a Storage block must be refused: {}",
-        blocked
+        written["success"], true,
+        "a put carrying a Storage block must now SUCCEED — nothing strips it: {}",
+        written
     );
-    assert_eq!(
-        blocked["error_code"], "STORAGE_STRIP_BLOCKED",
-        "refusal must carry STORAGE_STRIP_BLOCKED: {}",
-        blocked
-    );
-    // #217: the code alone was all this asserted, and the message underneath it made the
-    // BYPASS its only executable sentence — so callers took the bypass on classes they had
-    // just authored. This is the wire-level check that the repaired text actually reaches a
-    // client: the unit tests in doc.rs cover the wording, but only this covers the wiring.
-    let refusal = blocked["error"].as_str().unwrap_or("");
     assert!(
-        refusal.contains("FIX: delete the Storage block"),
-        "refusal must lead with the fix, not the bypass: {refusal}"
+        written.get("storage_stripped").is_none(),
+        "storage_stripped is retired (#331): a key that can only ever be false teaches a caller to \
+         branch on something dead. Got: {}",
+        written
     );
-    if let Some(bypass) = refusal.find("allow_storage_regeneration") {
-        let fix = refusal
-            .find("FIX: delete the Storage block")
-            .expect("checked above");
-        assert!(fix < bypass, "the fix must precede the bypass: {refusal}");
-    }
 
-    // Opting in strips the Storage block and writes the class.
-    let result = call_tool(
+    // READ IT BACK. The put succeeding is not the claim — the claim is that the block SURVIVED, with
+    // its slot numbering intact, because a stored row is a $list addressed by slot number and IRIS
+    // keeps those slots across properties added, deleted and renamed.
+    let back = call_tool(
         "iris_doc",
-        serde_json::json!({"mode":"put","name":"Test022.StorageTest.cls",
-            "content": cls_with_storage, "namespace":"USER",
-            "allow_storage_regeneration": true}),
+        serde_json::json!({"mode":"get","name":"Test022.StorageTest.cls","namespace":"USER"}),
     );
-    assert_eq!(
-        result["success"], true,
-        "put with allow_storage_regeneration should succeed: {}",
-        result
+    let content = back["content"].as_str().unwrap_or("");
+    assert!(
+        content.contains("Storage Default"),
+        "the Storage block must survive the round trip, not be regenerated: {content}"
     );
-    assert_eq!(
-        result["storage_stripped"], true,
-        "response must include storage_stripped:true: {}",
-        result
+    assert!(
+        content.contains("<DataLocation>^Test022.StorageTestD</DataLocation>"),
+        "the explicit DataLocation must come back byte-intact — an arbitrary global name IRIS \
+         minted is exactly what regeneration would not reproduce: {content}"
+    );
+    // This fixture's block declares exactly one slot. Asserting the slots of a DIFFERENT class
+    // would have passed locally (this target is ignored without IRIS) and failed only in CI's e2e
+    // job — so the list is taken from the fixture above, not from memory.
+    assert!(
+        content.contains("<Value>%%CLASSNAME</Value>"),
+        "slot 1 (%%CLASSNAME) is missing after the round trip — the layout was re-packed: {content}"
     );
 
     // Cleanup

@@ -887,23 +887,22 @@ fn test_doc_guards_storage_name_and_mode() {
     );
     assert_eq!(frame["result"]["isError"], true, "{frame}");
     let v = parse_tool_text(&frame);
-    assert_eq!(v["error_code"], "STORAGE_STRIP_BLOCKED", "{v}");
-    // #217: the refusal must name the fix (delete the block) ahead of the bypass flag.
-    let refusal = v["error"].as_str().unwrap_or("");
+    // #331: a put carrying a Storage block now SUCCEEDS and the block is preserved. This used to
+    // assert the refusal, then assert that the opt-in stripped the block and wrote anyway — the two
+    // behaviours that produced the loop and the data-layout loss respectively.
+    assert_ne!(
+        v.get("error_code").and_then(|c| c.as_str()),
+        Some("STORAGE_STRIP_BLOCKED"),
+        "the refusal is retired (#331) — nothing strips Storage: {v}"
+    );
+    assert_eq!(
+        v["success"], true,
+        "a put carrying a Storage block must succeed: {v}"
+    );
     assert!(
-        refusal.contains("FIX: delete the Storage block"),
-        "refusal must lead with the fix: {refusal}"
+        v.get("storage_stripped").is_none(),
+        "storage_stripped is retired (#331): it could only ever be false. Got: {v}"
     );
-
-    // 2. Same PUT with the opt-in → proceeds (storage stripped, class written).
-    let frame = exchange(
-        serde_json::json!({"mode":"put","name":"IrisDevE2E.StorageGuard.cls","content":with_storage,"compile":false,"allow_storage_regeneration":true}),
-        "iris_doc",
-    );
-    assert_ne!(frame["result"]["isError"], true, "{frame}");
-    let v = parse_tool_text(&frame);
-    assert_eq!(v["success"], true, "{v}");
-    assert_eq!(v["storage_stripped"], true, "{v}");
 
     // 3. Blank name → MISSING_PARAMS, not an Atelier #16006 retry loop.
     let frame = exchange(serde_json::json!({"mode":"get"}), "iris_doc");
