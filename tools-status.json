@@ -128,7 +128,7 @@
     {
       "tool": "iris_gateway_manage",
       "unit": "tools::gateway_manage::tests::*",
-      "e2e": "interop_e2e_tests::gateway_manage_names_which_failure_mode_the_gateway_is_in",
+      "e2e": "interop_e2e_tests::gateway_manage_names_which_failure_mode_the_gateway_is_in + gateway_manage_creates_and_deletes_without_ever_echoing_the_password",
       "status": "OK"
     },
     {

@@ -227,6 +227,130 @@ fn a_write_disallowed_connection_still_lists_every_tool() {
     child.kill().ok();
 }
 
+/// #343: `iris_gateway_manage`'s write half must be REFUSED at dispatch on a write-disallowed
+/// connection, and refusing must not echo the password back.
+///
+/// Classifying `create`/`delete` in `mutating_call` is not evidence the gate fires — a registered
+/// but unreached gate looks exactly like a working one, which is why this drives the real dispatch
+/// path instead of the classifier. The read half is called in the SAME session as the control: if
+/// probe were refused too, the write refusals below would prove nothing about writes.
+///
+/// Offline by construction, the same way `a_write_disallowed_connection_still_lists_every_tool` is:
+/// an unreachable host leaves `system_mode` Unknown, and `IRIS_NAMESPACE=PROD` then makes
+/// `is_write_allowed()` false with no network involved.
+#[test]
+fn the_gateway_write_actions_are_refused_on_a_write_disallowed_connection() {
+    let bin = iris_dev_bin();
+    if !bin.exists() {
+        eprintln!("Skipping: iris-agentic-dev binary not found");
+        return;
+    }
+    // Distinctive enough that a partial echo is still a failure.
+    const SENTINEL: &str = "Hunter2-SENTINEL-xyzzy";
+
+    let mut child = Command::new(&bin)
+        .arg("mcp")
+        .env("IRIS_HOST", "127.0.0.1")
+        .env("IRIS_WEB_PORT", "9")
+        .env("IRIS_NAMESPACE", "PROD")
+        .env_remove("IRIS_ALLOW_PROD")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn iris-agentic-dev mcp");
+
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    send_jsonrpc(
+        &mut stdin,
+        1,
+        "initialize",
+        r#"{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}"#,
+    );
+    let _ = read_jsonrpc(&mut reader);
+    stdin
+        .write_all(
+            b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\",\"params\":{}}\n",
+        )
+        .unwrap();
+    stdin.flush().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // Returns (what was sent on the wire, what came back).
+    let mut call = |id: u64, args: serde_json::Value| -> (String, String) {
+        let params = serde_json::json!({"name": "iris_gateway_manage", "arguments": args});
+        let sent = params.to_string();
+        send_jsonrpc(&mut stdin, id, "tools/call", &sent);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        (sent, line)
+    };
+
+    // ── the write half: refused at dispatch, by the gate, naming what it would have changed ─
+    let (create_sent, created) = call(
+        2,
+        serde_json::json!({
+            "action": "create",
+            "connection": "PG_GATE_TEST",
+            "url": "jdbc:postgresql://db:5432/X",
+            "driver": "org.postgresql.Driver",
+            "user": "u",
+            "password": SENTINEL,
+        }),
+    );
+    assert!(
+        created.contains("WRITE_GATED"),
+        "create was not refused by the write gate: {created}"
+    );
+    let (_, deleted) = call(
+        3,
+        serde_json::json!({"action": "delete", "connection": "PG_GATE_TEST"}),
+    );
+    assert!(
+        deleted.contains("WRITE_GATED"),
+        "delete was not refused by the write gate: {deleted}"
+    );
+
+    // ── the control: the READ half must reach the handler ────────────────────────────────
+    // It cannot succeed — nothing is listening on port 9 — and that is the point: it must fail
+    // for a CONNECTION reason, not the gate's. Without this, a gate that refused everything
+    // would satisfy both assertions above and look identical to a working one.
+    let (_, probed) = call(4, serde_json::json!({"action": "probe"}));
+    assert!(
+        !probed.contains("WRITE_GATED"),
+        "probe changes nothing and must not be write-gated — otherwise the refusals above are \
+         about a gate that blocks everything, not about writes: {probed}"
+    );
+
+    // ── and the password must not be anywhere in any of the three frames ─────────────────
+    for (label, frame) in [
+        ("create", &created),
+        ("delete", &deleted),
+        ("probe", &probed),
+    ] {
+        assert!(
+            !frame.contains(SENTINEL),
+            "the {label} response carries the password: {frame}"
+        );
+        // A partial echo is a leak too.
+        assert!(
+            !frame.contains("Hunter2"),
+            "the {label} response carries part of the password: {frame}"
+        );
+    }
+    // The control on that sweep: the sentinel really WAS sent, so "absent from the response" is a
+    // fact about the response rather than about a test that never used it. Asserted on the wire
+    // bytes, because the refusal deliberately echoes none of the arguments back.
+    assert!(
+        create_sent.contains(SENTINEL),
+        "the sentinel was never sent, so the sweep above proves nothing: {create_sent}"
+    );
+
+    child.kill().ok();
+}
+
 /// #112: every tool that takes parameters must SAY SO in its advertised schema.
 ///
 /// Ten of the 23 interop tools shipped `{"type":"object"}` — no properties, no `required` —
