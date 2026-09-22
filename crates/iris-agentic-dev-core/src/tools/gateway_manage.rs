@@ -59,10 +59,9 @@ use crate::objectscript::os_str_expr;
 /// one row and a jar path for another. Measured; do not query it.
 pub const JDBC_SERVER: &str = "%JDBC Server";
 
-/// Actions this tool accepts. `create` and `delete` are deliberately absent — see
-/// [`why_no_create_message`]. This is also the advertised `enum` on the `action` field; the two are
-/// held equal by `the_advertised_enum_is_the_action_list`.
-pub const ACTIONS: &[&str] = &["probe", "list", "test"];
+/// Actions this tool accepts. Also the advertised `enum` on the `action` field; the two are held
+/// equal by `the_advertised_enum_is_the_action_list`.
+pub const ACTIONS: &[&str] = &["probe", "list", "test", "create", "delete"];
 
 /// What a call resolved to. `None` is what [`unknown_action_message`] exists for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -70,6 +69,26 @@ pub enum Action {
     Probe,
     List,
     Test,
+    Create,
+    Delete,
+}
+
+impl Action {
+    /// Does this action CHANGE the instance? The write gate in `tools::mod` derives from this
+    /// rather than keeping its own `matches!` over action strings.
+    ///
+    /// The match is exhaustive on purpose — no `_` arm. A variant added here is a compile error
+    /// until someone classifies it, which is the only arrangement under which "dispatched but
+    /// missing from the gate's list" cannot happen. The tree already names that hazard at the
+    /// `iris_doc` arm of `mutating_call`: a mode added to the enum and dispatched but absent from a
+    /// duplicated list would be an UNGATED WRITE.
+    pub fn is_write(self) -> bool {
+        match self {
+            // Reads a definition, checks files, opens a connection read-only. No change.
+            Self::Probe | Self::List | Self::Test => false,
+            Self::Create | Self::Delete => true,
+        }
+    }
 }
 
 /// The ONE place an action string becomes a decision. The handler dispatches on this rather than on
@@ -80,6 +99,8 @@ pub fn parse_action(raw: &str) -> Option<Action> {
         "probe" => Some(Action::Probe),
         "list" => Some(Action::List),
         "test" => Some(Action::Test),
+        "create" => Some(Action::Create),
+        "delete" => Some(Action::Delete),
         _ => None,
     }
 }
@@ -584,35 +605,114 @@ impl GatewayDiagnosis {
     }
 }
 
-/// Why `create` and `delete` are not actions here, said where a caller will look for them.
-///
-/// #214's charter for this module is that no credential crosses the MCP boundary in either
-/// direction: the tool takes a connection NAME, and the username and password stay in the gateway
-/// definition where an administrator put them. A `create` action cannot honour that — a JDBC SQL
-/// Gateway connection stores its own username and password, so `create` would have to accept a
-/// plaintext password as a tool argument, which puts it in the transcript. That is the exact harm
-/// #214 was built to remove (it replaced 32 `PGPASSWORD=… psql` invocations).
-pub fn why_no_create_message() -> String {
-    format!(
-        "'create' and 'delete' are not actions of this tool. A SQL Gateway connection stores a \
-         username and password, so creating one here would mean sending a plaintext password as a \
-         tool argument and into the transcript — the harm this family of tools exists to remove. \
-         Create the connection once in the Management Portal under System Administration > \
-         Configuration > Connectivity > SQL Gateway Connections, then use action=test to verify it \
-         and iris_gateway_query to read through it. Valid actions: {}.",
-        ACTIONS.join(", ")
-    )
-}
-
 /// What to say for an action this tool does not have.
 pub fn unknown_action_message(action: &str) -> String {
-    if action.eq_ignore_ascii_case("create") || action.eq_ignore_ascii_case("delete") {
-        return why_no_create_message();
-    }
     format!(
         "'{action}' is not an action of iris_gateway_manage. Valid actions: {}.",
         ACTIONS.join(", ")
     )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// Keeping the password in
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+/// What replaces a secret anywhere it would otherwise be rendered.
+pub const REDACTED: &str = "[redacted]";
+
+/// The ObjectScript form of a secret, without the outer quotes `os_str_expr` adds.
+///
+/// This is the shape the password actually takes inside the generated program, and it is NOT the
+/// raw password: `os_str_expr` doubles a `"` and splices non-ASCII as `$CHAR(n)`. For `a"b` the
+/// program holds `a""b`; for `ñ` it holds `$CHAR(241)` with no quotes at all, which is why the
+/// strip is conditional rather than assumed.
+fn program_form(secret: &str) -> String {
+    let rendered = os_str_expr(secret);
+    match rendered.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+        // A single-part rendering: `"abc"` → `abc`.
+        Some(inner) if !inner.contains('"') || inner.contains("\"\"") => inner.to_string(),
+        // A rendering with no outer quotes at all (`$CHAR(241)`), or one whose strip would be
+        // ambiguous. Use it whole: over-matching is visible, under-matching is not.
+        _ => rendered,
+    }
+}
+
+/// Remove `secret` from text that is about to leave this process.
+///
+/// `create` has to put the password into generated ObjectScript — there is no other way to set
+/// `%Library.SQLConnection.pwd` (see the note on the `password` parameter). So the password exists,
+/// briefly, inside strings this process holds, and the question is not *whether* it is there but
+/// whether any path can render it back out. Two defences, and this is the second:
+///
+///  1. No envelope on the `create` path carries the generated program, IRIS's echo of it, or the
+///     call's parameters. That is the one that should hold.
+///  2. Every string that reaches a `create` envelope goes through THIS function first. It exists
+///     because defence 1 is a property of code that will be edited by people who do not know a
+///     password is in scope, and a leak is not the kind of mistake that gets a second chance.
+///
+/// TWO passes, and each is necessary — this used to be three, and a mutation disabling any ONE of
+/// them survived, because for every input tested the three covered each other. Each pass now has an
+/// input that only it catches:
+///
+/// | pass | the copy it removes | witness |
+/// |---|---|---|
+/// | raw | the password quoted as a VALUE in a message | `Contraseña` — the program holds `$CHAR(241)`, so the program form does not match a message quoting the plain word |
+/// | program form | the password as it appears in the generated source | `a"b` — the program holds `a""b`, which the raw form does not match |
+///
+/// An empty secret is a no-op. It MUST be: `str::replace` with an empty pattern inserts the marker
+/// between every character, which would mangle every message on a call that supplied no password.
+pub fn redact_secret(text: &str, secret: &str) -> String {
+    let secret = secret.trim();
+    if secret.is_empty() {
+        return text.to_string();
+    }
+    // Program form first: it is at least as long as the raw form, so the raw pass cannot chop a
+    // program-form occurrence in half and leave a fragment behind.
+    let out = text.replace(&program_form(secret), REDACTED);
+    out.replace(secret, REDACTED)
+}
+
+/// A password that can only leave this process redacted.
+///
+/// The point is the `Debug` and `Display` impls: the commonest way a secret escapes is not a missing
+/// scrub but a `{:?}` of the struct that holds it, in a log line or an error someone adds later. A
+/// newtype whose formatting is redacted makes that impossible rather than merely discouraged, and
+/// the one method that yields the real bytes is named so that reading it is a decision.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.trim().is_empty()
+    }
+
+    /// The real bytes. ONE caller: the generated-program builder. Named to be conspicuous.
+    fn expose_for_program(&self) -> &str {
+        &self.0
+    }
+
+    /// Remove this secret from text that is about to leave the process.
+    pub fn scrub(&self, text: &str) -> String {
+        redact_secret(text, &self.0)
+    }
+}
+
+// Both impls, not just Debug: `{}` and `{:?}` are equally easy to reach for, and a type that is safe
+// under one and not the other is a trap rather than a guarantee.
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(REDACTED)
+    }
+}
+
+impl std::fmt::Display for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(REDACTED)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -743,7 +843,6 @@ try {{
         do tOut.%Set("ok", 0)
         do tOut.%Set("error", "reading the gateway connection failed: SQLCODE " _ crs.%SQLCODE _ " " _ crs.%Message)
         do tOut.%Set("connection", tConn)
-        write tOut.%ToJSON()
         quit
     }}
     if tConn.%Get("defined") {{
@@ -788,6 +887,136 @@ write tOut.%ToJSON()"#,
 /// The `list` SELECT. Read-only SQL over the projection, so `list` needs no generated code and
 /// writes nothing to the instance.
 ///
+/// What `create` needs to build a JDBC SQL Gateway connection. Field names are
+/// `%Library.SQLConnection`'s own, because that is the class being populated.
+#[derive(Debug)]
+pub struct NewConnection {
+    pub name: String,
+    pub url: String,
+    pub driver: String,
+    pub classpath: String,
+    pub user: String,
+    /// A [`Secret`], so a `{:?}` of this struct cannot print it.
+    pub password: Secret,
+    pub properties: String,
+    pub on_connect_statement: String,
+}
+
+/// `action=create`. Refuses to overwrite: an existing name comes back as `exists`, never as a
+/// silent replacement of somebody else's connection.
+///
+/// `%Library.SQLConnection` has no SQL projection to INSERT through — `%Library.sys_SQLConnection`
+/// is a read-only projection, and the class itself has a numeric IDKEY — so this is object access
+/// from generated ObjectScript, which is why the password has to be in the program text at all. See
+/// [`redact_secret`].
+pub fn build_create_code(c: &NewConnection) -> String {
+    format!(
+        r#"set tOut = ##class(%DynamicObject).%New()
+do tOut.%Set("ok", 0)
+try {{
+    set crs = ##class(%SQL.Statement).%ExecDirect(, "SELECT ID FROM %Library.sys_SQLConnection WHERE Connection_Name = ?", {name})
+    set tSeen = crs.%Next()
+    if crs.%SQLCODE < 0 {{
+        do tOut.%Set("error", "could not check whether the connection already exists: SQLCODE " _ crs.%SQLCODE _ " " _ crs.%Message)
+        quit
+    }}
+    if tSeen {{
+        do tOut.%Set("ok", 1)
+        do tOut.%Set("exists", 1)
+        quit
+    }}
+    set conn = ##class(%Library.SQLConnection).%New()
+    set conn.Name = {name}
+    set conn.isJDBC = 1
+    set conn.driver = {driver}
+    set conn.classpath = {classpath}
+    set conn.URL = {url}
+    set conn.Usr = {user}
+    set conn.pwd = {pwd}
+    set conn.properties = {properties}
+    set conn.OnConnectStatement = {oncon}
+    set sc = conn.%Save()
+    if $SYSTEM.Status.IsError(sc) {{
+        do tOut.%Set("error", $EXTRACT($SYSTEM.Status.GetErrorText(sc), 1, 600))
+        quit
+    }}
+    kill conn
+    set vrs = ##class(%SQL.Statement).%ExecDirect(, "SELECT ID FROM %Library.sys_SQLConnection WHERE Connection_Name = ?", {name})
+    set tBack = vrs.%Next()
+    if vrs.%SQLCODE < 0 {{
+        do tOut.%Set("error", "the connection was saved but could not be read back: SQLCODE " _ vrs.%SQLCODE _ " " _ vrs.%Message)
+        quit
+    }}
+    if 'tBack {{
+        do tOut.%Set("error", "%Save() reported success but no connection with this name can be read back, so it was NOT created")
+        quit
+    }}
+    do tOut.%Set("exists", 0)
+    do tOut.%Set("ok", 1)
+}} catch e {{
+    do tOut.%Set("ok", 0)
+    do tOut.%Set("error", $EXTRACT(e.DisplayString(), 1, 600))
+}}
+write tOut.%ToJSON()"#,
+        name = os_str_expr(&c.name),
+        driver = os_str_expr(&c.driver),
+        classpath = os_str_expr(&c.classpath),
+        url = os_str_expr(&c.url),
+        user = os_str_expr(&c.user),
+        pwd = os_str_expr(c.password.expose_for_program()),
+        properties = os_str_expr(&c.properties),
+        oncon = os_str_expr(&c.on_connect_statement),
+    )
+}
+
+/// `action=delete`.
+///
+/// Three facts have to come back separately, and the reason is the house rule: a failed delete must
+/// never read like a success, and an absence must never be reported unless it was established.
+///
+///  * `found` — whether a row was there BEFORE. Read first, and a failed read aborts rather than
+///    answering "not found".
+///  * `removed` — whether it is gone AFTER. Re-read rather than trusting the status: a `%DeleteId`
+///    that reports success and leaves the row is exactly the shape this codebase keeps producing.
+pub fn build_delete_code(connection: &str) -> String {
+    format!(
+        r#"set tOut = ##class(%DynamicObject).%New()
+do tOut.%Set("ok", 0)
+try {{
+    set crs = ##class(%SQL.Statement).%ExecDirect(, "SELECT ID FROM %Library.sys_SQLConnection WHERE Connection_Name = ?", {name})
+    set tSeen = crs.%Next()
+    set tId = ""
+    if tSeen {{ set tId = crs.%GetData(1) }}
+    if crs.%SQLCODE < 0 {{
+        do tOut.%Set("error", "could not read the connection, so whether it exists is unknown and nothing was deleted: SQLCODE " _ crs.%SQLCODE _ " " _ crs.%Message)
+        quit
+    }}
+    if 'tSeen {{
+        do tOut.%Set("found", 0)
+        do tOut.%Set("removed", 0)
+        do tOut.%Set("ok", 1)
+        quit
+    }}
+    do tOut.%Set("found", 1)
+    set sc = ##class(%Library.SQLConnection).%DeleteId(tId)
+    do tOut.%Set("delete_status", $EXTRACT($SELECT($SYSTEM.Status.IsError(sc):$SYSTEM.Status.GetErrorText(sc), 1:""), 1, 600))
+    set vrs = ##class(%SQL.Statement).%ExecDirect(, "SELECT ID FROM %Library.sys_SQLConnection WHERE Connection_Name = ?", {name})
+    set tStill = vrs.%Next()
+    if vrs.%SQLCODE < 0 {{
+        do tOut.%Set("error", "the delete was attempted but the connection could not be read back, so whether it is gone is unknown: SQLCODE " _ vrs.%SQLCODE _ " " _ vrs.%Message)
+        quit
+    }}
+    do tOut.%Set("removed", $SELECT(tStill:0, 1:1))
+    do tOut.%Set("ok", 1)
+}} catch e {{
+    do tOut.%Set("ok", 0)
+    do tOut.%Set("error", $EXTRACT(e.DisplayString(), 1, 600))
+}}
+write tOut.%ToJSON()"#,
+        name = os_str_expr(connection)
+    )
+}
+
 /// `pwd` is a `%CSP.Util.Passwd` and `Secret` names an entry in the secure store; NEITHER is
 /// projected here. A gateway listing must not be a route to a credential.
 pub fn list_sql() -> String {
@@ -950,6 +1179,220 @@ pub enum GatewayListing {
     Unavailable {
         detail: String,
     },
+}
+
+/// What `create` did. Four cases, not two.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreateOutcome {
+    /// Saved AND read back under the name asked for.
+    Created { name: String },
+    /// A connection of that name was already there. Nothing was changed — this tool does not
+    /// overwrite somebody else's definition.
+    AlreadyExists { name: String },
+    /// IRIS refused, and said why.
+    Failed { name: String, reason: String },
+    /// The program produced no verdict, so whether anything was created is UNKNOWN. Distinct from
+    /// `Failed`: a caller must not conclude "not created" from it, because a save that landed and
+    /// then failed to report is the same shape.
+    Unavailable { detail: String },
+}
+
+/// What `delete` did. The three-way split is the point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeleteOutcome {
+    /// It was there, and a re-read confirms it is gone.
+    Deleted { name: String },
+    /// The read succeeded and found nothing. An ESTABLISHED absence, not a failure wearing one.
+    NotFound { name: String },
+    /// It was there and it is STILL there. `reason` carries whatever `%DeleteId` said, which may be
+    /// nothing at all — a status that reports success and leaves the row is the shape this whole
+    /// module is built against.
+    NotRemoved { name: String, reason: String },
+    /// Could not tell whether it existed, or whether the delete took. Never "not found".
+    Unavailable { detail: String },
+}
+
+/// `ok:0`, non-JSON and empty output all mean the same thing: no verdict. Shared by both writers so
+/// they cannot disagree about what silence means.
+fn write_verdict(out: &str) -> Result<serde_json::Value, String> {
+    let trimmed = out.trim();
+    if trimmed.is_empty() {
+        return Err(
+            "IRIS returned no output at all, so whether anything changed is UNKNOWN — this is not \
+             a report that nothing happened"
+                .to_string(),
+        );
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return Err(trimmed.chars().take(400).collect());
+    };
+    if json_bool(v.get("ok")) != Some(true) {
+        let err = json_str(&v, "error");
+        return Err(if err.is_empty() {
+            "the program reported failure and no message".to_string()
+        } else {
+            err
+        });
+    }
+    Ok(v)
+}
+
+/// Read `build_create_code`'s output.
+///
+/// Takes the [`Secret`] and scrubs `out` BEFORE looking at it, rather than trusting the caller to
+/// have scrubbed already. That is the difference between a guarantee and a convention: a mutation
+/// that removed the handler's separate scrub call survived the whole suite, because the only test
+/// that drove that path was write-gated before the handler ran. With the scrub in here there is no
+/// site left to forget.
+pub fn parse_create(out: &str, name: &str, secret: &Secret) -> CreateOutcome {
+    let scrubbed = secret.scrub(out);
+    let out: &str = &scrubbed;
+    let v = match write_verdict(out) {
+        Ok(v) => v,
+        // `ok:0` on this path carries IRIS's own reason for refusing the save, which is a FAILURE
+        // with a reason rather than an absent verdict. Non-JSON and silence are not.
+        Err(detail) => {
+            return if serde_json::from_str::<serde_json::Value>(out.trim()).is_ok() {
+                CreateOutcome::Failed {
+                    name: name.to_string(),
+                    reason: detail,
+                }
+            } else {
+                CreateOutcome::Unavailable { detail }
+            }
+        }
+    };
+    match json_bool(v.get("exists")) {
+        Some(true) => CreateOutcome::AlreadyExists {
+            name: name.to_string(),
+        },
+        Some(false) => CreateOutcome::Created {
+            name: name.to_string(),
+        },
+        // `ok:1` with no `exists` field: the program did not say which of the two happened, and
+        // guessing either way invents a fact about the instance.
+        None => CreateOutcome::Unavailable {
+            detail: "the program reported success without saying whether the connection was \
+                     created or already existed"
+                .to_string(),
+        },
+    }
+}
+
+/// Read `build_delete_code`'s output.
+pub fn parse_delete(out: &str, name: &str) -> DeleteOutcome {
+    let v = match write_verdict(out) {
+        Ok(v) => v,
+        Err(detail) => return DeleteOutcome::Unavailable { detail },
+    };
+    let found = json_bool(v.get("found"));
+    let removed = json_bool(v.get("removed"));
+    match (found, removed) {
+        (Some(false), _) => DeleteOutcome::NotFound {
+            name: name.to_string(),
+        },
+        (Some(true), Some(true)) => DeleteOutcome::Deleted {
+            name: name.to_string(),
+        },
+        (Some(true), Some(false)) => DeleteOutcome::NotRemoved {
+            name: name.to_string(),
+            reason: {
+                let r = json_str(&v, "delete_status");
+                if r.is_empty() {
+                    "%DeleteId reported no error, and the connection is still there — the delete \
+                     did not take effect"
+                        .to_string()
+                } else {
+                    r
+                }
+            },
+        },
+        // Either field missing is a missing answer, not a negative one.
+        _ => DeleteOutcome::Unavailable {
+            detail: "the program did not report both whether the connection existed and whether \
+                     it is now gone, so the result is unknown"
+                .to_string(),
+        },
+    }
+}
+
+impl CreateOutcome {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Created { .. } => "GATEWAY_CREATED",
+            Self::AlreadyExists { .. } => "GATEWAY_CONNECTION_EXISTS",
+            Self::Failed { .. } => "GATEWAY_CREATE_FAILED",
+            Self::Unavailable { .. } => "GATEWAY_CREATE_UNKNOWN",
+        }
+    }
+
+    pub fn succeeded(&self) -> bool {
+        matches!(self, Self::Created { .. })
+    }
+
+    pub fn message(&self) -> String {
+        match self {
+            Self::Created { name } => format!(
+                "SQL Gateway connection '{name}' was created and read back. The password is stored \
+                 in the IRIS gateway definition and is not returned by any action of this tool. \
+                 Run action=test next: creating a definition is not evidence that it connects."
+            ),
+            Self::AlreadyExists { name } => format!(
+                "a SQL Gateway connection named '{name}' already exists and was left EXACTLY as it \
+                 was — nothing was overwritten. Use action=test to see whether the existing one \
+                 works, or delete it first if you meant to replace it."
+            ),
+            Self::Failed { name, reason } => format!(
+                "IRIS refused to create SQL Gateway connection '{name}', so nothing was created. \
+                 IRIS reported: {reason}"
+            ),
+            Self::Unavailable { detail } => format!(
+                "the create program returned no verdict, so whether the connection was created is \
+                 UNKNOWN — do NOT assume it was not. Run action=list to see what is actually there \
+                 before retrying, because a retry against an existing name is refused rather than \
+                 merged. IRIS wrote: {detail}"
+            ),
+        }
+    }
+}
+
+impl DeleteOutcome {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Deleted { .. } => "GATEWAY_DELETED",
+            Self::NotFound { .. } => "GATEWAY_CONNECTION_NOT_DEFINED",
+            Self::NotRemoved { .. } => "GATEWAY_DELETE_FAILED",
+            Self::Unavailable { .. } => "GATEWAY_DELETE_UNKNOWN",
+        }
+    }
+
+    pub fn succeeded(&self) -> bool {
+        matches!(self, Self::Deleted { .. })
+    }
+
+    pub fn message(&self) -> String {
+        match self {
+            Self::Deleted { name } => format!(
+                "SQL Gateway connection '{name}' existed and is gone — confirmed by reading it back \
+                 after the delete, not by trusting the delete's own status."
+            ),
+            Self::NotFound { name } => format!(
+                "there is no SQL Gateway connection named '{name}' on this instance, so nothing \
+                 was deleted. This is an established absence: the lookup ran and returned no row. \
+                 Use action=list to see the names that do exist."
+            ),
+            Self::NotRemoved { name, reason } => format!(
+                "SQL Gateway connection '{name}' EXISTS and is still there — the delete did not \
+                 take effect. It has not been removed, whatever the delete reported. IRIS said: \
+                 {reason}"
+            ),
+            Self::Unavailable { detail } => format!(
+                "the delete program returned no verdict, so whether that connection still exists \
+                 is UNKNOWN — do NOT read this as 'it was not there'. Run action=list to find out. \
+                 IRIS wrote: {detail}"
+            ),
+        }
+    }
 }
 
 /// Read an Atelier query body into a listing.
@@ -1709,21 +2152,25 @@ mod tests {
 
     #[test]
     fn an_action_this_tool_does_not_have_says_what_it_does_have() {
-        for a in ["status", "", "PROBE!"] {
+        for a in ["status", "", "PROBE!", "drop", "update"] {
             let m = unknown_action_message(a);
             for valid in ACTIONS {
-                assert!(m.contains(valid), "{m}");
+                assert!(m.contains(valid), "'{valid}' missing from: {m}");
             }
         }
-        // create/delete get the reason, not just the list — a caller who asks for them is asking
-        // the right question and deserves the answer.
-        for a in ["create", "CREATE", "delete"] {
-            let m = unknown_action_message(a);
-            assert!(m.contains("plaintext password"), "{m}");
-            assert!(m.contains("SQL Gateway Connections"), "{m}");
-            // Naming the remediation must not hand out a bypass.
-            assert!(!m.to_lowercase().contains("pgpassword"), "{m}");
+        // create and delete are ACTIONS now, so they must not be described as absent. The charter
+        // refusal that used to live here was removed with them; its reasoning is on the `password`
+        // parameter, where someone about to "fix" the plaintext will read it.
+        for a in ["create", "CREATE", " delete "] {
+            assert!(
+                parse_action(a).is_some(),
+                "'{a}' must resolve now that the charter was relaxed"
+            );
         }
+        // Naming a remediation must still not hand out a bypass or a secret shape.
+        let m = unknown_action_message("status");
+        assert!(!m.to_lowercase().contains("pgpassword"), "{m}");
+        assert!(!m.to_lowercase().contains("iris_allow_prod"), "{m}");
     }
 
     /// The advertised `action` enum and the list the handler dispatches on are two copies of the
@@ -1755,19 +2202,584 @@ mod tests {
         // …and each to a DIFFERENT one, so two advertised names cannot silently do one thing.
         let distinct: std::collections::HashSet<_> = resolved.iter().collect();
         assert_eq!(distinct.len(), advertised.len(), "{resolved:?}");
-        assert!(
-            distinct.contains(&Action::Probe)
-                && distinct.contains(&Action::List)
-                && distinct.contains(&Action::Test),
-            "an Action variant exists that no advertised value reaches: {resolved:?}"
-        );
+        for expected in [
+            Action::Probe,
+            Action::List,
+            Action::Test,
+            Action::Create,
+            Action::Delete,
+        ] {
+            assert!(
+                distinct.contains(&expected),
+                "an Action variant exists that no advertised value reaches: {expected:?} not in \
+                 {resolved:?}"
+            );
+        }
         // The control: something NOT advertised must not resolve, or the loop above would pass on a
         // parser that accepts everything.
         assert_eq!(parse_action("status"), None);
-        assert_eq!(parse_action("create"), None);
+        assert_eq!(parse_action("drop"), None);
         assert_eq!(parse_action(""), None);
         // Case and surrounding space are the caller's, not the contract's.
         assert_eq!(parse_action("  PROBE "), Some(Action::Probe));
+    }
+
+    // ── the password must never come back out ─────────────────────────────────────────────
+    //
+    // A sentinel distinctive enough that a partial match is still a failure, and that no other
+    // fixture in this file can produce by accident.
+    const SENTINEL: &str = "Hunter2-SENTINEL-xyzzy";
+
+    fn sentinel_spec() -> NewConnection {
+        NewConnection {
+            name: "PG_SENTINEL".into(),
+            url: "jdbc:postgresql://db:5432/Cocina".into(),
+            driver: "org.postgresql.Driver".into(),
+            classpath: "/usr/irissys/mgr/postgresql-42.7.4.jar".into(),
+            user: "gateway_ro".into(),
+            password: Secret::new(SENTINEL),
+            properties: String::new(),
+            on_connect_statement: String::new(),
+        }
+    }
+
+    /// The premise the whole mitigation rests on: the password IS in the generated program. If this
+    /// ever stops being true the scrubbing tests below become vacuous and would still pass.
+    #[test]
+    fn the_generated_create_program_really_does_contain_the_password() {
+        let code = build_create_code(&sentinel_spec());
+        assert!(
+            code.contains(SENTINEL),
+            "the scrub tests are only meaningful because this is true"
+        );
+        assert!(code.contains("set conn.pwd ="), "{code}");
+    }
+
+    /// The worst case, and the one the scrub exists for: IRIS echoes the program back. Everything
+    /// that reaches a `create` envelope goes through `redact_secret`, so even an echo of the whole
+    /// source must come out clean.
+    #[test]
+    fn scrubbing_removes_the_password_from_an_echo_of_the_whole_program() {
+        let code = build_create_code(&sentinel_spec());
+        let scrubbed = redact_secret(&code, SENTINEL);
+        assert!(
+            !scrubbed.contains(SENTINEL),
+            "the password survived a scrub of the program text"
+        );
+        assert!(
+            scrubbed.contains(REDACTED),
+            "nothing was replaced: {scrubbed}"
+        );
+        // …and the scrub must not have eaten the rest of the program.
+        assert!(
+            scrubbed.contains("set conn.Usr = \"gateway_ro\""),
+            "{scrubbed}"
+        );
+        assert!(
+            scrubbed.contains("jdbc:postgresql://db:5432/Cocina"),
+            "{scrubbed}"
+        );
+    }
+
+    /// A password containing characters `os_str_expr` transforms does NOT appear literally in the
+    /// program — it is doubled or spliced as `$CHAR`. Scrubbing only the raw form would leave that
+    /// copy behind, which is the whole reason `redact_secret` removes the rendering too.
+    #[test]
+    fn scrubbing_covers_the_form_the_password_actually_takes_in_the_program() {
+        for pw in [
+            "quote\"inside",
+            "Contraseña",
+            "tab\there",
+            "plain",
+            "a\"b\"c",
+        ] {
+            let mut spec = sentinel_spec();
+            spec.password = Secret::new(pw);
+            let code = build_create_code(&spec);
+            let scrubbed = redact_secret(&code, pw);
+            assert!(
+                !scrubbed.contains(pw),
+                "raw form of {pw:?} survived: {scrubbed}"
+            );
+            // The rendered form is what is actually in the program; it must be gone too.
+            let rendered = crate::objectscript::os_str_expr(pw);
+            assert!(
+                !scrubbed.contains(&rendered),
+                "rendered form {rendered:?} of {pw:?} survived: {scrubbed}"
+            );
+            // Control: the unscrubbed program DOES carry the rendering, so the assertion above is
+            // not passing because there was nothing to find.
+            assert!(
+                code.contains(&rendered),
+                "control failed — {rendered:?} is not in the program at all: {code}"
+            );
+        }
+    }
+
+    /// Each redaction pass needs an input that ONLY it catches, or a mutation disabling it survives.
+    ///
+    /// This test exists because that happened: the implementation had three overlapping passes, and
+    /// disabling any one of them changed no test result — including the control, which is the worst
+    /// possible mutation outcome. The witnesses below are what makes each pass load-bearing.
+    #[test]
+    fn each_redaction_pass_has_an_input_only_it_catches() {
+        // WITNESS FOR THE PROGRAM-FORM PASS. A quote is doubled by os_str_expr, so the program
+        // holds `a""b` while the raw password is `a"b`. The raw pass cannot see it.
+        let pw = "a\"b";
+        let in_program = "set conn.pwd = \"a\"\"b\"";
+        assert!(
+            !in_program.contains(pw),
+            "premise: the raw form is NOT in the program text, which is why the raw pass alone \
+             would miss it"
+        );
+        assert!(
+            !redact_secret(in_program, pw).contains("a\"\"b"),
+            "the program-form pass is what removes this: {}",
+            redact_secret(in_program, pw)
+        );
+
+        // WITNESS FOR THE RAW PASS. A non-ASCII password is spliced as $CHAR in the program, so the
+        // program form is `"Contrase"_$CHAR(241)_"a"` — which does not appear in a message that
+        // quotes the plain word. Only the raw pass catches that.
+        let pw2 = "Contraseña";
+        let in_message = "IRIS refused: cannot store Contraseña for this user";
+        let form = program_form(pw2);
+        assert!(
+            !in_message.contains(&form),
+            "premise: the program form {form:?} is NOT in a message quoting the plain value, which \
+             is why the program-form pass alone would miss it"
+        );
+        assert!(
+            !redact_secret(in_message, pw2).contains(pw2),
+            "the raw pass is what removes this: {}",
+            redact_secret(in_message, pw2)
+        );
+
+        // A password that is ENTIRELY non-ASCII renders with no outer quotes at all, so the strip
+        // must not silently produce an empty pattern.
+        let pw3 = "ñé";
+        let spliced = program_form(pw3);
+        assert!(
+            spliced.starts_with("$CHAR("),
+            "premise for the no-quotes branch: {spliced:?}"
+        );
+        let prog3 = format!("set conn.pwd = {}", os_str_expr(pw3));
+        assert!(
+            !redact_secret(&prog3, pw3).contains(&spliced),
+            "an all-non-ASCII password survived in the program: {}",
+            redact_secret(&prog3, pw3)
+        );
+    }
+
+    /// The commonest way a secret escapes is not a missing scrub — it is a `{:?}` someone adds
+    /// later. `Secret`'s formatting is redacted so that cannot happen.
+    #[test]
+    fn a_secret_cannot_be_formatted_into_anything() {
+        let s = Secret::new(SENTINEL);
+        assert_eq!(format!("{s:?}"), REDACTED);
+        assert_eq!(format!("{s}"), REDACTED);
+        // …and the struct that holds one.
+        let spec = sentinel_spec();
+        let dumped = format!("{spec:?}");
+        assert!(
+            !dumped.contains(SENTINEL) && !dumped.contains("Hunter2"),
+            "a debug dump of the create parameters leaked the password: {dumped}"
+        );
+        // Control: the dump is not empty, so the assertion above is about redaction rather than
+        // about a Debug impl that prints nothing.
+        assert!(dumped.contains("gateway_ro"), "{dumped}");
+        assert!(dumped.contains(REDACTED), "{dumped}");
+    }
+
+    /// `parse_create` scrubs its own input, so there is no site for the handler to forget. A
+    /// mutation removing the handler's separate scrub survived before this existed.
+    #[test]
+    fn parse_create_scrubs_whatever_iris_said() {
+        let leaky = format!(r#"{{"ok":0,"error":"<SYNTAX> set conn.pwd = \"{SENTINEL}\""}}"#);
+        // The premise: the input really does carry it.
+        assert!(leaky.contains(SENTINEL));
+        let o = parse_create(&leaky, "PG_X", &Secret::new(SENTINEL));
+        let msg = o.message();
+        assert!(!msg.contains(SENTINEL), "{msg}");
+        assert!(
+            msg.contains(REDACTED),
+            "the reason must survive, redacted: {msg}"
+        );
+        // Control: passing the WRONG secret leaves it, which proves the scrub is driven by the
+        // secret it was given rather than by some unrelated filtering.
+        let other = parse_create(&leaky, "PG_X", &Secret::new("something-else"));
+        assert!(other.message().contains(SENTINEL), "{}", other.message());
+    }
+
+    /// An empty secret must be a NO-OP. `str::replace` with an empty pattern inserts the marker
+    /// between every character, so a call that supplied no password would come back mangled.
+    #[test]
+    fn an_empty_secret_scrubs_nothing() {
+        let text = "SQL Gateway connection 'PG_X' was created.";
+        assert_eq!(redact_secret(text, ""), text);
+        assert_eq!(redact_secret(text, "   "), text);
+        // The control: a real secret DOES change the text, so the equality above is not trivially
+        // true of every input.
+        assert_ne!(
+            redact_secret("the pw is s3cret", "s3cret"),
+            "the pw is s3cret"
+        );
+    }
+
+    /// Every message this module can produce on the `create` path, scrubbed. A message that quotes
+    /// IRIS's own error is the likeliest accidental carrier.
+    #[test]
+    fn no_create_outcome_message_can_carry_the_password() {
+        let outcomes = [
+            CreateOutcome::Created {
+                name: "PG_SENTINEL".into(),
+            },
+            CreateOutcome::AlreadyExists {
+                name: "PG_SENTINEL".into(),
+            },
+            // IRIS quoting the failing line back at us — the realistic leak.
+            CreateOutcome::Failed {
+                name: "PG_SENTINEL".into(),
+                reason: format!("ERROR #5002: <SYNTAX> set conn.pwd = \"{SENTINEL}\""),
+            },
+            CreateOutcome::Unavailable {
+                detail: format!("<SYNTAX> zSet+4 set conn.pwd = \"{SENTINEL}\""),
+            },
+        ];
+        for o in &outcomes {
+            let scrubbed = redact_secret(&o.message(), SENTINEL);
+            assert!(
+                !scrubbed.contains(SENTINEL),
+                "{} leaked the password: {scrubbed}",
+                o.code()
+            );
+        }
+        // Controls. Two of these fixtures DO contain the sentinel before scrubbing, so the sweep
+        // above is not passing over messages that never had it.
+        let carriers = outcomes
+            .iter()
+            .filter(|o| o.message().contains(SENTINEL))
+            .count();
+        assert_eq!(
+            carriers, 2,
+            "the two IRIS-quoting fixtures must carry the sentinel before scrubbing, or this test \
+             proves nothing"
+        );
+    }
+
+    /// The parse must survive a scrubbed input — the handler scrubs BEFORE parsing, so a scrub that
+    /// broke the JSON would turn every create into `Unavailable`.
+    #[test]
+    fn scrubbing_before_parsing_does_not_break_the_verdict() {
+        let raw = r#"{"ok":1,"exists":0}"#;
+        assert_eq!(
+            parse_create(raw, "PG_X", &Secret::new(SENTINEL)),
+            CreateOutcome::Created {
+                name: "PG_X".into()
+            }
+        );
+        // …including when the output genuinely quotes the password back.
+        let leaky = format!(r#"{{"ok":0,"error":"cannot set pwd to {SENTINEL}"}}"#);
+        match parse_create(&leaky, "PG_X", &Secret::new(SENTINEL)) {
+            CreateOutcome::Failed { reason, .. } => {
+                assert!(!reason.contains(SENTINEL), "{reason}");
+                assert!(reason.contains(REDACTED), "{reason}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // ── create: four outcomes ─────────────────────────────────────────────────────────────
+    #[test]
+    fn create_reports_created_only_when_it_was_read_back() {
+        assert_eq!(
+            parse_create(r#"{"ok":1,"exists":0}"#, "PG_X", &Secret::new("")),
+            CreateOutcome::Created {
+                name: "PG_X".into()
+            }
+        );
+        assert!(parse_create(r#"{"ok":1,"exists":0}"#, "PG_X", &Secret::new("")).succeeded());
+    }
+
+    #[test]
+    fn create_never_overwrites_an_existing_name() {
+        let o = parse_create(r#"{"ok":1,"exists":1}"#, "PG_X", &Secret::new(""));
+        assert_eq!(
+            o,
+            CreateOutcome::AlreadyExists {
+                name: "PG_X".into()
+            }
+        );
+        assert!(!o.succeeded(), "an existing name is NOT a create");
+        assert!(
+            o.message().contains("left EXACTLY as it was"),
+            "{}",
+            o.message()
+        );
+    }
+
+    #[test]
+    fn a_create_that_could_not_be_told_about_is_not_a_create_that_failed() {
+        // Non-JSON and silence carry no verdict: a save that landed and then failed to report has
+        // exactly this shape, so "not created" would be an invented fact.
+        for raw in ["", "   ", "<CLASS DOES NOT EXIST> *%Library.SQLConnection"] {
+            let o = parse_create(raw, "PG_X", &Secret::new(""));
+            assert_eq!(o.code(), "GATEWAY_CREATE_UNKNOWN", "{raw:?} -> {o:?}");
+            assert!(!o.succeeded());
+            assert!(
+                o.message().contains("do NOT assume it was not"),
+                "{}",
+                o.message()
+            );
+        }
+        // `ok:1` with no `exists` is also no answer — the program did not say which happened.
+        assert_eq!(
+            parse_create(r#"{"ok":1}"#, "PG_X", &Secret::new("")).code(),
+            "GATEWAY_CREATE_UNKNOWN"
+        );
+        // The control: a JSON `ok:0` IS a reason, and must stay a FAILURE rather than an unknown.
+        let failed = parse_create(
+            r#"{"ok":0,"error":"duplicate name"}"#,
+            "PG_X",
+            &Secret::new(""),
+        );
+        assert_eq!(failed.code(), "GATEWAY_CREATE_FAILED");
+        assert!(
+            failed.message().contains("duplicate name"),
+            "{}",
+            failed.message()
+        );
+    }
+
+    /// `%Save()` returning OK is not evidence the row is there. The program re-reads, and this is
+    /// the verdict that must come back if the re-read finds nothing.
+    #[test]
+    fn a_save_that_reported_success_but_left_nothing_is_a_failure() {
+        let raw = r#"{"ok":0,"error":"%Save() reported success but no connection with this name can be read back, so it was NOT created"}"#;
+        let o = parse_create(raw, "PG_X", &Secret::new(""));
+        assert_eq!(o.code(), "GATEWAY_CREATE_FAILED");
+        assert!(!o.succeeded());
+    }
+
+    // ── delete: found / removed is a three-way answer ─────────────────────────────────────
+    #[test]
+    fn delete_tells_absent_apart_from_not_removed() {
+        assert_eq!(
+            parse_delete(r#"{"ok":1,"found":1,"removed":1}"#, "PG_X"),
+            DeleteOutcome::Deleted {
+                name: "PG_X".into()
+            }
+        );
+        assert_eq!(
+            parse_delete(r#"{"ok":1,"found":0,"removed":0}"#, "PG_X"),
+            DeleteOutcome::NotFound {
+                name: "PG_X".into()
+            }
+        );
+        // Existed, still there. This must NEVER read as a success or as an absence.
+        let stuck = parse_delete(
+            r#"{"ok":1,"found":1,"removed":0,"delete_status":"ERROR #5803: lock failed"}"#,
+            "PG_X",
+        );
+        assert_eq!(stuck.code(), "GATEWAY_DELETE_FAILED");
+        assert!(!stuck.succeeded());
+        assert!(
+            stuck.message().contains("still there"),
+            "{}",
+            stuck.message()
+        );
+        assert!(
+            stuck.message().contains("lock failed"),
+            "{}",
+            stuck.message()
+        );
+        // The three codes must differ, or the distinction is not addressable.
+        let codes: std::collections::HashSet<&str> = [
+            parse_delete(r#"{"ok":1,"found":1,"removed":1}"#, "X").code(),
+            parse_delete(r#"{"ok":1,"found":0,"removed":0}"#, "X").code(),
+            stuck.code(),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(codes.len(), 3, "{codes:?}");
+    }
+
+    /// The measured hazard this re-read exists for: a status that says OK and leaves the row.
+    /// `delete_status` is empty, and the verdict must still be "not removed".
+    #[test]
+    fn a_delete_that_reported_no_error_and_changed_nothing_is_still_a_failure() {
+        let o = parse_delete(
+            r#"{"ok":1,"found":1,"removed":0,"delete_status":""}"#,
+            "PG_X",
+        );
+        assert_eq!(o.code(), "GATEWAY_DELETE_FAILED");
+        assert!(
+            o.message().contains("did not take effect"),
+            "{}",
+            o.message()
+        );
+    }
+
+    #[test]
+    fn a_delete_that_could_not_be_told_about_is_not_a_connection_that_was_absent() {
+        for raw in [
+            "",
+            "   ",
+            "<CLASS DOES NOT EXIST>",
+            r#"{"ok":0,"error":"SQLCODE -30"}"#,
+            // Either field missing is a missing answer.
+            r#"{"ok":1,"found":1}"#,
+            r#"{"ok":1,"removed":1}"#,
+        ] {
+            let o = parse_delete(raw, "PG_X");
+            assert_eq!(o.code(), "GATEWAY_DELETE_UNKNOWN", "{raw:?} -> {o:?}");
+            assert!(!o.succeeded());
+            assert!(
+                o.message()
+                    .contains("do NOT read this as 'it was not there'"),
+                "{}",
+                o.message()
+            );
+        }
+        // Control: a complete answer is still read, or the sweep above would pass on a parser that
+        // called everything unknown.
+        assert!(parse_delete(r#"{"ok":1,"found":1,"removed":1}"#, "PG_X").succeeded());
+    }
+
+    // ── the generated writers ─────────────────────────────────────────────────────────────
+    #[test]
+    fn the_create_program_checks_first_reads_back_and_never_overwrites() {
+        let code = build_create_code(&sentinel_spec());
+        // It looks before it leaps, and reports the existing name rather than replacing it.
+        assert!(code.contains(r#"%Set("exists", 1)"#), "{code}");
+        assert!(
+            !code.contains("%DeleteId") && !code.contains("%KillExtent"),
+            "create must not remove anything: {code}"
+        );
+        // A %Save() that reports success is not the verdict — it reads the row back.
+        assert!(code.contains("could not be read back"), "{code}");
+        assert!(code.contains("%Library.SQLConnection).%New()"), "{code}");
+        assert!(code.contains("set conn.isJDBC = 1"), "{code}");
+        // A failed existence check must abort rather than fall through into a create.
+        assert!(
+            code.contains("could not check whether the connection already exists"),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn the_delete_program_reads_back_instead_of_trusting_the_status() {
+        let code = build_delete_code("PG_X");
+        assert!(code.contains("%DeleteId"), "{code}");
+        // The re-read: two SELECTs, one before and one after.
+        assert_eq!(
+            code.matches("SELECT ID FROM %Library.sys_SQLConnection")
+                .count(),
+            2,
+            "the delete must confirm by reading back, not by trusting %DeleteId: {code}"
+        );
+        assert!(code.contains(r#"%Set("removed""#), "{code}");
+        assert!(code.contains(r#"%Set("found""#), "{code}");
+        // A failed read must not answer "not found".
+        assert!(
+            code.contains("whether it exists is unknown and nothing was deleted"),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn the_writers_escape_their_inputs_and_carry_no_underscored_dot_access() {
+        let code = build_delete_code("PG\"X");
+        assert!(code.contains(r#""PG""X""#), "{code}");
+        assert!(
+            !code.contains('\\'),
+            "backslash is not an escape here: {code}"
+        );
+        let mut spec = sentinel_spec();
+        spec.name = "Pur\u{e9}".into();
+        assert!(build_create_code(&spec).contains("$CHAR(233)"));
+    }
+
+    /// `_` is ObjectScript's concatenation operator — the same defect the read programs hit. The
+    /// writers use `%Set` for every underscored key too.
+    #[test]
+    fn the_writers_use_set_for_underscored_keys() {
+        for code in [build_create_code(&sentinel_spec()), build_delete_code("C")] {
+            let stripped: String = code
+                .lines()
+                .map(|l| match l.find("//") {
+                    Some(i) => &l[..i],
+                    None => l,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                !stripped.contains("tOut.delete_status") && !stripped.contains("tOut.on_connect"),
+                "dot access to an underscored dynamic key aborts <SYNTAX> at run time: {stripped}"
+            );
+            assert!(
+                code.contains(r#"do tOut.%Set("ok""#),
+                "the verdict key must be set through %Set: {code}"
+            );
+        }
+        // Control: the detector can see the forbidden shape when it is there.
+        let bad = "        set tOut.delete_status = \"x\"\n";
+        assert!(bad.contains("tOut.delete_status"));
+    }
+
+    /// Every generated program must write its verdict EXACTLY once.
+    ///
+    /// Measured on the live instance while building `create`: `quit` inside a `try` block ends the
+    /// BLOCK, not the routine, so an early exit spelled `write tOut.%ToJSON()` + `quit` fell
+    /// through to the trailing write and emitted `{"ok":1,"exists":1}{"ok":1,"exists":1}`. Two
+    /// concatenated objects are not JSON, so the create came back `GATEWAY_CREATE_UNKNOWN` —
+    /// honest, and useless.
+    ///
+    /// The SAME shape was already in the merged `test` program's SQLCODE path, which no test had
+    /// ever driven. Both are fixed here: an early exit sets its fields and `quit`s, and the one
+    /// trailing write emits the object.
+    #[test]
+    fn every_generated_program_writes_its_verdict_exactly_once() {
+        for (label, code) in [
+            ("probe", build_probe_code()),
+            ("test", build_test_code("C", None)),
+            ("test+probe", build_test_code("C", Some("SELECT 1 FROM t"))),
+            ("create", build_create_code(&sentinel_spec())),
+            ("delete", build_delete_code("C")),
+        ] {
+            assert_eq!(
+                code.matches("write tOut.%ToJSON()").count(),
+                1,
+                "{label} writes its verdict more than once; `quit` inside `try` does not end the \
+                 routine, so the output is two concatenated objects and parses as nothing: {code}"
+            );
+            // …and the one it has must be the LAST statement, or an early exit would skip it.
+            assert!(
+                code.trim_end().ends_with("write tOut.%ToJSON()"),
+                "{label}: the single write must be the final statement: {code}"
+            );
+        }
+        // The control: the detector can see a doubled write when there is one.
+        let doubled = "write tOut.%ToJSON()\nquit\nwrite tOut.%ToJSON()";
+        assert_eq!(doubled.matches("write tOut.%ToJSON()").count(), 2);
+    }
+
+    /// The write classification the gate derives from. Getting this backwards on either side is a
+    /// security-relevant bug: a read wrongly gated is friction, a write wrongly ungated is not.
+    #[test]
+    fn only_create_and_delete_are_writes() {
+        assert!(!Action::Probe.is_write());
+        assert!(!Action::List.is_write());
+        assert!(!Action::Test.is_write());
+        assert!(Action::Create.is_write());
+        assert!(Action::Delete.is_write());
+        // Derived from ACTIONS so a new action cannot be added without landing on one side.
+        let writes: Vec<&str> = ACTIONS
+            .iter()
+            .copied()
+            .filter(|a| parse_action(a).is_some_and(|x| x.is_write()))
+            .collect();
+        assert_eq!(writes, vec!["create", "delete"], "the write set moved");
     }
 
     #[test]
@@ -1924,18 +2936,78 @@ pub struct GatewayManageParams {
     /// external language server defined, and is its Java runtime present and supported. "list":
     /// the SQL Gateway connections defined here, with driver, class path and username (never a
     /// password). "test": take ONE connection all the way to the external database and name which
-    /// failure mode it is if it does not get there.
+    /// failure mode it is if it does not get there. "create": define a new JDBC connection.
+    /// "delete": remove one.
     // #112: the values belong in the SCHEMA, not only in the UNKNOWN_ACTION message. Naming the
     // field without them moves the guess one level down, which cost nine of the campaign's 31
     // parameter errors. `every_tool_advertises_the_parameters_it_reads` enforces it — and caught
     // this one. Kept in step with [`ACTIONS`] by `the_advertised_enum_is_the_action_list`.
-    #[schemars(extend("enum" = ["probe", "list", "test"]))]
+    #[schemars(extend("enum" = ["probe", "list", "test", "create", "delete"]))]
     pub action: String,
-    /// NAME of a SQL Gateway connection, for action=test (for example "PG_COCINA"). This tool
-    /// never accepts a host, user, or password: the credential stays in the IRIS gateway
-    /// definition where an administrator put it.
+    /// NAME of a SQL Gateway connection (for example "PG_COCINA"). Required for test, create and
+    /// delete.
     #[serde(default)]
     pub connection: Option<String>,
+    /// JDBC URL of the external database, for action=create — for example
+    /// "jdbc:postgresql://dbhost:5432/Cocina". IRIS treats an entry containing a colon as a JDBC
+    /// URL.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// JDBC driver class, for action=create — for example "org.postgresql.Driver".
+    #[serde(default)]
+    pub driver: Option<String>,
+    /// Full path to the driver jar AS IRIS SEES IT, for action=create — inside the IRIS container,
+    /// not on the client host. Separate several with the target OS's path separator. action=test
+    /// checks each entry against the filesystem, because a jar that is not there makes a connection
+    /// that works until the Java server next restarts.
+    #[serde(default)]
+    pub classpath: Option<String>,
+    /// Username the connection logs in as, for action=create.
+    #[serde(default)]
+    pub user: Option<String>,
+    /// Password for `user`, for action=create. It is stored in the IRIS gateway definition and is
+    /// never returned by any action of this tool.
+    //
+    // WHY THIS IS PLAINTEXT, and what was considered instead. Read this before "fixing" it.
+    //
+    // #214 built this family of tools so that no credential crosses the MCP boundary: iris_gateway_
+    // query takes a connection NAME precisely so the password stays where an administrator put it.
+    // `create` cannot honour that, and the maintainer relaxed the charter deliberately for this
+    // action. It is not an oversight and it is not fixable by being cleverer about the API:
+    //
+    //   * `%Library.SQLConnection` stores its own `Usr` and `pwd`. It does not read
+    //     `Ens.Config.Credentials`, so an interop credential id cannot be pointed at — verified
+    //     against the class, whose properties are `Usr`, `pwd` (`%CSP.Util.Passwd`) and `Secret`.
+    //   * `Secret` names an entry in the secure store, but creating THAT entry needs the password
+    //     too, so routing through it moves the plaintext one call earlier and removes nothing.
+    //   * There is no SQL write path to substitute a bound parameter for:
+    //     `%Library.sys_SQLConnection` is a read-only projection and the class has a numeric IDKEY,
+    //     so `create` is object access from generated ObjectScript, and the password is therefore
+    //     inside the program text.
+    //
+    // What is mitigated instead is the way OUT: see `redact_secret` and `Secret`. Do not add a
+    // credential-lookup parameter believing it removes the plaintext — it does not, and it would
+    // give a caller a reason to think the password is safe when it is in the transcript either way.
+    //
+    // KNOWN RESIDUE, stated rather than papered over. `execute_via_generator` PUTs the program as a
+    // class document, compiles it, runs it and deletes it — and that delete is best effort, so a
+    // process killed between compile and delete leaves an `IrisDevTmp.Run<id>` class on the instance
+    // whose source contains this password in clear. It is the SAME instance that is about to store
+    // the password in the gateway definition anyway, so this exposes it to no new party, but it does
+    // sit in a class document rather than in `pwd`. If that matters for a deployment, the fix is at
+    // the generator, not here: nothing this module can do about it, and pretending otherwise would
+    // be worse than the note.
+    //
+    // The redaction covers the way back to the CALLER. It does not and cannot cover the instance.
+    #[serde(default)]
+    pub password: Option<String>,
+    /// Extra JDBC driver properties, for action=create. Optional.
+    #[serde(default)]
+    pub properties: Option<String>,
+    /// Statement to run on the remote system immediately after connecting, for action=create.
+    /// Optional — an Oracle session NLS setting is the usual use.
+    #[serde(default)]
+    pub on_connect_statement: Option<String>,
     /// Optional read-only SELECT for action=test, in the EXTERNAL database's own dialect. Once the
     /// connection is proven, this statement is run through it — so "the gateway is broken" and
     /// "the gateway works and the target refused this statement" come back as different answers.
@@ -2138,6 +3210,139 @@ pub async fn handle_gateway_manage(
             let facts = parse_facts(&out);
             let diagnosis = diagnose(&facts);
             emit(&facts, &diagnosis, &namespace, "test")
+        }
+        Some(Action::Create) => {
+            // The password is in scope from here to the end of this arm. NOTHING in it may put a
+            // string into an envelope without `redact_secret` — including IRIS's own error text,
+            // which can quote the line it failed on.
+            let password = Secret::new(p.password.clone().unwrap_or_default());
+
+            let connection = p.connection.as_deref().unwrap_or("").trim().to_string();
+            let mut missing: Vec<&str> = Vec::new();
+            if connection.is_empty() {
+                missing.push("connection");
+            }
+            if p.url.as_deref().unwrap_or("").trim().is_empty() {
+                missing.push("url");
+            }
+            if p.driver.as_deref().unwrap_or("").trim().is_empty() {
+                missing.push("driver");
+            }
+            if p.user.as_deref().unwrap_or("").trim().is_empty() {
+                missing.push("user");
+            }
+            if password.is_empty() {
+                missing.push("password");
+            }
+            if !missing.is_empty() {
+                return crate::tools::envelope::fail_with(
+                    "MISSING_PARAMS",
+                    &format!(
+                        "action=create needs {} — nothing was created. 'connection' is the NAME to \
+                         give the definition, 'url' the JDBC URL as IRIS will reach the database, \
+                         'driver' the JDBC driver class, and 'user'/'password' the login it stores. \
+                         'classpath' should name the driver jar as IRIS sees it.",
+                        missing.join(", ")
+                    ),
+                    // Deliberately no echo of the arguments: one of them is the password.
+                    serde_json::json!({ "namespace": namespace, "missing": missing }),
+                );
+            }
+
+            let spec = NewConnection {
+                name: connection.clone(),
+                url: p.url.as_deref().unwrap_or("").trim().to_string(),
+                driver: p.driver.as_deref().unwrap_or("").trim().to_string(),
+                classpath: p.classpath.as_deref().unwrap_or("").trim().to_string(),
+                user: p.user.as_deref().unwrap_or("").trim().to_string(),
+                password,
+                properties: p.properties.as_deref().unwrap_or("").trim().to_string(),
+                on_connect_statement: p
+                    .on_connect_statement
+                    .as_deref()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+            };
+            let out = match iris
+                .execute_via_generator(&build_create_code(&spec), &namespace, client)
+                .await
+            {
+                Ok(v) => v,
+                // The transport error can quote the request body, which held the program.
+                Err(e) => {
+                    return crate::tools::envelope::transport_fail(
+                        "handle_gateway_manage",
+                        &spec.password.scrub(&e.to_string()),
+                    )
+                }
+            };
+            let outcome = parse_create(&out, &connection, &spec.password);
+            let detail = serde_json::json!({
+                "namespace": namespace,
+                "action": "create",
+                "connection": connection,
+                "outcome": outcome.code(),
+                // Echoed back so a caller can see what was stored — MINUS the password, which is
+                // simply not a field of this object.
+                "url": spec.url,
+                "driver": spec.driver,
+                "class_path": spec.classpath,
+                "user": spec.user,
+            });
+            if outcome.succeeded() {
+                let mut obj = detail;
+                obj["success"] = true.into();
+                obj["message"] = spec.password.scrub(&outcome.message()).into();
+                obj["next_step"] = format!(
+                    "run action=test connection={connection} — a definition that saved is not a \
+                     connection that works, and the class path is only checked there."
+                )
+                .into();
+                return crate::tools::envelope::ok_json(obj);
+            }
+            crate::tools::envelope::fail_with(
+                outcome.code(),
+                &spec.password.scrub(&outcome.message()),
+                detail,
+            )
+        }
+        Some(Action::Delete) => {
+            let connection = p.connection.as_deref().unwrap_or("").trim().to_string();
+            if connection.is_empty() {
+                return crate::tools::envelope::fail_with(
+                    "MISSING_PARAMS",
+                    "action=delete needs 'connection' — the NAME of the SQL Gateway connection to \
+                     remove. Nothing was deleted. Use action=list to see which names exist.",
+                    serde_json::json!({ "namespace": namespace }),
+                );
+            }
+            let out = match iris
+                .execute_via_generator(&build_delete_code(&connection), &namespace, client)
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    return crate::tools::envelope::transport_fail(
+                        "handle_gateway_manage",
+                        &e.to_string(),
+                    )
+                }
+            };
+            let outcome = parse_delete(&out, &connection);
+            let detail = serde_json::json!({
+                "namespace": namespace,
+                "action": "delete",
+                "connection": connection,
+                "outcome": outcome.code(),
+            });
+            if outcome.succeeded() {
+                let mut obj = detail;
+                obj["success"] = true.into();
+                obj["message"] = outcome.message().into();
+                return crate::tools::envelope::ok_json(obj);
+            }
+            crate::tools::envelope::fail_with(outcome.code(), &outcome.message(), detail)
         }
         None => crate::tools::envelope::fail_with(
             "UNKNOWN_ACTION",

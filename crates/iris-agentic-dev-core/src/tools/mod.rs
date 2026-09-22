@@ -4408,6 +4408,7 @@ pub struct IrisTools {
 #[cfg(test)]
 pub(crate) const MUTATING_PROBES_SRC: &[&str] = &[
     "put",
+    "create",
     "delete",
     "set",
     "import",
@@ -4432,6 +4433,7 @@ fn mutating_probes() -> Vec<serde_json::Value> {
     // two agree, so they cannot drift.
     let actions = [
         "put",
+        "create",
         "delete",
         "set",
         "import",
@@ -4505,10 +4507,13 @@ const GENERATOR_WRITE_TOOLS: &[&str] = &[
     // honestly read-only again and are deliberately absent from this list. Removing the write beat
     // relabelling it: diagnosing a mistake must not modify the instance.
     "iris_gateway_query",
-    // #343: actions `probe` and `test` run generated ObjectScript — IsGatewayRunning, %File.Exists
-    // and TestConnection have no SQL projection to read them through — so a scratch class is
-    // written. `list` deliberately does NOT: it is a plain SELECT over %Library.sys_SQLConnection,
-    // because diagnosing a mistake should modify the instance as little as possible.
+    // #343: actions `probe`, `test`, `create` and `delete` run generated ObjectScript —
+    // IsGatewayRunning, %File.Exists, TestConnection and %Library.SQLConnection object access have
+    // no SQL projection to reach them through — so a scratch class is written. `list` deliberately
+    // does NOT: it is a plain SELECT over %Library.sys_SQLConnection, because diagnosing a mistake
+    // should modify the instance as little as possible. Note this is SEPARATE from the write gate:
+    // create and delete are gated by `mutating_call`, and probe/test/list are not, but all four
+    // generator users are honest about the scratch class here.
     "iris_gateway_manage",
     "iris_message_body",
     "iris_production_diff",
@@ -4594,6 +4599,17 @@ pub(crate) fn mutating_call(tool: &str, args: &serde_json::Value) -> Option<&'st
             matches!(action, "set" | "delete").then_some("change a lookup table")
         }
         "iris_lookup_transfer" => (action == "import").then_some("import a lookup table"),
+        // #343: probe/list/test only read — they check files, read the gateway definition and open
+        // the target SetReadOnly(1). create and delete change the instance.
+        //
+        // DERIVED from `Action::is_write`, for the same reason the `iris_doc` arm derives from
+        // `DocMode::is_write`: a second `matches!` over action strings here would be a duplicate,
+        // and an action added to the enum and dispatched but absent from the duplicate would be an
+        // UNGATED WRITE. `Action::is_write` has no `_` arm, so a new variant cannot compile until it
+        // is classified, and this arm then follows it with no edit here.
+        "iris_gateway_manage" => crate::tools::gateway_manage::parse_action(action)
+            .is_some_and(|a| a.is_write())
+            .then_some("create or delete a SQL Gateway connection"),
         "iris_production" => matches!(
             action,
             "start" | "stop" | "restart" | "update" | "recover" | "set_autostart"
@@ -4645,12 +4661,6 @@ pub(crate) fn mutating_call(tool: &str, args: &serde_json::Value) -> Option<&'st
         // role that should hold SELECT-only grants. The screen alone would not be enough — the
         // target speaks a foreign SQL dialect — which is why the connection is the guarantee.
         | "iris_gateway_query"
-        // #343: a diagnostic. It reads the gateway definition, checks whether the class-path files
-        // exist, asks $SYSTEM.SQLGateway.TestConnection, and reads the JDBC metadata; any statement
-        // it runs on the caller's behalf goes through the same read-only screen as
-        // iris_gateway_query, over a connection opened SetReadOnly(1). It deliberately has no
-        // create or delete action — that would mean accepting a plaintext password.
-        | "iris_gateway_manage"
         | "iris_table_info" => None,
         _ => None,
     }
@@ -8531,7 +8541,7 @@ Methods:
     }
 
     #[tool(
-        description = "Diagnose an IRIS SQL Gateway before you try to use it, and say WHICH thing is wrong instead of \"connection failed\". action=probe answers the question there is otherwise no canonical API for — can a JDBC gateway run here at all: is the %JDBC Server external language server defined, and is its Java runtime present and supported. action=list names the gateway connections defined on this instance with their driver, class path and username (never a password). action=test takes one connection all the way to the external database and returns ONE named mode: Java absent, no such server, connection not defined, an ODBC connection, a class path naming a jar that is not on the IRIS host, a connection that failed with no reason at all, a credential the target refused, another reason the target gave, a handshake that did not complete, or — with probe_query — the gateway working and the target refusing THAT statement, which is the failure that costs most to misread. Each mode carries its own remedy. A class path naming a missing jar is reported even when the connection test passes, because a Java server that already loaded the driver makes that test pass until the next restart. Creating a connection is not an action here: it would mean sending a plaintext password. Use iris_gateway_query to read rows once this says the connection is healthy. namespace: optional — defaults to the connection namespace (IRIS_NAMESPACE)."
+        description = "Diagnose an IRIS SQL Gateway before you try to use it, and say WHICH thing is wrong instead of \"connection failed\". action=probe answers the question there is otherwise no canonical API for — can a JDBC gateway run here at all: is the %JDBC Server external language server defined, and is its Java runtime present and supported. action=list names the gateway connections defined on this instance with their driver, class path and username (never a password). action=test takes one connection all the way to the external database and returns ONE named mode: Java absent, no such server, connection not defined, an ODBC connection, a class path naming a jar that is not on the IRIS host, a connection that failed with no reason at all, a credential the target refused, another reason the target gave, a handshake that did not complete, or — with probe_query — the gateway working and the target refusing THAT statement, which is the failure that costs most to misread. Each mode carries its own remedy. A class path naming a missing jar is reported even when the connection test passes, because a Java server that already loaded the driver makes that test pass until the next restart. action=create defines a new JDBC connection (connection, url, driver, classpath, user, password) and refuses rather than overwriting a name that already exists; the password is stored in the IRIS gateway definition and is never returned by any action. action=delete removes one, and reports \"there was no such connection\" separately from \"it exists and the delete did not take effect\" — it re-reads afterwards rather than trusting the delete's own status. create and delete change the instance and are refused on a connection that is not write-allowed. Use iris_gateway_query to read rows once this says the connection is healthy. namespace: optional — defaults to the connection namespace (IRIS_NAMESPACE)."
     )]
     async fn iris_gateway_manage(
         &self,
@@ -11619,6 +11629,7 @@ mod tool_annotation_tests {
             "iris_production_item",
             "iris_debug",
             "iris_query",
+            "iris_gateway_manage",
         ] {
             assert!(
                 tool_can_mutate(tool),
@@ -11830,9 +11841,9 @@ mod tool_annotation_tests {
             "doc.rs",
             "execute_method.rs",
             "gateway.rs",
-            // #343: `probe` and `test` run generated ObjectScript, so this file writes a scratch
-            // class and `iris_gateway_manage` is in GENERATOR_WRITE_TOOLS. `list` does not — it is
-            // a plain SELECT.
+            // #343: `probe`, `test`, `create` and `delete` run generated ObjectScript, so this
+            // file writes a scratch class and `iris_gateway_manage` is in GENERATOR_WRITE_TOOLS.
+            // `list` does not — it is a plain SELECT.
             "gateway_manage.rs",
             "hl7_schema.rs",
             "info.rs",
@@ -13737,6 +13748,19 @@ mod write_gate_tests {
                 serde_json::json!({"action": "get_settings"}),
             ),
             ("iris_lookup_manage", serde_json::json!({"action": "get"})),
+            // #343: the diagnostic half of iris_gateway_manage. These reach the generator and so
+            // are honestly in GENERATOR_WRITE_TOOLS, but they change NOTHING on the instance, and
+            // gating them would make the tool useless for the case it exists for — diagnosing a
+            // gateway on an instance nobody wants written to.
+            (
+                "iris_gateway_manage",
+                serde_json::json!({"action": "probe"}),
+            ),
+            ("iris_gateway_manage", serde_json::json!({"action": "list"})),
+            (
+                "iris_gateway_manage",
+                serde_json::json!({"action": "test", "connection": "PG_X"}),
+            ),
             (
                 "iris_lookup_manage",
                 serde_json::json!({"action": "list_tables"}),
@@ -13810,6 +13834,22 @@ mod write_gate_tests {
             ("iris_compile", serde_json::json!({"target": "A.B.cls"})),
             ("iris_test", serde_json::json!({"pattern": "A"})),
             ("iris_lookup_manage", serde_json::json!({"action": "set"})),
+            // #343: create writes a connection definition carrying a credential, delete removes
+            // one. Both must be refused on a connection that is not write-allowed.
+            (
+                "iris_gateway_manage",
+                serde_json::json!({"action": "create", "connection": "PG_X"}),
+            ),
+            (
+                "iris_gateway_manage",
+                serde_json::json!({"action": "delete", "connection": "PG_X"}),
+            ),
+            // Case is the caller's: the handler lowercases before dispatching, so the gate must
+            // too, or an upper-case action would reach the write path ungated.
+            (
+                "iris_gateway_manage",
+                serde_json::json!({"action": "CREATE", "connection": "PG_X"}),
+            ),
             (
                 "iris_lookup_manage",
                 serde_json::json!({"action": "delete"}),

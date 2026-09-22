@@ -1804,16 +1804,37 @@ fn gateway_manage_names_which_failure_mode_the_gateway_is_in() {
     }
 
     // ── an action this tool does not have explains itself ─────────────────────────────────
-    let created = ask(serde_json::json!({"action": "create", "namespace": "%SYS"}));
-    assert_eq!(created["error_code"], "UNKNOWN_ACTION", "{created}");
-    let created_msg = created["error"].as_str().unwrap_or_default();
+    // This used to assert that `create` was refused on charter grounds. The maintainer relaxed the
+    // charter, so `create` is a real action now and its lifecycle is covered by
+    // `gateway_manage_creates_and_deletes_without_ever_echoing_the_password`. What is asserted here
+    // instead is the property that survived: an action the tool really does not have names the ones
+    // it does, rather than failing opaquely.
+    let unknown = ask(serde_json::json!({"action": "drop", "namespace": "%SYS"}));
+    assert_eq!(unknown["error_code"], "UNKNOWN_ACTION", "{unknown}");
+    let unknown_msg = unknown["error"].as_str().unwrap_or_default();
+    for valid in ["probe", "list", "test", "create", "delete"] {
+        assert!(
+            unknown_msg.contains(valid),
+            "the refusal must name '{valid}' as available: {unknown}"
+        );
+    }
+    // And `create` with nothing to create must say WHICH fields are missing, not just "bad call".
+    let bare = ask(serde_json::json!({"action": "create", "namespace": "%SYS"}));
+    assert_eq!(bare["error_code"], "MISSING_PARAMS", "{bare}");
+    let named: Vec<&str> = bare["missing"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    for field in ["connection", "url", "driver", "user", "password"] {
+        assert!(
+            named.contains(&field),
+            "'{field}' is required and must be named as missing: {bare}"
+        );
+    }
+    // It must not echo the arguments back — one of them, on a real call, is the password.
     assert!(
-        created_msg.contains("plaintext password"),
-        "create is absent for a reason, and the reason is the answer: {created}"
-    );
-    assert!(
-        created_msg.contains("probe") && created_msg.contains("test"),
-        "it must name the actions that do exist: {created}"
+        bare.get("arguments").is_none() && bare.get("password").is_none(),
+        "{bare}"
     );
 
     // ── list: the stated trap is isJDBC arriving as JSON true ─────────────────────────────
@@ -2010,5 +2031,305 @@ fn gateway_manage_names_which_failure_mode_the_gateway_is_in() {
             .unwrap_or_default()
             .contains("action=list"),
         "it must say how to find the names: {no_name}"
+    );
+}
+
+/// #343, second half: `create` and `delete` compose with the rest of the tool, and the password
+/// never comes back out.
+///
+/// The sequence IS the proof: create → the connection is listed → test → delete → test again and
+/// get the not-defined answer. Each step's precondition is the previous step's effect, so a create
+/// that silently did nothing or a delete that silently did nothing cannot pass it.
+///
+/// Where the gateway rig is deployed the middle of that sequence also reaches PostgreSQL, and the
+/// expected result is the one already measured for `PG_COCINA_E2E`. Where it is not — CI runs a
+/// plain IRIS with no PostgreSQL — the lifecycle still runs in full, because creating and deleting
+/// a DEFINITION needs no external database; only the connect attempt does.
+#[test]
+#[ignore = "requires live IRIS"]
+fn gateway_manage_creates_and_deletes_without_ever_echoing_the_password() {
+    let iris_host = std::env::var("IRIS_HOST").unwrap_or_default();
+    if iris_host.is_empty() {
+        return;
+    }
+    // Distinctive enough that a partial echo is still a failure, and not a string any other
+    // fixture can produce.
+    const SENTINEL: &str = "Hunter2-SENTINEL-xyzzy";
+    const NAME: &str = "PG_E2E_ROUNDTRIP";
+
+    let ask = |args: serde_json::Value| -> serde_json::Value {
+        let responses = mcp_exchange(&[
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
+            serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"iris_gateway_manage","arguments":args}}),
+        ]);
+        parse_tool_text(&find_response(&responses, 2).expect("no tool response"))
+    };
+    let names = || -> Vec<String> {
+        let listed = ask(serde_json::json!({"action": "list", "namespace": "%SYS"}));
+        listed["connections"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|c| c["name"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    // Every envelope this test sees, checked for the password. Collected rather than asserted
+    // inline so the final sweep covers the error paths too.
+    let mut seen: Vec<(&str, serde_json::Value)> = Vec::new();
+
+    // Idempotent start: a previous failed run must not make this one fail for the wrong reason.
+    let _ = ask(serde_json::json!({"action": "delete", "connection": NAME, "namespace": "%SYS"}));
+    assert!(
+        !names().contains(&NAME.to_string()),
+        "the test name is still present before the test begins"
+    );
+
+    // ── create ───────────────────────────────────────────────────────────────────────────
+    let create_args = serde_json::json!({
+        "action": "create",
+        "connection": NAME,
+        "url": "jdbc:postgresql://pg-gateway-e2e:5432/Cocina",
+        "driver": "org.postgresql.Driver",
+        "classpath": "/usr/irissys/mgr/postgresql-42.7.4.jar",
+        "user": "gateway_ro",
+        "password": SENTINEL,
+        "namespace": "%SYS",
+    });
+    let created = ask(create_args.clone());
+    seen.push(("create", created.clone()));
+    assert_eq!(created["success"], true, "{created}");
+    assert_eq!(created["outcome"], "GATEWAY_CREATED", "{created}");
+    // It echoes back what it stored, MINUS the password — which is not a field of the envelope.
+    assert_eq!(created["user"], "gateway_ro", "{created}");
+    assert_eq!(created["driver"], "org.postgresql.Driver", "{created}");
+    assert!(
+        created.get("password").is_none(),
+        "the envelope has a password field at all: {created}"
+    );
+
+    // …and the effect is real, seen through a DIFFERENT action.
+    assert!(
+        names().contains(&NAME.to_string()),
+        "create reported success and the connection is not listed: {:?}",
+        names()
+    );
+
+    // ── create again: refused, nothing overwritten ───────────────────────────────────────
+    let again = ask(create_args.clone());
+    seen.push(("create-again", again.clone()));
+    assert_eq!(again["error_code"], "GATEWAY_CONNECTION_EXISTS", "{again}");
+    assert_ne!(again["success"], true, "{again}");
+
+    // ── test: the middle of the sequence ─────────────────────────────────────────────────
+    let tested =
+        ask(serde_json::json!({"action": "test", "connection": NAME, "namespace": "%SYS"}));
+    seen.push(("test", tested.clone()));
+    // Whatever the verdict, it must be ABOUT this connection rather than "no such connection" —
+    // that is what proves create's effect reached the diagnostic path.
+    assert_ne!(
+        tested["diagnosis"], "GATEWAY_CONNECTION_NOT_DEFINED",
+        "the connection was just created and test cannot find it: {tested}"
+    );
+    assert_ne!(
+        tested["error_code"], "GATEWAY_CONNECTION_NOT_DEFINED",
+        "{tested}"
+    );
+    // Whether the rig is deployed is decided by the rig's OWN connection being present, not by the
+    // verdict this call happened to return — a verdict-based check would make the branch below
+    // unfalsifiable.
+    let rig_present = names().contains(&"PG_COCINA_E2E".to_string());
+    let tested_code = tested["error_code"]
+        .as_str()
+        .or_else(|| tested["diagnosis"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        tested_code.starts_with("GATEWAY_"),
+        "a created connection must still get a NAMED mode: {tested}"
+    );
+    if rig_present {
+        // This connection was created with the SENTINEL as its password, so PostgreSQL is expected
+        // to refuse the credential — and that refusal is itself the proof that the definition this
+        // test wrote reached PostgreSQL through the Java gateway and the jar.
+        assert_eq!(
+            tested_code, "GATEWAY_CREDENTIAL_REJECTED",
+            "a connection created with a deliberately wrong password should be refused BY THE \
+             TARGET, which is what proves it got that far: {tested}"
+        );
+        assert_eq!(
+            tested["connection"]["class_path_missing"]
+                .as_array()
+                .map(Vec::len),
+            Some(0),
+            "the jar the rig uses does exist, so the class-path stage must be clean: {tested}"
+        );
+    } else {
+        eprintln!("gateway rig absent; test reported {tested_code} for the created connection");
+    }
+
+    // ── delete ───────────────────────────────────────────────────────────────────────────
+    let deleted =
+        ask(serde_json::json!({"action": "delete", "connection": NAME, "namespace": "%SYS"}));
+    seen.push(("delete", deleted.clone()));
+    assert_eq!(deleted["success"], true, "{deleted}");
+    assert_eq!(deleted["outcome"], "GATEWAY_DELETED", "{deleted}");
+    assert!(
+        !names().contains(&NAME.to_string()),
+        "delete reported success and the connection is still listed: {:?}",
+        names()
+    );
+
+    // ── test again: the not-defined answer, which closes the loop ────────────────────────
+    let gone = ask(serde_json::json!({"action": "test", "connection": NAME, "namespace": "%SYS"}));
+    seen.push(("test-after-delete", gone.clone()));
+    assert_eq!(
+        gone["error_code"], "GATEWAY_CONNECTION_NOT_DEFINED",
+        "after a delete, test must say the connection is not defined: {gone}"
+    );
+
+    // ── delete again: absent is not the same answer as deleted ───────────────────────────
+    let twice =
+        ask(serde_json::json!({"action": "delete", "connection": NAME, "namespace": "%SYS"}));
+    seen.push(("delete-twice", twice.clone()));
+    assert_eq!(
+        twice["error_code"], "GATEWAY_CONNECTION_NOT_DEFINED",
+        "deleting what is not there must not report a deletion: {twice}"
+    );
+    assert_ne!(twice["success"], true, "{twice}");
+    assert_ne!(
+        twice["outcome"], deleted["outcome"],
+        "'deleted it' and 'there was nothing to delete' must be different answers: {twice}"
+    );
+
+    // ── error paths, with the password still in play ─────────────────────────────────────
+    let mut missing_args = create_args.clone();
+    missing_args["url"] = serde_json::Value::Null;
+    missing_args.as_object_mut().unwrap().remove("url");
+    let missing = ask(missing_args);
+    seen.push(("missing-params", missing.clone()));
+    assert_eq!(missing["error_code"], "MISSING_PARAMS", "{missing}");
+
+    let mut bad_driver = create_args.clone();
+    bad_driver["connection"] = format!("{NAME}_BAD").into();
+    bad_driver["url"] = "not a url at all".into();
+    let bad = ask(bad_driver);
+    seen.push(("bad-url", bad.clone()));
+    // Whatever IRIS makes of it, the envelope must be a named outcome and never carry the secret.
+    // Clean up if that odd name did get created.
+    let _ = ask(
+        serde_json::json!({"action": "delete", "connection": format!("{NAME}_BAD"), "namespace": "%SYS"}),
+    );
+
+    // ── THE assertion: the password appears in no field of any response ──────────────────
+    for (label, env) in &seen {
+        let text = env.to_string();
+        assert!(
+            !text.contains(SENTINEL),
+            "the '{label}' response carries the password: {env}"
+        );
+        // A partial echo is a leak too, and so is the redaction marker being the only thing
+        // stopping a full one.
+        assert!(
+            !text.contains("Hunter2"),
+            "the '{label}' response carries part of the password: {env}"
+        );
+    }
+    // The control on that sweep: the password WAS sent, on the calls that take one. Without this,
+    // a test that quietly stopped sending it would sweep clean and prove nothing.
+    assert!(
+        create_args.to_string().contains(SENTINEL),
+        "the sentinel was never sent, so the sweep above means nothing"
+    );
+    assert!(
+        seen.iter().any(|(l, _)| *l == "create"),
+        "the create response must be among the swept envelopes"
+    );
+    assert!(
+        bad["error_code"].is_string() || bad["success"] == true,
+        "{bad}"
+    );
+
+    // ── the good control: the full sequence the issue asks for, against the real target ───
+    //
+    // Same lifecycle, but created with the rig's ACTUAL credentials (e2e/gateway/seed.sql), so
+    // `test` must reach the measured healthy result — `PostgreSQL <version>` through the
+    // PostgreSQL JDBC driver — rather than merely a named failure. Then delete, and `test` must
+    // answer not-defined. That is create → test → delete → test, end to end.
+    if !rig_present {
+        eprintln!(
+            "gateway rig absent; skipped the good-control round trip (lifecycle asserted above)"
+        );
+        return;
+    }
+    const GOOD: &str = "PG_E2E_ROUNDTRIP_OK";
+    let _ = ask(serde_json::json!({"action": "delete", "connection": GOOD, "namespace": "%SYS"}));
+    let made = ask(serde_json::json!({
+        "action": "create",
+        "connection": GOOD,
+        "url": "jdbc:postgresql://pg-gateway-e2e:5432/Cocina",
+        "driver": "org.postgresql.Driver",
+        "classpath": "/usr/irissys/mgr/postgresql-42.7.4.jar",
+        "user": "gateway_ro",
+        // The rig's own role password, from e2e/gateway/seed.sql. A fixture credential for a
+        // throwaway container, and the only way to reach the healthy verdict.
+        "password": "gateway_ro_pw",
+        "namespace": "%SYS",
+    }));
+    assert_eq!(made["outcome"], "GATEWAY_CREATED", "{made}");
+
+    let healthy = ask(serde_json::json!({
+        "action": "test", "connection": GOOD, "probe_query": "SELECT count(*) FROM public.menus",
+        "namespace": "%SYS",
+    }));
+    assert_eq!(
+        healthy["diagnosis"], "GATEWAY_OK",
+        "a connection this tool created with correct credentials must reach the target: {healthy}"
+    );
+    assert_eq!(healthy["success"], true, "{healthy}");
+    assert!(
+        healthy["connection"]["database"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("PostgreSQL"),
+        "{healthy}"
+    );
+    assert_eq!(
+        healthy["connection"]["driver_name"], "PostgreSQL JDBC Driver",
+        "{healthy}"
+    );
+    assert_eq!(healthy["connection"]["probe_ok"], true, "{healthy}");
+    // The password must not be readable back through any action, including this one.
+    for field in ["password", "pwd"] {
+        assert!(
+            healthy["connection"].get(field).is_none(),
+            "test exposes '{field}': {healthy}"
+        );
+    }
+    assert!(
+        !healthy.to_string().contains("gateway_ro_pw"),
+        "the stored password came back through test: {healthy}"
+    );
+
+    let removed =
+        ask(serde_json::json!({"action": "delete", "connection": GOOD, "namespace": "%SYS"}));
+    assert_eq!(removed["outcome"], "GATEWAY_DELETED", "{removed}");
+    let after = ask(serde_json::json!({"action": "test", "connection": GOOD, "namespace": "%SYS"}));
+    assert_eq!(
+        after["error_code"], "GATEWAY_CONNECTION_NOT_DEFINED",
+        "after delete, test must say the connection is not defined: {after}"
+    );
+    assert!(
+        !names().contains(&GOOD.to_string()),
+        "the good-control connection was left behind: {:?}",
+        names()
+    );
+    // The rig's own connection must be untouched by all of this.
+    assert!(
+        names().contains(&"PG_COCINA_E2E".to_string()),
+        "this test removed the shared rig connection: {:?}",
+        names()
     );
 }
