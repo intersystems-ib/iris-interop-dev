@@ -87,6 +87,12 @@ const REMEDIES: &[(&str, &str)] = &[
     ("USER_EXISTS", "a user of that name already exists; modify that account rather than creating it"),
     ("USER_NOT_FOUND", "list users with iris_credential_list or check_config and use an existing name, or create the account first"),
     ("WEBAPP_EXISTS", "a web application is already mapped at that path; edit it, or choose a different path"),
+    // Emitted via `envelope::fail_with`, which this file did not scan until #329 — see the note in
+    // `vocabulary()`. These four had no remedy on record while being fully reachable.
+    ("COMPILE_ERROR", "the source was written but IRIS refused to compile it; the message and compile_console carry the ObjectScript errors — fix those rather than retrying the same source"),
+    ("IRIS_RUNTIME_ERROR", "the code ran and IRIS raised an error mid-execution; the message carries the ObjectScript error and location — this will not succeed on retry unchanged"),
+    ("SQL_ERROR", "IRIS rejected the SQL; the message carries the SQLCODE and its text — resolve real table and column names with iris_table_info or docs_introspect rather than guessing, then correct the statement"),
+    ("WRITE_ABORTED", "the write was cancelled before anything changed — you declined the source-control checkout it needed; re-issue and approve it, or check the document out first"),
     ("WEBAPP_NOT_FOUND", "list the defined web applications and use one of those paths — the path must include its leading slash"),
 ];
 
@@ -301,6 +307,18 @@ fn vocabulary() -> Vec<(String, Vec<String>)> {
         }
         for c in codes_after(&prod, "err_json_with_url(\"") {
             add(c, "literal");
+        }
+        // #329: `envelope::fail_with` / `fail` are a THIRD emission route, and this scan missed them
+        // entirely. The omission was invisible until item 2 replaced four `err_json("ITEM_NOT_FOUND",
+        // …)` calls with one `fail_with("ITEM_NOT_FOUND", …)` helper — at which point
+        // `no_remedy_entry_is_stale` declared the code unreachable while the server still emitted it.
+        // Measuring the route turned up FOUR live codes with no remedy on record, so the guarantee
+        // this file advertises was narrower than its name for as long as it has existed.
+        for c in codes_after(&prod, "fail_with(\"") {
+            add(c, "fail_with");
+        }
+        for c in codes_after(&prod, "fail(\"") {
+            add(c, "fail");
         }
         for c in fallback_codes(&prod) {
             add(c, "fallback");
