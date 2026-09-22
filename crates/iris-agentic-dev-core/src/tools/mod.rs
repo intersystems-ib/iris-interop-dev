@@ -11788,6 +11788,10 @@ mod tool_annotation_tests {
             "doc.rs",
             "execute_method.rs",
             "gateway.rs",
+            // #343: `probe` and `test` run generated ObjectScript, so this file writes a scratch
+            // class and `iris_gateway_manage` is in GENERATOR_WRITE_TOOLS. `list` does not — it is
+            // a plain SELECT.
+            "gateway_manage.rs",
             "hl7_schema.rs",
             "info.rs",
             "interop.rs",

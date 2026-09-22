@@ -1734,10 +1734,13 @@ fn gateway_manage_names_which_failure_mode_the_gateway_is_in() {
 
     // ── probe: the canonical answer the benchmark runs had to guess at ────────────────────
     let probe = ask(serde_json::json!({"action": "probe", "namespace": "%SYS"}));
-    assert_eq!(probe["success"], true, "{probe}");
-    assert_eq!(probe["diagnosis"], "GATEWAY_OK", "{probe}");
     let gw = &probe["java_gateway"];
-    assert_eq!(gw["defined"], true, "{probe}");
+    // These hold on ANY instance, and they are the facts the benchmark runs went looking for.
+    assert_eq!(
+        gw["defined"], true,
+        "every IRIS install defines this external language server; if this is ever false it is a \
+         finding, not a flake: {probe}"
+    );
     assert_eq!(
         gw["name"], "%JDBC Server",
         "the external language server every JDBC gateway connection runs through: {probe}"
@@ -1745,14 +1748,6 @@ fn gateway_manage_names_which_failure_mode_the_gateway_is_in() {
     assert!(
         gw["port"].as_str().is_some_and(|p| !p.is_empty()),
         "the port is the fact a caller cannot otherwise get: {probe}"
-    );
-    assert_eq!(gw["java_found"], true, "{probe}");
-    assert_eq!(gw["java_supported"], true, "{probe}");
-    assert!(
-        gw["java_version"]
-            .as_str()
-            .is_some_and(|v| v.starts_with(char::is_numeric)),
-        "a Java version must be reported, not inferred: {probe}"
     );
     // Not-listening is a FACT, never the verdict: measured, this server starts on demand.
     assert!(
@@ -1766,6 +1761,41 @@ fn gateway_manage_names_which_failure_mode_the_gateway_is_in() {
             .contains("starts on demand"),
         "a caller must not read 'not listening' as a fault: {probe}"
     );
+
+    // The Java verdict depends on the runner. Both outcomes are legitimate facts about it, and
+    // BOTH are asserted: this test is about whether the tool discriminates, so an instance with no
+    // JDK must produce the named Java failure rather than a vague one. It must never produce a
+    // third thing.
+    match probe["diagnosis"].as_str() {
+        Some("GATEWAY_OK") => {
+            assert_eq!(probe["success"], true, "{probe}");
+            assert_eq!(gw["java_found"], true, "{probe}");
+            assert_eq!(gw["java_supported"], true, "{probe}");
+            assert!(
+                gw["java_version"]
+                    .as_str()
+                    .is_some_and(|v| v.starts_with(char::is_numeric)),
+                "a Java version must be reported, not inferred: {probe}"
+            );
+        }
+        Some(code @ ("GATEWAY_JAVA_ABSENT" | "GATEWAY_JAVA_UNSUPPORTED")) => {
+            assert_eq!(probe["success"], false, "{probe}");
+            assert_eq!(
+                gw["java_found"],
+                code == "GATEWAY_JAVA_UNSUPPORTED",
+                "{probe}"
+            );
+            assert!(
+                probe["error"].as_str().unwrap_or_default().contains("Java"),
+                "a Java failure must say so: {probe}"
+            );
+            eprintln!("runner has no usable JDK; asserted the named Java failure instead");
+        }
+        other => panic!(
+            "probe returned neither a healthy verdict nor a NAMED Java failure ({other:?}) — a \
+             vague answer here is the defect the issue is about: {probe}"
+        ),
+    }
 
     // ── an action this tool does not have explains itself ─────────────────────────────────
     let created = ask(serde_json::json!({"action": "create", "namespace": "%SYS"}));
@@ -1783,14 +1813,35 @@ fn gateway_manage_names_which_failure_mode_the_gateway_is_in() {
     // ── list: the stated trap is isJDBC arriving as JSON true ─────────────────────────────
     let listed = ask(serde_json::json!({"action": "list", "namespace": "%SYS"}));
     assert_eq!(listed["success"], true, "{listed}");
-    let listed_text = listed.to_string();
-    for secret in ["pwd", "password", "Secret"] {
+    let conns = listed["connections"].as_array().expect("connections array");
+
+    // A listing must not be a route to a credential. Scoped to the ROWS: the envelope's own note
+    // legitimately contains the word "password" (it says the password is never returned), and a
+    // guard over the whole envelope fires on that — measured, it did.
+    for row in conns {
+        let obj = row.as_object().expect("a row is an object");
+        for key in obj.keys() {
+            let k = key.to_lowercase();
+            assert!(
+                !(k.contains("pwd") || k.contains("password") || k.contains("secret")),
+                "a connection row carries a credential field '{key}': {listed}"
+            );
+        }
+        // And by value, with a needle that is known to exist: the rig's role password is in
+        // e2e/gateway/seed.sql, so a leak of it would be visible here rather than inferred from
+        // the absence of a field name.
+        let text = row.to_string();
         assert!(
-            !listed_text.contains(secret),
-            "a listing must not be a route to a credential ('{secret}'): {listed}"
+            !text.contains("gateway_ro_pw"),
+            "the stored password reached the listing: {listed}"
+        );
+        // The control for that needle: the row DOES carry the username, so this row is the kind of
+        // thing a password would have appeared in.
+        assert!(
+            text.contains("gateway_ro") || obj.get("user").is_some(),
+            "a row with no user field at all makes the password check vacuous: {listed}"
         );
     }
-    let conns = listed["connections"].as_array().expect("connections array");
     let rig = conns.iter().find(|c| c["name"] == "PG_COCINA_E2E").cloned();
     if rig.is_none() {
         // The rig is not deployed. Assert the contract that covers that case rather than passing

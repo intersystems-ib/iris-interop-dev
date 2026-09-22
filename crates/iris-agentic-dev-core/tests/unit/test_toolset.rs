@@ -231,7 +231,7 @@ fn test_merged_tool_count() {
     let tools = IrisTools::new_with_toolset(None, Toolset::Merged).expect("IrisTools::new");
     let count = tools.registered_tool_names().len();
     assert_eq!(
-        count, 52,
+        count, 53,
         "Merged toolset must advertise exactly 53 tools, got {}",
         count
     );
@@ -379,7 +379,7 @@ fn test_baseline_tool_count() {
         .registered_tool_names()
         .len();
     assert_eq!(
-        n, 60,
+        n, 61,
         "Baseline must advertise exactly 61 tools (Toolset::Baseline doc comment says 61), got {}",
         n
     );
@@ -467,7 +467,7 @@ fn test_new_uses_pruned_baseline_router() {
         .registered_tool_names();
     assert_eq!(
         via_new.len(),
-        60,
+        61,
         "new() claims Toolset::Baseline, so it must advertise the baseline surface"
     );
     assert_eq!(

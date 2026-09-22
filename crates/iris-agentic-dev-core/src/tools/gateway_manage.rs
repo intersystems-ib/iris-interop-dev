@@ -60,8 +60,29 @@ use crate::objectscript::os_str_expr;
 pub const JDBC_SERVER: &str = "%JDBC Server";
 
 /// Actions this tool accepts. `create` and `delete` are deliberately absent — see
-/// [`why_no_create_message`].
+/// [`why_no_create_message`]. This is also the advertised `enum` on the `action` field; the two are
+/// held equal by `the_advertised_enum_is_the_action_list`.
 pub const ACTIONS: &[&str] = &["probe", "list", "test"];
+
+/// What a call resolved to. `None` is what [`unknown_action_message`] exists for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Action {
+    Probe,
+    List,
+    Test,
+}
+
+/// The ONE place an action string becomes a decision. The handler dispatches on this rather than on
+/// its own `match` over literals, so "advertised" and "accepted" cannot be two lists that drift —
+/// `the_advertised_enum_is_the_action_list` runs the mapping for every advertised value.
+pub fn parse_action(raw: &str) -> Option<Action> {
+    match raw.trim().to_lowercase().as_str() {
+        "probe" => Some(Action::Probe),
+        "list" => Some(Action::List),
+        "test" => Some(Action::Test),
+        _ => None,
+    }
+}
 
 /// Rows `list` will return before it says it truncated. A namespace has a handful of gateway
 /// connections, not thousands.
@@ -160,6 +181,12 @@ pub enum ServerFacts {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectionFacts {
     pub name: String,
+    /// Is there a row for this name? `None` means the program did not say — which must not be read
+    /// as "there is no such connection", the exact substitution this repo is named after. Carried
+    /// as its own field rather than inferred from four empty strings, because an inference is a
+    /// guess dressed as a measurement and a connection CAN legitimately have every one of those
+    /// fields blank.
+    pub defined: Option<bool>,
     pub driver: String,
     pub url: String,
     pub dsn: String,
@@ -320,10 +347,23 @@ pub fn diagnose(facts: &GatewayFacts) -> GatewayDiagnosis {
         };
     };
 
-    if c.is_jdbc.is_none() && c.driver.is_empty() && c.url.is_empty() && c.dsn.is_empty() {
-        return GatewayDiagnosis::ConnectionNotDefined {
-            connection: c.name.clone(),
-        };
+    match c.defined {
+        None => {
+            return GatewayDiagnosis::Inconclusive {
+                stage: "connection",
+                detail: format!(
+                    "the program did not say whether '{}' is defined on this instance, so whether \
+                     it exists is unknown — that is not the same as its not existing",
+                    c.name
+                ),
+            }
+        }
+        Some(false) => {
+            return GatewayDiagnosis::ConnectionNotDefined {
+                connection: c.name.clone(),
+            }
+        }
+        Some(true) => {}
     }
     if c.is_jdbc == Some(false) {
         return GatewayDiagnosis::NotJdbc {
@@ -819,29 +859,19 @@ fn parse_server(v: &serde_json::Value) -> ServerFacts {
 
 fn parse_connection(v: &serde_json::Value) -> Option<ConnectionFacts> {
     let c = v.get("connection")?;
-    let defined = json_bool(c.get("defined")) == Some(true);
+    let defined = json_bool(c.get("defined"));
     Some(ConnectionFacts {
         name: json_str(c, "name"),
-        driver: if defined {
-            json_str(c, "driver")
-        } else {
-            String::new()
-        },
-        url: if defined {
-            json_str(c, "url")
-        } else {
-            String::new()
-        },
-        dsn: if defined {
-            json_str(c, "dsn")
-        } else {
-            String::new()
-        },
+        defined,
+        driver: json_str(c, "driver"),
+        url: json_str(c, "url"),
+        dsn: json_str(c, "dsn"),
         user: json_str(c, "user"),
-        is_jdbc: if defined {
-            json_bool(c.get("is_jdbc")).or(Some(false))
-        } else {
-            None
+        // Only meaningful for a connection that exists. `None` where it does not, so nothing
+        // downstream can read "not JDBC" off a row that was never there.
+        is_jdbc: match defined {
+            Some(true) => json_bool(c.get("is_jdbc")).or(Some(false)),
+            _ => None,
         },
         classpath_entries: json_strings(c, "classpath_entries"),
         classpath_missing: json_strings(c, "classpath_missing"),
@@ -1193,6 +1223,66 @@ mod tests {
         let m = diagnose(&parse_facts(raw)).remedy();
         assert!(m.contains("SQL Gateway Connections"), "{m}");
         assert!(m.contains("never accepts a credential"), "{m}");
+
+        // The envelope must not assert anything ABOUT a row that is not there. `is_jdbc: false`
+        // for a connection that does not exist is a property of nothing — and the diagnosis
+        // returns before that field is consulted, so only this assertion pins it. (Found by a
+        // surviving mutant: dropping the `defined` guard on is_jdbc changed no verdict.)
+        let GatewayFacts::Read {
+            connection: Some(c),
+            ..
+        } = parse_facts(raw)
+        else {
+            panic!("fixture must parse")
+        };
+        assert_eq!(
+            c.is_jdbc, None,
+            "a connection that does not exist is neither JDBC nor not-JDBC"
+        );
+        assert_eq!(
+            connection_json(&c)["is_jdbc"],
+            serde_json::Value::Null,
+            "and that must survive into the envelope as null, not false"
+        );
+        // The control: a connection that DOES exist reports the flag, so the assertion above is
+        // not satisfied by a field that is always null.
+        let GatewayFacts::Read {
+            connection: Some(live),
+            ..
+        } = parse_facts(LIVE_HEALTHY)
+        else {
+            panic!("live fixture must parse")
+        };
+        assert_eq!(connection_json(&live)["is_jdbc"], serde_json::json!(true));
+    }
+
+    /// "We could not tell whether this connection exists" must not come back as "it does not."
+    /// The two are one `if` apart and a caller acts on them completely differently: one is a typo
+    /// to fix, the other is a broken tool.
+    #[test]
+    fn a_connection_stage_that_says_nothing_is_not_a_connection_that_is_absent() {
+        let raw = r#"{"ok":1,
+          "server":{"defined":1,"name":"%JDBC Server","port":53772,"address":"127.0.0.1",
+                    "listening":1,"java_found":1,"java_version":"11.0.31","java_supported":1},
+          "connection":{"name":"MYSTERY","classpath_entries":[],"classpath_missing":[]}}"#;
+        match diagnose(&parse_facts(raw)) {
+            GatewayDiagnosis::Inconclusive { stage, detail } => {
+                assert_eq!(stage, "connection");
+                assert!(detail.contains("MYSTERY"), "{detail}");
+                assert!(
+                    detail.contains("not the same as its not existing"),
+                    "{detail}"
+                );
+            }
+            other => panic!("a missing answer read as an answer: {other:?}"),
+        }
+        // The control: the SAME output with the field present must reach the definite verdict, or
+        // the test above would pass on a parser that called every connection unknown.
+        let answered = raw.replace(r#""name":"MYSTERY","#, r#""name":"MYSTERY","defined":0,"#);
+        assert!(matches!(
+            diagnose(&parse_facts(&answered)),
+            GatewayDiagnosis::ConnectionNotDefined { .. }
+        ));
     }
 
     #[test]
@@ -1228,6 +1318,52 @@ mod tests {
         }
         let m = diagnose(&parse_facts(&raw)).remedy();
         assert!(m.contains("until the gateway restarts"), "{m}");
+    }
+
+    /// The COLD half of the same measurement, and the assertion a surviving mutant named.
+    ///
+    /// Missing jar AND `test_ok:0` AND a zero-length reason is one single measured state — the
+    /// cold Java server that could not load the driver. Both `ClasspathMissing` and
+    /// `ConnectFailedWithoutReason` match it, so which one wins is decided purely by the order of
+    /// two `if`s, and the test above cannot see that order: its fixture has `test_ok:1`, which the
+    /// empty-reason branch never fires on. Moving the empty-reason check above the file check
+    /// SURVIVED the whole suite until this existed.
+    ///
+    /// The file check must win. It knows WHY; the connection test measurably knows nothing.
+    #[test]
+    fn a_cold_server_with_a_missing_jar_is_named_by_the_file_check_not_by_the_silence() {
+        let raw = with(
+            "classpath_missing",
+            r#"["/usr/irissys/mgr/postgresql-42.7.4.jar"]"#,
+        );
+        let raw = raw.replace(r#""test_ok":1"#, r#""test_ok":0"#);
+        // The other half of the measured signature: the reason is zero-length, not merely vague.
+        assert!(raw.contains(r#""test_error":"""#), "fixture shape: {raw}");
+
+        match diagnose(&parse_facts(&raw)) {
+            GatewayDiagnosis::ClasspathMissing {
+                missing,
+                test_passed_anyway,
+                ..
+            } => {
+                assert_eq!(missing, vec!["/usr/irissys/mgr/postgresql-42.7.4.jar"]);
+                assert!(
+                    !test_passed_anyway,
+                    "this is the COLD case — the connection test failed too"
+                );
+            }
+            other => panic!(
+                "the file check knows the reason and the connection test does not; the verdict \
+                 must not be the silent one: {other:?}"
+            ),
+        }
+        // …and the remedy must be the cold-case wording, not the warm one.
+        let m = diagnose(&parse_facts(&raw)).remedy();
+        assert!(m.contains("EMPTY reason"), "{m}");
+        assert!(
+            !m.contains("until the gateway restarts"),
+            "the warm-gateway wording is wrong here: {m}"
+        );
     }
 
     /// Measured: a COLD Java server with a jar that is not there fails with a zero-length reason.
@@ -1590,6 +1726,50 @@ mod tests {
         }
     }
 
+    /// The advertised `action` enum and the list the handler dispatches on are two copies of the
+    /// same fact. A schema that advertises an action the handler rejects — or omits one it
+    /// accepts — is a guess the caller cannot recover from, so the two are asserted equal here
+    /// rather than left to be noticed.
+    #[test]
+    fn the_advertised_enum_is_the_action_list() {
+        let schema = serde_json::to_value(schemars::schema_for!(GatewayManageParams)).unwrap();
+        let advertised: Vec<&str> = schema["properties"]["action"]["enum"]
+            .as_array()
+            .unwrap_or_else(|| panic!("action has no enum in the advertised schema: {schema}"))
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(
+            advertised, ACTIONS,
+            "the advertised values and the dispatch list disagree"
+        );
+        // Every advertised value must RESOLVE, through the same function the handler dispatches on.
+        // Advertising an action the handler then rejects is a guess a caller cannot recover from.
+        let resolved: Vec<Action> = advertised
+            .iter()
+            .map(|a| {
+                parse_action(a)
+                    .unwrap_or_else(|| panic!("'{a}' is advertised but does not resolve"))
+            })
+            .collect();
+        // …and each to a DIFFERENT one, so two advertised names cannot silently do one thing.
+        let distinct: std::collections::HashSet<_> = resolved.iter().collect();
+        assert_eq!(distinct.len(), advertised.len(), "{resolved:?}");
+        assert!(
+            distinct.contains(&Action::Probe)
+                && distinct.contains(&Action::List)
+                && distinct.contains(&Action::Test),
+            "an Action variant exists that no advertised value reaches: {resolved:?}"
+        );
+        // The control: something NOT advertised must not resolve, or the loop above would pass on a
+        // parser that accepts everything.
+        assert_eq!(parse_action("status"), None);
+        assert_eq!(parse_action("create"), None);
+        assert_eq!(parse_action(""), None);
+        // Case and surrounding space are the caller's, not the contract's.
+        assert_eq!(parse_action("  PROBE "), Some(Action::Probe));
+    }
+
     #[test]
     fn the_credential_hint_only_ever_chooses_between_two_carrying_variants() {
         assert!(looks_like_credential_refusal(
@@ -1745,6 +1925,11 @@ pub struct GatewayManageParams {
     /// the SQL Gateway connections defined here, with driver, class path and username (never a
     /// password). "test": take ONE connection all the way to the external database and name which
     /// failure mode it is if it does not get there.
+    // #112: the values belong in the SCHEMA, not only in the UNKNOWN_ACTION message. Naming the
+    // field without them moves the guess one level down, which cost nine of the campaign's 31
+    // parameter errors. `every_tool_advertises_the_parameters_it_reads` enforces it — and caught
+    // this one. Kept in step with [`ACTIONS`] by `the_advertised_enum_is_the_action_list`.
+    #[schemars(extend("enum" = ["probe", "list", "test"]))]
     pub action: String,
     /// NAME of a SQL Gateway connection, for action=test (for example "PG_COCINA"). This tool
     /// never accepts a host, user, or password: the credential stays in the IRIS gateway
@@ -1838,10 +2023,9 @@ pub async fn handle_gateway_manage(
 ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
     let namespace = crate::tools::interop::resolve_namespace(p.namespace.as_deref(), Some(iris));
     let action_raw = p.action.trim().to_string();
-    let action = action_raw.to_lowercase();
 
-    match action.as_str() {
-        "probe" => {
+    match parse_action(&action_raw) {
+        Some(Action::Probe) => {
             let out = match iris
                 .execute_via_generator(&build_probe_code(), &namespace, client)
                 .await
@@ -1858,7 +2042,7 @@ pub async fn handle_gateway_manage(
             let diagnosis = diagnose(&facts);
             emit(&facts, &diagnosis, &namespace, "probe")
         }
-        "list" => {
+        Some(Action::List) => {
             let body = match iris.query(&list_sql(), vec![], &namespace, client).await {
                 Ok(v) => v,
                 Err(e) => {
@@ -1911,7 +2095,7 @@ pub async fn handle_gateway_manage(
                 }
             }
         }
-        "test" => {
+        Some(Action::Test) => {
             let connection = p.connection.as_deref().unwrap_or("").trim().to_string();
             if connection.is_empty() {
                 return crate::tools::envelope::fail_with(
@@ -1955,7 +2139,7 @@ pub async fn handle_gateway_manage(
             let diagnosis = diagnose(&facts);
             emit(&facts, &diagnosis, &namespace, "test")
         }
-        _ => crate::tools::envelope::fail_with(
+        None => crate::tools::envelope::fail_with(
             "UNKNOWN_ACTION",
             &unknown_action_message(&action_raw),
             serde_json::json!({ "namespace": namespace, "valid_actions": ACTIONS }),
