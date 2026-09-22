@@ -117,13 +117,24 @@ pub struct IrisDocParams {
     /// For mode=get: byte offset to start returning from (use with max_bytes to paginate).
     #[serde(default)]
     pub offset: usize,
-    /// mode=put: write the class even though its Storage block will be stripped, letting IRIS
-    /// regenerate storage on the next compile. Default false. When a write is refused, the fix
-    /// is almost always to DELETE the Storage block from your source and write again — IRIS
-    /// generates the storage definition itself, so a class you have just authored does not
-    /// need one. Set this to true only for a class that ALREADY holds data whose custom global
-    /// names you have confirmed the regenerated defaults will match; otherwise it discards the
-    /// storage layout of a live %Persistent extent.
+    // ── NOT a doc comment, deliberately. ──────────────────────────────────────────────────────
+    // A `///` here becomes the advertised inputSchema description, shipped on every tools/list, and
+    // `mcp_server_tools_list_returns_interop_profile` rejects Rust-internal commentary in a schema
+    // for exactly that reason: it is context spent on every client, every session. The rationale
+    // below is for whoever reads this file; the one-line description the caller sees is on the field.
+    //
+    // RETIRED (#331). `put` used to STRIP Storage blocks and then refuse the write rather than
+    // discard a layout silently, and this flag was the opt-in. Measured on writable throwaway
+    // instances, through plain Atelier REST: IRIS ACCEPTS a class carrying a generated Storage block
+    // and preserves it across compile — PUT 201 / 200 with zero errors on 2025.3 and 2026.1, slot
+    // list and <DataLocation> byte-intact on read-back. So nothing is stripped, nothing needs
+    // regenerating, and there is nothing to opt into.
+    //
+    // KEPT IN THE SCHEMA so a caller that still passes it is not rejected while deserialising with a
+    // bare -32602 carrying no error_code and no hint (#211: name what happened instead of failing to
+    // parse). It is read and ignored.
+    /// Retired and ignored. Storage blocks are no longer stripped on write, so there is nothing to
+    /// opt into; the class is written exactly as you sent it. Accepted for older callers.
     #[serde(default)]
     pub allow_storage_regeneration: bool,
     /// mode=insert_lines / delete_lines: the 1-BASED line to act at. For insert, the new lines go
@@ -948,69 +959,12 @@ fn write_result_succeeded(result: &rmcp::model::CallToolResult) -> bool {
         .unwrap_or(false)
 }
 
-/// `Foo.Bar.cls` -> `Foo.Bar`. Case-insensitive: Atelier accepts `.CLS` as readily as `.cls`,
-/// and a stem carrying a stray extension would make the dictionary probe miss every time and
-/// report `Absent` for a class that exists — the one direction of this error that loses data.
-fn strip_cls_suffix(name: &str) -> &str {
-    match name.rsplit_once('.') {
-        Some((stem, ext)) if ext.eq_ignore_ascii_case("cls") => stem,
-        _ => name,
-    }
-}
-
-/// #217: the STORAGE_STRIP_BLOCKED text. Pure, and separate from `do_write`, because the
-/// defect being repaired here was entirely in the wording and nothing in the tree asserted
-/// on the wording — both existing tests check only `error_code`.
-///
-/// Two properties the unit tests pin:
-///   1. The FIX — delete the block — precedes any mention of the bypass. It used to come
-///      last, after three lines of risk, which made the bypass the only instruction present.
-///   2. When the class does not exist yet, the bypass flag is not named AT ALL. Naming it
-///      even in order to warn against it hands the caller the exact string to paste; that is
-///      how a refusal becomes an escalation recipe.
-fn storage_strip_blocked_message(
-    class_name: &str,
-    namespace: &str,
-    presence: &super::ClassPresence,
-) -> String {
-    // Not "an EXPLICIT Storage definition", which is what this said for as long as it
-    // existed: `strip_storage_blocks` cannot tell a hand-authored block from a generated
-    // `Storage Default` one and removes either (see the cases at `Storage Default {}` in
-    // the strip tests). A caller who pasted a generated block read "explicit" and concluded
-    // the refusal was about someone else's problem.
-    const FIX: &str = "The class content includes a Storage block and iris_doc cannot write \
-                       it (IRIS 2025.1 UDL parser limitation) — a generated `Storage Default` \
-                       counts, since the write path cannot tell one from a hand-written block. \
-                       FIX: delete the Storage block from your source and write the class \
-                       again — for a class you have just authored this is always the right \
-                       move, IRIS generates the storage definition itself on first compile.";
-    match presence {
-        // Nothing was found to preserve, so there is no legitimate use of the bypass here and
-        // the message does not mention one.
-        //
-        // The wording says "was found", not "does not exist", because the probe can be stale
-        // in one measured direction: a class written AND COMPILED earlier in this same MCP
-        // process is still invisible to %Dictionary.CompiledClass / ClassDefinition SQL from
-        // that process, and becomes visible only to a later one. Measured on IRIS for Health
-        // 2026.1: same-exchange read (0, 0), fresh-exchange read of the same class (1, 1),
-        // with %Studio.Project reading (1, 1) throughout as the control. The advice does not
-        // change for that population — a class created moments ago in this session has no
-        // extent worth preserving either — so only the claim is softened, not the branch.
-        super::ClassPresence::Absent => format!(
-            "{FIX} No existing class '{class_name}' was found in namespace '{namespace}', so \
-             there is no %Persistent extent here whose storage layout could be lost."
-        ),
-        // Compiled, DefinedNotCompiled and Undetermined all keep the full text. Undetermined
-        // deliberately included: a probe that failed must not talk the caller out of a
-        // warning it has not earned.
-        _ => format!(
-            "{FIX} Only pass allow_storage_regeneration: true if '{class_name}' ALREADY holds \
-             data in namespace '{namespace}' AND you have confirmed the regenerated global \
-             names match the ones it uses now — otherwise that flag discards the layout of a \
-             live %Persistent extent."
-        ),
-    }
-}
+// #331: `storage_strip_blocked_message` lived here — the STORAGE_STRIP_BLOCKED text that #217
+// rewrote so the FIX preceded the bypass. It is deleted with the refusal it worded, not because #217
+// was wrong: its wording was right for a refusal that had to exist. Nothing strips Storage any more
+// (the parser accepts it — measured on 2025.3 and 2026.1), so there is no refusal to word, and its
+// first instruction — delete the block and write again — is the data-layout loss this issue is about.
+// `strip_cls_suffix` went with it: the refusal was its only production caller.
 
 async fn do_write(
     iris: &IrisConnection,
@@ -1021,33 +975,44 @@ async fn do_write(
     compile_after: bool,
     allow_storage_regeneration: bool,
 ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
-    // I-3: strip Storage blocks — IRIS 2025.1 UDL parser (#5559) fails on Storage XML.
-    // IRIS will auto-generate correct storage on first compile.
-    // strip_storage_blocks handles the no-block case cheaply (single pass, no alloc).
-    let (content_for_write, storage_stripped) = strip_storage_blocks(content);
-    // Refuse to silently discard an explicit Storage definition unless the caller has
-    // opted in. A stripped Storage on a %Persistent class with a custom global map
-    // causes IRIS to regenerate default storage on compile — data-layout loss with no
-    // visible error (issue #18, upstream #88).
-    if storage_stripped && !allow_storage_regeneration {
-        // #217: the guard is correct and stays; its wording was the defect. Three lines
-        // described the risk and the single executable sentence was "pass
-        // allow_storage_regeneration: true" — so that is what callers did. 2 of 3 observed
-        // refusals were neutralised by following the message's own advice, on freshly
-        // authored message classes with no extent to preserve. The dictionary probe runs
-        // ONLY on this refusal path, so the happy path costs nothing.
-        let class_name = strip_cls_suffix(name);
-        let presence = super::class_presence(iris, client, namespace, class_name).await;
-        return err_json(
-            "STORAGE_STRIP_BLOCKED",
-            &storage_strip_blocked_message(class_name, namespace, &presence),
-        );
-    }
+    // #331: THE SOURCE IS WRITTEN UNTOUCHED. Storage blocks are no longer stripped.
+    //
+    // WHY IT USED TO STRIP. `doc.rs` carried "IRIS 2025.1 UDL parser (#5559) fails on Storage XML",
+    // stripped every block unconditionally — nothing consulted the server version — and then refused
+    // the write rather than discard a layout silently. The refusal was right; the strip it was
+    // guarding against was the problem.
+    //
+    // WHY IT NO LONGER DOES. Measured on two writable throwaway instances, through plain Atelier REST
+    // so the transport itself was under test:
+    //
+    //   2025.3 (the tag ci.yml pins)   PUT 201 errors:[]   compile 200 errors:[]   block preserved
+    //   2026.1 (Build 235U)            PUT 200 errors:[]   compile 200 errors:[]   block preserved
+    //
+    // Read back after compile, the slot list (`%%CLASSNAME`, then each property in order) and
+    // `<DataLocation>` were byte-intact on both. So the strip removed a block the server would have
+    // accepted, and the guard then refused the write BECAUSE the strip had happened: a loop entirely
+    // of our own making. `iris_doc(get)` returns the generated block, so every get -> edit -> put of
+    // a compiled %Persistent class hit it — and the refusal's own first instruction, "delete the
+    // Storage block and write the class again", is the data-layout loss reached by the other door.
+    //
+    // WHY PASSING IT THROUGH IS THE ONLY SAFE OPTION. A generated block is not derivable from the
+    // current property set: IRIS mints arbitrary global names (`Ens.Config.Credentials` stores to
+    // `^Ens.Conf.CredentialsD`) and tracks slots across properties added, deleted and renamed, so a
+    // deleted property's slot stays vacant to keep the survivors in place. Regeneration re-packs, and
+    // a stored row is a $list addressed by slot number — slot 3 stops being `Username` while every
+    // existing row still holds the old layout. Nothing errors, and both may be strings.
+    //
+    // Not verified: 2025.1 itself, whose community licence has expired, so the container will not
+    // start. If the limitation was ever real there it was fixed by 2025.3. A version gate can be
+    // added if that support is required; `strip_storage_blocks` and its unit tests are kept for
+    // exactly that, unused on this path.
+    let content_for_write = content;
+    let _ = allow_storage_regeneration; // retired (#331); see the field's doc comment
 
     // Name the methods that will run ObjectScript at COMPILE time. This is reported on
     // every write and refused only when the caller asked for that (IRIS_BLOCK_CODEGEN=1)
     // — see `compile_time_methods` for why the default is to inform rather than block.
-    let generators = compile_time_methods(&content_for_write);
+    let generators = compile_time_methods(content_for_write);
     if !generators.is_empty() && block_compile_time_code() {
         return crate::tools::envelope::fail_with(
             "COMPILE_TIME_CODE_BLOCKED",
@@ -1195,7 +1160,6 @@ async fn do_write(
             let mut payload = serde_json::json!({
                 "name": name,
                 "open_uri": open_uri,
-                "storage_stripped": storage_stripped,
                 "compiled": false,
                 "compile_errors": compile_errors,
                 "compile_console": compile_console,
@@ -1204,8 +1168,7 @@ async fn do_write(
             // still in scope, so the hint can name the members whose names carry `_`. Written
             // BEFORE note_error_undercount, which overwrites `hint` unconditionally when it
             // fires — that ordering keeps the existing undercount regression green.
-            if let Some((h, offenders)) = crate::tools::hint_5559(&first, Some(&content_for_write))
-            {
+            if let Some((h, offenders)) = crate::tools::hint_5559(&first, Some(content_for_write)) {
                 payload["hint"] = serde_json::Value::String(h);
                 if !offenders.is_empty() {
                     payload["did_you_mean"] = serde_json::Value::Array(
@@ -1237,7 +1200,6 @@ async fn do_write(
             "success": true,
             "name": name,
             "open_uri": open_uri,
-            "storage_stripped": storage_stripped,
             "compiled": true,
             "compile_errors": compile_errors,
             "compile_console": compile_console,
@@ -1254,7 +1216,11 @@ async fn do_write(
         return ok_json(payload);
     }
 
-    let mut payload = serde_json::json!({"success": true, "name": name, "open_uri": open_uri, "storage_stripped": storage_stripped});
+    // #331: `storage_stripped` is gone from the payload. Nothing strips any more, so the key would
+    // be structurally always-false — and a field that cannot vary is the defect #332 documented one
+    // tool over: an advertised value that cannot occur teaches a caller to branch on something dead.
+    // It was never named in the iris_doc description, so no documented contract changes here.
+    let mut payload = serde_json::json!({"success": true, "name": name, "open_uri": open_uri});
     note_compile_time_methods(&mut payload, &generators);
     ok_json(payload)
 }
@@ -3241,184 +3207,12 @@ mod prop_collision_put_tests {
     }
 }
 
-/// #217: the STORAGE_STRIP_BLOCKED wording. Nothing in the tree asserted on this text before
-/// — both e2e tests check only `error_code` — which is how a message whose only executable
-/// sentence was its own bypass survived. These pin the properties, not the prose.
-#[cfg(test)]
-mod storage_strip_message_tests {
-    use super::super::ClassPresence;
-    use super::{storage_strip_blocked_message, strip_cls_suffix};
-
-    const BYPASS: &str = "allow_storage_regeneration";
-    const FIX_MARKER: &str = "FIX: delete the Storage block";
-
-    /// THE defect. A class that does not exist has no extent to protect, so the bypass is
-    /// never the right answer — and the message must not hand over the flag name at all.
-    /// Naming it even to warn against it is what 2 of the 3 observed callers acted on.
-    #[test]
-    fn an_absent_class_never_names_the_bypass_flag() {
-        let msg = storage_strip_blocked_message("Pkg.MSG.Census", "APP", &ClassPresence::Absent);
-        assert!(
-            !msg.contains(BYPASS),
-            "an absent class must not be told the flag name: {msg}"
-        );
-        assert!(msg.contains(FIX_MARKER), "must still state the fix: {msg}");
-        assert!(
-            msg.contains("was found in namespace 'APP'"),
-            "must say why the bypass is irrelevant: {msg}"
-        );
-    }
-
-    /// The guard fires for ANY block `strip_storage_blocks` removes, and that function makes
-    /// no distinction between hand-authored and generated storage. Calling the block "explicit"
-    /// told a caller who had pasted a generated `Storage Default` that this was not about them.
-    #[test]
-    fn the_text_does_not_claim_the_block_must_be_hand_written() {
-        for presence in [
-            ClassPresence::Absent,
-            ClassPresence::Compiled,
-            ClassPresence::DefinedNotCompiled,
-            ClassPresence::Undetermined,
-        ] {
-            let msg = storage_strip_blocked_message("A.B", "NS", &presence);
-            assert!(
-                !msg.contains("explicit"),
-                "{presence:?}: the guard cannot tell explicit from generated: {msg}"
-            );
-            assert!(
-                msg.contains("Storage Default"),
-                "{presence:?}: must say a generated block counts too: {msg}"
-            );
-        }
-    }
-
-    /// The dictionary probe behind `Absent` has a measured stale direction: a class written
-    /// and compiled earlier in THIS MCP process still reads as absent from it. So the text may
-    /// not assert non-existence as a fact about the instance — it reports what the probe saw.
-    #[test]
-    fn the_absent_branch_reports_the_probe_not_the_world() {
-        let msg = storage_strip_blocked_message("Pkg.MSG.Census", "APP", &ClassPresence::Absent);
-        assert!(
-            !msg.contains("does not exist"),
-            "must not state non-existence as fact — the probe can be stale: {msg}"
-        );
-        assert!(
-            msg.contains("was found"),
-            "must report what the probe saw: {msg}"
-        );
-    }
-
-    /// The ordering that was inverted: three lines of risk, then the bypass, and no fix.
-    #[test]
-    fn the_fix_precedes_the_bypass_whenever_the_bypass_is_mentioned() {
-        for presence in [
-            ClassPresence::Compiled,
-            ClassPresence::DefinedNotCompiled,
-            ClassPresence::Undetermined,
-        ] {
-            let msg = storage_strip_blocked_message("Pkg.MSG.Census", "APP", &presence);
-            let fix = msg.find(FIX_MARKER).unwrap_or_else(|| {
-                panic!("{presence:?}: no fix sentence at all: {msg}");
-            });
-            let bypass = msg
-                .find(BYPASS)
-                .unwrap_or_else(|| panic!("{presence:?}: bypass missing: {msg}"));
-            assert!(
-                fix < bypass,
-                "{presence:?}: the fix must come first, got fix@{fix} bypass@{bypass}: {msg}"
-            );
-        }
-    }
-
-    /// A class that exists keeps the warning, and the warning states the condition that makes
-    /// the flag legitimate rather than offering it unconditionally.
-    #[test]
-    fn an_existing_class_keeps_a_conditioned_bypass() {
-        let msg = storage_strip_blocked_message("Pkg.MSG.Census", "APP", &ClassPresence::Compiled);
-        assert!(msg.contains(BYPASS), "{msg}");
-        assert!(
-            msg.contains("ALREADY holds"),
-            "must state the condition: {msg}"
-        );
-        assert!(
-            msg.contains("'Pkg.MSG.Census'"),
-            "must name the class: {msg}"
-        );
-        assert!(msg.contains("'APP'"), "must name the namespace: {msg}");
-    }
-
-    /// A probe that FAILED must not be treated as "absent". Dropping the warning on an
-    /// Undetermined result would silently remove it for every instance where the dictionary
-    /// query errors — the failure mode is invisible and loses data.
-    #[test]
-    fn an_undetermined_probe_keeps_the_full_warning() {
-        let msg =
-            storage_strip_blocked_message("Pkg.MSG.Census", "APP", &ClassPresence::Undetermined);
-        assert!(
-            msg.contains(BYPASS),
-            "a failed probe must not suppress the warning: {msg}"
-        );
-    }
-
-    /// An uncompiled .cls still exists on disk in IRIS and may already have an extent.
-    #[test]
-    fn a_defined_but_uncompiled_class_keeps_the_full_warning() {
-        let msg = storage_strip_blocked_message(
-            "Pkg.MSG.Census",
-            "APP",
-            &ClassPresence::DefinedNotCompiled,
-        );
-        assert!(msg.contains(BYPASS), "{msg}");
-    }
-
-    /// Every branch must lead with the fix — that is the whole point of the change.
-    #[test]
-    fn every_branch_states_the_fix() {
-        for presence in [
-            ClassPresence::Absent,
-            ClassPresence::Compiled,
-            ClassPresence::DefinedNotCompiled,
-            ClassPresence::Undetermined,
-        ] {
-            let msg = storage_strip_blocked_message("A.B", "NS", &presence);
-            assert!(msg.contains(FIX_MARKER), "{presence:?}: {msg}");
-        }
-    }
-
-    /// The `\` line-continuation idiom fails SILENTLY if a `\` is dropped: the literal then
-    /// carries the source file's indentation into the middle of the sentence. A reader of the
-    /// error sees a ragged paragraph and no test would otherwise notice.
-    #[test]
-    fn no_branch_leaks_source_indentation_into_the_text() {
-        for presence in [
-            ClassPresence::Absent,
-            ClassPresence::Compiled,
-            ClassPresence::DefinedNotCompiled,
-            ClassPresence::Undetermined,
-        ] {
-            let msg = storage_strip_blocked_message("A.B", "NS", &presence);
-            assert!(
-                !msg.contains("  "),
-                "{presence:?}: literal carries source indentation: {msg}"
-            );
-            assert!(!msg.contains('\n'), "{presence:?}: embedded newline: {msg}");
-        }
-    }
-
-    /// A stem that keeps its extension makes the dictionary probe miss and report `Absent`
-    /// for a class that exists — the one direction of this decision that can lose data.
-    #[test]
-    fn the_cls_suffix_is_stripped_case_insensitively() {
-        assert_eq!(strip_cls_suffix("Pkg.MSG.Census.cls"), "Pkg.MSG.Census");
-        assert_eq!(strip_cls_suffix("Pkg.MSG.Census.CLS"), "Pkg.MSG.Census");
-        assert_eq!(strip_cls_suffix("Pkg.MSG.Census.Cls"), "Pkg.MSG.Census");
-        // Already a bare class name: unchanged, not truncated at the last dot.
-        assert_eq!(strip_cls_suffix("Pkg.MSG.Census"), "Pkg.MSG.Census");
-        // Not a class document: left alone, so it cannot masquerade as a class name.
-        assert_eq!(strip_cls_suffix("Pkg.Routine.mac"), "Pkg.Routine.mac");
-        assert_eq!(strip_cls_suffix("NoDots"), "NoDots");
-    }
-}
+// #331: `storage_strip_message_tests` lived here — eight tests pinning the properties of the
+// STORAGE_STRIP_BLOCKED message (the FIX before the bypass; the bypass unnamed when the class is
+// absent). Removed with the message they assert on. They were good tests of a message that should no
+// longer exist, and the guard that replaces them is
+// `the_5559_hint_never_advises_deleting_a_storage_block` in mod.rs — which asserts the destructive
+// INSTRUCTION appears nowhere, rather than that it is well worded.
 
 #[cfg(test)]
 mod doc_mode_single_source_tests {
