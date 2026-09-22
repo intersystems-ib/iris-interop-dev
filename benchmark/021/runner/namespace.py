@@ -26,13 +26,9 @@ def _mcp_call(tool: str, args: dict) -> dict:
         "IRIS_PASSWORD": iris_pass,
     })
 
-    proc = subprocess.Popen(
-        ["iris-dev", "mcp"],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        env=env,
-    )
+    from .binary import spawn_mcp
+
+    proc = spawn_mcp(env=env)
 
     # send with small delays so server processes each message
     for i, msg in enumerate(msgs):
@@ -52,7 +48,27 @@ def _mcp_call(tool: str, args: dict) -> dict:
                 return obj
         except json.JSONDecodeError:
             pass
-    return {}
+    # No response carrying our id. This MUST raise rather than return {}: the callers read
+    # resp["result"]["content"][0]["text"], get "" from an empty dict, and then `"ERROR" in ""` is
+    # False -- so reset_benchmark_namespace() reported SUCCESS for a server that never answered, and
+    # a 15-task condition ran against a namespace that was never dropped. That is precisely the
+    # carry-over FR-001b exists to prevent, arriving as clean-looking data.
+    rc = proc.poll()
+    died = f" (server exited with code {rc})" if rc not in (0, None) else ""
+    raise RuntimeError(
+        f"no MCP response for {tool}{died}. stderr: "
+        f"{_stderr_tail(proc)!r}; stdout was {out[:400]!r}"
+    )
+
+
+def _stderr_tail(proc) -> str:
+    """Last line of the spawned server's stderr, if it was captured to a file."""
+    path = getattr(proc, "_stderr_log", None)
+    if not path:
+        return ""
+    from .binary import last_line
+
+    return last_line(path)
 
 
 def reset_benchmark_namespace():

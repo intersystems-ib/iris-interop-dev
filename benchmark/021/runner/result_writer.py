@@ -3,6 +3,7 @@ import json
 import os
 import datetime
 from pathlib import Path
+from typing import NamedTuple, Optional
 
 
 class ResultWriter:
@@ -13,9 +14,13 @@ class ResultWriter:
         self.run_dir = str(base)
         self.scores_path = str(base / "scores.json")
         self.report_path = str(base / "report.html")
+        version = _get_version()
         self._run = {
             "run_id": ts,
-            "iris_dev_version": _get_version(),
+            # null, never a placeholder. A version that could not be read is not a version, and
+            # writing "unknown" here put a failure into the report shaped like a fact.
+            "iris_dev_version": version.value,
+            "iris_dev_version_error": version.detail,
             "tasks": [],
             "summary": {},
         }
@@ -59,13 +64,53 @@ class ResultWriter:
         generate_report(self.scores_path, self.report_path)
 
 
-def _get_version() -> str:
+class Version(NamedTuple):
+    """Either a known version, or the reason it could not be read -- never a placeholder.
+
+    `value` is None ONLY when the version is genuinely unknown, and `detail` then says why. The
+    previous code returned the string "unknown" for four unrelated causes (binary absent, killed by
+    a signal, non-zero exit, empty stdout), which reads in the report as a statement about the
+    server rather than a failure to ask it.
+    """
+
+    value: Optional[str]
+    detail: Optional[str]
+
+
+def _get_version(timeout: float = 10.0) -> Version:
+    """Read `<binary> --version`, or report why it could not be read.
+
+    `timeout` is the point of this signature. The previous call passed none, so a binary that blocks
+    blocks the whole run -- and the blanket `except Exception` could not catch that, because a hang
+    raises nothing. A stale pre-rename `iris-dev` took minutes under Gatekeeper before being killed.
+    """
     import subprocess
+
+    from .binary import BinaryUnavailable, exit_reason, resolve_binary
+
     try:
-        r = subprocess.run(["iris-dev", "--version"], capture_output=True, text=True)
-        return r.stdout.strip().split()[-1]
-    except Exception:
-        return "unknown"
+        path = resolve_binary()
+    except BinaryUnavailable as e:
+        return Version(None, str(e))
+    try:
+        r = subprocess.run(
+            [path, "--version"], capture_output=True, text=True, timeout=timeout
+        )
+    except subprocess.TimeoutExpired:
+        return Version(None, f"{path} --version did not return within {timeout:g}s")
+    except OSError as e:
+        return Version(None, f"{path} could not be executed: {e}")
+    stderr_tail = ""
+    if r.stderr and r.stderr.strip():
+        stderr_tail = r.stderr.strip().splitlines()[-1]
+    if r.returncode != 0:
+        return Version(None, exit_reason(path, r.returncode, stderr_tail))
+    fields = r.stdout.split()
+    if not fields:
+        # Exit 0 with nothing on stdout. The old code indexed [-1] into the empty list, raised
+        # IndexError, and the blanket `except Exception` turned that into "unknown" too.
+        return Version(None, f"{path} --version exited 0 but printed nothing on stdout")
+    return Version(fields[-1], None)
 
 
 def _scm_triggered(transcript: list) -> bool:

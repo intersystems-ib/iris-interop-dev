@@ -38,14 +38,9 @@ def _build_system_prompt(path: str) -> str:
 
 
 def _spawn_mcp() -> subprocess.Popen:
-    env = os.environ.copy()
-    return subprocess.Popen(
-        ["iris-dev", "mcp"],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        env=env,
-    )
+    from .binary import spawn_mcp
+
+    return spawn_mcp(env=os.environ.copy())
 
 
 def _shutdown_mcp(proc: subprocess.Popen):
@@ -65,7 +60,22 @@ def _handshake(proc: subprocess.Popen):
     time.sleep(0.2)
     # read the initialize response
     line = proc.stdout.readline()
-    return json.loads(line) if line else {}
+    if not line:
+        # EOF on the first read means the server is not speaking MCP -- almost always that it is not
+        # running at all. Returning {} here let the run continue into _get_tools, which then reported
+        # an empty toolset, and every task scored as the model choosing no tools.
+        raise RuntimeError(_dead_server_message(proc, "no initialize response"))
+    return json.loads(line)
+
+
+def _dead_server_message(proc: subprocess.Popen, what: str) -> str:
+    rc = proc.poll()
+    from .binary import exit_reason, last_line
+
+    tail = last_line(getattr(proc, "_stderr_log", "") or "")
+    if rc is not None and rc != 0:
+        return f"{what}: {exit_reason('the MCP server', rc, tail)}"
+    return f"{what} (server still running){': ' + tail if tail else ''}"
 
 
 def _send(proc: subprocess.Popen, obj: dict):
@@ -89,7 +99,14 @@ def _mcp_call(proc: subprocess.Popen, tool: str, args: dict, call_id: int) -> di
                 return obj
         except json.JSONDecodeError:
             pass
-    return {}
+    # A tool call with no answer. If the SERVER is gone this is infrastructure and must stop the run;
+    # if it is merely slow, the transcript records the timeout explicitly rather than an empty string
+    # the model would read as a tool returning nothing.
+    rc = proc.poll()
+    if rc is not None:
+        raise RuntimeError(_dead_server_message(proc, f"no response to {tool}"))
+    text = f"ERROR: no response to {tool} within the deadline"
+    return {"result": {"content": [{"text": text}]}, "error": {"message": text}}
 
 
 def _get_tools(proc: subprocess.Popen) -> list:
@@ -104,6 +121,13 @@ def _get_tools(proc: subprocess.Popen) -> list:
             obj = json.loads(line)
             if obj.get("id") == 99:
                 tools_raw = obj.get("result", {}).get("tools", [])
+                if not tools_raw:
+                    # The server answered and advertised nothing. A benchmark that measures tool
+                    # choice cannot run on an empty toolset, and continuing scored every task as the
+                    # model declining to use tools.
+                    raise RuntimeError(
+                        "the MCP server advertised zero tools — check IRIS_TOOLSET"
+                    )
                 return [
                     {"name": t["name"],
                      "description": t.get("description", ""),
@@ -112,7 +136,7 @@ def _get_tools(proc: subprocess.Popen) -> list:
                 ]
         except json.JSONDecodeError:
             pass
-    return []
+    raise RuntimeError(_dead_server_message(proc, "no tools/list response"))
 
 
 def run_task(task: dict, path: str) -> dict:
