@@ -911,6 +911,42 @@ fn test_doc_guards_storage_name_and_mode() {
         "storage_stripped is retired (#331): it could only ever be false. Got: {v}"
     );
 
+    // 2b. #327: a put carrying `names` is REFUSED, not silently reduced to the single `name`.
+    //     `names` is read nowhere in handle_put, so this used to write one document, discard the
+    //     rest, and return success: true — a partial write reported as a whole one. Driven here
+    //     because the refusal must reach the caller as an error FRAME, which only the wire shows.
+    let frame = exchange(
+        serde_json::json!({
+            "mode": "put",
+            "name": "IrisDevE2E.NamesGuard.cls",
+            "names": ["IrisDevE2E.A.cls", "IrisDevE2E.B.cls"],
+            "content": "Class IrisDevE2E.NamesGuard {}\n",
+            "compile": false
+        }),
+        "iris_doc",
+    );
+    assert_eq!(
+        frame["result"]["isError"], true,
+        "a put carrying `names` must be an error frame, not a partial write: {frame}"
+    );
+    let v = parse_tool_text(&frame);
+    assert_eq!(v["error_code"], "INVALID_PARAMS", "{v}");
+    assert_eq!(
+        v["names_ignored"],
+        serde_json::json!(["IrisDevE2E.A.cls", "IrisDevE2E.B.cls"]),
+        "the refusal must echo exactly what would have been discarded: {v}"
+    );
+    // And it must NOT have written the single name it was given — the refusal precedes the write.
+    let head = exchange(
+        serde_json::json!({"mode": "head", "name": "IrisDevE2E.NamesGuard.cls"}),
+        "iris_doc",
+    );
+    let h = parse_tool_text(&head);
+    assert_ne!(
+        h["exists"], true,
+        "the refused put must not have written anything: {h}"
+    );
+
     // 3. Blank name → MISSING_PARAMS, not an Atelier #16006 retry loop.
     let frame = exchange(serde_json::json!({"mode":"get"}), "iris_doc");
     assert_eq!(frame["result"]["isError"], true, "{frame}");
