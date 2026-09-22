@@ -14,7 +14,7 @@
       "label": "cargo test build (debug)",
       "type": "shell",
       "command": "cargo",
-      "args": ["test", "--no-run", "-p", "iris-dev-core"],
+      "args": ["test", "--no-run", "-p", "iris-agentic-dev-core"],
       "group": "build",
       "presentation": { "reveal": "silent", "panel": "shared" },
       "problemMatcher": ["$rustc"]
