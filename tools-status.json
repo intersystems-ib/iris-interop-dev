@@ -18,7 +18,7 @@
   "profile_surface": {
     "test": "mcp_handshake::mcp_server_tools_list_returns_interop_profile",
     "status": "OK",
-    "note": "asserts exactly the 29 interop tools, meta tools pruned"
+    "note": "asserts the interop profile is exactly INTEROP_TOOLS, meta tools pruned. No count here: this one said 29 against a profile of 32 and nothing failed, because no code reads it. test_toolset::test_toolset_counts_match_doc_comments executes the derivation."
   },
   "tools": [
     {
@@ -123,6 +123,12 @@
       "tool": "iris_gateway_query",
       "unit": "tools::gateway::tests::* (13)",
       "e2e": "interop_e2e_tests::gateway_query_reads_the_external_postgres_table",
+      "status": "OK"
+    },
+    {
+      "tool": "iris_gateway_manage",
+      "unit": "tools::gateway_manage::tests::*",
+      "e2e": "interop_e2e_tests::gateway_manage_names_which_failure_mode_the_gateway_is_in",
       "status": "OK"
     },
     {

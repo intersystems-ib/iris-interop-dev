@@ -193,8 +193,8 @@ fn tools_list_returns_interop_profile() {
     // them. A skip that reports `ok` is indistinguishable from a pass, which is why the CI
     // dispatch (where IRIS_HOST IS set) is the only thing that actually exercises this.
     assert!(
-        names.len() == 31,
-        "expected the interop profile (31 tools), got {}: {:?}",
+        names.len() == 32,
+        "expected the interop profile (32 tools), got {}: {:?}",
         names.len(),
         names
     );
@@ -1708,5 +1708,307 @@ fn gateway_query_reads_the_external_postgres_table() {
     assert_eq!(
         missing["error_code"], "GATEWAY_CONNECTION_NOT_DEFINED",
         "{missing}"
+    );
+}
+
+/// #343: `iris_gateway_manage` must name WHICH failure mode a gateway is in.
+///
+/// The issue's evidence is that `e31-bo-jdbc` is the most expensive step in all twelve benchmark
+/// runs, and that the minutes go on probing the API — two runs opened with two different classes
+/// for "is the gateway up?". So the thing under test is not "does it return 200": it is whether the
+/// verdict DISCRIMINATES. Every assertion below is about telling one mode from another.
+///
+/// Same rig as `gateway_query_reads_the_external_postgres_table`
+/// (`e2e/gateway/docker-compose.yaml` plus a `PG_COCINA_E2E` connection). Where the connection is
+/// absent the rig-free assertions still run and the connection-dependent branch asserts the refusal
+/// contract rather than returning silently.
+#[test]
+#[ignore = "requires live IRIS"]
+fn gateway_manage_names_which_failure_mode_the_gateway_is_in() {
+    let iris_host = std::env::var("IRIS_HOST").unwrap_or_default();
+    if iris_host.is_empty() {
+        return;
+    }
+    let ask = |args: serde_json::Value| -> serde_json::Value {
+        let responses = mcp_exchange(&[
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}),
+            serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"iris_gateway_manage","arguments":args}}),
+        ]);
+        parse_tool_text(&find_response(&responses, 2).expect("no tool response"))
+    };
+
+    // ── probe: the canonical answer the benchmark runs had to guess at ────────────────────
+    let probe = ask(serde_json::json!({"action": "probe", "namespace": "%SYS"}));
+    let gw = &probe["java_gateway"];
+    // These hold on ANY instance, and they are the facts the benchmark runs went looking for.
+    assert_eq!(
+        gw["defined"], true,
+        "every IRIS install defines this external language server; if this is ever false it is a \
+         finding, not a flake: {probe}"
+    );
+    assert_eq!(
+        gw["name"], "%JDBC Server",
+        "the external language server every JDBC gateway connection runs through: {probe}"
+    );
+    assert!(
+        gw["port"].as_str().is_some_and(|p| !p.is_empty()),
+        "the port is the fact a caller cannot otherwise get: {probe}"
+    );
+    // Not-listening is a FACT, never the verdict: measured, this server starts on demand.
+    assert!(
+        gw["listening"].is_boolean(),
+        "listening must be reported either way: {probe}"
+    );
+    assert!(
+        gw["listening_note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("starts on demand"),
+        "a caller must not read 'not listening' as a fault: {probe}"
+    );
+
+    // The Java verdict depends on the runner. Both outcomes are legitimate facts about it, and
+    // BOTH are asserted: this test is about whether the tool discriminates, so an instance with no
+    // JDK must produce the named Java failure rather than a vague one. It must never produce a
+    // third thing.
+    match probe["diagnosis"].as_str() {
+        Some("GATEWAY_OK") => {
+            assert_eq!(probe["success"], true, "{probe}");
+            assert_eq!(gw["java_found"], true, "{probe}");
+            assert_eq!(gw["java_supported"], true, "{probe}");
+            assert!(
+                gw["java_version"]
+                    .as_str()
+                    .is_some_and(|v| v.starts_with(char::is_numeric)),
+                "a Java version must be reported, not inferred: {probe}"
+            );
+        }
+        Some(code @ ("GATEWAY_JAVA_ABSENT" | "GATEWAY_JAVA_UNSUPPORTED")) => {
+            assert_eq!(probe["success"], false, "{probe}");
+            assert_eq!(
+                gw["java_found"],
+                code == "GATEWAY_JAVA_UNSUPPORTED",
+                "{probe}"
+            );
+            assert!(
+                probe["error"].as_str().unwrap_or_default().contains("Java"),
+                "a Java failure must say so: {probe}"
+            );
+            eprintln!("runner has no usable JDK; asserted the named Java failure instead");
+        }
+        other => panic!(
+            "probe returned neither a healthy verdict nor a NAMED Java failure ({other:?}) — a \
+             vague answer here is the defect the issue is about: {probe}"
+        ),
+    }
+
+    // ── an action this tool does not have explains itself ─────────────────────────────────
+    let created = ask(serde_json::json!({"action": "create", "namespace": "%SYS"}));
+    assert_eq!(created["error_code"], "UNKNOWN_ACTION", "{created}");
+    let created_msg = created["error"].as_str().unwrap_or_default();
+    assert!(
+        created_msg.contains("plaintext password"),
+        "create is absent for a reason, and the reason is the answer: {created}"
+    );
+    assert!(
+        created_msg.contains("probe") && created_msg.contains("test"),
+        "it must name the actions that do exist: {created}"
+    );
+
+    // ── list: the stated trap is isJDBC arriving as JSON true ─────────────────────────────
+    let listed = ask(serde_json::json!({"action": "list", "namespace": "%SYS"}));
+    assert_eq!(listed["success"], true, "{listed}");
+    let conns = listed["connections"].as_array().expect("connections array");
+
+    // A listing must not be a route to a credential. Scoped to the ROWS: the envelope's own note
+    // legitimately contains the word "password" (it says the password is never returned), and a
+    // guard over the whole envelope fires on that — measured, it did.
+    for row in conns {
+        let obj = row.as_object().expect("a row is an object");
+        for key in obj.keys() {
+            let k = key.to_lowercase();
+            assert!(
+                !(k.contains("pwd") || k.contains("password") || k.contains("secret")),
+                "a connection row carries a credential field '{key}': {listed}"
+            );
+        }
+        // And by value, with a needle that is known to exist: the rig's role password is in
+        // e2e/gateway/seed.sql, so a leak of it would be visible here rather than inferred from
+        // the absence of a field name.
+        let text = row.to_string();
+        assert!(
+            !text.contains("gateway_ro_pw"),
+            "the stored password reached the listing: {listed}"
+        );
+        // The control for that needle: the row DOES carry the username, so this row is the kind of
+        // thing a password would have appeared in.
+        assert!(
+            text.contains("gateway_ro") || obj.get("user").is_some(),
+            "a row with no user field at all makes the password check vacuous: {listed}"
+        );
+    }
+    let rig = conns.iter().find(|c| c["name"] == "PG_COCINA_E2E").cloned();
+    if rig.is_none() {
+        // The rig is not deployed. Assert the contract that covers that case rather than passing
+        // by having nothing to look at: an empty list must SAY it is an answer, and a test against
+        // a name that is not there must name the fix.
+        assert_eq!(
+            listed["count"],
+            conns.len(),
+            "count and list must agree even when there is nothing to show: {listed}"
+        );
+        let absent = ask(serde_json::json!({
+            "action": "test", "connection": "PG_COCINA_E2E", "namespace": "%SYS"
+        }));
+        assert_eq!(
+            absent["error_code"], "GATEWAY_CONNECTION_NOT_DEFINED",
+            "{absent}"
+        );
+        assert!(
+            absent["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("SQL Gateway Connections"),
+            "the refusal must name where to define it: {absent}"
+        );
+        eprintln!("gateway rig absent; asserted the probe and refusal contracts instead");
+        return;
+    }
+    let rig = rig.unwrap();
+    assert_eq!(
+        rig["is_jdbc"], true,
+        "isJDBC arrives as JSON true over Atelier, not 1 — this is the shape that broke \
+         iris_execute_method once: {listed}"
+    );
+    assert_eq!(rig["driver"], "org.postgresql.Driver", "{listed}");
+    assert!(
+        rig["classpath"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with(".jar"),
+        "{listed}"
+    );
+    assert_eq!(rig["user"], "gateway_ro", "{listed}");
+
+    // ── test: the healthy path reports the target it actually reached ─────────────────────
+    let healthy = ask(serde_json::json!({
+        "action": "test", "connection": "PG_COCINA_E2E", "namespace": "%SYS"
+    }));
+    assert_eq!(healthy["success"], true, "{healthy}");
+    assert_eq!(healthy["diagnosis"], "GATEWAY_OK", "{healthy}");
+    let hc = &healthy["connection"];
+    assert!(
+        hc["database"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("PostgreSQL"),
+        "the JDBC handshake must report the remote product, which is what proves it completed: \
+         {healthy}"
+    );
+    assert_eq!(hc["driver_name"], "PostgreSQL JDBC Driver", "{healthy}");
+    assert_eq!(hc["connect_test_ok"], true, "{healthy}");
+    assert_eq!(
+        hc["class_path_missing"].as_array().map(Vec::len),
+        Some(0),
+        "every class path entry must be checked against the filesystem: {healthy}"
+    );
+    assert!(
+        !hc["class_path_entries"]
+            .as_array()
+            .expect("entries")
+            .is_empty(),
+        "the entries must actually have been enumerated, or the empty `missing` above means \
+         nothing: {healthy}"
+    );
+    // A working gateway connection is NOT a working Business Operation, and this is where a caller
+    // stops looking.
+    assert!(
+        healthy["business_operation_note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("JGService"),
+        "{healthy}"
+    );
+
+    // ── mode 4: the gateway works and the TARGET refused the statement ────────────────────
+    let refused_stmt = ask(serde_json::json!({
+        "action": "test",
+        "connection": "PG_COCINA_E2E",
+        "probe_query": "SELECT no_such_col FROM public.menus",
+        "namespace": "%SYS",
+    }));
+    assert_eq!(
+        refused_stmt["error_code"], "GATEWAY_TARGET_REJECTED_STATEMENT",
+        "the most expensive failure to misread must not arrive as a broken gateway: {refused_stmt}"
+    );
+    let rs_msg = refused_stmt["error"].as_str().unwrap_or_default();
+    assert!(
+        rs_msg.contains("gateway WORKS"),
+        "it must say the gateway is fine: {refused_stmt}"
+    );
+    assert!(
+        rs_msg.contains("no_such_col"),
+        "the target's own words are the diagnosis: {refused_stmt}"
+    );
+    // The earlier stages in the SAME call were green — that is what makes this mode 4 and not a
+    // connection failure.
+    assert_eq!(
+        refused_stmt["connection"]["connect_test_ok"], true,
+        "{refused_stmt}"
+    );
+    assert_eq!(
+        refused_stmt["connection"]["probe_ok"], false,
+        "{refused_stmt}"
+    );
+
+    // A probe statement that works leaves the verdict healthy — the control for the above.
+    let good_stmt = ask(serde_json::json!({
+        "action": "test",
+        "connection": "PG_COCINA_E2E",
+        "probe_query": "SELECT count(*) FROM public.menus",
+        "namespace": "%SYS",
+    }));
+    assert_eq!(good_stmt["diagnosis"], "GATEWAY_OK", "{good_stmt}");
+    assert_eq!(good_stmt["connection"]["probe_ok"], true, "{good_stmt}");
+
+    // ── a mutating probe statement is refused before anything is sent ─────────────────────
+    let mutating = ask(serde_json::json!({
+        "action": "test",
+        "connection": "PG_COCINA_E2E",
+        "probe_query": "INSERT INTO public.menus (paciente_id) VALUES (9)",
+        "namespace": "%SYS",
+    }));
+    assert_eq!(mutating["error_code"], "SQL_NOT_READ_ONLY", "{mutating}");
+    assert!(
+        mutating["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Nothing was sent"),
+        "{mutating}"
+    );
+
+    // ── a name that is not defined is not a connection that failed ────────────────────────
+    let absent = ask(serde_json::json!({
+        "action": "test", "connection": "NO_SUCH_GATEWAY_CONN_ZZZ", "namespace": "%SYS"
+    }));
+    assert_eq!(
+        absent["error_code"], "GATEWAY_CONNECTION_NOT_DEFINED",
+        "{absent}"
+    );
+    // …and it is a DIFFERENT code from the one a real connection failure would produce, which is
+    // the whole point of the issue.
+    assert_ne!(absent["error_code"], refused_stmt["error_code"]);
+    assert_ne!(absent["error_code"], mutating["error_code"]);
+
+    // ── action=test with no connection must not be answered as a gateway verdict ──────────
+    let no_name = ask(serde_json::json!({"action": "test", "namespace": "%SYS"}));
+    assert_eq!(no_name["error_code"], "MISSING_PARAMS", "{no_name}");
+    assert!(
+        no_name["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("action=list"),
+        "it must say how to find the names: {no_name}"
     );
 }
