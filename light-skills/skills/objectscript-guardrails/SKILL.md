@@ -55,7 +55,7 @@ trigger: Use for tdyar/iris-light-slim
 - [ ] **$ListBuild()**: Empty list is `""` not `$ListBuild()` — `$ListLength($ListBuild()) = 1`
 - [ ] **%Status**: Use `$$$ISERR(sc)` / `$$$ThrowOnError(sc)`. Never return `$$$OK` after catching an error
 - [ ] **Transactions**: `If $TLevel > 0 { TROLLBACK }` — never `Return` inside TSTART without rollback
-- [ ] **Storage blocks**: NEVER write `Storage Default { ... }` in UDL — omit entirely. IRIS auto-generates storage. Writing one causes ERROR #5559 in IRIS 2025.1+.
+- [ ] **Storage blocks — depends on whether the class ALREADY EXISTS**: when AUTHORING a new class, omit `Storage Default { ... }` and let IRIS generate it. When EDITING an existing class, KEEP the block exactly as `iris_doc(get)` returned it — never delete it to "let IRIS regenerate". IRIS mints arbitrary global names and tracks slot numbers across properties added, deleted and renamed, so regenerating re-packs the slots and silently re-maps every stored row (#331).
 - [ ] **%INLIST in ObjectScript**: `%INLIST` is SQL-only. In ObjectScript method code use `$ListFind(list, value) > 0`. Writing `Return (x %INLIST list)` causes ERROR #1010.
 - [ ] **`'=` in SQL strings**: `'=` is the ObjectScript not-equal operator. Inside SQL string literals, use `<>`. `"WHERE Tags '= ''"` → parser sees `'` as start of SQL string.
 
@@ -85,7 +85,8 @@ celsius * 9 / 5 + 32               →  (celsius * 1.8) + 32
 Set lst = $ListBuild()             →  Set lst = ""
 
 // Storage / Operators:
-Storage Default { <Type>...</Type> }   →  (omit entirely — IRIS auto-generates)
+Storage Default { ... }  in a NEW class     →  (omit — IRIS generates it)
+Storage Default { ... }  in an EXISTING one →  (KEEP it verbatim — deleting it re-maps stored rows)
 Return (tag %INLIST myList)            →  Return ($ListFind(myList, tag) > 0)
 "WHERE Tags '= ''"                     →  "WHERE Tags <> ''"
 ```
