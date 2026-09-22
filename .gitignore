@@ -27,37 +27,42 @@ target/
 .claude/settings.local.json
 benchmark/021/results/
 docs/*.txt
-docs/*.md
 *.profraw
 .specify/
 .opencode/
 .claude/
 vscode-iris-dev/*.vsix
-specs/
+/specs/
 *.exe
 iris-dev-macos*
 iris-dev-linux*
 *.vsix
-run_benchmark.py
+/run_benchmark.py
 *.pptx
-*.cls
-*.md
-# ...but the repo's own docs are not scratch files. The blanket *.md above silently swallowed
-# CLAUDE.md when it was added (#310): git add -A skipped it without a word, and only the diff
-# not matching the commit message revealed it. The 124 tracked .md files survive only because
-# ignore rules do not apply to already-tracked paths — any NEW doc needs an exception or a -f.
-!CLAUDE.md
-Bench/
-EvalDemo/
-EvalDemo.*
-ListFilter.cls
-MyApp/
-example_patient*
-fixed_query*
-src/
-tests/Test/
+# NO BLANKET *.md / *.cls RULE. #334: the blanket pair used to live here, and it silently
+# swallowed CLAUDE.md when that was added (#310) — `git add -A` skipped it without a word, and
+# only the commit diff not matching the commit message revealed it. Tracked docs survived only
+# because ignore rules do not apply to already-tracked paths, so every NEW doc needed an
+# exception or a -f. That is a failure answered as a negative fact (see CLAUDE.md), in the one
+# place where the failure is a file quietly not existing for anyone else.
+#
+# Scratch files are ignored BY NAME or BY DIRECTORY below, never by extension. If you need a new
+# scratch pattern, add the narrowest one that covers it — a rule that can swallow a document is
+# not worth the typing it saves. `documentation_shaped_paths_are_not_ignored` enforces this.
+/Bench/
+/EvalDemo/
+/EvalDemo.*
+/ListFilter.cls
+/MyApp/
+/example_patient*
+/fixed_query*
+/src/
+/tests/Test/
 .iris-dev/
 
-# Fork: do not ignore the Rust crate sources (the generic src/ rule above hid new files)
-!crates/iris-agentic-dev-core/src/
-!crates/iris-agentic-dev-bin/src/
+# The scratch names above are ROOT-ANCHORED with a leading slash. #334: unanchored, git matches such
+# a pattern at EVERY depth, so `MyApp/` also hid crates/iris-agentic-dev-core/tests/fixtures/MyApp/ —
+# a directory with two tracked fixtures, where a NEW fixture was silently skipped by `git add -A`.
+# `src/` did the same to the Rust crate sources, which is why this file used to carry
+# `!crates/*/src/` exceptions; anchoring removes the cause, so those exceptions are gone with it.
+# Add a scratch rule as `/name/`, not `name/`, unless you genuinely mean it at any depth.
