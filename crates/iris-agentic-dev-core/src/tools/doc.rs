@@ -517,7 +517,19 @@ async fn handle_get(
         {
             return missing;
         }
-        return err_json("NOT_FOUND", &format!("Document not found: {name}"));
+        // #329: a bare "Document not found" was the largest bucket of refusals carrying no next
+        // action — 43 of 2,386 error envelopes — and in that corpus the misses were near misses of
+        // real classes (`Censo.Msg.*` against a `Censo.MSG.*` package that exists). The namespace
+        // holds the answer, and the lookup runs ONLY here, on a path that has already established
+        // the document is absent, so a successful read never pays for it.
+        let misses = crate::tools::near_miss::near_misses_for(iris, client, &namespace, name).await;
+        return err_json(
+            "NOT_FOUND",
+            &format!(
+                "Document not found: {name}{}",
+                crate::tools::near_miss::describe(&namespace, &misses)
+            ),
+        );
     }
     if !resp.status().is_success() {
         return http_err(resp, Some(name)).await;
@@ -1299,7 +1311,19 @@ async fn handle_delete(
         {
             return missing;
         }
-        return err_json("NOT_FOUND", &format!("Document not found: {name}"));
+        // #329: a bare "Document not found" was the largest bucket of refusals carrying no next
+        // action — 43 of 2,386 error envelopes — and in that corpus the misses were near misses of
+        // real classes (`Censo.Msg.*` against a `Censo.MSG.*` package that exists). The namespace
+        // holds the answer, and the lookup runs ONLY here, on a path that has already established
+        // the document is absent, so a successful read never pays for it.
+        let misses = crate::tools::near_miss::near_misses_for(iris, client, &namespace, name).await;
+        return err_json(
+            "NOT_FOUND",
+            &format!(
+                "Document not found: {name}{}",
+                crate::tools::near_miss::describe(&namespace, &misses)
+            ),
+        );
     }
     if !resp.status().is_success() {
         return http_err(resp, Some(name)).await;
