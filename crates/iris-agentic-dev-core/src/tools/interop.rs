@@ -152,6 +152,162 @@ For i=1:1:tProd.Items.Count() {{
     )
 }
 
+/// #329: the body of every `ITEM_NOT_FOUND` branch — the refusal PLUS the item names that do exist.
+///
+/// Four sites emitted a bare `Item not found: X`, so the caller was told the name it had just
+/// passed and nothing else. All four interpolate `resolve_production_prologue`, which has already
+/// opened `tProd` and refused with NO_PRODUCTION / INTEROP_ERROR if it could not — so the candidate
+/// list is reachable at every one of them, and this is ONE definition rather than four to keep in
+/// step.
+///
+/// ## Why a record per line, and a declared count
+///
+/// The names are appended as their own `ITEM_CANDIDATE:` lines, never packed onto the error line.
+/// Packing an unbounded list onto one line is exactly the defect #347 fixed in two marker protocols,
+/// where a CRLF-joined value silently lost everything after the first line.
+///
+/// `ITEM_CANDIDATES_N` declares how many the production HAS. If the reader collects fewer, it
+/// reports a floor ("at least N of M") rather than a list — a short read must never become
+/// "the production contains these three items".
+///
+/// ## Quit
+///
+/// `Quit` inside `If { }` returns from the method — measured on IRIS 2026.1, where a probe showed
+/// the statement after the block does NOT run. (Inside `Try { }` it does: that is the fall-through
+/// #349 found, where a successful create emitted two concatenated JSON objects.) So the writes here
+/// are followed by a return, and the code after each site never sees the invalid handle.
+pub fn item_not_found_block(item_expr: &str) -> String {
+    format!(
+        r#"Write "ERROR:ITEM_NOT_FOUND:Item not found: "_{item}_$C(10)
+Write "ITEM_CANDIDATES_N:"_tProd.Items.Count()_$C(10)
+For zcand=1:1:tProd.Items.Count() {{ Write "ITEM_CANDIDATE:"_tProd.Items.GetAt(zcand).Name_$C(10) }}
+Quit"#,
+        item = item_expr
+    )
+}
+
+/// What the reader made of an `ITEM_NOT_FOUND` payload.
+///
+/// Three states on purpose. `Unavailable` is NOT an empty list: a server that did not send the
+/// candidate block (or sent a malformed one) has told us nothing about what the production holds,
+/// and rendering that as "no items" would be a failure answered as a fact.
+#[derive(Debug, PartialEq)]
+pub enum Candidates {
+    /// The production's item names, complete: the declared count matched what arrived.
+    All(Vec<String>),
+    /// Fewer names arrived than were declared — report as a floor, never as the whole list.
+    Partial { names: Vec<String>, declared: usize },
+    /// No usable candidate block. Carries why.
+    Unavailable(String),
+}
+
+/// Split an `ITEM_NOT_FOUND` payload into its message and its candidate block.
+pub fn parse_item_candidates(payload: &str) -> (String, Candidates) {
+    let mut message = String::new();
+    let mut declared: Option<usize> = None;
+    let mut names: Vec<String> = Vec::new();
+    for (i, line) in payload.lines().enumerate() {
+        let l = line.trim_end_matches('\r');
+        if let Some(v) = l.strip_prefix("ITEM_CANDIDATES_N:") {
+            declared = v.trim().parse::<usize>().ok();
+        } else if let Some(v) = l.strip_prefix("ITEM_CANDIDATE:") {
+            names.push(v.trim().to_string());
+        } else if i == 0 {
+            message = l.to_string();
+        }
+    }
+    let cands = match declared {
+        None => Candidates::Unavailable(
+            "the server did not report which items the production holds".to_string(),
+        ),
+        Some(d) if d == names.len() => Candidates::All(names),
+        Some(d) if d > names.len() => Candidates::Partial { names, declared: d },
+        Some(d) => Candidates::Unavailable(format!(
+            "the item list was inconsistent: {d} declared but {} arrived",
+            names.len()
+        )),
+    };
+    (message, cands)
+}
+
+/// The ONE place an `ITEM_NOT_FOUND` payload becomes an envelope.
+///
+/// Four readers used to pass the raw payload straight to a bare error envelope, so the message was
+/// whatever the generator had written and nothing more. Routing all four through here means the
+/// candidate list cannot be added to three sites and forgotten at the fourth — the sibling-defect
+/// shape CLAUDE.md warns about, and the one that nearly happened here: a first pass over these
+/// readers counted FIVE, because the doc comment describing the fix contained the very call it was
+/// replacing.
+pub fn item_not_found(payload: &str) -> Result<CallToolResult, McpError> {
+    let (message, extra) = item_not_found_envelope(payload);
+    crate::tools::envelope::fail_with("ITEM_NOT_FOUND", &message, extra)
+}
+
+/// How many names to name inline before saying "and N more".
+const CANDIDATE_INLINE_CAP: usize = 20;
+
+/// Render the `ITEM_NOT_FOUND` envelope: the refusal, plus what the production actually holds.
+pub fn item_not_found_envelope(payload: &str) -> (String, serde_json::Value) {
+    let (message, cands) = parse_item_candidates(payload);
+    let base = if message.is_empty() {
+        "Item not found.".to_string()
+    } else {
+        message
+    };
+    match cands {
+        Candidates::All(names) if names.is_empty() => (
+            format!("{base} The production has no configured items at all."),
+            serde_json::json!({"items_in_production": [], "items_total": 0}),
+        ),
+        Candidates::All(names) => {
+            let shown: Vec<&String> = names.iter().take(CANDIDATE_INLINE_CAP).collect();
+            let more = names.len().saturating_sub(shown.len());
+            let tail = if more > 0 {
+                format!(" (and {more} more — see `items_in_production`)")
+            } else {
+                String::new()
+            };
+            (
+                format!(
+                    "{base} The production has {} item(s): {}{tail}. Names must match exactly, \
+                     including package.",
+                    names.len(),
+                    shown
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                serde_json::json!({
+                    "items_in_production": names,
+                    "items_total": names.len(),
+                }),
+            )
+        }
+        Candidates::Partial { names, declared } => (
+            format!(
+                "{base} The production has {declared} item(s); {} of them arrived, so this list is \
+                 a FLOOR, not the whole set: {}.",
+                names.len(),
+                names.join(", ")
+            ),
+            serde_json::json!({
+                "items_in_production": names,
+                "items_total": declared,
+                "items_truncated": true,
+            }),
+        ),
+        Candidates::Unavailable(why) => (
+            format!(
+                "{base} The list of existing items could not be read ({why}), so this is NOT \
+                 evidence that the production is empty — retry, or list it with \
+                 iris_production_item action=list."
+            ),
+            serde_json::json!({"items_in_production": null, "items_unavailable": why}),
+        ),
+    }
+}
+
 /// Parse `build_list_items_code`'s tab-delimited output into the `items` array (#204).
 pub fn parse_list_items(out: &str) -> Vec<serde_json::Value> {
     out.lines()
@@ -1934,7 +2090,9 @@ pub fn build_remove_item_code(production: &str, item: &str) -> String {
     format!(
         r#"{prologue}
 Set tIdx=0 For i=1:1:tProd.Items.Count() {{ If tProd.Items.GetAt(i).Name={item} {{ Set tIdx=i Quit }} }}
-If tIdx=0 {{ Write "ERROR:ITEM_NOT_FOUND:Item not found: "_{item} Quit }}
+If tIdx=0 {{
+{not_found}
+}}
 Do tProd.Items.RemoveAt(tIdx)
 Set tSC4=tProd.%Save()
 If $$$ISERR(tSC4) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC4) Quit }}
@@ -1942,7 +2100,8 @@ Set tRun="" Do ##class(Ens.Director).GetProductionStatus(.tRun,.s2)
 If tRun=tProdName {{ Set tSC5=##class(Ens.Director).UpdateProduction(10,0) If $$$ISERR(tSC5) {{ Write "ERROR:UPDATE_FAILED:"_$System.Status.GetErrorText(tSC5) Quit }} }}
 Write "OK:"_tProdName"#,
         prologue = resolve_production_prologue(production),
-        item = item_e
+        item = item_e,
+        not_found = item_not_found_block(&item_e)
     )
 }
 
@@ -1991,14 +2150,17 @@ Set tS.Value={value}
     format!(
         r#"{prologue}
 Set tItem=tProd.FindItemByConfigName({item},,.tSC3)
-If '$IsObject(tItem) {{ Write "ERROR:ITEM_NOT_FOUND:Item not found: "_{item} Quit }}
+If '$IsObject(tItem) {{
+{not_found}
+}}
 {setting_lines}Set tSC4=tProd.%Save()
 If $$$ISERR(tSC4) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC4) Quit }}
 {update_line}Write "OK""#,
         prologue = resolve_production_prologue(production),
         item = item_e,
         setting_lines = setting_lines,
-        update_line = update_line
+        update_line = update_line,
+        not_found = item_not_found_block(&item_e)
     )
 }
 
@@ -2075,6 +2237,9 @@ pub async fn interop_production_item_impl(
         None => return err_json("IRIS_UNREACHABLE", "No IRIS connection"),
     };
     let item = os_str_expr(&params.item);
+    // #329: ONE candidate block, shared by the enable/disable and get_settings templates below, so
+    // the two cannot drift apart. `item` is already os_str_expr'd.
+    let not_found = item_not_found_block(&item);
     // #119: every action resolves its target the same way — `production=` when given, the
     // running production otherwise. `add`/`remove` get theirs inside build_*_item_code.
     let prologue = resolve_production_prologue(params.production.as_deref().unwrap_or(""));
@@ -2088,7 +2253,9 @@ pub async fn interop_production_item_impl(
             let code = format!(
                 r#"{prologue}
 Set tItem=tProd.FindItemByConfigName({item},,.tSC3)
-If '$IsObject(tItem) {{ Write "ERROR:ITEM_NOT_FOUND:Item not found: "_{item} Quit }}
+If '$IsObject(tItem) {{
+{not_found}
+}}
 Set tItem.Enabled={enabled_val}
 Set tSC4=tProd.%Save()
 If $$$ISERR(tSC4) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC4) Quit }}
@@ -2104,7 +2271,7 @@ Write "OK""#
                             serde_json::json!({"success":true,"item":params.item,"enabled":params.action=="enable"}),
                         )
                     } else if let Some(msg) = out.strip_prefix("ERROR:ITEM_NOT_FOUND:") {
-                        err_json("ITEM_NOT_FOUND", msg)
+                        item_not_found(msg)
                     } else if let Some(msg) = out.strip_prefix("ERROR:NO_PRODUCTION:") {
                         err_json("NO_PRODUCTION", msg)
                     } else if let Some(msg) = out.strip_prefix("ERROR:UPDATE_FAILED:") {
@@ -2120,7 +2287,9 @@ Write "OK""#
             let code = format!(
                 r#"{prologue}
 Set tItem=tProd.FindItemByConfigName({item},,.tSC3)
-If '$IsObject(tItem) {{ Write "ERROR:ITEM_NOT_FOUND:Item not found: "_{item} Quit }}
+If '$IsObject(tItem) {{
+{not_found}
+}}
 Set tKey="" For {{ Set tSetting=tItem.Settings.GetNext(.tKey) Quit:tKey=""
   Write tSetting.Name_"="_tSetting.Value_$CHAR(10) }}"#
             );
@@ -2128,7 +2297,7 @@ Set tKey="" For {{ Set tSetting=tItem.Settings.GetNext(.tKey) Quit:tKey=""
                 Ok(out) => {
                     let out = out.trim();
                     if let Some(msg) = out.strip_prefix("ERROR:ITEM_NOT_FOUND:") {
-                        return err_json("ITEM_NOT_FOUND", msg);
+                        return item_not_found(msg);
                     }
                     if let Some(msg) = out.strip_prefix("ERROR:NO_PRODUCTION:") {
                         return err_json("NO_PRODUCTION", msg);
@@ -2216,7 +2385,7 @@ Set tKey="" For {{ Set tSetting=tItem.Settings.GetNext(.tKey) Quit:tKey=""
                         }
                         ok_json(env)
                     } else if let Some(msg) = out.strip_prefix("ERROR:ITEM_NOT_FOUND:") {
-                        err_json("ITEM_NOT_FOUND", msg)
+                        item_not_found(msg)
                     } else if let Some(msg) = out.strip_prefix("ERROR:NO_PRODUCTION:") {
                         err_json("NO_PRODUCTION", msg)
                     } else if let Some(msg) = out.strip_prefix("ERROR:UPDATE_FAILED:") {
@@ -2289,7 +2458,7 @@ Set tKey="" For {{ Set tSetting=tItem.Settings.GetNext(.tKey) Quit:tKey=""
                             "production": prod,
                         }))
                     } else if let Some(msg) = out.strip_prefix("ERROR:ITEM_NOT_FOUND:") {
-                        err_json("ITEM_NOT_FOUND", msg)
+                        item_not_found(msg)
                     } else if let Some(msg) = out.strip_prefix("ERROR:NO_PRODUCTION:") {
                         err_json("NO_PRODUCTION", msg)
                     } else if let Some(msg) = out.strip_prefix("ERROR:UPDATE_FAILED:") {
