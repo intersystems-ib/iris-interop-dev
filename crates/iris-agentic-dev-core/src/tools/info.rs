@@ -1246,8 +1246,11 @@ if rs.%Next() {{
         });
 
         if p.include_row_count {
-            let count = get_row_count(iris, client, &namespace, &sql_schema, &sql_table).await;
+            let (count, why) = get_row_count(iris, client, &namespace, &sql_schema, &sql_table)
+                .await
+                .into_payload();
             obj["row_count"] = count;
+            obj["row_count_error"] = why;
         }
         obj
     } else {
@@ -1272,8 +1275,11 @@ if rs.%Next() {{
         });
 
         if p.include_row_count {
-            let count = get_row_count(iris, client, &namespace, &sql_schema, &sql_table).await;
+            let (count, why) = get_row_count(iris, client, &namespace, &sql_schema, &sql_table)
+                .await
+                .into_payload();
             obj["row_count"] = count;
+            obj["row_count_error"] = why;
         }
         obj
     };
@@ -1294,29 +1300,138 @@ if rs.%Next() {{
     crate::tools::ok_json(payload)
 }
 
+/// A row count, or the reason there is not one.
+///
+/// #303: the previous signature returned `serde_json::Value` and answered EVERY failure with
+/// `Null` — a refused query, an unparseable answer, and the generator script's own literal
+/// `"error"` were indistinguishable from one another, and `null` in the payload reads as a fact
+/// about the table rather than as "we could not ask". Two states cannot express that difference,
+/// so the caller could not either. See CLAUDE.md: a failure must never be answered with a
+/// negative fact.
+///
+/// `Counted(0)` is a real zero. Measured on IRIS 2026.1, `Ens_Config.Item` in an empty namespace
+/// answers `[{"row_count": 0}]` while `%Dictionary.ClassDefinition` answers `[{"row_count": 15915}]`
+/// — the same path produces both, which is what makes the zero trustworthy.
+enum RowCount {
+    Counted(u64),
+    Unavailable(String),
+}
+
+impl RowCount {
+    /// `(row_count, row_count_error)` — exactly one of the two is non-null.
+    fn into_payload(self) -> (serde_json::Value, serde_json::Value) {
+        match self {
+            RowCount::Counted(n) => (serde_json::Value::from(n), serde_json::Value::Null),
+            RowCount::Unavailable(why) => (serde_json::Value::Null, serde_json::Value::from(why)),
+        }
+    }
+}
+
 async fn get_row_count(
     iris: &crate::iris::connection::IrisConnection,
     client: &reqwest::Client,
     namespace: &str,
     schema: &str,
     table: &str,
-) -> serde_json::Value {
-    // #67: build the SQL in Rust, then hand the whole statement to ObjectScript as ONE
-    // escaped expression. The delimited-identifier quotes around the schema are part of the
-    // SQL text, and os_str_expr doubles them for the ObjectScript literal.
-    let sql = format!(r#"SELECT COUNT(*) FROM "{schema}".{table}"#);
-    let code = format!(
-        r#"set rs = ##class(%SQL.Statement).%ExecDirect(,{sql})
-if rs.%Next() {{ write rs.%GetData(1),! }} else {{ write "error",! }}"#,
-        sql = os_str_expr(&sql),
-    );
-    match iris.execute_via_generator(&code, namespace, client).await {
-        Ok(out) => out
-            .trim()
-            .parse::<u64>()
-            .map(serde_json::Value::from)
-            .unwrap_or(serde_json::Value::Null),
-        Err(_) => serde_json::Value::Null,
+) -> RowCount {
+    // #303: a COUNT(*) is a pure SELECT, and it used to travel through `execute_via_generator`,
+    // which PUTs a scratch class, compiles it, runs it and deletes it — a real write, on an
+    // optional branch of a tool the caller experiences as a read. `IrisConnection::query` is the
+    // Atelier /action/query path, needs no scratch class, and already carries the transparent
+    // retry that idempotent SELECTs are safe to have (#7). This is the "remove the write instead
+    // of relabelling it" case: nothing about the answer needed a generator.
+    //
+    // The count is ALIASED. Measured on IRIS 2026.1: an un-aliased COUNT(*) comes back as
+    // `[{"Aggregate_1": 0}]`, and that name is generated — it would keep parsing until IRIS chose
+    // to generate a different one, then silently stop matching.
+    let sql = format!(r#"SELECT COUNT(*) AS row_count FROM "{schema}".{table}"#);
+    let body = match iris.query(&sql, vec![], namespace, client).await {
+        Ok(b) => b,
+        // The message carries IRIS's own text, e.g.
+        // `ERROR #5540: SQLCODE: -30 Message: Table 'NO_SUCH.NOPE' not found`.
+        Err(e) => return RowCount::Unavailable(format!("the row count could not be read: {e}")),
+    };
+    // A COUNT(*) returns exactly one row. An absent or empty `content` is therefore a failure to
+    // ask, NOT a count of zero, and collapsing it to 0 would be the same defect in a new coat.
+    let Some(row) = body["result"]["content"].as_array().and_then(|a| a.first()) else {
+        return RowCount::Unavailable(format!(
+            "the row count query returned no row, which a COUNT(*) never does: {}",
+            crate::iris::connection::truncate_body(&body.to_string(), 200)
+        ));
+    };
+    match row["row_count"].as_u64() {
+        Some(n) => RowCount::Counted(n),
+        None => RowCount::Unavailable(format!(
+            "the row count column was missing or not a number in {}",
+            crate::iris::connection::truncate_body(&row.to_string(), 200)
+        )),
+    }
+}
+
+#[cfg(test)]
+mod row_count_tests {
+    use super::RowCount;
+
+    #[test]
+    fn a_counted_row_count_carries_the_number_and_no_reason() {
+        let (n, why) = RowCount::Counted(15915).into_payload();
+        assert_eq!(n, serde_json::json!(15915));
+        assert!(
+            why.is_null(),
+            "a successful count must carry no error: {why}"
+        );
+    }
+
+    #[test]
+    fn zero_is_a_count_not_an_absence() {
+        // Measured: Ens_Config.Item in an empty namespace answers [{"row_count": 0}] on the same
+        // path that answers 15915 for %Dictionary.ClassDefinition. The zero is real, and it must
+        // NOT be rendered the way a failure is.
+        let (n, why) = RowCount::Counted(0).into_payload();
+        assert_eq!(
+            n,
+            serde_json::json!(0),
+            "zero must stay a number, not become null"
+        );
+        assert!(why.is_null());
+    }
+
+    #[test]
+    fn an_unavailable_row_count_is_null_and_also_carries_the_reason() {
+        let (n, why) = RowCount::Unavailable(
+            "the row count could not be read: ERROR #5540: SQLCODE: -30 Message: Table \
+             'NO_SUCH.NOPE' not found"
+                .to_string(),
+        )
+        .into_payload();
+        assert!(
+            n.is_null(),
+            "a failure must not be rendered as a number: {n}"
+        );
+        let text = why.as_str().expect("the reason must be a string");
+        assert!(
+            text.contains("-30") && text.contains("not found"),
+            "the reason must carry IRIS's own text, not a generic message: {text}"
+        );
+    }
+
+    #[test]
+    fn the_two_states_are_never_both_populated_nor_both_null() {
+        // This is the property the old `serde_json::Value` return could not express: `Null` meant
+        // refused, unparseable, and IRIS's own literal "error" all at once, so no caller could tell
+        // "the table is empty" from "we could not ask".
+        for rc in [
+            RowCount::Counted(0),
+            RowCount::Counted(7),
+            RowCount::Unavailable("why".to_string()),
+        ] {
+            let (n, why) = rc.into_payload();
+            assert_ne!(
+                n.is_null(),
+                why.is_null(),
+                "exactly one of row_count / row_count_error must be null, got {n} and {why}"
+            );
+        }
     }
 }
 
