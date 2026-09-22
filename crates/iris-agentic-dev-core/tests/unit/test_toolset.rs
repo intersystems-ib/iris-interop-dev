@@ -213,7 +213,7 @@ fn test_merged_excludes_original_interop_production_tools() {
     }
 }
 
-/// Merged must advertise exactly 52 tools, and must stay Nostub - 8 + 4.
+/// Merged must advertise exactly 53 tools, and must stay Nostub - 8 + 4.
 ///
 /// The count is stated ONCE, in the assertion. This comment used to open with "exactly 51 tools
 /// (measured 2026-09-19; 55 - 8 + 4)" two lines above an assertion of 52 — so a reader who
@@ -232,7 +232,7 @@ fn test_merged_tool_count() {
     let count = tools.registered_tool_names().len();
     assert_eq!(
         count, 52,
-        "Merged toolset must advertise exactly 52 tools, got {}",
+        "Merged toolset must advertise exactly 53 tools, got {}",
         count
     );
     // The derivation, executed. 8 folded away (4 debug_*, 3 container, agent_info) and 4
@@ -380,7 +380,7 @@ fn test_baseline_tool_count() {
         .len();
     assert_eq!(
         n, 60,
-        "Baseline must advertise exactly 60 tools (Toolset::Baseline doc comment says 60), got {}",
+        "Baseline must advertise exactly 61 tools (Toolset::Baseline doc comment says 61), got {}",
         n
     );
 }
@@ -393,7 +393,7 @@ fn test_nostub_tool_count_absolute() {
         .expect("IrisTools::new")
         .registered_tool_names()
         .len();
-    assert_eq!(n, 56, "Nostub must advertise exactly 56 tools, got {}", n);
+    assert_eq!(n, 57, "Nostub must advertise exactly 57 tools, got {}", n);
 }
 
 /// The single regression gate for the four doc-comment numbers. A failure here means the
@@ -402,10 +402,10 @@ fn test_nostub_tool_count_absolute() {
 #[test]
 fn test_toolset_counts_match_doc_comments() {
     for (ts, expected) in [
-        (Toolset::Baseline, 60usize),
-        (Toolset::Nostub, 56),
-        (Toolset::Merged, 52),
-        (Toolset::Interop, 31),
+        (Toolset::Baseline, 61usize),
+        (Toolset::Nostub, 57),
+        (Toolset::Merged, 53),
+        (Toolset::Interop, 32),
     ] {
         let n = IrisTools::new_with_toolset(None, ts)
             .expect("IrisTools::new")
@@ -421,7 +421,7 @@ fn test_toolset_counts_match_doc_comments() {
     // Two independent anchors for the interop number: the keep-list and the router.
     assert_eq!(
         iris_agentic_dev_core::tools::INTEROP_TOOLS.len(),
-        31,
+        32,
         "INTEROP_TOOLS is the interop profile — it must agree with the measured count"
     );
 }

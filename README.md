@@ -290,7 +290,9 @@ schemas this instance actually carries, and their segments/fields — both refus
 `HL7_NOT_AVAILABLE` on a stock IRIS that has none).
 
 **External data** — `iris_gateway_query` (read through a configured SQL Gateway connection to a
-foreign database).
+foreign database), `iris_gateway_manage` (`probe` whether a JDBC gateway can run here at all, `list`
+the connections defined on the instance, `test` one end to end — and get back WHICH failure mode it
+is, each with its own remedy, instead of one opaque "connection failed").
 
 ---
 

@@ -213,7 +213,7 @@ fn a_write_disallowed_connection_still_lists_every_tool() {
         .collect();
     assert_eq!(
         names.len(),
-        31,
+        32,
         "the write gate must not shrink the tool list — it used to advertise 21 here, and \
          the two it removed took their read actions with them: {names:?}"
     );
@@ -528,12 +528,12 @@ fn mcp_server_tools_list_returns_interop_profile() {
 
     let tool_names: Vec<_> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
-    // Interop profile (this fork's default toolset) exposes exactly the 31-tool
+    // Interop profile (this fork's default toolset) exposes exactly the 32-tool
     // interop keep-list (INTEROP_TOOLS).
     assert_eq!(
         tool_names.len(),
-        31,
-        "expected the 31-tool interop profile, got {}: {:?}",
+        32,
+        "expected the 32-tool interop profile, got {}: {:?}",
         tool_names.len(),
         tool_names
     );
@@ -550,7 +550,7 @@ fn mcp_server_tools_list_returns_interop_profile() {
         "iris_table_info",
         "iris_debug",
         "docs_introspect",
-        // The count assertion above is satisfied by ANY 31 tools. This pins the one whose
+        // The count assertion above is satisfied by ANY 32 tools. This pins the one whose
         // absence was invisible: it is the only consumer of the ObjectScript tree-sitter
         // grammars, so dropping it from the keep-list makes those grammars unreachable
         // again without changing a single number.

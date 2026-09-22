@@ -314,6 +314,7 @@ pub mod envelope;
 pub mod execute_method;
 pub mod formal_spec;
 pub mod gateway;
+pub mod gateway_manage;
 pub mod hl7_schema;
 pub mod info;
 pub mod interop;
@@ -336,16 +337,16 @@ pub use scm::ScmParams;
 /// Read from `IRIS_TOOLSET` env var or `--toolset` CLI flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Toolset {
-    /// 60 tools advertised (measured 2026-09-20). NOT this fork's default —
+    /// 61 tools advertised (measured 2026-09-22). NOT this fork's default —
     /// `--toolset` defaults to `interop`; baseline is opt-in via IRIS_TOOLSET/--toolset.
-    /// Note this is already a pruned router: the 59 tools the `#[tool_router]` macro
+    /// Note this is already a pruned router: the tools the `#[tool_router]` macro
     /// registers minus the 4 merged-only ones. Was 54 of 58 before iris_execute_method.
     Baseline,
-    /// 56 tools advertised (measured 2026-09-20). Baseline minus the 4 NOT_IMPLEMENTED
+    /// 57 tools advertised (measured 2026-09-22). Baseline minus the 4 NOT_IMPLEMENTED
     /// stubs (skill_propose, skill_optimize, skill_share, skill_community_install).
     /// No merged dispatchers. Not this fork's default.
     Nostub,
-    /// 52 tools advertised (measured 2026-09-20). Nostub (56) minus 8 — the 4 debug_*
+    /// 53 tools advertised (measured 2026-09-22). Nostub minus 8 — the 4 debug_*
     /// folded into iris_debug, the 3 container tools folded into iris_containers, and
     /// agent_info dropped outright — plus the 4 merged-only tools iris_debug,
     /// iris_containers, iris_admin, iris_get_log.
@@ -356,7 +357,7 @@ pub enum Toolset {
     /// executes the derivation against the live Nostub count instead.
     /// Not this fork's default.
     Merged,
-    /// 31 tools advertised (measured 2026-09-20) — exactly `INTEROP_TOOLS`. THIS FORK'S
+    /// 32 tools advertised (measured 2026-09-22) — exactly `INTEROP_TOOLS`. THIS FORK'S
     /// DEFAULT: `--toolset` carries `default_value = "interop"` (see
     /// crates/iris-agentic-dev-bin/src/cmd/mcp.rs). Keeps only the tools the iris-interop
     /// skills actually exercise; everything else (skill_*/kb_*/agent_*/generate_*/
@@ -457,6 +458,14 @@ pub const INTEROP_TOOLS: &[&str] = &[
     // which puts the credential in the transcript and in shell history, and verifies outside the
     // trace so the row cannot be correlated with the session that produced it.
     "iris_gateway_query",
+    // #343: `e31-bo-jdbc` — stand up a JDBC Business Operation — is the most expensive step in all
+    // twelve Sonnet runs of the benchmark, 14–37 minutes, hitting the 60-turn cap twice two plugin
+    // years apart, and the arm whose CLAUDE.md pointed imperatively at the JDBC skill took 37
+    // minutes anyway: it is the only one of 44 steps where that arm does not win. The minutes go on
+    // probing the API — two runs opened with two DIFFERENT classes for "is the gateway up?" —
+    // because there is no canonical answer to ask for, and because every failure mode looks alike
+    // from outside.
+    "iris_gateway_manage",
 ];
 
 pub const ERR_NO_TESTS_FOUND: &str = "NO_TESTS_FOUND";
@@ -4262,19 +4271,21 @@ fn library_frame_hint(abort: &str) -> Option<&'static str> {
     if abort.contains("INVALID OREF")
         && (abort.contains("^EnsLib.JavaGateway.Common") || abort.contains("initAdapterJG"))
     {
-        return Some(
-            "This abort happened inside EnsLib.JavaGateway.Common, not in the code you sent — \
-             your code called into it. That routine is the JDBC adapter's gateway \
-             initialisation. Per the SQL Gateway documentation, JGService is REQUIRED for all \
-             JDBC data sources, even with a working SQL gateway connection: a business service \
-             of type EnsLib.JavaGateway.Service must be present, and the adapter needs that \
-             configuration item's exact name. Check, in this order: (1) an \
-             EnsLib.JavaGateway.Service item exists in the production, (2) the production is \
-             started, (3) the operation's JGService setting names that item exactly — set it \
-             with iris_production_item(action=set_settings, item=<BO>, \
-             settings={\"Adapter.JGService\": \"<that item name>\"}). Do not hunt for the bug \
-             line by line in your script; the line that trapped is not in it.",
-        );
+        // #343: the requirement sentence is no longer written here. It is
+        // `gateway_manage::JGSERVICE_REQUIREMENT`, so this hint and `iris_gateway_manage`'s
+        // healthy-path note cannot drift — and the copy that gets quoted later is one copy.
+        // Built once at first use because two `&str` constants cannot be concatenated in a
+        // const, and this function's contract is `&'static str`.
+        static JG_ABORT_HINT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+            format!(
+                "This abort happened inside EnsLib.JavaGateway.Common, not in the code you sent \
+                 — your code called into it. That routine is the JDBC adapter's gateway \
+                 initialisation. {} Do not hunt for the bug line by line in your script; the \
+                 line that trapped is not in it.",
+                gateway_manage::JGSERVICE_REQUIREMENT
+            )
+        });
+        return Some(JG_ABORT_HINT.as_str());
     }
     None
 }
@@ -4456,6 +4467,11 @@ const GENERATOR_WRITE_TOOLS: &[&str] = &[
     // honestly read-only again and are deliberately absent from this list. Removing the write beat
     // relabelling it: diagnosing a mistake must not modify the instance.
     "iris_gateway_query",
+    // #343: actions `probe` and `test` run generated ObjectScript — IsGatewayRunning, %File.Exists
+    // and TestConnection have no SQL projection to read them through — so a scratch class is
+    // written. `list` deliberately does NOT: it is a plain SELECT over %Library.sys_SQLConnection,
+    // because diagnosing a mistake should modify the instance as little as possible.
+    "iris_gateway_manage",
     "iris_message_body",
     "iris_production_diff",
     // iris_gateway_query and iris_table_info each already carry an explicit `=> None` arm in
@@ -4591,6 +4607,12 @@ pub(crate) fn mutating_call(tool: &str, args: &serde_json::Value) -> Option<&'st
         // role that should hold SELECT-only grants. The screen alone would not be enough — the
         // target speaks a foreign SQL dialect — which is why the connection is the guarantee.
         | "iris_gateway_query"
+        // #343: a diagnostic. It reads the gateway definition, checks whether the class-path files
+        // exist, asks $SYSTEM.SQLGateway.TestConnection, and reads the JDBC metadata; any statement
+        // it runs on the caller's behalf goes through the same read-only screen as
+        // iris_gateway_query, over a connection opened SetReadOnly(1). It deliberately has no
+        // create or delete action — that would mean accepting a plaintext password.
+        | "iris_gateway_manage"
         | "iris_table_info" => None,
         _ => None,
     }
@@ -4735,6 +4757,7 @@ pub(crate) const CLASSIFIED_TOOLS: &[&str] = &[
     "iris_doc",
     "iris_execute",
     "iris_execute_method",
+    "iris_gateway_manage",
     "iris_gateway_query",
     "hl7_schema_inspect",
     "hl7_schema_list",
@@ -8470,6 +8493,19 @@ Methods:
     }
 
     #[tool(
+        description = "Diagnose an IRIS SQL Gateway before you try to use it, and say WHICH thing is wrong instead of \"connection failed\". action=probe answers the question there is otherwise no canonical API for — can a JDBC gateway run here at all: is the %JDBC Server external language server defined, and is its Java runtime present and supported. action=list names the gateway connections defined on this instance with their driver, class path and username (never a password). action=test takes one connection all the way to the external database and returns ONE named mode: Java absent, no such server, connection not defined, an ODBC connection, a class path naming a jar that is not on the IRIS host, a connection that failed with no reason at all, a credential the target refused, another reason the target gave, a handshake that did not complete, or — with probe_query — the gateway working and the target refusing THAT statement, which is the failure that costs most to misread. Each mode carries its own remedy. A class path naming a missing jar is reported even when the connection test passes, because a Java server that already loaded the driver makes that test pass until the next restart. Creating a connection is not an action here: it would mean sending a plaintext password. Use iris_gateway_query to read rows once this says the connection is healthy. namespace: optional — defaults to the connection namespace (IRIS_NAMESPACE)."
+    )]
+    async fn iris_gateway_manage(
+        &self,
+        Parameters(p): Parameters<gateway_manage::GatewayManageParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let iris = self.get_iris_reloaded().await?;
+        let result = gateway_manage::handle_gateway_manage(&iris, self.http_client(), p).await;
+        self.record_call("iris_gateway_manage", Self::call_ok(&result));
+        result
+    }
+
+    #[tool(
         description = "List the HL7 schema categories this instance has (e.g. 2.1 through 2.8.1, plus any custom category), with whether each is a standard schema and what it is based on. Call this first to learn the exact category string hl7_schema_inspect wants. Requires IRIS for Health or HealthShare — a plain IRIS has no HL7 schemas and the tool says so rather than returning an empty list. namespace: optional — defaults to the connection namespace (IRIS_NAMESPACE)."
     )]
     async fn hl7_schema_list(
@@ -11818,10 +11854,10 @@ mod tool_annotation_tests {
     #[test]
     fn the_read_only_split_is_pinned_per_toolset() {
         for (label, ts, total, ro_expected) in [
-            ("interop", Toolset::Interop, 31_usize, 9_usize),
-            ("nostub", Toolset::Nostub, 56, 34),
-            ("merged", Toolset::Merged, 52, 29),
-            ("baseline", Toolset::Baseline, 60, 38),
+            ("interop", Toolset::Interop, 32_usize, 9_usize),
+            ("nostub", Toolset::Nostub, 57, 34),
+            ("merged", Toolset::Merged, 53, 29),
+            ("baseline", Toolset::Baseline, 61, 38),
         ] {
             let t = IrisTools::new_with_toolset(None, ts).expect("build");
             let all = t.advertised_tools();
@@ -13038,6 +13074,39 @@ mod library_frame_tests {
         );
         // It must tell the caller to stop reading their own script for the bug.
         assert!(h.contains("not in the code you sent"), "{h}");
+    }
+
+    /// #343: `iris_gateway_manage` needs the same requirement text, and a second copy would be a
+    /// second thing to keep true. Both users must carry ONE string, byte for byte.
+    ///
+    /// The assertion is the substring relation, not equality of the two full messages: this hint
+    /// wraps the requirement in abort-specific framing, and the gateway tool does not.
+    #[test]
+    fn jgservice_requirement_is_not_restated() {
+        let requirement = gateway_manage::JGSERVICE_REQUIREMENT;
+        // A guard whose window is wider than its claim passes on unrelated text, so anchor on
+        // something long enough to be the requirement itself rather than the topic.
+        assert!(
+            requirement.contains("JGService is REQUIRED for all JDBC data sources"),
+            "the shared const stopped being the requirement sentence: {requirement}"
+        );
+        assert!(
+            abort_hint(MEASURED).unwrap().contains(requirement),
+            "the #209 abort hint has its own copy again — one of the two will drift"
+        );
+        // And the second user: the healthy path of iris_gateway_manage, which is where a caller
+        // stops looking. Asserted through the rendered remedy so a refactor that drops the note
+        // cannot pass by leaving the const in place.
+        let healthy = gateway_manage::GatewayDiagnosis::Healthy {
+            connection: "PG_X".into(),
+            database: "PostgreSQL 17.11".into(),
+            driver: "PostgreSQL JDBC Driver 42.7.4".into(),
+        };
+        assert!(
+            healthy.remedy().contains("JGService"),
+            "a healthy gateway must still point at the Business Operation requirement: {}",
+            healthy.remedy()
+        );
     }
 
     /// The false claim the issue explicitly forbids: adapters DO instantiate and work when
