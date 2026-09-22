@@ -142,6 +142,39 @@ pub fn metric_list(req: &CoverageRequest) -> Vec<String> {
     out
 }
 
+/// Refusal markers. `COVERAGE_REFUSED` carries a one-line message this generator composes itself,
+/// so it is single-line by construction. `COVERAGE_START_FAILED` carries
+/// `$SYSTEM.Status.GetErrorText(tSC)`, which is the whole `%Status` chain CRLF-joined, so it is
+/// repeated on every line of the chain and `..._LINES` declares how many lines there are (#347).
+pub const M_REFUSED: &str = "COVERAGE_REFUSED:";
+pub const M_START_FAILED_LINES: &str = "COVERAGE_START_FAILED_LINES:";
+pub const M_START_FAILED: &str = "COVERAGE_START_FAILED:";
+
+/// What the program writes when `Start` hands back a bad `%Status`: the decoded chain, one
+/// marker-prefixed line per element, preceded by the number of lines to expect.
+///
+/// A LINE count rather than the character count `iris_execute_method` declares for its own fields:
+/// `parse_output` trims every line before matching it, because it shares the device with `%UnitTest`
+/// which indents freely, and a trimmed line no longer carries the character count it was measured
+/// with. Declaring characters here would report a false short read on any error text with
+/// leading or trailing space.
+///
+/// Public because this is what the #347 e2e target drives with a REAL `AppendStatus` chain. Making
+/// `%Monitor.System.LineByLine.Start` itself fail with a two-element chain is not something a test
+/// can arrange, so the test feeds the shipped emitter rather than re-implementing it — a
+/// re-implementation would pass while the product stayed broken.
+pub fn build_start_failure_report(status_var: &str) -> String {
+    format!(
+        "set tFailText=$SYSTEM.Status.GetErrorText({status_var})\n{}",
+        crate::objectscript::write_marker_lines(
+            "tFailText",
+            M_START_FAILED_LINES,
+            M_START_FAILED,
+            crate::objectscript::Declared::Lines,
+        )
+    )
+}
+
 /// A `$LISTBUILD(...)` of quoted strings.
 fn list_build(items: &[String]) -> String {
     let parts: Vec<String> = items
@@ -173,16 +206,17 @@ pub fn build_program(req: &CoverageRequest) -> String {
     // goes through its own Run(), a TestCase through DebugRunTestCase, a package prefix expands, and
     // only a genuine suite spec falls through to RunTest.
     let run = crate::tools::build_class_test_run_code(req.test_spec.trim(), "/noload/nodelete", "");
+    let start_failed = build_start_failure_report("tSC");
     format!(
         r#"set $ZTRAP=""
 set tStart=##class(%Monitor.System.LineByLine).GetRoutineCount()
 if tStart>0 {{
-  write "COVERAGE_REFUSED:monitor already running, "_tStart_" routines",!
+  write "{M_REFUSED}monitor already running, "_tStart_" routines",!
   quit
 }}
 set tSC=##class(%Monitor.System.LineByLine).Start({routines},{metrics},$LISTBUILD($JOB))
 if '$SYSTEM.Status.IsOK(tSC) {{
-  write "COVERAGE_START_FAILED:"_$SYSTEM.Status.GetErrorText(tSC),!
+{start_failed}
   quit
 }}
 set tRunErr=""
@@ -260,7 +294,66 @@ pub struct CoverageReport {
     /// running degrades the instance and blocks the next Start.
     pub stopped: bool,
     /// The refusal, when the program declined to start.
-    pub refused: Option<String>,
+    pub refused: Option<Refusal>,
+}
+
+/// Why the program declined to run — and whether the whole reason survived the read.
+///
+/// Three cases, not two. `refused: None` is "not refused"; `Whole` is "refused, and this is the
+/// reason"; `Partial` is "refused, and the reason did NOT arrive complete". Without the third, a
+/// one-line prefix of a multi-element `%Status` chain is handed back looking exactly like a whole
+/// refusal — and on a `Start` failure the specific cause is frequently the element further down
+/// (#347).
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub enum Refusal {
+    /// Every line the program declared arrived.
+    Whole(String),
+    /// Fewer lines arrived than the program declared. `text` is a PREFIX of the reason.
+    Partial {
+        text: String,
+        lines_declared: usize,
+        lines_received: usize,
+    },
+}
+
+impl Refusal {
+    /// What arrived, whether or not it is all of it. For display only — a caller that must not
+    /// present a prefix as the reason has to match the variant.
+    pub fn text(&self) -> &str {
+        match self {
+            Refusal::Whole(t) => t,
+            Refusal::Partial { text, .. } => text,
+        }
+    }
+
+    /// True when the reason arrived complete.
+    pub fn is_whole(&self) -> bool {
+        matches!(self, Refusal::Whole(_))
+    }
+
+    /// The tool-level outcome: error code and message.
+    ///
+    /// Here rather than inline in the handler so the code/message pair for each arm is testable
+    /// without a connection. The wiring between a parsed third case and what the caller is told is
+    /// the layer that gets left untested, and an untested third case is worth as much as none.
+    pub fn outcome(&self) -> (&'static str, String) {
+        match self {
+            Refusal::Whole(m) => ("COVERAGE_REFUSED", m.clone()),
+            Refusal::Partial {
+                text,
+                lines_declared,
+                lines_received,
+            } => (
+                "COVERAGE_REFUSED_INCOMPLETE",
+                format!(
+                    "The coverage run was refused and the REASON did not arrive whole: the program \
+                     declared {lines_declared} line(s) of %Status text and {lines_received} \
+                     arrived. What follows is a prefix, not the reason — read `output` for the raw \
+                     device text before acting on it. {text}"
+                ),
+            ),
+        }
+    }
 }
 
 /// Parse the program's stdout. Tolerant of interleaved `%UnitTest` output, which writes freely to the
@@ -275,12 +368,20 @@ pub fn parse_output(out: &str) -> CoverageReport {
         refused: None,
     };
     let mut pending: Option<(String, usize, usize)> = None;
+    // The START_FAILED chain is accumulated, not assigned: it arrives as one marker line per element
+    // of the %Status chain (#347). Assigning would keep whichever element came last; before #347 the
+    // later elements carried no marker at all and were dropped by the catch-all below.
+    let mut start_failed: Vec<String> = Vec::new();
+    let mut start_failed_lines: Option<usize> = None;
     for line in out.lines() {
         let l = line.trim();
-        if let Some(v) = l.strip_prefix("COVERAGE_REFUSED:") {
-            rep.refused = Some(v.to_string());
-        } else if let Some(v) = l.strip_prefix("COVERAGE_START_FAILED:") {
-            rep.refused = Some(v.to_string());
+        if let Some(v) = l.strip_prefix(M_REFUSED) {
+            rep.refused = Some(Refusal::Whole(v.to_string()));
+        } else if let Some(v) = l.strip_prefix(M_START_FAILED_LINES) {
+            // Tested before M_START_FAILED so a declaration can never be read as content.
+            start_failed_lines = v.trim().parse::<usize>().ok();
+        } else if let Some(v) = l.strip_prefix(M_START_FAILED) {
+            start_failed.push(v.to_string());
         } else if let Some(v) = l.strip_prefix("COVERAGE_METRICS:") {
             rep.metrics = v
                 .split(',')
@@ -318,6 +419,21 @@ pub fn parse_output(out: &str) -> CoverageReport {
         } else if let Some(v) = l.strip_prefix("COVERAGE_STOPPED:") {
             rep.stopped = v.trim() == "0";
         }
+    }
+    // Reassemble the START_FAILED chain. The two markers are mutually exclusive in the program — each
+    // branch `quit`s — so this cannot overwrite a COVERAGE_REFUSED that really happened.
+    if start_failed_lines.is_some() || !start_failed.is_empty() {
+        let text = start_failed.join("\n");
+        rep.refused = Some(match start_failed_lines {
+            // Fewer lines than declared: the reason is a prefix and must not be presented as the
+            // reason. This is the case that a bare `refused: Option<String>` could not express.
+            Some(n) if start_failed.len() < n => Refusal::Partial {
+                text,
+                lines_declared: n,
+                lines_received: start_failed.len(),
+            },
+            _ => Refusal::Whole(text),
+        });
     }
     rep
 }
@@ -746,8 +862,10 @@ COVERAGE_STOPPED:0
     fn a_refusal_is_surfaced_and_carries_no_invented_coverage() {
         let r = parse_output("COVERAGE_REFUSED:monitor already running, 4 routines\n");
         assert_eq!(
-            r.refused.as_deref(),
-            Some("monitor already running, 4 routines")
+            r.refused,
+            Some(Refusal::Whole(
+                "monitor already running, 4 routines".to_string()
+            ))
         );
         assert!(r.routines.is_empty(), "must not invent rows");
         assert!(
@@ -760,8 +878,144 @@ COVERAGE_STOPPED:0
     fn a_start_failure_is_surfaced_as_a_refusal() {
         let r = parse_output("COVERAGE_START_FAILED:ERROR #6060: Unknown metric: Nope\n");
         assert!(
-            r.refused.as_deref().unwrap_or_default().contains("#6060"),
+            r.refused
+                .as_ref()
+                .map(Refusal::text)
+                .unwrap_or_default()
+                .contains("#6060"),
             "{r:?}"
+        );
+    }
+
+    /// #347. Every element of the `%Status` chain must reach `refused`. The elements are the MEASURED
+    /// shape: `GetErrorText` on a two-element chain returns them CRLF-joined, and the program now
+    /// writes one marker line each.
+    #[test]
+    fn every_element_of_a_start_failure_chain_reaches_refused() {
+        let r = parse_output(
+            "COVERAGE_START_FAILED_LINES:2\n\
+             COVERAGE_START_FAILED:ERROR #5001: first cause\n\
+             COVERAGE_START_FAILED:ERROR #5001: second cause\n",
+        );
+        assert_eq!(
+            r.refused,
+            Some(Refusal::Whole(
+                "ERROR #5001: first cause\nERROR #5001: second cause".to_string()
+            )),
+            "both elements must arrive, newline-joined: {r:?}"
+        );
+    }
+
+    /// The shape a REAL `Start` failure produces, measured rather than imagined: two `Start` calls in
+    /// one process on IRIS 2026.1 give `ERROR #6062: The Monitor is already running` — a ONE-element
+    /// chain, so the program declares 1 line and writes 1. A single element must come out `Whole`; a
+    /// chain length of one is not evidence of a truncation.
+    #[test]
+    fn a_real_single_element_start_failure_is_whole() {
+        let r = parse_output(
+            "COVERAGE_START_FAILED_LINES:1\n\
+             COVERAGE_START_FAILED:ERROR #6062: The Monitor is already running\n",
+        );
+        assert_eq!(
+            r.refused,
+            Some(Refusal::Whole(
+                "ERROR #6062: The Monitor is already running".to_string()
+            )),
+            "{r:?}"
+        );
+    }
+
+    /// The third case. Fewer lines than declared means the reason is a PREFIX — and on a Start
+    /// failure the specific cause is frequently the element that did not arrive, so a prefix
+    /// presented as the reason is the worst of the two halves.
+    #[test]
+    fn a_start_failure_chain_that_arrives_short_is_partial_not_whole() {
+        let r = parse_output(
+            "COVERAGE_START_FAILED_LINES:3\n\
+             COVERAGE_START_FAILED:ERROR #5001: first cause\n",
+        );
+        assert_eq!(
+            r.refused,
+            Some(Refusal::Partial {
+                text: "ERROR #5001: first cause".to_string(),
+                lines_declared: 3,
+                lines_received: 1,
+            }),
+            "{r:?}"
+        );
+        assert!(
+            !r.refused.as_ref().unwrap().is_whole(),
+            "a prefix must not read as the whole reason"
+        );
+    }
+
+    /// The declaration arriving with NO content lines is still a refusal, and still not a reason.
+    /// Reporting it as `Whole("")` would hand the caller an empty explanation for a real failure.
+    #[test]
+    fn a_declaration_with_no_lines_is_a_partial_refusal_not_an_empty_one() {
+        let r = parse_output("COVERAGE_START_FAILED_LINES:2\n");
+        match r.refused {
+            Some(Refusal::Partial {
+                lines_declared,
+                lines_received,
+                ..
+            }) => {
+                assert_eq!((lines_declared, lines_received), (2, 0));
+            }
+            other => panic!("expected a Partial refusal, got {other:?}"),
+        }
+    }
+
+    /// The two arms must reach the caller under DIFFERENT codes. A partial refusal surfaced as
+    /// `COVERAGE_REFUSED` is the whole defect again one layer out: the caller reads a prefix as the
+    /// reason and never learns there was more.
+    #[test]
+    fn a_partial_refusal_reaches_the_caller_under_its_own_code() {
+        let (whole_code, whole_msg) = Refusal::Whole("monitor already running".into()).outcome();
+        assert_eq!(whole_code, "COVERAGE_REFUSED");
+        assert_eq!(
+            whole_msg, "monitor already running",
+            "a complete reason must be passed through unchanged"
+        );
+
+        let (partial_code, partial_msg) = Refusal::Partial {
+            text: "ERROR #5001: first cause".into(),
+            lines_declared: 3,
+            lines_received: 1,
+        }
+        .outcome();
+        assert_eq!(partial_code, "COVERAGE_REFUSED_INCOMPLETE");
+        assert_ne!(
+            partial_code, whole_code,
+            "a prefix must not arrive under the same code as a whole reason"
+        );
+        assert!(
+            partial_msg.contains("3") && partial_msg.contains("1"),
+            "both counts must be named: {partial_msg}"
+        );
+        assert!(
+            partial_msg.contains("ERROR #5001: first cause"),
+            "what did arrive is still reported: {partial_msg}"
+        );
+    }
+
+    /// The program writes the failure report through the shipped emitter, so the e2e target can drive
+    /// exactly what ships. Both halves are asserted: the count and the per-line write.
+    #[test]
+    fn the_start_failure_report_declares_its_lines_and_repeats_its_marker() {
+        let p = build_program(&req("T", &["A*"], &[]));
+        assert!(
+            p.contains("write \"COVERAGE_START_FAILED_LINES:\"_$LENGTH(tFailText,$CHAR(10))"),
+            "{p}"
+        );
+        assert!(
+            p.contains("$PIECE(tFailText,$CHAR(10),tMLI)"),
+            "the chain must be written one piece per line: {p}"
+        );
+        // The single-line form is what dropped elements 2..n.
+        assert!(
+            !p.contains("write \"COVERAGE_START_FAILED:\"_$SYSTEM.Status.GetErrorText"),
+            "{p}"
         );
     }
 

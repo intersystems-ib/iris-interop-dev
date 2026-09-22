@@ -6569,10 +6569,19 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
         let rep = coverage::parse_output(&out);
         if let Some(refused) = &rep.refused {
             self.record_call("iris_coverage", false);
+            // #347: a refusal whose %Status chain did not arrive whole gets its OWN code. The reason
+            // text is the entire value of this failure, and a prefix of a chain reads exactly like a
+            // complete one-error reason — while the specific cause of a Start failure is frequently
+            // the element that is missing. The mapping lives on Refusal so it is testable.
+            let (code, message) = refused.outcome();
             return envelope::fail_with(
-                "COVERAGE_REFUSED",
-                refused,
-                serde_json::json!({"namespace": namespace, "output": out.trim()}),
+                code,
+                &message,
+                serde_json::json!({
+                    "namespace": namespace,
+                    "output": out.trim(),
+                    "refusal_complete": refused.is_whole(),
+                }),
             );
         }
         self.record_call("iris_coverage", true);

@@ -101,10 +101,22 @@ pub fn arg_expr(v: &serde_json::Value) -> String {
 /// return value may itself contain tabs and newlines, so each field gets its own line and
 /// the VALUE goes last, preceded by its length. The length is what makes a truncated read
 /// detectable — a value that arrives short otherwise looks like a successful short answer.
+///
+/// #347: `IEM_STATUS_TEXT` and `IEM_ERROR` are not line-oriented values either, and being written
+/// as one line each is what dropped every `%Status` error after the first.
+/// `$SYSTEM.Status.GetErrorText` returns a chain CRLF-joined, and `ex.DisplayString()` of a
+/// `%Exception.StatusException` carrying a chain does the same (both measured on 2026.1 and 2025c —
+/// 51 and 46 characters respectively, two pieces each). Both now repeat their marker on every line
+/// and declare their character count, so the reader reassembles the whole field and can tell a short
+/// arrival from a short answer. Every other field is single-line BY CONSTRUCTION: `IEM_KIND` is one
+/// of four literals this generator writes, `IEM_STATUS_OK` is `0`/`1`/empty, and `IEM_RETURN_TYPE` is
+/// a class name out of `%Dictionary.CompiledMethod`.
 pub const M_KIND: &str = "IEM_KIND\t";
 pub const M_RETURN_TYPE: &str = "IEM_RETURN_TYPE\t";
 pub const M_STATUS_OK: &str = "IEM_STATUS_OK\t";
+pub const M_STATUS_TEXT_LEN: &str = "IEM_STATUS_TEXT_LEN\t";
 pub const M_STATUS_TEXT: &str = "IEM_STATUS_TEXT\t";
+pub const M_ERROR_LEN: &str = "IEM_ERROR_LEN\t";
 pub const M_ERROR: &str = "IEM_ERROR\t";
 pub const M_VALUE_LEN: &str = "IEM_VALUE_LEN\t";
 pub const M_VALUE: &str = "IEM_VALUE\t";
@@ -154,6 +166,21 @@ pub fn build_invoke_code(
         ""
     };
 
+    // The two free-text fields go out one marker line per line of their content, with their
+    // character count declared in front. See M_STATUS_TEXT's doc comment for why (#347).
+    let status_text_block = crate::objectscript::write_marker_lines(
+        "tStatusText",
+        M_STATUS_TEXT_LEN,
+        M_STATUS_TEXT,
+        crate::objectscript::Declared::Chars,
+    );
+    let error_block = crate::objectscript::write_marker_lines(
+        "tErr",
+        M_ERROR_LEN,
+        M_ERROR,
+        crate::objectscript::Declared::Chars,
+    );
+
     format!(
         r#"  set tKind="value"
   set tVal=""
@@ -170,18 +197,18 @@ pub fn build_invoke_code(
   write "{M_KIND}"_tKind_$C(10)
   write "{M_RETURN_TYPE}"_{rt}_$C(10)
   write "{M_STATUS_OK}"_tOk_$C(10)
-  write "{M_STATUS_TEXT}"_tStatusText_$C(10)
-  write "{M_ERROR}"_tErr_$C(10)
+{status_text_block}
+{error_block}
   write "{M_VALUE_LEN}"_$LENGTH(tVal)_$C(10)
   write "{M_VALUE}"_tVal_$C(10)"#,
         invoke = invoke,
         status_block = status_block,
+        status_text_block = status_text_block,
+        error_block = error_block,
         rt = os_str_expr(&meta.return_type),
         M_KIND = M_KIND,
         M_RETURN_TYPE = M_RETURN_TYPE,
         M_STATUS_OK = M_STATUS_OK,
-        M_STATUS_TEXT = M_STATUS_TEXT,
-        M_ERROR = M_ERROR,
         M_VALUE_LEN = M_VALUE_LEN,
         M_VALUE = M_VALUE,
     )
@@ -199,22 +226,77 @@ pub struct InvokeResult {
     /// value must not be presented as the method's answer.
     pub truncated: bool,
     pub status_ok: Option<bool>,
+    /// The decoded `%Status` chain, its elements newline-joined — ALL of them, not just the first
+    /// (#347).
     pub status_text: String,
+    /// Declared character count of `status_text`, when reported.
+    pub status_text_len: Option<usize>,
+    /// True when less of the `%Status` chain arrived than IRIS declared. The third case: not a
+    /// shorter error message, but an error message whose missing part may be the cause.
+    pub status_text_truncated: bool,
     pub error: String,
+    /// Declared character count of `error`, when reported.
+    pub error_len: Option<usize>,
+    /// True when less of the exception text arrived than IRIS declared.
+    pub error_truncated: bool,
+}
+
+/// Cut `text` to the length IRIS declared and say whether it arrived SHORT.
+///
+/// IRIS reported the exact character count, so use it rather than guessing which trailing
+/// whitespace belongs to the field and which is the write that terminated it. Stripping "one
+/// trailing newline" left a spurious `\n` on every value, because the generator's own output adds
+/// one of its own; cutting to the declared length cannot make that mistake.
+///
+/// A short arrival is returned rather than silently accepted: without it, a field that got cut is
+/// indistinguishable from a field that was genuinely that short.
+fn fit_to_declared(text: &mut String, declared: Option<usize>) -> bool {
+    let Some(n) = declared else {
+        return false;
+    };
+    let got = text.chars().count();
+    if got > n {
+        *text = text.chars().take(n).collect();
+    }
+    got < n
 }
 
 /// Parse the marker block. The VALUE marker is last, so everything after it (newlines
 /// included) belongs to the value.
+///
+/// `IEM_STATUS_TEXT` and `IEM_ERROR` arrive as one marker line per line of their content and are
+/// reassembled by joining with `\n`, then checked against the count their `..._LEN` marker declared
+/// (#347). Before that they were read with a single `strip_prefix` assignment, which captured the
+/// first line of a CRLF-joined `%Status` chain and dropped the rest on iterations that matched no arm.
 pub fn parse_invoke_output(out: &str) -> InvokeResult {
     let mut r = InvokeResult::default();
-    if let Some(i) = out.find(M_VALUE) {
+    let value_at = out.find(M_VALUE);
+    if let Some(i) = value_at {
         r.value = out[i + M_VALUE.len()..]
             .strip_suffix('\n')
             .unwrap_or(&out[i + M_VALUE.len()..])
             .to_string();
     }
-    for line in out.lines() {
-        if let Some(v) = line.strip_prefix(M_KIND) {
+    // Scan for the other fields only in front of the VALUE marker. Everything after it is the
+    // method's own return value — arbitrary text, possibly multi-line — and a line of it beginning
+    // with a marker literal would otherwise be read as that field.
+    let fields = match value_at {
+        Some(i) => &out[..i],
+        None => out,
+    };
+    let mut status_text: Vec<&str> = Vec::new();
+    let mut error: Vec<&str> = Vec::new();
+    for line in fields.lines() {
+        // The `..._LEN` arms come first so a declaration can never be mistaken for content. They
+        // cannot collide today — the marker's separator is a tab and `_LEN`'s is an underscore —
+        // but the ordering makes that independent of the separator choice.
+        if let Some(v) = line.strip_prefix(M_STATUS_TEXT_LEN) {
+            r.status_text_len = v.trim().parse::<usize>().ok();
+        } else if let Some(v) = line.strip_prefix(M_ERROR_LEN) {
+            r.error_len = v.trim().parse::<usize>().ok();
+        } else if let Some(v) = line.strip_prefix(M_VALUE_LEN) {
+            r.value_len = v.trim().parse::<usize>().ok();
+        } else if let Some(v) = line.strip_prefix(M_KIND) {
             r.kind = v.trim_end().to_string();
         } else if let Some(v) = line.strip_prefix(M_RETURN_TYPE) {
             r.return_type = v.trim_end().to_string();
@@ -224,25 +306,43 @@ pub fn parse_invoke_output(out: &str) -> InvokeResult {
                 r.status_ok = Some(t == "1");
             }
         } else if let Some(v) = line.strip_prefix(M_STATUS_TEXT) {
-            r.status_text = v.trim_end().to_string();
+            // APPEND, never assign: one line per chain element.
+            status_text.push(v);
         } else if let Some(v) = line.strip_prefix(M_ERROR) {
-            r.error = v.trim_end().to_string();
-        } else if let Some(v) = line.strip_prefix(M_VALUE_LEN) {
-            r.value_len = v.trim().parse::<usize>().ok();
+            error.push(v);
         }
     }
-    // IRIS reported the exact character count, so use it rather than guessing which trailing
-    // whitespace belongs to the value and which is the write that terminated it. Stripping "one
-    // trailing newline" left a spurious \n on every value, because the generator's own output
-    // adds one of its own; cutting to the declared length cannot make that mistake.
-    if let Some(n) = r.value_len {
-        let got = r.value.chars().count();
-        r.truncated = got < n;
-        if got > n {
-            r.value = r.value.chars().take(n).collect();
-        }
-    }
+    r.status_text = status_text.join("\n");
+    r.error = error.join("\n");
+    r.truncated = fit_to_declared(&mut r.value, r.value_len);
+    r.status_text_truncated = fit_to_declared(&mut r.status_text, r.status_text_len);
+    r.error_truncated = fit_to_declared(&mut r.error, r.error_len);
     r
+}
+
+/// The tool-level outcome when the decoded `%Status` chain did not arrive whole (#347): error code
+/// and message.
+///
+/// A named function rather than inline text in the handler, for the same reason
+/// `coverage::Refusal::outcome` is one — the mapping from a parsed third case to what the caller is
+/// told is otherwise reachable only through a live connection, and an untested third case is worth as
+/// much as none.
+pub fn status_text_truncated_report(
+    class: &str,
+    method: &str,
+    declared: usize,
+    received: usize,
+) -> (&'static str, String) {
+    (
+        "STATUS_TEXT_TRUNCATED",
+        format!(
+            "'{class}::{method}' returned a failing %Status whose decoded text IRIS measured at \
+             {declared} characters, but only {received} arrived — so the error chain is incomplete \
+             and is not reported as the status text. On a chained %Status the first element is often \
+             a generic wrapper and the specific cause is further down, so the part that is missing \
+             may be the part you need. What did arrive is in `status_text_partial`."
+        ),
+    )
 }
 
 /// The message for a method the dictionary says is an INSTANCE method. Naming the
@@ -341,53 +441,148 @@ pub async fn handle_iris_execute_method(
 
     let r = parse_invoke_output(&out);
 
-    // A <...> thrown inside the method is the method's answer, not a transport failure, so it
-    // is reported as a named outcome rather than swallowed into the value.
+    match classify(&r) {
+        Outcome::Threw => report_threw(class, method, &namespace, &r),
+        Outcome::ValueTruncated => report_value_truncated(class, method, &namespace, &r),
+        Outcome::StatusTextUnreassembled => {
+            report_status_text_unreassembled(class, method, &namespace, &r)
+        }
+        Outcome::Answered => crate::tools::envelope::ok_json(serde_json::json!({
+            "success": true,
+            "class": class,
+            "method": method,
+            "namespace": namespace,
+            // "value" | "status" | "oref" | "void" — what the DECLARED return type made this.
+            "kind": r.kind,
+            "return_type": r.return_type,
+            "value": r.value,
+            "value_len": r.value_len,
+            // Present only for a method declared to return %Status: the decoded verdict, so the
+            // caller does not have to recognise a status string by eye.
+            "status_ok": r.status_ok,
+            "status_text": r.status_text,
+            "args_passed": p.args.len(),
+        })),
+    }
+}
+
+/// What one invocation amounts to, decided from the parsed marker block alone.
+///
+/// A named enum rather than a chain of `if`s inside the async handler, so the precedence AND the rule
+/// that an unreassembled field is its OWN outcome are testable without a connection. The `if
+/// r.truncated` this replaces had no test at all: reaching it needs a live short read, which is
+/// exactly the shape of branch that gets written once and never exercised.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// The method raised. Its text may itself have arrived incomplete.
+    Threw,
+    /// IRIS measured the return value longer than what arrived.
+    ValueTruncated,
+    /// IRIS measured the decoded `%Status` chain longer than what arrived (#347).
+    StatusTextUnreassembled,
+    /// Everything arrived. Report the result.
+    Answered,
+}
+
+/// The precedence: what the METHOD did comes before what the transport did to it, and a value that
+/// did not arrive comes before a status text that did not, because the value is the answer.
+pub fn classify(r: &InvokeResult) -> Outcome {
     if !r.error.is_empty() {
-        return crate::tools::envelope::fail_with(
-            "METHOD_THREW",
-            &format!("'{class}::{method}' raised: {}", r.error),
-            serde_json::json!({
-                "class": class, "method": method, "namespace": namespace,
-                "return_type": r.return_type, "error_detail": r.error,
-            }),
-        );
+        Outcome::Threw
+    } else if r.truncated {
+        Outcome::ValueTruncated
+    } else if r.status_text_truncated {
+        Outcome::StatusTextUnreassembled
+    } else {
+        Outcome::Answered
     }
+}
 
-    // IRIS measured the value longer than what arrived. Reporting the short value as the
-    // answer is the failure mode worth refusing outright.
-    if r.truncated {
-        return crate::tools::envelope::fail_with(
-            "VALUE_TRUNCATED",
-            &format!(
-                "'{class}::{method}' returned {} characters but only {} arrived, so the value \
-                 is incomplete and is not reported as the result.",
-                r.value_len.unwrap_or(0),
-                r.value.chars().count()
-            ),
-            serde_json::json!({
-                "class": class, "method": method, "namespace": namespace,
-                "value_len": r.value_len, "received_len": r.value.chars().count(),
-            }),
-        );
-    }
+/// A `<...>` thrown inside the method is the method's answer, not a transport failure, so it is
+/// reported as a named outcome rather than swallowed into the value.
+fn report_threw(
+    class: &str,
+    method: &str,
+    namespace: &str,
+    r: &InvokeResult,
+) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+    // `ex.DisplayString()` of a %Exception.StatusException carrying a chained %Status is
+    // CRLF-joined, so the exception text is multi-line too (#347). If less of it arrived than
+    // IRIS declared, say so — a prefix of an exception message reads exactly like the whole one.
+    let cut = if r.error_truncated {
+        format!(
+            " [INCOMPLETE: IRIS declared {} characters of exception text and {} arrived, so the \
+             text above is a PREFIX, not the whole exception]",
+            r.error_len.unwrap_or(0),
+            r.error.chars().count(),
+        )
+    } else {
+        String::new()
+    };
+    crate::tools::envelope::fail_with(
+        "METHOD_THREW",
+        &format!("'{class}::{method}' raised: {}{cut}", r.error),
+        serde_json::json!({
+            "class": class, "method": method, "namespace": namespace,
+            "return_type": r.return_type, "error_detail": r.error,
+            "error_detail_complete": !r.error_truncated,
+            "error_detail_len": r.error_len,
+        }),
+    )
+}
 
-    crate::tools::envelope::ok_json(serde_json::json!({
-        "success": true,
-        "class": class,
-        "method": method,
-        "namespace": namespace,
-        // "value" | "status" | "oref" | "void" — what the DECLARED return type made this.
-        "kind": r.kind,
-        "return_type": r.return_type,
-        "value": r.value,
-        "value_len": r.value_len,
-        // Present only for a method declared to return %Status: the decoded verdict, so the
-        // caller does not have to recognise a status string by eye.
-        "status_ok": r.status_ok,
-        "status_text": r.status_text,
-        "args_passed": p.args.len(),
-    }))
+/// IRIS measured the value longer than what arrived. Reporting the short value as the answer is the
+/// failure mode worth refusing outright.
+fn report_value_truncated(
+    class: &str,
+    method: &str,
+    namespace: &str,
+    r: &InvokeResult,
+) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+    crate::tools::envelope::fail_with(
+        "VALUE_TRUNCATED",
+        &format!(
+            "'{class}::{method}' returned {} characters but only {} arrived, so the value \
+             is incomplete and is not reported as the result.",
+            r.value_len.unwrap_or(0),
+            r.value.chars().count()
+        ),
+        serde_json::json!({
+            "class": class, "method": method, "namespace": namespace,
+            "value_len": r.value_len, "received_len": r.value.chars().count(),
+        }),
+    )
+}
+
+/// The same refusal, for the decoded `%Status` chain (#347). A chain whose later elements did not
+/// arrive is not a shorter error message: on a start or checkout failure the first element is
+/// frequently a generic wrapper and the specific cause is the one further down, so reporting the
+/// prefix as the status text would hand the caller the least useful half and call it complete.
+fn report_status_text_unreassembled(
+    class: &str,
+    method: &str,
+    namespace: &str,
+    r: &InvokeResult,
+) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+    let (code, message) = status_text_truncated_report(
+        class,
+        method,
+        r.status_text_len.unwrap_or(0),
+        r.status_text.chars().count(),
+    );
+    crate::tools::envelope::fail_with(
+        code,
+        &message,
+        serde_json::json!({
+            "class": class, "method": method, "namespace": namespace,
+            "kind": r.kind, "return_type": r.return_type,
+            "status_ok": r.status_ok,
+            "status_text_len": r.status_text_len,
+            "received_len": r.status_text.chars().count(),
+            // NOT `status_text`: the caller must not read a prefix under the name of the whole field.
+            "status_text_partial": r.status_text,
+        }),
+    )
 }
 
 #[cfg(test)]
@@ -546,19 +741,158 @@ mod tests {
         assert!(code.contains("$classmethod(\"App.U\",\"Go\")"), "{code}");
     }
 
+    /// The fixture is the shape `build_invoke_code` actually emits, declaration lines included.
     #[test]
     fn the_parser_reads_every_field() {
         let out = "IEM_KIND\tstatus\nIEM_RETURN_TYPE\t%Status\nIEM_STATUS_OK\t0\n\
-                   IEM_STATUS_TEXT\tERROR #5001: boom\nIEM_ERROR\t\nIEM_VALUE_LEN\t3\n\
+                   IEM_STATUS_TEXT_LEN\t17\nIEM_STATUS_TEXT\tERROR #5001: boom\n\
+                   IEM_ERROR_LEN\t0\nIEM_ERROR\t\nIEM_VALUE_LEN\t3\n\
                    IEM_VALUE\t0 e\n";
         let r = parse_invoke_output(out);
         assert_eq!(r.kind, "status");
         assert_eq!(r.return_type, "%Status");
         assert_eq!(r.status_ok, Some(false));
         assert_eq!(r.status_text, "ERROR #5001: boom");
+        assert!(!r.status_text_truncated);
+        assert_eq!(r.error, "");
         assert_eq!(r.value, "0 e");
         assert_eq!(r.value_len, Some(3));
         assert!(!r.truncated);
+    }
+
+    /// #347. The lengths are the MEASURED ones: on IRIS 2026.1 and 2025c a two-element chain built
+    /// with `$system.Status.AppendStatus` decodes to 51 characters CRLF-joined, which is 50 once the
+    /// CR is removed — 24 + 1 + 25.
+    #[test]
+    fn every_element_of_a_status_chain_is_reassembled() {
+        let out = "IEM_KIND\tstatus\nIEM_RETURN_TYPE\t%Library.Status\nIEM_STATUS_OK\t0\n\
+                   IEM_STATUS_TEXT_LEN\t50\n\
+                   IEM_STATUS_TEXT\tERROR #5001: first cause\n\
+                   IEM_STATUS_TEXT\tERROR #5001: second cause\n\
+                   IEM_ERROR_LEN\t0\nIEM_ERROR\t\nIEM_VALUE_LEN\t0\nIEM_VALUE\t\n";
+        let r = parse_invoke_output(out);
+        assert_eq!(
+            r.status_text, "ERROR #5001: first cause\nERROR #5001: second cause",
+            "both elements must arrive, newline-joined"
+        );
+        assert_eq!(r.status_text_len, Some(50));
+        assert!(
+            !r.status_text_truncated,
+            "50 declared, 50 present: {:?}",
+            r.status_text
+        );
+    }
+
+    /// The third case. A chain whose later elements did not arrive is not a shorter error message —
+    /// it must be reportable as unreassembled, or the caller acts on a prefix that looks whole.
+    #[test]
+    fn a_status_chain_that_arrives_short_is_flagged_not_silently_shortened() {
+        let out = "IEM_STATUS_TEXT_LEN\t50\nIEM_STATUS_TEXT\tERROR #5001: first cause\n\
+                   IEM_VALUE_LEN\t0\nIEM_VALUE\t\n";
+        let r = parse_invoke_output(out);
+        assert!(
+            r.status_text_truncated,
+            "IRIS declared 50 characters of chain and 24 arrived: {r:?}"
+        );
+        assert_eq!(
+            r.status_text, "ERROR #5001: first cause",
+            "what arrived is still reported, as the partial it is"
+        );
+    }
+
+    /// The sibling field. `ex.DisplayString()` of a %Exception.StatusException carrying a chained
+    /// %Status is CRLF-joined too — measured at 46 characters for a two-element chain, 45 with the CR
+    /// removed (22 + 1 + 22). Fixing only `status_text` would have left this one looking correct.
+    #[test]
+    fn every_line_of_a_thrown_exception_is_reassembled() {
+        let out = "IEM_KIND\tvalue\nIEM_STATUS_TEXT_LEN\t0\nIEM_STATUS_TEXT\t\n\
+                   IEM_ERROR_LEN\t45\n\
+                   IEM_ERROR\tERROR #5001: throw one\n\
+                   IEM_ERROR\tERROR #5001: throw two\n\
+                   IEM_VALUE_LEN\t0\nIEM_VALUE\t\n";
+        let r = parse_invoke_output(out);
+        assert_eq!(
+            r.error, "ERROR #5001: throw one\nERROR #5001: throw two",
+            "the exception text is a chain as well"
+        );
+        assert!(!r.error_truncated, "{r:?}");
+    }
+
+    /// A field with no declaration must be reported as it arrived, NOT cut to zero. This is the
+    /// direction a defaulted length would break: `unwrap_or(0)` would empty every field.
+    #[test]
+    fn an_undeclared_field_is_kept_whole_rather_than_cut() {
+        let out = "IEM_STATUS_TEXT\tERROR #5001: boom\nIEM_VALUE\tx\n";
+        let r = parse_invoke_output(out);
+        assert_eq!(r.status_text, "ERROR #5001: boom");
+        assert_eq!(r.status_text_len, None);
+        assert!(
+            !r.status_text_truncated,
+            "absence of a count is not a short read"
+        );
+    }
+
+    /// The VALUE field is arbitrary method output and comes last on purpose. A line of it that
+    /// begins with another marker's literal must stay part of the value — reading it as that field
+    /// is how a truncation would have become a corruption.
+    ///
+    /// The canary is `IEM_KIND`, and deliberately not `IEM_ERROR`. `IEM_ERROR` HAS a declared length,
+    /// and when the first version of this test injected an `IEM_ERROR` line into the value the
+    /// unbounded-scan mutant SURVIVED: the injected text was appended, then cut back to the declared
+    /// 0 characters, and `error.is_empty()` passed for entirely the wrong reason. `IEM_KIND` carries
+    /// no declaration, so nothing can mask an overwrite of it.
+    #[test]
+    fn a_marker_literal_inside_the_value_is_not_read_as_a_field() {
+        let out = "IEM_KIND\tvalue\nIEM_STATUS_TEXT_LEN\t0\nIEM_STATUS_TEXT\t\n\
+                   IEM_ERROR_LEN\t0\nIEM_ERROR\t\n\
+                   IEM_VALUE_LEN\t47\nIEM_VALUE\tline1\nIEM_KIND\tcorrupted\n\
+                   IEM_ERROR\tnot an error\n";
+        let r = parse_invoke_output(out);
+        assert_eq!(
+            r.kind, "value",
+            "a line of the VALUE overwrote the kind field: {r:?}"
+        );
+        assert!(
+            r.error.is_empty(),
+            "a line of the VALUE was parsed as the error field: {r:?}"
+        );
+        assert_eq!(
+            r.value, "line1\nIEM_KIND\tcorrupted\nIEM_ERROR\tnot an error",
+            "the value must arrive verbatim, marker literals and all"
+        );
+        assert!(!r.truncated, "{r:?}");
+    }
+
+    /// Codegen. Both assertions name the marker WITH its tab: a bare `"IEM_STATUS_TEXT"` is also a
+    /// prefix of `IEM_STATUS_TEXT_LEN`, so a check without the separator would be satisfied by the
+    /// declaration line alone and stay green with every per-line write deleted.
+    #[test]
+    fn the_status_chain_is_written_one_marker_line_per_line() {
+        let meta = MethodMeta {
+            found: true,
+            return_type: "%Status".into(),
+            is_class_method: true,
+        };
+        let code = build_invoke_code("Ens.Director", "StartProduction", &[], &meta);
+        assert!(
+            code.contains("write \"IEM_STATUS_TEXT_LEN\"_$CHAR(9)_$LENGTH(tStatusText)_$CHAR(10)"),
+            "the chain's character count must be declared: {code}"
+        );
+        assert!(
+            code.contains("$PIECE(tStatusText,$CHAR(10),tMLI)"),
+            "the chain must be written one piece per line, or elements 2..n are lost: {code}"
+        );
+        assert!(
+            code.contains("write \"IEM_ERROR_LEN\"_$CHAR(9)_$LENGTH(tErr)_$CHAR(10)")
+                && code.contains("$PIECE(tErr,$CHAR(10),tMLI)"),
+            "the exception text is a chain too and gets the same treatment: {code}"
+        );
+        // CR must be removed before the count is taken, or the declaration counts characters the
+        // reader never sees and every chain reports as a short read.
+        assert!(
+            code.contains("set tStatusText=$TRANSLATE(tStatusText,$CHAR(13))"),
+            "{code}"
+        );
     }
 
     /// A value containing newlines is why the VALUE marker is last and length-prefixed.
@@ -610,6 +944,73 @@ mod tests {
         assert_eq!(
             r.status_ok, None,
             "a non-status method has no status, which is not the same as a failed one"
+        );
+    }
+
+    /// The WIRING. `classify` exists because the `if r.status_text_truncated` it replaced survived a
+    /// mutation: the mapping was tested, the decision to use it was not, and a handler `if` reachable
+    /// only through a live short read is a branch nothing ever runs.
+    #[test]
+    fn an_unreassembled_status_chain_is_its_own_outcome_not_an_answer() {
+        let mut r = InvokeResult {
+            kind: "status".into(),
+            status_ok: Some(false),
+            status_text: "ERROR #5001: first cause".into(),
+            status_text_len: Some(50),
+            status_text_truncated: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            classify(&r),
+            Outcome::StatusTextUnreassembled,
+            "a chain that did not arrive whole must not be reported as an answer"
+        );
+        assert_ne!(classify(&r), Outcome::Answered);
+
+        // CONTROL: the same result with the chain complete IS an answer. Without this, "classify
+        // always returns StatusTextUnreassembled" would satisfy the assertion above.
+        r.status_text_truncated = false;
+        assert_eq!(classify(&r), Outcome::Answered);
+    }
+
+    /// Precedence. What the METHOD did outranks what the transport did to the report of it, and a
+    /// value that did not arrive outranks a status text that did not, because the value is the answer.
+    #[test]
+    fn the_outcome_precedence_puts_the_method_first_and_the_value_before_the_status_text() {
+        let threw = InvokeResult {
+            error: "<UNDEFINED> zzz".into(),
+            truncated: true,
+            status_text_truncated: true,
+            ..Default::default()
+        };
+        assert_eq!(classify(&threw), Outcome::Threw);
+
+        let cut_value = InvokeResult {
+            truncated: true,
+            status_text_truncated: true,
+            ..Default::default()
+        };
+        assert_eq!(classify(&cut_value), Outcome::ValueTruncated);
+
+        assert_eq!(classify(&InvokeResult::default()), Outcome::Answered);
+    }
+
+    /// The third case must reach the caller as its OWN code, not as a shorter status text under
+    /// `success: true`, and the message must carry both numbers so the caller can see how much is
+    /// missing. Both halves asserted: a right message under the wrong code is still a false answer.
+    #[test]
+    fn an_unreassembled_status_chain_gets_its_own_error_code_and_both_numbers() {
+        let (code, msg) = status_text_truncated_report("Ens.Director", "StartProduction", 50, 24);
+        assert_eq!(code, "STATUS_TEXT_TRUNCATED");
+        assert_ne!(
+            code, "VALUE_TRUNCATED",
+            "the value and the status text are different fields"
+        );
+        assert!(msg.contains("50") && msg.contains("24"), "{msg}");
+        assert!(msg.contains("Ens.Director::StartProduction"), "{msg}");
+        assert!(
+            msg.contains("status_text_partial"),
+            "the caller must be told where the partial went: {msg}"
         );
     }
 
