@@ -68,6 +68,20 @@ TEMPLATE = """<!DOCTYPE html>
 </html>"""
 
 
+def _render_version(run: dict) -> str:
+    """Render the version for the report header, saying WHY when it is not known.
+
+    `iris_dev_version` is null when the version could not be read, and the reason travels beside it
+    in `iris_dev_version_error`. Rendering the reason keeps the report honest: a header reading
+    "iris-dev unknown" looked like a version string and hid a server that never ran.
+    """
+    value = run.get("iris_dev_version")
+    if value:
+        return value
+    detail = run.get("iris_dev_version_error")
+    return f"version unavailable — {detail}" if detail else "version unavailable"
+
+
 def generate_report(scores_path: str, output_path: str = None):
     with open(scores_path) as f:
         run = json.load(f)
@@ -114,7 +128,7 @@ def generate_report(scores_path: str, output_path: str = None):
 
     html = TEMPLATE.format(
         run_id=run["run_id"],
-        version=run.get("iris_dev_version", "?"),
+        version=_render_version(run),
         task_count=len(run.get("tasks", [])),
         mean_a=mean_a,
         mean_b=mean_b,
