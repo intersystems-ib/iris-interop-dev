@@ -758,14 +758,42 @@ async fn handle_put(
                 &iris.username,
                 &iris.password,
             );
-            if let Ok(out) = iris
+            // #342: this was `if let Ok(out) = ...`, which skipped the WHOLE block on an Err —
+            // a transport failure, a 401, a timeout — and fell through to `checkout_cache.mark`
+            // below, recording a checkout that never happened and then writing on that basis. The
+            // comment above explains why AfterUserAction is called at all: without it the write
+            // hits ERROR #5865 "not checked out of source control". When the call FAILS we got
+            // exactly that, plus a cache entry that makes the next write skip its pre-write probe.
+            //
+            // The sibling at scm.rs already had a real Err arm. Two call sites for one operation,
+            // one of which checked the error — and the correct one made this one look considered.
+            match iris
                 .execute_via_generator(&after_code, &pending.namespace, client)
                 .await
             {
-                let out = out.lines().next().unwrap_or("").trim().to_string();
-                // Non-empty output from after_user_action_code is an SCM error string.
-                if !out.is_empty() && out != "SCM_UNAVAILABLE" {
-                    return err_json("SCM_CHECKOUT_FAILED", &out);
+                Err(e) => {
+                    return err_json(
+                        crate::tools::scm::scm_error_code(&e.to_string()),
+                        &format!(
+                            "The checkout could not be finalized: {e}. The document was NOT \
+                             checked out and nothing was written — a failed AfterUserAction is not \
+                             a committed checkout. Retry, or check the SCM provider."
+                        ),
+                    );
+                }
+                Ok(out) => {
+                    // #342: the FULL output, not `lines().next()`. after_user_action_code ends with
+                    // `write $system.Status.GetErrorText(sc)`, and that returns the WHOLE %Status
+                    // chain CRLF-joined — measured on 2026.1: a 2-error chain came back as
+                    // "ERROR #5001: first cause\r\nERROR #5001: second cause". Taking the first
+                    // line reported error 1 and discarded the rest, and on a checkout failure the
+                    // specific cause is frequently the later element while the first is a generic
+                    // wrapper. Empty still means success here — see the asymmetry pinned by
+                    // `the_two_generators_disagree_about_empty` in scm.rs.
+                    let out = out.trim();
+                    if !out.is_empty() && out != "SCM_UNAVAILABLE" {
+                        return err_json("SCM_CHECKOUT_FAILED", out);
+                    }
                 }
             }
             // Checkout is now committed server-side — cache it so writes that follow

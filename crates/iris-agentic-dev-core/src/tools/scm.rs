@@ -23,7 +23,10 @@ fn err_json(code: &str, msg: &str) -> Result<rmcp::model::CallToolResult, rmcp::
 /// still right when the SCM session genuinely could not start; it is not right for a 401,
 /// a 403, or a closed port, and those three now say what they are and carry the hint that
 /// goes with them.
-fn scm_error_code(msg: &str) -> &'static str {
+// pub(crate) since #342: the elicitation-resume path in doc.rs finalizes a checkout too and must
+// classify a failed AfterUserAction the same way this module does. One classifier, not two — the
+// duplication that hid #342 in the first place was two call sites disagreeing about error handling.
+pub(crate) fn scm_error_code(msg: &str) -> &'static str {
     crate::tools::interop::classify_iris_error_or(msg, "SCM_UNAVAILABLE")
 }
 
@@ -389,9 +392,18 @@ pub async fn handle_iris_source_control(
                     after_user_action_code("%CheckOut", doc, "yes", &iris.username, &iris.password);
                 match xecute(iris, client, &after_code, ns).await {
                     Ok(o) => {
-                        let aout = o.lines().next().unwrap_or("").trim().to_string();
+                        // #342: the FULL output, not `lines().next()`. This generator ends with
+                        // `write $system.Status.GetErrorText(sc)`, which returns the whole %Status
+                        // chain CRLF-joined — measured on 2026.1, a 2-error chain came back as
+                        // "ERROR #5001: first cause\r\nERROR #5001: second cause". Reporting line 1
+                        // discarded the rest, and the specific cause of a checkout failure is
+                        // frequently the later element.
+                        //
+                        // Empty still means success: GetErrorText is "" for an OK status, which is
+                        // the asymmetry `the_two_generators_disagree_about_empty` pins.
+                        let aout = o.trim();
                         if !aout.is_empty() && aout != "SCM_UNAVAILABLE" {
-                            return err_json("SCM_CHECKOUT_FAILED", &aout);
+                            return err_json("SCM_CHECKOUT_FAILED", aout);
                         }
                     }
                     Err(e) => return err_json(scm_error_code(&e.to_string()), &e.to_string()),
