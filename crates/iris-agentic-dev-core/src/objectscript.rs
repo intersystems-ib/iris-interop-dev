@@ -84,6 +84,68 @@ pub fn os_stream_write_stmts(stream_var: &str, payload: &str, chunk_chars: usize
         .collect()
 }
 
+/// What the declaration line of a [`write_marker_lines`] block declares — and therefore what the
+/// reader can check the arrival against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Declared {
+    /// The exact character count of the whole field, newline separators included. Catches a missing
+    /// line AND a last line that arrived half-written.
+    Chars,
+    /// The number of lines. Weaker than [`Declared::Chars`], and the right choice for a reader that
+    /// TRIMS each line before matching it: a trimmed line no longer carries the character count it
+    /// was measured with, so a character declaration would report a false short read.
+    Lines,
+}
+
+/// Generated ObjectScript that carries `var`'s value through a LINE-ORIENTED marker protocol
+/// intact, whatever newlines it contains: one `line_marker`-prefixed line per line of the value,
+/// preceded by one `declaration_marker` line saying how much there is to reassemble.
+///
+/// This exists because of `$SYSTEM.Status.GetErrorText`. On a chained `%Status` it returns the WHOLE
+/// chain CRLF-joined. Measured on IRIS 2026.1 and 2025c, a two-element chain built with
+/// `$system.Status.AppendStatus` decodes to 51 characters in two CRLF-separated pieces:
+///
+/// ```text
+/// ERROR #5001: first cause<CR><LF>ERROR #5001: second cause
+/// ```
+///
+/// Written as a single marker line, element 1 is captured by the reader's `strip_prefix` arm and
+/// elements 2..n land on lines that match no arm at all and are dropped silently — no error, no log
+/// line, no shortened-output marker. Worse, a dropped line that happens to begin with ANOTHER
+/// marker's literal is parsed as that field, so the loss becomes corruption.
+///
+/// Repeating the marker closes both: every line of the value is attributed to this field, and no
+/// content of it can be mistaken for another one. The declaration is what makes a SHORT arrival
+/// detectable, so the reader can report "I could not reassemble this" as its own case instead of a
+/// shorter-but-plausible value — the mechanism `IEM_VALUE_LEN` already proves for
+/// `iris_execute_method`'s return value.
+///
+/// CR is deleted first, so the declaration is measured on exactly what the reader reassembles: the
+/// reader joins the lines with `\n`, and Rust's `str::lines()` has already dropped any `\r` for it.
+/// Deleting rather than translating means a LONE CR (no LF) joins two elements instead of splitting
+/// them — content is preserved either way, and `GetErrorText` uses CRLF.
+///
+/// One statement per line, because `IrisConnection::build_exec_class` splits generated code on
+/// `\n`: the `for` loop and its body must stay on one line.
+pub fn write_marker_lines(
+    var: &str,
+    declaration_marker: &str,
+    line_marker: &str,
+    declared: Declared,
+) -> String {
+    let n = match declared {
+        Declared::Chars => format!("$LENGTH({var})"),
+        Declared::Lines => format!("$LENGTH({var},$CHAR(10))"),
+    };
+    format!(
+        "set {var}=$TRANSLATE({var},$CHAR(13))\n\
+         write {decl}_{n}_$CHAR(10)\n\
+         for tMLI=1:1:$LENGTH({var},$CHAR(10)) {{ write {line}_$PIECE({var},$CHAR(10),tMLI)_$CHAR(10) }}",
+        decl = os_str_expr(declaration_marker),
+        line = os_str_expr(line_marker),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,6 +244,42 @@ mod tests {
                 "unbalanced quotes in {expr}"
             );
         }
+    }
+
+    /// The block must repeat the marker per line and declare a count — those two together are what
+    /// make a chain carryable and a short arrival detectable.
+    #[test]
+    fn marker_lines_repeat_the_marker_and_declare_a_count() {
+        let b = write_marker_lines("tX", "M_LEN\t", "M\t", Declared::Chars);
+        // CR removed before measuring, or the declaration counts characters the reader never sees.
+        assert!(b.contains("set tX=$TRANSLATE(tX,$CHAR(13))"), "{b}");
+        // The declaration is the CHARACTER count, not the line count.
+        assert!(
+            b.contains("write \"M_LEN\"_$CHAR(9)_$LENGTH(tX)_$CHAR(10)"),
+            "{b}"
+        );
+        // One write per line, driven by $PIECE — this is what carries element 2..n at all.
+        assert!(
+            b.contains("for tMLI=1:1:$LENGTH(tX,$CHAR(10)) {")
+                && b.contains("_$PIECE(tX,$CHAR(10),tMLI)_"),
+            "the value must be written one line per piece: {b}"
+        );
+        // Every generated statement on its own line: build_exec_class splits on '\n'.
+        assert_eq!(b.lines().count(), 3, "{b}");
+    }
+
+    /// `Declared::Lines` is the variant for a reader that trims; it must declare a piece COUNT.
+    #[test]
+    fn a_line_declaration_counts_pieces_not_characters() {
+        let b = write_marker_lines("tX", "M_LINES:", "M:", Declared::Lines);
+        assert!(
+            b.contains("write \"M_LINES:\"_$LENGTH(tX,$CHAR(10))_$CHAR(10)"),
+            "{b}"
+        );
+        assert!(
+            !b.contains("_$LENGTH(tX)_"),
+            "a Lines declaration must not emit the character count: {b}"
+        );
     }
 
     #[test]
