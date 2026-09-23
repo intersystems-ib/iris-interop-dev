@@ -138,6 +138,11 @@ run skips it**. Validate a branch with `gh workflow run CI --ref <branch>`.
 - **Mutation-check every new assertion.** Break the thing it guards, watch it go red, restore it,
   confirm it goes green. Print "applied" when the mutation lands: a mutation that never applied and a
   genuinely surviving mutant print identical output.
+- **Capture the mutation run's FULL output, not just `test result:`.** There is a third case that
+  looks like both of the above: a mutation that applied and did not COMPILE. It prints no
+  `test result:` line at all, so a harness that greps for one reports the same silence as a survivor.
+  Two mutations in #329 landed there — a crude text splice produced invalid Rust, and the harness had
+  discarded the compiler's output. Keep the log, and read the exit code.
 - **A mutation must change behaviour, not a string an assertion greps for.** Several tests here
   necessarily assert on the *text* of generated ObjectScript. A mutation that inserts the exact
   literal such an assertion forbids is circular — its red is guaranteed by construction, and it is
