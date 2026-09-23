@@ -327,6 +327,7 @@ pub mod search;
 pub mod skills_tools;
 pub mod sql_lint;
 pub mod sql_mode;
+pub mod stream_inspect;
 pub mod symbols_local;
 pub mod unittest_result;
 pub mod wildcard;
@@ -406,6 +407,7 @@ pub const INTEROP_TOOLS: &[&str] = &[
     "iris_compile",
     "iris_test",
     "iris_coverage",
+    "stream_inspect",
     // diagnostics / introspection
     "iris_symbols",
     "docs_introspect",
@@ -4517,6 +4519,10 @@ const GENERATOR_WRITE_TOOLS: &[&str] = &[
     "iris_gateway_manage",
     "iris_message_body",
     "iris_production_diff",
+    // #352: reads a stream through a scratch class, because %Stream.GlobalCharacter has no SQL
+    // projection to read a body through. Read-only in intent — nothing here writes to the stream —
+    // but honest about the scratch class, which is what this list is for.
+    "stream_inspect",
     // iris_gateway_query and iris_table_info each already carry an explicit `=> None` arm in
     // `mutating_call`, reasoned about the REMOTE database being opened SetReadOnly(1) with
     // SELECT-only grants. That reasoning is correct and does not reach the local scratch class,
@@ -4584,6 +4590,7 @@ pub(crate) fn mutating_call(tool: &str, args: &serde_json::Value) -> Option<&'st
         // is instance-wide, exclusive, and degrades performance for every process while it runs —
         // so this is mutating even for a test suite that only reads.
         "iris_coverage" => Some("run tests under the line-by-line monitor"),
+        "stream_inspect" => Some("read a stream by id"),
         // Every action of this tool writes a credential.
         "iris_credential_manage" => Some("change credentials"),
 
@@ -4799,6 +4806,7 @@ pub(crate) const CLASSIFIED_TOOLS: &[&str] = &[
     "iris_business_rule_info",
     "iris_compile",
     "iris_coverage",
+    "stream_inspect",
     "iris_credential_list",
     "iris_credential_manage",
     "iris_debug",
@@ -6868,6 +6876,52 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
         .await;
         self.record_call("iris_doc", Self::call_ok(&result));
         result
+    }
+
+    #[tool(
+        description = "Read an IRIS stream by id — size first, then up to max_chars of its content. THE question it answers: a relay wrote an empty file, so is the body empty or was it never written? An id that opens nothing reports STREAM_NOT_FOUND and says out loud that this is NOT an empty stream; a stream that opened and holds nothing reports size 0 with empty: true. Those are different answers and they send you to different places. Read-only: nothing here writes to the stream, and read position is per-instance in IRIS (measured), so inspecting does not consume what a later reader needs. The body arrives whole however many newlines it contains — an HL7 v2 message is CR-separated — and `body_incomplete` says so if less arrived than IRIS declared. Only max_chars are read, never the whole stream, so a multi-megabyte body is inspectable rather than failing <MAXSTRING>; `truncated` plus `size` tell you it is a prefix. A binary stream reports its size and omits its bytes, because bytes cannot cross a text protocol intact. stream_id is the stream's %Id. namespace: optional — defaults to the connection namespace."
+    )]
+    async fn stream_inspect(
+        &self,
+        Parameters(p): Parameters<stream_inspect::StreamInspectParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let iris = self.get_iris_reloaded().await?;
+        let client = self.http_client();
+        let namespace = interop::resolve_namespace(p.namespace.as_deref(), Some(&iris));
+        let id = p.stream_id.trim().to_string();
+        if id.is_empty() {
+            self.record_call("stream_inspect", false);
+            return envelope::fail(
+                "MISSING_PARAMS",
+                "stream_inspect needs the stream's %Id in `stream_id` (oid and id are also                  accepted). Nothing was sent, so nothing was opened.",
+            );
+        }
+        let code = stream_inspect::build_inspect_code(&id, p.max_chars);
+        let out = match iris.execute_via_generator(&code, &namespace, client).await {
+            Ok(out) => out,
+            Err(e) => {
+                self.record_call("stream_inspect", false);
+                return envelope::transport_fail("stream_inspect", &e.to_string());
+            }
+        };
+        let read = stream_inspect::parse_inspect_output(&out);
+        let payload = stream_inspect::payload(&id, p.max_chars, &read);
+        match &read {
+            stream_inspect::StreamRead::Read { .. } => {
+                self.record_call("stream_inspect", true);
+                ok_json(payload)
+            }
+            // A stream that could not be opened or read is a FAILURE, not a stream with no content.
+            _ => {
+                self.record_call("stream_inspect", false);
+                let code = payload["error_code"]
+                    .as_str()
+                    .unwrap_or("STREAM_UNREADABLE")
+                    .to_string();
+                let msg = payload["error"].as_str().unwrap_or("").to_string();
+                envelope::fail_with(&code, &msg, payload)
+            }
+        }
     }
 
     #[tool(
@@ -11920,10 +11974,15 @@ mod tool_annotation_tests {
     #[test]
     fn the_read_only_split_is_pinned_per_toolset() {
         for (label, ts, total, ro_expected) in [
-            ("interop", Toolset::Interop, 32_usize, 9_usize),
-            ("nostub", Toolset::Nostub, 57, 34),
-            ("merged", Toolset::Merged, 53, 29),
-            ("baseline", Toolset::Baseline, 61, 38),
+            // #352: every row is +1 for `stream_inspect`, which every toolset picks up. The
+            // read-only figures are UNCHANGED and that is the measured point, not an oversight: it
+            // is in GENERATOR_WRITE_TOOLS because it reads a stream through a scratch class, so it
+            // is honestly not advertised readOnlyHint:true even though it writes nothing to the
+            // stream. Recorded by running the gate row by row, not by arithmetic.
+            ("interop", Toolset::Interop, 33_usize, 9_usize),
+            ("nostub", Toolset::Nostub, 58, 34),
+            ("merged", Toolset::Merged, 54, 29),
+            ("baseline", Toolset::Baseline, 62, 38),
         ] {
             let t = IrisTools::new_with_toolset(None, ts).expect("build");
             let all = t.advertised_tools();

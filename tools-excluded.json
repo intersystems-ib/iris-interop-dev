@@ -1,10 +1,10 @@
 {
-  "$schema_note": "#353: why each upstream tool is NOT in the interop profile. The mechanical half — which upstream tools we ported and pruned versus never ported — is COMPUTED by scripts/validate-tools.sh from the two trees. This file records only the JUDGEMENT: why the fork does not advertise it. Keep no counts here; a count in this file would be a second source of truth for something a command already prints, and every prose count in this repo has gone stale (#359).",
+  "$schema_note": "#353: why each upstream tool is NOT in the interop profile. The mechanical half \u2014 which upstream tools we ported and pruned versus never ported \u2014 is COMPUTED by scripts/validate-tools.sh from the two trees. This file records only the JUDGEMENT: why the fork does not advertise it. Keep no counts here; a count in this file would be a second source of truth for something a command already prints, and every prose count in this repo has gone stale (#359).",
   "categories": {
     "unsafe-here": "The capability lets an agent damage an instance or reach past what this fork is for, and no interop task needs it. Excluded on purpose; not a candidate.",
-    "not-interop": "A legitimate upstream capability outside this fork's interoperability remit — instance administration, the server registry, the skill/KB machinery, agent telemetry. Excluded on scope, not on merit.",
+    "not-interop": "A legitimate upstream capability outside this fork's interoperability remit \u2014 instance administration, the server registry, the skill/KB machinery, agent telemetry. Excluded on scope, not on merit.",
     "covered-here": "This fork already answers the same question through a tool it does advertise. Adopting it would give a caller two ways to ask one thing.",
-    "wanted": "Would help interop work and is not excluded on principle — only not adopted yet. `tracking` names where the decision is being made."
+    "wanted": "Would help interop work and is not excluded on principle \u2014 only not adopted yet. `tracking` names where the decision is being made."
   },
   "tools": {
     "global_kill": {
@@ -31,10 +31,9 @@
       "category": "unsafe-here",
       "why": "Closes the persistent terminal session. Excluded with the capability it belongs to."
     },
-
     "iris_admin": {
       "category": "not-interop",
-      "why": "Instance administration dispatcher — users, roles, databases, webapps, locks, processes. Interop work needs none of it, and its write actions reach far outside a production."
+      "why": "Instance administration dispatcher \u2014 users, roles, databases, webapps, locks, processes. Interop work needs none of it, and its write actions reach far outside a production."
     },
     "iris_namespace_create": {
       "category": "not-interop",
@@ -46,7 +45,7 @@
     },
     "iris_database_stats": {
       "category": "not-interop",
-      "why": "Database disk usage. Same axis as iris_database_list — storage administration."
+      "why": "Database disk usage. Same axis as iris_database_list \u2014 storage administration."
     },
     "iris_mirror_status": {
       "category": "not-interop",
@@ -54,7 +53,7 @@
     },
     "iris_system_performance": {
       "category": "not-interop",
-      "why": "SystemPerformance (pbuttons) profiles and runs — whole-instance performance profiling, read by a person diagnosing the platform rather than the integration."
+      "why": "SystemPerformance (pbuttons) profiles and runs \u2014 whole-instance performance profiling, read by a person diagnosing the platform rather than the integration."
     },
     "query_audit_log": {
       "category": "not-interop",
@@ -62,7 +61,7 @@
     },
     "journal_search": {
       "category": "not-interop",
-      "why": "Journal SetKill records. A recovery and forensics instrument for the database, not a view of a production's message flow — iris_interop_query answers that."
+      "why": "Journal SetKill records. A recovery and forensics instrument for the database, not a view of a production's message flow \u2014 iris_interop_query answers that."
     },
     "iris_servers": {
       "category": "not-interop",
@@ -82,7 +81,7 @@
     },
     "iris_test_server": {
       "category": "not-interop",
-      "why": "Probes a REGISTERED server for reachability. The fork's equivalent question — is the configured instance answering — is what check_config and the IRIS_UNREACHABLE envelope already report."
+      "why": "Probes a REGISTERED server for reachability. The fork's equivalent question \u2014 is the configured instance answering \u2014 is what check_config and the IRIS_UNREACHABLE envelope already report."
     },
     "iris_reload_pool": {
       "category": "not-interop",
@@ -90,7 +89,7 @@
     },
     "iris_containers": {
       "category": "not-interop",
-      "why": "Container lifecycle — list, select, start. Provisioning the instance is a step before the work; the fork talks to whatever is already listening."
+      "why": "Container lifecycle \u2014 list, select, start. Provisioning the instance is a step before the work; the fork talks to whatever is already listening."
     },
     "iris_list_containers": {
       "category": "not-interop",
@@ -118,7 +117,7 @@
     },
     "agent_history": {
       "category": "not-interop",
-      "why": "Recent tool calls of the running session — introspection of the agent, not of IRIS."
+      "why": "Recent tool calls of the running session \u2014 introspection of the agent, not of IRIS."
     },
     "agent_info": {
       "category": "not-interop",
@@ -196,10 +195,9 @@
       "category": "not-interop",
       "why": "A superclass-chain diagram for any class. The structural question an interop reviewer asks is the production's topology, which mermaid_production answers and #352 is evaluating."
     },
-
     "iris_source_control": {
       "category": "covered-here",
-      "why": "SCM status, menu, checkout. iris_doc does the checkout itself on every write — including the elicitation dialog when IRIS asks for confirmation — so the caller never has to sequence it."
+      "why": "SCM status, menu, checkout. iris_doc does the checkout itself on every write \u2014 including the elicitation dialog when IRIS asks for confirmation \u2014 so the caller never has to sequence it."
     },
     "debug_source_map": {
       "category": "covered-here",
@@ -217,7 +215,6 @@
       "category": "covered-here",
       "why": "Captures error state plus recent log entries as one bundle. Its two halves are what iris_debug and iris_get_log already return."
     },
-
     "compare_namespace": {
       "category": "wanted",
       "why": "Diffs all classes across two namespaces. The drift report a reviewer writes by hand today, and the fork's own conformance pass needs exactly this answer.",
@@ -228,20 +225,13 @@
       "why": "Diffs one document across two servers. The per-class half of the same drift question, and the direct check for 'the file on disk and the class in IRIS have diverged'.",
       "tracking": "intersystems-ib/iris-interop-dev#351"
     },
-    "stream_inspect": {
-      "category": "wanted",
-      "why": "Reads a stream body by OID. Interop message bodies are streams, so this is a first-class interop read; measured here that a fresh %OpenId reads from the start, so it does not consume what it inspects.",
-      "tracking": "intersystems-ib/iris-interop-dev#352"
-    },
     "iris_generate_test": {
-      "category": "wanted",
-      "why": "Generates a %UnitTest.TestCase for an existing class, introspecting it first. The fork's own workflow is test-first, so the shape is right even though it needs an external model key.",
-      "tracking": "intersystems-ib/iris-interop-dev#352"
+      "category": "not-interop",
+      "why": "Declined on #352's own precondition, which cannot be met: it asks the model to \"Extend %UnitTest.TestCase\", while this fork's tdd skill requires %UnitTest.TestProduction with Parameter PRODUCTION and TestControl neutralised. Its only output check is validate_cls_syntax \u2014 contains \"Class \", contains a brace, braces balanced \u2014 so the shape is a request to an LLM, not a guarantee, and \"verify the output shape before adopting\" has no answer for a non-deterministic generator."
     },
     "mermaid_production": {
-      "category": "wanted",
-      "why": "A flowchart of a production's configured items. The topology is what a reviewer reads first, and nothing advertised here renders it.",
-      "tracking": "intersystems-ib/iris-interop-dev#352"
+      "category": "covered-here",
+      "why": "Declined on measurement: its implementation reads only Ens_Config.Item and draws every item as a child of the production node, so it renders a one-level fan-out with no edge between items. On a real 10-item production, 2 item-to-item edges are knowable from TargetConfigName(s) and 2 more items route through a business rule; the imported diagram would show 0 of those 4. This fork already reads both sources \u2014 items via iris_production_item(list) and targets via get_settings, batched since #372 \u2014 so it can answer a question the port cannot."
     },
     "resolve_storage": {
       "category": "wanted",
@@ -258,7 +248,7 @@
     },
     "iris_info": {
       "category": "wanted",
-      "why": "Read-only namespace discovery — documents, recently modified, namespace config, IRIS version. what=modified answers 'what did I just change', which nothing advertised here does."
+      "why": "Read-only namespace discovery \u2014 documents, recently modified, namespace config, IRIS version. what=modified answers 'what did I just change', which nothing advertised here does."
     },
     "iris_namespace_list": {
       "category": "wanted",
