@@ -59,6 +59,7 @@ const REMEDIES: &[(&str, &str)] = &[
     ("CONTAINER_UNREACHABLE", "the container exists but its web server did not answer; wait for startup to finish and check the web port is published, then retry"),
     ("CREDENTIAL_EXISTS", "a credential of that name is already defined; pick another name, or update the existing one instead of creating it"),
     ("CREDENTIAL_NOT_FOUND", "list the defined credentials with iris_credential_list and use one of those names, or create it first"),
+    ("CURRENT_UNAVAILABLE", "the running item set could not be read, so no comparison is possible; check the production is running and Ens_Config.Item is readable, then retry — an unread current set is not a production with no items"),
     ("DELETE_FAILED", "the delete was attempted and refused; the message carries the server's reason — check for a lock or a dependent item before retrying"),
     ("DOCKER_REQUIRED", "this path needs a reachable Docker daemon and IRIS_CONTAINER set; start the daemon, or use the HTTP path by setting IRIS_HOST and IRIS_WEB_PORT"),
     ("ELICITATION_EXPIRED", "pending dialogs are held for five minutes only; re-run the original write to get a fresh one and confirm it promptly"),
