@@ -4328,6 +4328,42 @@ fn library_frame_hint(abort: &str) -> Option<&'static str> {
     None
 }
 
+/// #323: attach the decoded `%Status` chain to an `iris_execute` payload.
+///
+/// The model hand-writes this decode on every call — 785 of them across 364 transcripts, and the
+/// largest single failure cluster in the workshop cohort. `$SYSTEM.Status.GetErrorText` returns the
+/// whole chain CRLF-joined (measured on IRIS 2026.1; the issue's claim that it reads only the first
+/// element is wrong), so nothing is lost today — but it arrives as one string with no per-error
+/// code, so a caller wanting a remedy for error 6301 has to match a substring of a concatenation.
+/// [`crate::status::decode_chain`] splits it once, here.
+///
+/// **Strictly additive.** It writes exactly one key and only when a chain was recognised:
+///
+/// * `success` is still decided by [`runtime_abort_line`] alone, so a script that PRINTS the words
+///   "ERROR #5002" while succeeding still succeeds — it just also carries the block.
+/// * `output` is untouched, so the caller can still read what was actually printed.
+/// * `hint` is untouched: the slot is contended (#185) and this has no advice to give.
+/// * A recognised chain is by construction an ERROR chain — `GetErrorText` on an OK status returns
+///   "" — so nothing here can produce `ok: true`, and the ABSENCE of the block is not a claim that
+///   the script's status was OK. This path sees only what a script chose to write; it cannot tell
+///   an OK status from no status at all. `iris_execute_method`, which reads IRIS's own `$$$ISOK`,
+///   is the path where `ok: true` is a measured fact (see `execute_method::status_block`).
+///
+/// One function called from both transports, because the same call must not come back structured
+/// over HTTP and unstructured over docker exec — the #105 shape, where a second copy of a path
+/// quietly kept the old behaviour.
+///
+/// Returns whether a block was attached, so a caller can assert on it.
+pub(crate) fn attach_status_chain(resp: &mut serde_json::Value, output: &str) -> bool {
+    match crate::status::decode_chain(output).payload() {
+        Some(status) => {
+            resp["status"] = status;
+            true
+        }
+        None => false,
+    }
+}
+
 fn abort_hint(abort: &str) -> Option<&'static str> {
     // #209: known library frames first — they only match when there is no RunUser+ frame,
     // so this cannot take the slot from a per-line explanation.
@@ -6610,7 +6646,7 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
     }
 
     #[tool(
-        description = "Execute arbitrary ObjectScript code on IRIS and return stdout. Uses pure-HTTP execution: your code is written into the RunUser() method of a temp class, compiled, run at CALL time by an Execute() SqlProc that captures the device output, then the class is deleted. Falls back to docker exec if IRIS_CONTAINER env var is set and HTTP fails. &sql(...) embedded SQL macros are automatically translated to %SQL.Statement calls (set translate_sql: false to disable). When translation fires, response includes sql_translated: true and translated_code. Example: code='write $ZVERSION,!' returns the IRIS version string. Use this for side-effecting ObjectScript only — for SELECTs use iris_query, for class/table introspection use docs_introspect/iris_symbols/iris_table_info, for production state use iris_production/iris_interop_query, and to create+compile a class use iris_doc(put,compile) over Atelier (never $SYSTEM.OBJ.Load from a file path — that needs IRIS to share this host's disk). When the code matches one of those, the response includes a `hint` naming the typed tool. namespace: optional — defaults to the connection namespace (IRIS_NAMESPACE), never a hardcoded USER; the response echoes the namespace it ran in."
+        description = "Execute arbitrary ObjectScript code on IRIS and return stdout. Uses pure-HTTP execution: your code is written into the RunUser() method of a temp class, compiled, run at CALL time by an Execute() SqlProc that captures the device output, then the class is deleted. Falls back to docker exec if IRIS_CONTAINER env var is set and HTTP fails. &sql(...) embedded SQL macros are automatically translated to %SQL.Statement calls (set translate_sql: false to disable). When translation fires, response includes sql_translated: true and translated_code. Example: code='write $ZVERSION,!' returns the IRIS version string. Use this for side-effecting ObjectScript only — for SELECTs use iris_query, for class/table introspection use docs_introspect/iris_symbols/iris_table_info, for production state use iris_production/iris_interop_query, and to create+compile a class use iris_doc(put,compile) over Atelier (never $SYSTEM.OBJ.Load from a file path — that needs IRIS to share this host's disk). When the code matches one of those, the response includes a `hint` naming the typed tool. When your code writes a %Status (`write $SYSTEM.Status.GetErrorText(sc)`), the response also carries `status`: that chain split into per-error {code, text}, so you never split it or re-parse the `ERROR #NNNN:` prefix yourself — `status.complete: false` means part of it did not decode and `status.undecoded` holds it verbatim. No `status` key means no %Status text was found in the output, which is NOT a claim that a status was OK. This tool can only decode a status your code actually writes, so for a ClassMethod that returns one prefer iris_execute_method, which reads the status itself. namespace: optional — defaults to the connection namespace (IRIS_NAMESPACE), never a hardcoded USER; the response echoes the namespace it ran in."
     )]
     async fn iris_execute(
         &self,
@@ -6675,6 +6711,7 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                     "namespace": namespace,
                     "method": "http",
                 });
+                attach_status_chain(&mut resp, trimmed);
                 if let Some(abort) = abort {
                     resp["error_code"] = serde_json::Value::String("IRIS_RUNTIME_ERROR".into());
                     if let Some(h) = abort_hint(abort) {
@@ -6813,6 +6850,7 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                     "namespace": namespace,
                     "method": "docker",
                 });
+                attach_status_chain(&mut resp, trimmed);
                 if let Some(abort) = abort {
                     resp["error_code"] = serde_json::Value::String("IRIS_RUNTIME_ERROR".into());
                     if let Some(h) = abort_hint(abort) {
@@ -8524,7 +8562,7 @@ Methods:
     }
 
     #[tool(
-        description = "Invoke a ClassMethod directly by class + method + positional args, with no wrapper class to write. Returns the return value AND, for a method declared to return %Status, the decoded verdict (status_ok plus status_text) — so a failed status does not arrive as an opaque string. The method's declared return type drives the call: a method returning nothing is invoked without reading a value, an object comes back as its class name, and a value reported shorter than IRIS measured it is refused rather than returned incomplete. Runs arbitrary code, so it is write-gated exactly like iris_execute. Use iris_query for SELECTs and iris_doc(put,compile) to create a class. namespace: optional — defaults to the connection namespace (IRIS_NAMESPACE)."
+        description = "Invoke a ClassMethod directly by class + method + positional args, with no wrapper class to write. Returns the return value AND, for a method declared to return %Status, the decoded verdict (status_ok plus status_text) — so a failed status does not arrive as an opaque string. The chain also arrives structured as `status`: {ok, errors:[{code, text}]}, one entry per error, so you key a remedy on the error NUMBER instead of matching a substring of the joined text; `status.ok` comes from IRIS's own $$$ISOK, not from failing to find an error in the text. The method's declared return type drives the call: a method returning nothing is invoked without reading a value, an object comes back as its class name, and a value reported shorter than IRIS measured it is refused rather than returned incomplete. Runs arbitrary code, so it is write-gated exactly like iris_execute. Use iris_query for SELECTs and iris_doc(put,compile) to create a class. namespace: optional — defaults to the connection namespace (IRIS_NAMESPACE)."
     )]
     async fn iris_execute_method(
         &self,
@@ -18552,5 +18590,98 @@ mod record_call_survives_a_poisoned_history {
             Some("iris_compile"),
             "the recorded entry must be the one just made"
         );
+    }
+}
+
+/// #323: `iris_execute` hands back a decoded `%Status` chain, and the block is strictly additive.
+#[cfg(test)]
+mod status_chain_attachment_tests {
+    use super::*;
+
+    /// Measured on IRIS 2026.1 with a throwaway probe class: two errors joined by
+    /// `$system.Status.AppendStatus`, decoded by the real `$SYSTEM.Status.GetErrorText`. CRLF, and
+    /// both elements present — the issue's claim that only the first survives is wrong.
+    const PRINTED: &str = "Stop: ERROR #5002: ObjectScript error: first problem\r\n\
+                           ERROR #6301: SAX XML Parser Error: second problem";
+
+    fn payload(output: &str, success: bool) -> (serde_json::Value, bool) {
+        let mut resp = serde_json::json!({
+            "success": success,
+            "output": output,
+            "namespace": "APP",
+            "method": "http",
+        });
+        let attached = attach_status_chain(&mut resp, output);
+        (resp, attached)
+    }
+
+    #[test]
+    fn the_chain_arrives_as_per_error_codes_and_texts() {
+        let (resp, attached) = payload(PRINTED, true);
+        assert!(attached);
+        assert_eq!(resp["status"]["ok"], false);
+        let codes: Vec<u64> = resp["status"]["errors"]
+            .as_array()
+            .expect("errors")
+            .iter()
+            .map(|e| e["code"].as_u64().expect("a code"))
+            .collect();
+        assert_eq!(
+            codes,
+            vec![5002, 6301],
+            "a remedy keyed on 6301 cannot be found by matching a substring of the joined text"
+        );
+        assert_eq!(resp["status"]["preamble"], "Stop: ");
+    }
+
+    /// The additive rule. A script that PRINTS the words of an error while succeeding — a diagnostic
+    /// dump, a log tail, this repo's own test fixtures — must not be turned into a failure by the
+    /// presence of the block. `success` belongs to `runtime_abort_line`.
+    #[test]
+    fn attaching_the_block_does_not_touch_success_or_output() {
+        for success in [true, false] {
+            let (resp, _) = payload(PRINTED, success);
+            assert_eq!(resp["success"], success, "success was rewritten");
+            assert_eq!(resp["output"], PRINTED, "output was rewritten");
+            assert!(
+                resp.get("hint").is_none(),
+                "the hint slot is contended (#185) and this has no advice to give: {:?}",
+                resp.get("hint")
+            );
+            assert!(resp.get("error_code").is_none());
+        }
+    }
+
+    /// Output with no status text carries NO block. Not `ok: true`: this path sees only what the
+    /// script chose to write, so it cannot tell an OK status from no status at all, and answering
+    /// the absence with a success verdict is exactly the negative fact #310 is about.
+    #[test]
+    fn output_with_no_status_gets_no_block_rather_than_a_successful_one() {
+        for out in ["", "OK", "Stop: OK", "42"] {
+            let (resp, attached) = payload(out, true);
+            assert!(!attached, "{out:?}");
+            assert!(
+                resp.get("status").is_none(),
+                "{out:?} must carry no status key at all, got {:?}",
+                resp.get("status")
+            );
+        }
+        // CONTROL: the same helper DOES attach one for a real chain, so the four assertions above
+        // are not passing because nothing is ever attached.
+        assert!(
+            payload(PRINTED, true).1,
+            "control: a real chain must attach"
+        );
+    }
+
+    /// A chain cut mid-element reaches the caller as incomplete, with what did arrive kept. A
+    /// truncated chain silently reported as a shorter chain is the #347 shape.
+    #[test]
+    fn a_chain_cut_mid_element_says_so_on_the_payload() {
+        let (resp, attached) = payload("ERROR #5002: ObjectScript error: boom\r\nERROR #63", true);
+        assert!(attached);
+        assert_eq!(resp["status"]["complete"], false);
+        assert_eq!(resp["status"]["undecoded"][0], "ERROR #63");
+        assert_eq!(resp["status"]["errors"][0]["code"], 5002);
     }
 }
