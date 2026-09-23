@@ -6848,7 +6848,7 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
     }
 
     #[tool(
-        description = "Read, write, delete, or check an IRIS document. mode='get' fetches source, mode='put' writes (with automatic SCM checkout if needed), mode='delete' removes, mode='head' checks existence. POSITIONAL EDITS instead of a full re-upload: mode='insert_lines' inserts `lines` BEFORE the 1-based line `at` (at = one past the last line appends), and mode='delete_lines' removes `count` lines (default 1) starting at `at`. Both READ the document, edit it and write it back, so they are write-gated exactly like put. `expect` is the text you believe is currently at `at`: REQUIRED for delete_lines and refused on mismatch, because your line numbers came from an earlier read and a delete on the wrong line destroys content — optional for insert_lines, which loses nothing if misplaced. One operation per call: after an edit the lines below it have shifted, and the response returns the new count in `line_edit.lines_after` so you can place the next one. name needs the Atelier type suffix — 'MyApp.Patient.cls', not 'MyApp.Patient' (put adds it for you when the content starts with `Class <name>` or `ROUTINE <name>`). Batch via the 'names' array is supported by mode='get' and mode='delete' ONLY — put writes one document per call and refuses a 'names' array rather than discarding it. elicitation_id/elicitation_answer resume an SCM dialog. For large source, paginate get with max_bytes + offset (response includes next_offset), or prefer docs_introspect for signatures/structure instead of full source. With compile=true, compile_errors is cross-checked against IRIS's own `Detected N errors` tally — `errors_incomplete: true` means the list is a SUBSET and `compile_console` holds the rest. No Python required."
+        description = "Read, write, delete, or check an IRIS document. mode='get' fetches source, mode='put' writes (with automatic SCM checkout if needed), mode='delete' removes, mode='head' checks existence. POSITIONAL EDITS instead of a full re-upload: mode='insert_lines' inserts `lines` BEFORE the 1-based line `at` (at = one past the last line appends), and mode='delete_lines' removes `count` lines (default 1) starting at `at`. Both READ the document, edit it and write it back, so they are write-gated exactly like put. `expect` is the text you believe is currently at `at`: REQUIRED for delete_lines and refused on mismatch, because your line numbers came from an earlier read and a delete on the wrong line destroys content — optional for insert_lines, which loses nothing if misplaced. One operation per call: after an edit the lines below it have shifted, and the response returns the new count in `line_edit.lines_after` so you can place the next one. name needs the Atelier type suffix — 'MyApp.Patient.cls', not 'MyApp.Patient' (put adds it for you when the content starts with `Class <name>` or `ROUTINE <name>`). Batch via the 'names' array is supported by mode='get' and mode='delete' ONLY — put writes one document per call and refuses a 'names' array rather than discarding it. elicitation_id/elicitation_answer resume an SCM dialog. For large source, paginate get with max_bytes + offset (response includes next_offset), or prefer docs_introspect for signatures/structure instead of full source. With compile=true, compile_errors is cross-checked against IRIS's own `Detected N errors` tally — `errors_incomplete: true` means the list is a SUBSET and `compile_console` holds the rest. Every write reports both `compiled` and `compile_requested`, so a class nobody asked to compile is distinguishable from one whose compile failed. `test: '<%UnitTest class>'` runs that suite in the SAME call once the class has compiled (needs compile=true) — the result arrives under `test` with `test_ok` beside it, the write's own `success` is never overwritten by it, and if the test did not run `test_skipped` says why. No Python required."
     )]
     async fn iris_doc(
         &self,
@@ -6858,6 +6858,10 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
         let namespace = interop::resolve_namespace(p.namespace.as_deref(), Some(&iris));
         tracing::info!(namespace = %namespace, "iris_doc");
         let client = self.http_client();
+        // #327 item 2: `p` moves into the handler, so what the caller asked to test is captured
+        // first. 579 of the measured `iris_doc(put)` calls are followed immediately by `iris_test`.
+        let want_test = p.test.clone();
+        let test_namespace = p.namespace.clone();
         let result = doc::handle_iris_doc(
             &iris,
             client,
@@ -6867,7 +6871,87 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
         )
         .await;
         self.record_call("iris_doc", Self::call_ok(&result));
-        result
+        self.run_test_after_doc(want_test.as_deref(), test_namespace.as_deref(), result)
+            .await
+    }
+
+    /// #327 item 2: run the `test` a `iris_doc` call asked for, once the write has COMPILED.
+    ///
+    /// Sequenced here rather than inside `doc::handle_iris_doc` because running a `%UnitTest` suite
+    /// is `iris_test`'s whole 600-line job — polling, the result query, the per-case shaping (#233,
+    /// #273). Re-implementing it beside the writer would be a second copy that drifts; calling the
+    /// tool means the two paths cannot disagree about what a red test looks like.
+    ///
+    /// A failed write is returned EXACTLY as it came back. Its envelope already carries what the
+    /// caller must act on — a compile error, an SCM elicitation, a refusal — and rebuilding it to
+    /// add a note about a test that did not run would risk dropping the `isError` flag and hints
+    /// that are the actual answer.
+    async fn run_test_after_doc(
+        &self,
+        want_test: Option<&str>,
+        namespace: Option<&str>,
+        result: Result<CallToolResult, McpError>,
+    ) -> Result<CallToolResult, McpError> {
+        let Ok(ref ok) = result else { return result };
+        let payload = ok
+            .content
+            .first()
+            .and_then(|c| c.raw.as_text())
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t.text).ok());
+        match doc::test_gate(want_test, payload.as_ref()) {
+            doc::TestGate::NotRequested => result,
+            // The write failed: hand its own envelope back untouched.
+            doc::TestGate::SkippedCallFailed => result,
+            gate @ doc::TestGate::SkippedNotCompiled { .. } => {
+                let mut payload = match payload {
+                    Some(v) => v,
+                    None => return result,
+                };
+                if let Some(reason) = gate.skipped_reason() {
+                    payload["test_skipped"] = serde_json::Value::String(reason);
+                }
+                ok_json(payload)
+            }
+            doc::TestGate::Run(pattern) => {
+                let mut payload = match payload {
+                    Some(v) => v,
+                    None => return result,
+                };
+                let mut args = serde_json::json!({ "pattern": pattern });
+                if let Some(ns) = namespace {
+                    args["namespace"] = serde_json::Value::String(ns.to_string());
+                }
+                let run = self.iris_test(Parameters(Described::new(args))).await;
+                match run {
+                    Ok(r) => {
+                        let body = r
+                            .content
+                            .first()
+                            .and_then(|c| c.raw.as_text())
+                            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t.text).ok());
+                        match body {
+                            Some(b) => doc::attach_test_result(&mut payload, &pattern, b),
+                            // The run produced a result this code cannot read. Say that, rather
+                            // than leaving the caller to read the absence of `test` as a pass.
+                            None => {
+                                payload["test_pattern"] =
+                                    serde_json::Value::String(pattern.clone());
+                                payload["test_skipped"] = serde_json::Value::String(
+                                    "the test ran but its result could not be parsed — call                                      iris_test directly to see it."
+                                        .into(),
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        payload["test_pattern"] = serde_json::Value::String(pattern.clone());
+                        payload["test_skipped"] =
+                            format!("the test could not be started: {e}").into();
+                    }
+                }
+                ok_json(payload)
+            }
+        }
     }
 
     #[tool(
@@ -18551,6 +18635,152 @@ mod record_call_survives_a_poisoned_history {
             guard.back().map(|e| e.tool.as_str()),
             Some("iris_compile"),
             "the recorded entry must be the one just made"
+        );
+    }
+}
+
+/// #327 item 2: the `test` a caller names on `iris_doc` reaches the wire and reaches `iris_test`.
+///
+/// `doc_put_runs_the_test.rs` covers the DECISION — pure, and mutation-checked there. What it cannot
+/// see is whether the parameter is advertised at all and whether the handler is wired to the tool
+/// that runs suites. A `test` the schema never publishes is a parameter no caller discovers, and a
+/// gate nothing calls is dead code that looks like a feature.
+#[cfg(test)]
+mod doc_test_parameter_tests {
+    use super::*;
+
+    fn iris_doc_schema() -> serde_json::Value {
+        let t = IrisTools::new_with_toolset(None, Toolset::Interop).expect("build");
+        let tool = t
+            .advertised_tools()
+            .into_iter()
+            .find(|x| x.name == "iris_doc")
+            .expect("iris_doc is in the interop profile");
+        serde_json::to_value(&*tool.input_schema).expect("schema serialises")
+    }
+
+    #[test]
+    fn the_test_parameter_is_advertised_on_iris_doc() {
+        let schema = iris_doc_schema();
+        let props = schema["properties"]
+            .as_object()
+            .expect("iris_doc publishes properties");
+        assert!(
+            props.contains_key("test"),
+            "the `test` parameter is not in the advertised schema, so no caller can discover it. \
+             Properties: {:?}",
+            props.keys().collect::<Vec<_>>()
+        );
+        // CONTROL: a name that was never added must be absent, or `contains_key` is not
+        // discriminating on this object at all.
+        assert!(!props.contains_key("test_teleport"));
+        // It must not be REQUIRED — 2,979 measured puts pass no test at all.
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        assert!(!required.contains(&"test"), "required: {required:?}");
+    }
+
+    /// The description has to say the compile gate exists, because the failure it prevents is
+    /// silent: a caller who passes `test` without `compile` gets a write, no test, and a
+    /// `test_skipped` they did not expect to need.
+    ///
+    /// Asserted on the SENTENCE that introduces `test`, not on the whole description. A bare
+    /// `description.contains("compile")` passes on any of the eight other places the word appears
+    /// (`compile=true` on the compile flag, `compile_errors`, `compile_console`, …) — measured: a
+    /// mutation that deleted "(needs compile=true)" from this very sentence left that assertion
+    /// green.
+    #[test]
+    fn the_description_says_the_test_needs_a_compile() {
+        let t = IrisTools::new_with_toolset(None, Toolset::Interop).expect("build");
+        let tool = t
+            .advertised_tools()
+            .into_iter()
+            .find(|x| x.name == "iris_doc")
+            .expect("iris_doc");
+        let d = tool.description.unwrap_or_default().to_string();
+        let at = d
+            .find("`test:")
+            .expect("the description must document the `test` parameter by name");
+        // To the end of that sentence: the claim is about what THIS sentence tells the caller.
+        let claim = &d[at..];
+        let claim = &claim[..claim.find(". ").map(|i| i + 1).unwrap_or(claim.len())];
+        assert!(
+            claim.len() < d.len() / 2,
+            "the sentence window is {} of {} chars — that is not one sentence, so this guard is \
+             not measuring what it claims",
+            claim.len(),
+            d.len()
+        );
+        assert!(
+            claim.contains("compile=true"),
+            "the sentence introducing `test` must say it needs compile=true. A caller who passes \
+             `test` without it gets a write, no test, and a `test_skipped` they did not expect to \
+             need. Sentence: {claim}"
+        );
+        assert!(
+            claim.contains("test_ok") && claim.contains("test_skipped"),
+            "it must name both fields the caller reads back — the verdict and the reason there is \
+             none: {claim}"
+        );
+        // CONTROL: the window really is a window. A phrase from elsewhere in the description must
+        // not be inside it, or the three assertions above are reading the whole text.
+        assert!(
+            !claim.contains("mode='get' fetches source"),
+            "the window ran past its sentence: {claim}"
+        );
+    }
+
+    /// The wiring, read at the source because driving it needs a live instance: `iris_doc` must hand
+    /// its result to the sequencer, and the sequencer must call the tool that actually runs suites.
+    /// Windows are bounded by the functions' own bodies, so neither claim can be satisfied by text
+    /// somewhere else in the file.
+    #[test]
+    fn iris_doc_hands_its_result_to_the_test_sequencer() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tools/mod.rs"),
+        )
+        .expect("mod.rs");
+        let body = |from: &str| -> String {
+            let start = src
+                .find(from)
+                .unwrap_or_else(|| panic!("no `{from}` in mod.rs"));
+            let rest = &src[start..];
+            let end = rest.find("\n    }\n").unwrap_or(rest.len());
+            rest[..end].to_string()
+        };
+
+        let doc = body("async fn iris_doc(");
+        assert!(
+            doc.contains("run_test_after_doc("),
+            "iris_doc returns without passing its result to the test sequencer, so `test` is \
+             accepted and silently ignored (#327)"
+        );
+        assert!(
+            doc.contains("p.test.clone()"),
+            "`p` moves into handle_iris_doc, so what the caller asked to test must be captured \
+             before the move — otherwise the sequencer is called with None on every call"
+        );
+
+        let seq = body("async fn run_test_after_doc(");
+        assert!(
+            seq.contains("self.iris_test("),
+            "the sequencer never calls iris_test, so a gate that says Run runs nothing"
+        );
+        assert!(
+            seq.contains("doc::test_gate("),
+            "the sequencer decides without the gate, so the compile check lives in two places"
+        );
+        // CONTROL: the windows are the functions, not the file. `iris_query` is a sibling tool that
+        // must NOT appear in either.
+        assert!(
+            !doc.contains("async fn iris_query("),
+            "the iris_doc window ran past its body"
+        );
+        assert!(
+            !seq.contains("async fn iris_query("),
+            "the sequencer window ran past its body"
         );
     }
 }
