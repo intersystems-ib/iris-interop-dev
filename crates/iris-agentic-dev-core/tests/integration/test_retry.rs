@@ -152,7 +152,11 @@ fn test_compile_uses_http_when_no_container() {
             .and(path_regex("/api/atelier/.*/action/query"))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"result":{"content":[{"output":"OK"}]},"status":{"errors":[]}})),
+                    // #362: this said "output". `Execute()` aliases its column as "result"
+                    // because `output` is a reserved word in IRIS SQL, so the generator read
+                    // `content[0].result`, found nothing, and returned Ok("") — which the
+                    // assertion below used to accept.
+                    .set_body_json(serde_json::json!({"result":{"content":[{"result":"OK"}]},"status":{"errors":[]}})),
             )
             .mount(&mock_server)
             .await;
@@ -180,10 +184,15 @@ fn test_compile_uses_http_when_no_container() {
         // Should succeed via HTTP without requiring IRIS_CONTAINER
         assert!(result.is_ok(), "HTTP execution should succeed without IRIS_CONTAINER, got: {:?}", result);
         let output = result.unwrap();
-        assert!(
-            output.trim() == "OK" || output.is_empty(), // generator may return empty if mock doesn't fully simulate
-            "unexpected output: {:?}",
-            output
+        // #362: this was `== "OK" || output.is_empty()`. A disjunction that accepts both the
+        // right answer and the empty one cannot fail for the reason the test exists, and the
+        // empty branch is the one it actually took, because of the mock column above. Asserting
+        // the value makes this a positive control for the generator's happy path: it now fails if
+        // the output ever stops arriving.
+        assert_eq!(
+            output.trim(),
+            "OK",
+            "the generator must return what the SqlProc produced, not an empty string"
         );
     });
 }
