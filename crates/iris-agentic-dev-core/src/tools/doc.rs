@@ -164,14 +164,36 @@ fn require_name(
 ) -> Result<String, Result<rmcp::model::CallToolResult, rmcp::ErrorData>> {
     match p.name.as_deref().map(str::trim) {
         Some(n) if !n.is_empty() => Ok(n.to_string()),
-        _ => Err(crate::tools::envelope::fail_with(
-            "MISSING_PARAMS",
-            &format!(
-                "iris_doc mode={mode} requires `name` (e.g. \"MyApp.Patient.cls\" — \
-                 include the .cls/.mac/.int/.inc extension)."
-            ),
-            serde_json::json!({"mode": mode}),
-        )),
+        _ => {
+            // #327: when the caller supplied `names` instead, SAY SO. The old message named only
+            // `name`, so someone who passed `names` to a mode that does not read it was told a true
+            // fact that did not explain their failure — and the modes differ (get and delete read
+            // `names`; put, head and the line edits do not), which is not derivable from the error.
+            let takes_names = matches!(mode, "get" | "delete");
+            let detail = if p.names.is_empty() {
+                String::new()
+            } else if takes_names {
+                format!(
+                    " You passed {} name(s) in `names`, which mode={mode} does accept — this error \
+                     means they were all empty or whitespace.",
+                    p.names.len()
+                )
+            } else {
+                format!(
+                    " You passed {} name(s) in `names`, which mode={mode} does NOT read; only \
+                     mode=get and mode=delete do.",
+                    p.names.len()
+                )
+            };
+            Err(crate::tools::envelope::fail_with(
+                "MISSING_PARAMS",
+                &format!(
+                    "iris_doc mode={mode} requires `name` (e.g. \"MyApp.Patient.cls\" — \
+                     include the .cls/.mac/.int/.inc extension).{detail}"
+                ),
+                serde_json::json!({"mode": mode, "names_count": p.names.len()}),
+            ))
+        }
     }
 }
 
@@ -734,6 +756,30 @@ async fn handle_put(
 ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
     let namespace = crate::tools::interop::resolve_namespace(p.namespace.as_deref(), Some(iris));
     let ns = &namespace;
+
+    // #327: `names` is READ NOWHERE in this function. Measured on master with a word-boundary scan
+    // (`p\.names\b`, which correctly rejects `p.namespace`): handle_get reads it 5 times,
+    // handle_delete 2, handle_put 0. So a caller passing `name` AND `names` had the single `name`
+    // written, the rest discarded, and `success: true` returned — a partial write reported as a
+    // whole one, which is the house rule's exact shape (CLAUDE.md) with data loss attached.
+    //
+    // This REFUSES rather than writing the batch. `put` has no multi-document machinery, and
+    // inventing it here would pre-empt the separate multi-document-put item in #327. Refusing is
+    // also the only answer that cannot lose content: the caller learns the rule and re-issues.
+    if !p.names.is_empty() {
+        return crate::tools::envelope::fail_with(
+            "INVALID_PARAMS",
+            &format!(
+                "iris_doc mode=put writes ONE document and does not read `names`, so the {} name(s)                  you passed there would have been silently discarded. Pass a single `name` with its                  `content`, one call per document. `names` is for mode=get and mode=delete.",
+                p.names.len()
+            ),
+            serde_json::json!({
+                "mode": "put",
+                "names_ignored": p.names,
+                "names_supported_by": ["get", "delete"],
+            }),
+        );
+    }
 
     // Elicitation resume — user answered a prior SCM dialog
     if let (Some(eid), Some(answer)) = (&p.elicitation_id, &p.elicitation_answer) {
