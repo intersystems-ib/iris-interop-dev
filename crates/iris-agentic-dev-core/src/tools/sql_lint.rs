@@ -149,6 +149,24 @@ pub fn sqlcode_hint(err: &str) -> Option<&'static str> {
              methods ARE callable from SQL: SELECT parent, Name FROM %Dictionary.CompiledMethod \
              WHERE SqlProc = 1 AND parent %STARTSWITH '<Package>'.",
         ),
+        // #329 item 4. Measured on IRIS 2026.1 rather than inferred, because the neighbouring
+        // guesses were wrong: `BETWEEN 1 2` without AND and `IN 1` without parens are BOTH -1, and
+        // a doubled operator is -12. Only two operands with no operator between them give -14
+        // (`WHERE ID 5`, `WHERE Name Super`, `HAVING COUNT(*) 1`).
+        //
+        // The echo is the useful part and its shape is not obvious: IRIS prints `^` and then your
+        // statement re-parsed and TRUNCATED at the point it stopped, with literals replaced by `?`
+        // — so `WHERE Name Super` comes back as `... WHERE Name `. The missing operator belongs at
+        // the END of that echo, which is a position, not a guess.
+        -14 => Some(
+            "SQLCODE -14 means two operands with no comparison operator between them — IRIS \
+             reached a point where it needed =, <>, <, >, LIKE or similar and found the next term \
+             instead. The message carries the position: after the `^` IRIS re-prints your \
+             statement truncated where parsing stopped, with literals replaced by `?`, so the \
+             operator belongs at the END of that echo. A missing `=` in a WHERE or HAVING clause \
+             is the usual cause. Note this is NOT the code for a malformed BETWEEN or IN — those \
+             are -1, and a doubled operator is -12.",
+        ),
         -1 => Some(
             "SQLCODE -1 is a parse error. Two things to check first in IRIS SQL: a package maps \
              to a schema with underscores (class Ens.Config.Item -> table Ens_Config.Item), and \
@@ -408,6 +426,96 @@ fn strip_quoted(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// #329 item 4: the SQLCODE -14 tail.
+    ///
+    /// Every string here was captured from IRIS 2026.1 over Atelier `/action/query`, not written
+    /// from the documentation — and capturing them is what stopped the hint claiming two things
+    /// that are false. The neighbours are kept as fixtures precisely so the arm cannot quietly
+    /// widen onto them.
+    mod sqlcode_14 {
+        use super::super::*;
+
+        /// Two operands with no operator between them. All three measured.
+        const MEASURED_14: &[&str] = &[
+            "ERROR #5540: SQLCODE: -14 Message:  A comparison operator is required here^ SELECT * FROM %Dictionary . ClassDefinition WHERE ID ?",
+            "ERROR #5540: SQLCODE: -14 Message:  A comparison operator is required here^ SELECT * FROM %Dictionary . ClassDefinition WHERE Name ",
+            "ERROR #5540: SQLCODE: -14 Message:  A comparison operator is required here^ SELECT COUNT ( * ) FROM %Dictionary . ClassDefinition HAVING COUNT ( * ) ?",
+        ];
+
+        /// The NEAR MISSES — each one a shape a reader would expect to be -14, and none of them is.
+        const MEASURED_NOT_14: &[(&str, &str)] = &[
+            ("BETWEEN without AND", "ERROR #5540: SQLCODE: -1 Message:  AND expected, ? found ^ SELECT * FROM %Dictionary . ClassDefinition WHERE ID BETWEEN ? ?"),
+            ("IN without parens",   "ERROR #5540: SQLCODE: -1 Message:  ( expected, ? found ^ SELECT * FROM %Dictionary . ClassDefinition WHERE ID IN ?"),
+            ("doubled operator",    "ERROR #5540: SQLCODE: -12 Message:  A term expected, beginning with either of:  identifier, constant, aggregate"),
+        ];
+
+        #[test]
+        fn every_measured_minus_fourteen_gets_the_hint() {
+            for err in MEASURED_14 {
+                let h = sqlcode_hint(err)
+                    .unwrap_or_else(|| panic!("no hint for a real -14 envelope: {err}"));
+                assert!(
+                    h.contains("comparison operator"),
+                    "the hint must name what is missing: {h}"
+                );
+            }
+        }
+
+        #[test]
+        fn the_hint_explains_where_to_look_not_just_what_is_wrong() {
+            // The position is the actionable half. IRIS re-prints the statement after `^`
+            // TRUNCATED at the point it stopped, so the operator belongs at the end of that echo —
+            // which a caller cannot guess from "a comparison operator is required".
+            let h = sqlcode_hint(MEASURED_14[0]).expect("hint");
+            assert!(h.contains('^'), "must point at the marker IRIS prints: {h}");
+            assert!(
+                h.contains("END of that echo") || h.contains("end of that echo"),
+                "must say the operator belongs at the end of the truncated echo: {h}"
+            );
+        }
+
+        #[test]
+        fn the_arm_does_not_widen_onto_its_neighbours() {
+            // THE CONTROL that the measurement bought. A hint that claimed BETWEEN and IN would
+            // pass every test above while being wrong about both — they are -1.
+            for (shape, err) in MEASURED_NOT_14 {
+                let h = sqlcode_hint(err).unwrap_or("");
+                assert!(
+                    !h.contains("comparison operator"),
+                    "{shape} is not -14, so it must not get the -14 hint: {h}"
+                );
+            }
+        }
+
+        #[test]
+        fn minus_one_still_gets_its_own_hint_and_minus_twelve_gets_none() {
+            // Positive control: the table still answers for a code it covers, so an empty result
+            // above means "no arm" rather than "sqlcode_hint stopped working".
+            let (_, minus_one) = MEASURED_NOT_14[0];
+            assert!(
+                sqlcode_hint(minus_one).is_some_and(|h| h.contains("parse error")),
+                "-1 must still reach its own arm"
+            );
+            let (_, minus_twelve) = MEASURED_NOT_14[2];
+            assert!(
+                sqlcode_hint(minus_twelve).is_none(),
+                "-12 has no arm yet; this pins that it is a deliberate gap, not a silent wrong hint"
+            );
+        }
+
+        #[test]
+        fn a_table_not_found_is_still_routed_away_from_here() {
+            // -30 is handled by `is_table_not_found` before `sqlcode_hint` is consulted, and that
+            // ordering is the thing #208 had to fix once. Assert the classifier still claims it.
+            let minus_thirty =
+                "ERROR #5540: SQLCODE: -30 Message:  Table 'NO_SUCH.THING' not found";
+            assert!(
+                is_table_not_found(minus_thirty),
+                "-30 must still be claimed by the table arm"
+            );
+        }
+    }
+
     use super::*;
 
     /// #208: `is_table_not_found`'s catch-all matched SQLCODE -29, whose IRIS wording is
