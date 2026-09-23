@@ -3059,7 +3059,11 @@ If $$$ISERR(tSC) { Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC)
                     serde_json::json!({"success":true,"namespace":ns,"autostart_enabled":false,"production":null}),
                 );
             }
-            Ok(out) => return err_json("INTEROP_ERROR", out.trim()),
+            // #329 item 3: the generator writes `ERROR:INTEROP_ERROR:<text>`, and passing that
+            // straight through put the MARKER PREFIX into the user-visible message —
+            // `error: "ERROR:INTEROP_ERROR:Cannot open production Foo"`. `interop_fail` strips it
+            // and classifies by content, which is what the other 12 call sites already do.
+            Ok(out) => return interop_fail(out.trim(), None),
             Err(e) => return err_json(classify_iris_error(&e.to_string()), &e.to_string()),
         }
     }
@@ -3108,7 +3112,9 @@ If $$$ISERR(tSC) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC
         Ok(out) if out.trim() == "OK" => ok_json(
             serde_json::json!({"success":true,"namespace":ns,"autostart_enabled":true,"production":prod_name}),
         ),
-        Ok(out) => err_json("INTEROP_ERROR", out.trim()),
+        // #329 item 3: same prefix leak as the disable path above. `prod_name` is in scope here,
+        // so the failure can also name the production it was pointed at.
+        Ok(out) => interop_fail(out.trim(), Some(&prod_name)),
         Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
     }
 }
