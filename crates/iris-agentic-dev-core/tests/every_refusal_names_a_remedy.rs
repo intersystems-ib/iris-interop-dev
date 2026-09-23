@@ -134,6 +134,7 @@ const REMEDIES: &[(&str, &str)] = &[
     ("SCM_REJECTED", "source control declined the operation by policy; the message carries the provider's reason — this needs a change in the provider, not a retry"),
     ("SCM_UNAVAILABLE", "no source-control provider answered; this means UNKNOWN, not 'not under source control' — check the provider is configured before treating the document as free"),
     ("SCOPE_REQUIRED", "the pattern would select on its tail alone, which is the whole namespace; qualify it with at least one package level and retry"),
+    ("SCRATCH_WRITE_BLOCKED", "this tool reads, but answers by writing a temporary class, and strict read-only refuses that; set IRIS_SOFT_READ_ONLY instead if a scratch class is acceptable — it still refuses every declared mutation"),
     ("SEARCH_PROP_NOT_FOUND", "that property is not registered on the Search Table extent; the payload lists the ones that are — use one of those"),
     ("SEARCH_TABLE_NOT_FOUND", "the search-table class is not registered or not compiled here; compile it, or drop the search_table filter — do not read this as no matches"),
     ("SEARCH_TIMEOUT", "the asynchronous search did not finish in its window, so nothing can be concluded about matches; narrow the document scope or the pattern and run it again"),
@@ -144,9 +145,11 @@ const REMEDIES: &[(&str, &str)] = &[
     ("STREAM_READ_ERROR", "the stream could not be read; retry, and if it repeats the document may be corrupt on the server"),
     ("TABLE_NOT_FOUND", "resolve the real table name with iris_table_info or docs_introspect — IRIS table names differ from class names and the separator is not a dot"),
     ("TIMEOUT", "the operation did not finish inside its budget and may STILL be running on the server; check the instance's state, then raise timeout or narrow the work before retrying"),
+    ("TOOL_NOT_IN_TOOLSET", "the tool exists in this build but the running toolset does not include it; restart the server with --toolset baseline (or IRIS_TOOLSET=baseline) if you need it"),
     ("TOO_BROAD", "the wildcard matched more documents than one request may queue and nothing ran; add the next package level to narrow it and proceed in parts"),
     ("UNKNOWN_ACTION", "the action is not one this tool accepts; the payload lists the valid actions — resend with one of them"),
     ("UNKNOWN_SEGMENT_OR_CATEGORY", "the segment or category is not defined in that schema version; list what the version defines and use one of those names"),
+    ("UNKNOWN_TOOL", "no tool of that name exists in this build; list the advertised tools and use one of those names, and check the build with check_config if you expected it to be there"),
     ("UNSUPPORTED_BODY_CLASS", "this tool projects only the body families the message lists; read the body through iris_query against its own table, or convert it first"),
     ("UNSUPPORTED_IRIS_VERSION", "this IRIS build lacks the API the feature needs; the payload names the missing method — use a newer instance or take the manual route"),
     ("UPDATE_FAILED", "the update was attempted and refused; the message carries the server's reason — re-read the current value before retrying"),
@@ -158,6 +161,7 @@ const REMEDIES: &[(&str, &str)] = &[
     ("WEBAPP_NOT_FOUND", "list the defined web applications and use one of those paths — the path must include its leading slash"),
     ("WORKSPACE_NOT_FOUND", "the path does not exist on the host running this server; pass a path that exists there — a path on your own machine is not visible to this process"),
     ("WRITE_ABORTED", "the write was cancelled before anything changed — you declined the source-control checkout it needed; re-issue and approve it, or check the document out first"),
+    ("WRITE_GATED", "the write gate is shut, so the mutation was never attempted; the read actions of this tool still work, and the server log names what to set if the gate is shut by a heuristic and writing is intended — an explicitly requested read-only mode is deliberate and has no override"),
 ];
 
 /// Below this many literal codes, assume the scan broke rather than that the server stopped
@@ -315,6 +319,26 @@ fn first_arg_code(args: &str) -> Option<String> {
     Some(tok)
 }
 
+/// Codes written straight into a payload as `"error_code": "CODE"`.
+///
+/// `McpError::invalid_params(msg, Some(json!({"error_code": "X", ...})))` is a complete emission
+/// route that goes nowhere near `err_json`, so none of the other scans can see it.
+fn error_code_fields(code: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut from = 0usize;
+    let pat = "\"error_code\"";
+    while let Some(rel) = code[from..].find(pat) {
+        let at = from + rel + pat.len();
+        if let Some(rest) = code[at..].trim_start().strip_prefix(':') {
+            if let Some(tok) = first_arg_code(rest) {
+                out.push(tok);
+            }
+        }
+        from = at;
+    }
+    out
+}
+
 /// The `&'static str` fallback passed as the 2nd argument of `classify_iris_error_or(msg, "CODE")`.
 fn fallback_codes(code: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -403,6 +427,14 @@ fn vocabulary() -> Vec<(String, Vec<String>)> {
         }
         for c in fallback_codes(&prod) {
             add(c, "fallback");
+        }
+        // A THIRD emission route, found when SCRATCH_WRITE_BLOCKED was added for #303 and this file
+        // called the brand-new row stale. `McpError::invalid_params` carries its own
+        // `json!({"error_code": ...})` payload and never touches `err_json`, so the route was
+        // invisible to every scan above — including `WRITE_GATED`, the write gate's own refusal,
+        // which has reached callers with no reviewed remedy for as long as the gate has existed.
+        for c in error_code_fields(&prod) {
+            add(c, "error_code field");
         }
         let name = f
             .file_name()

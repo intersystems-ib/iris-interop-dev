@@ -294,17 +294,14 @@ impl IrisConnection {
     /// Returns true if write-capable tools should be registered.
     /// Checks SystemMode, namespace heuristics, and IRIS_ALLOW_PROD override (issue #26).
     pub fn is_write_allowed(&self) -> bool {
-        if std::env::var("IRIS_ALLOW_PROD")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-        {
-            return true;
-        }
-        match &self.system_mode {
-            SystemMode::Live => false,
-            SystemMode::Development | SystemMode::Test => true,
-            SystemMode::Unknown => !is_production_namespace(&self.namespace),
-        }
+        write_allowed_with(
+            read_only_mode(),
+            &self.system_mode,
+            &self.namespace,
+            std::env::var("IRIS_ALLOW_PROD")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+        )
     }
 
     /// Build the full Atelier REST URL for a given path suffix.
@@ -1034,6 +1031,118 @@ fn system_mode_from_global(raw: &str) -> SystemMode {
 ///
 /// See [`system_mode_from_global`] above: this function's case-insensitivity is the behaviour that
 /// the mode match was missing.
+/// An EXPLICIT read-only request, independent of what the instance looks like.
+///
+/// #303. The inferred write gate ([`IrisConnection::is_write_allowed`]) answers *"does this instance
+/// look like production?"* — a safety guess from `SystemMode` and a namespace heuristic. This answers
+/// a different question: *"the operator asked for read-only"*. That is not a guess, so no heuristic
+/// and no `IRIS_ALLOW_PROD` may override it.
+///
+/// Two levels, because "can it change my code?" and "can it touch my instance at all?" are different
+/// questions and only the asker knows which one they mean. The ten tools in `GENERATOR_WRITE_TOOLS`
+/// are read-only in INTENT but PUT, compile and delete a scratch class in `IrisDevTmp` to answer,
+/// because the data they read has no SQL projection to reach it through. `Soft` keeps them; `Strict`
+/// refuses them.
+///
+/// Neither level replaces SELECT-only grants on the MCP's IRIS user. These are enforced in this
+/// server; privileges are enforced by the database. For an instance that genuinely must not be
+/// written, do both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReadOnlyMode {
+    /// No explicit request — the inferred gate decides, exactly as it did before this existed.
+    #[default]
+    Off,
+    /// Every declared mutator is refused. The scratch-class readers still answer, and still write.
+    Soft,
+    /// Also refuses anything that writes a scratch class to answer.
+    Strict,
+}
+
+impl ReadOnlyMode {
+    /// Whether an explicit request is in force at all. `Off` means "ask the inferred gate".
+    pub fn is_read_only(self) -> bool {
+        !matches!(self, ReadOnlyMode::Off)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReadOnlyMode::Off => "off",
+            ReadOnlyMode::Soft => "soft",
+            ReadOnlyMode::Strict => "strict",
+        }
+    }
+}
+
+/// Resolve the mode from a variable getter.
+///
+/// Taking a getter rather than reading `std::env` directly is what makes the PRECEDENCE testable
+/// without mutating process environment. Tests that set shared env already race each other here —
+/// `admin_unit_tests::write_not_allowed_without_env` is the known case — and precedence is the part
+/// most worth pinning, so it is pinned by a pure function instead.
+pub(crate) fn resolve_read_only_mode(get: impl Fn(&str) -> Option<String>) -> ReadOnlyMode {
+    let on = |name: &str| {
+        get(name)
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                v == "1" || v == "true" || v == "yes"
+            })
+            .unwrap_or(false)
+    };
+    // Strict beats soft: asking for both is asking for the stronger one, never the weaker.
+    if on("IRIS_STRICT_READ_ONLY") {
+        return ReadOnlyMode::Strict;
+    }
+    if on("IRIS_SOFT_READ_ONLY") {
+        return ReadOnlyMode::Soft;
+    }
+    ReadOnlyMode::Off
+}
+
+/// This process's read-only mode, resolved once.
+///
+/// Once, deliberately: `is_write_allowed` reads `IRIS_ALLOW_PROD` from the environment on every
+/// call, and a gate that can change answer mid-process is a gate that cannot be reasoned about. A
+/// request made at startup holds for the life of the server.
+pub fn read_only_mode() -> ReadOnlyMode {
+    static MODE: std::sync::OnceLock<ReadOnlyMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| resolve_read_only_mode(|k| std::env::var(k).ok()))
+}
+
+/// The write decision, as a pure function of everything that feeds it.
+///
+/// Extracted so the PRECEDENCE can be tested without mutating process environment.
+/// [`read_only_mode`] is cached for the life of the process — deliberately, since a gate that can
+/// change its answer mid-run cannot be reasoned about — which also means no in-process test can vary
+/// it. A pure function is the only honest way to pin the order, and the order is the part that
+/// decides whether asking for read-only is trustworthy.
+///
+/// #303 precedence, strongest first:
+/// `IRIS_STRICT_READ_ONLY` > `IRIS_SOFT_READ_ONLY` > `IRIS_ALLOW_PROD` > the inferred gate.
+///
+/// The last two lines of that chain are unchanged, so a deployment setting neither new variable
+/// behaves exactly as it did before this existed.
+pub(crate) fn write_allowed_with(
+    requested: ReadOnlyMode,
+    system_mode: &SystemMode,
+    namespace: &str,
+    allow_prod: bool,
+) -> bool {
+    // An explicit request is not a guess and nothing below may override it. If `allow_prod` won
+    // here, an operator with IRIS_ALLOW_PROD exported — precisely the environment where asking for
+    // read-only matters — would silently get writes while believing they had asked for none.
+    if requested.is_read_only() {
+        return false;
+    }
+    if allow_prod {
+        return true;
+    }
+    match system_mode {
+        SystemMode::Live => false,
+        SystemMode::Development | SystemMode::Test => true,
+        SystemMode::Unknown => !is_production_namespace(namespace),
+    }
+}
+
 fn is_production_namespace(ns: &str) -> bool {
     let upper = ns.to_uppercase();
     matches!(upper.as_str(), "PROD" | "PRODUCTION" | "LIVE" | "PRD")
@@ -1381,6 +1490,135 @@ mod system_mode_tests {
 }
 
 // ── Issues #101 / #102: the query path must not destroy what IRIS said ───────
+/// #303: the two explicit read-only levels, and the precedence that makes them trustworthy.
+///
+/// All of this is asserted through the pure functions, with no process environment touched. That is
+/// not convenience: `read_only_mode()` caches for the life of the process on purpose, so an
+/// in-process test cannot vary it, and tests here that set shared env would race each other the way
+/// `admin_unit_tests::write_not_allowed_without_env` already does.
+#[cfg(test)]
+mod read_only_mode_tests {
+    use super::*;
+
+    /// A getter over a fixed list, standing in for the environment. Owns its data so the closure
+    /// borrows nothing — the point is to resolve a mode without touching `std::env` at all.
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let owned: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k: &str| {
+            owned
+                .iter()
+                .find(|(name, _)| name == k)
+                .map(|(_, v)| v.clone())
+        }
+    }
+
+    #[test]
+    fn nothing_requested_leaves_the_inferred_gate_in_charge() {
+        assert_eq!(resolve_read_only_mode(env(&[])), ReadOnlyMode::Off);
+        // A deployment that sets neither variable must behave exactly as it did before #303, so
+        // this is the row that says the change is additive.
+        assert!(!ReadOnlyMode::Off.is_read_only());
+    }
+
+    #[test]
+    fn each_level_resolves_to_itself() {
+        assert_eq!(
+            resolve_read_only_mode(env(&[("IRIS_SOFT_READ_ONLY", "1")])),
+            ReadOnlyMode::Soft
+        );
+        assert_eq!(
+            resolve_read_only_mode(env(&[("IRIS_STRICT_READ_ONLY", "1")])),
+            ReadOnlyMode::Strict
+        );
+    }
+
+    #[test]
+    fn strict_beats_soft_when_both_are_asked_for() {
+        let both = [("IRIS_SOFT_READ_ONLY", "1"), ("IRIS_STRICT_READ_ONLY", "1")];
+        assert_eq!(
+            resolve_read_only_mode(env(&both)),
+            ReadOnlyMode::Strict,
+            "asking for both is asking for the stronger one — resolving to soft would quietly \
+             grant the scratch-class writes that strict was set to refuse"
+        );
+    }
+
+    #[test]
+    fn an_explicit_request_beats_allow_prod() {
+        // THE precedence that decides whether asking for read-only means anything. IRIS_ALLOW_PROD
+        // forces writes on, and an operator with it exported is exactly who most needs the request
+        // honoured.
+        for requested in [ReadOnlyMode::Soft, ReadOnlyMode::Strict] {
+            assert!(
+                !write_allowed_with(requested, &SystemMode::Development, "USER", true),
+                "{requested:?} must refuse writes even with IRIS_ALLOW_PROD set"
+            );
+        }
+    }
+
+    #[test]
+    fn allow_prod_still_wins_when_no_read_only_was_requested() {
+        // CONTROL for the test above. Without this, "an explicit request beats allow_prod" is also
+        // satisfied by a gate that simply never allows writes, which would be a different bug.
+        assert!(
+            write_allowed_with(ReadOnlyMode::Off, &SystemMode::Live, "PROD", true),
+            "IRIS_ALLOW_PROD must still override the heuristic when nothing was requested"
+        );
+    }
+
+    #[test]
+    fn the_inferred_gate_is_untouched() {
+        // The pre-#303 truth table, re-asserted so a change to the new precedence cannot quietly
+        // alter the old behaviour underneath it.
+        let off = ReadOnlyMode::Off;
+        assert!(!write_allowed_with(off, &SystemMode::Live, "USER", false));
+        assert!(write_allowed_with(
+            off,
+            &SystemMode::Development,
+            "USER",
+            false
+        ));
+        assert!(write_allowed_with(off, &SystemMode::Test, "USER", false));
+        assert!(write_allowed_with(off, &SystemMode::Unknown, "USER", false));
+        assert!(!write_allowed_with(
+            off,
+            &SystemMode::Unknown,
+            "PROD",
+            false
+        ));
+        assert!(!write_allowed_with(
+            off,
+            &SystemMode::Unknown,
+            "production",
+            false
+        ));
+    }
+
+    #[test]
+    fn only_affirmative_values_turn_a_level_on() {
+        for on in ["1", "true", "TRUE", "yes", " 1 "] {
+            assert_eq!(
+                resolve_read_only_mode(env(&[("IRIS_STRICT_READ_ONLY", on)])),
+                ReadOnlyMode::Strict,
+                "{on:?} should request strict"
+            );
+        }
+        // An unset variable and an explicitly negative one must give the same answer: a deployment
+        // that writes IRIS_STRICT_READ_ONLY=0 into a config has NOT asked for read-only, and
+        // treating any non-empty value as truthy is how that becomes a silent surprise.
+        for off in ["0", "false", "no", "", "off"] {
+            assert_eq!(
+                resolve_read_only_mode(env(&[("IRIS_STRICT_READ_ONLY", off)])),
+                ReadOnlyMode::Off,
+                "{off:?} must not request strict"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod atelier_http_error_tests {
     use super::*;
