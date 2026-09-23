@@ -3920,22 +3920,37 @@ If $System.Status.IsError(sc)||('isInSC) {{ Write "NO_SCM" }} Else {{ Write "IN_
         )
         .await
     {
-        Ok(resp) => resp["result"]["content"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .iter()
-            .map(|r| {
-                (
-                    r["Name"].as_str().unwrap_or("").to_string(),
-                    r["ClassName"].as_str().unwrap_or("").to_string(),
-                    // Enabled comes back as a SQL boolean on some builds and 0/1 on others.
-                    r["Enabled"]
-                        .as_bool()
-                        .unwrap_or_else(|| r["Enabled"].as_i64().unwrap_or(0) != 0),
+        // #360: this used to end in `.unwrap_or_default()`. `query()` already turns a transport
+        // fault, a non-2xx and a non-JSON body into `Err`, so the ONE way in is a 200 whose JSON
+        // parsed but carries no `result.content` array — a shape this server does not recognise.
+        // An empty item set there makes the diff report EVERY committed item as `removed` under
+        // success:true, the mirror image of what #153 fixed on the committed side.
+        Ok(resp) => match resp["result"]["content"].as_array() {
+            Some(rows) => rows
+                .iter()
+                .map(|r| {
+                    (
+                        r["Name"].as_str().unwrap_or("").to_string(),
+                        r["ClassName"].as_str().unwrap_or("").to_string(),
+                        // Enabled comes back as a SQL boolean on some builds and 0/1 on others.
+                        r["Enabled"]
+                            .as_bool()
+                            .unwrap_or_else(|| r["Enabled"].as_i64().unwrap_or(0) != 0),
+                    )
+                })
+                .collect(),
+            None => {
+                return err_json(
+                    "CURRENT_UNAVAILABLE",
+                    &format!(
+                        "Could not read the running item set for '{prod_name}' in namespace \
+                         '{ns}': IRIS answered, but the response carried no result rows. \
+                         Refusing rather than diffing against an empty current set, which \
+                         would report every committed item as `removed`."
+                    ),
                 )
-            })
-            .collect(),
+            }
+        },
         Err(e) => return err_json(classify_iris_error(&e.to_string()), &e.to_string()),
     };
 
@@ -3948,7 +3963,41 @@ If $System.Status.IsError(sc)||('isInSC) {{ Write "NO_SCM" }} Else {{ Write "IN_
         .await
     {
         Ok(resp) if resp.status().is_success() => {
-            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            // #360: `resp.json().await.unwrap_or_default()` yielded `Value::Null` on an
+            // unparseable body, `doc_content_to_string(&Null)` yielded "", and zero items
+            // followed — so a 200 reached the empty baseline that the arms below exist to
+            // refuse, by the one path that never consults them. Two `unwrap_or_default()` calls
+            // in series, each individually defensible.
+            let body: serde_json::Value = match resp.json().await {
+                Ok(b) => b,
+                Err(e) => {
+                    return err_json(
+                        "BASELINE_UNAVAILABLE",
+                        &format!(
+                            "Could not read the class definition for '{doc_name}' in namespace \
+                             '{ns}': IRIS answered 200 but the body could not be parsed ({e}). \
+                             Refusing rather than diffing against an empty baseline, which would \
+                             report every running item as `added`."
+                        ),
+                    )
+                }
+            };
+            // The document must arrive as an array of source lines. `%ExistsId` proved two calls
+            // ago that the class EXISTS, so a body with no lines is a read that failed, not a
+            // production whose source is empty — and a production with no <Item> entries still
+            // has a class definition, so this does not refuse a legitimately empty production.
+            let lines = body["result"]["content"].as_array();
+            if lines.is_none_or(|l| l.is_empty()) {
+                return err_json(
+                    "BASELINE_UNAVAILABLE",
+                    &format!(
+                        "Could not read the class definition for '{doc_name}' in namespace \
+                         '{ns}': IRIS answered 200 with no source lines, though the class was \
+                         just confirmed to exist. Refusing rather than diffing against an empty \
+                         baseline, which would report every running item as `added`."
+                    ),
+                );
+            }
             let source = crate::tools::doc::doc_content_to_string(&body);
             parse_production_items_from_source(&source)
         }
@@ -4007,6 +4056,11 @@ If $System.Status.IsError(sc)||('isInSC) {{ Write "NO_SCM" }} Else {{ Write "IN_
         "namespace": ns,
         "in_sync": changes.is_empty(),
         "changes": changes,
+        // #360: a verdict is not interpretable without the size of both sides. "every item
+        // added" and "every item removed" read exactly like real drift unless the caller can
+        // see the denominators they were computed from.
+        "committed_item_count": committed_items.len(),
+        "current_item_count": current_items.len(),
         // #153: name what the diff was taken against, so "in_sync" is interpretable.
         "baseline": baseline,
     }))
