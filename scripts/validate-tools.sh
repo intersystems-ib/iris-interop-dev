@@ -84,3 +84,95 @@ if bad:
     sys.exit(1)
 print("GATE OK: every 'OK' tool names a unit AND an e2e test.")
 PY
+
+# ── #353: the upstream surface, computed rather than restated ─────────────────────
+# Why this lives here: the gate above already compares NAMES against INTEROP_TOOLS and refuses a
+# restated count. What it could not answer is "which of upstream's tools are we not advertising, and
+# is that because we never ported them or because we pruned them?" — two states with different
+# remedies (a port vs one line in INTEROP_TOOLS) that the issue's "48 excluded" conflated.
+#
+# NO COUNT IS WRITTEN HERE. #353 was filed stating upstream's total and ours, and both were wrong
+# by the time anyone read it — which is the same failure this gate already refuses in
+# tools-status.json's `_comment` and `profile` fields. Run the script; it prints the current numbers
+# and the arithmetic that ties them together.
+#
+# THREE outcomes, not two. If `upstream/master` is not fetched, this section says so and does NOT
+# fail the gate (CI need not carry the remote) — but it must never report the comparison as clean,
+# which is the same rule the rest of this gate follows.
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+if ! git -C "$ROOT" rev-parse --verify --quiet upstream/master >/dev/null 2>&1; then
+  echo
+  echo "UPSTREAM SURFACE: NOT CHECKED — upstream/master is not fetched in this clone."
+  echo "  Run: git fetch upstream master    (remote 'upstream' must exist)"
+  echo "  This is not a pass: the comparison did not run."
+  exit 0
+fi
+
+python3 - "$ROOT" <<'PY'
+import re, subprocess, sys
+ROOT = sys.argv[1]
+TOOL = re.compile(r'#\[tool\((?:[^)]|\)[^\]])*\)\]\s*(?:pub\s+)?async\s+fn\s+(\w+)', re.S)
+MOD  = re.compile(r'#\[cfg\(test\)\]\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*\{')
+
+def git(*a):
+    return subprocess.run(["git","-C",ROOT,*a], capture_output=True, text=True).stdout
+
+def strip_test_mods(t):
+    out, i = [], 0
+    while True:
+        m = MOD.search(t, i)
+        if not m:
+            out.append(t[i:]); break
+        out.append(t[i:m.start()])
+        d, j = 1, m.end()
+        while j < len(t) and d:
+            if t[j] == '{': d += 1
+            elif t[j] == '}': d -= 1
+            j += 1
+        i = j
+    return "".join(out)
+
+def tools_at(ref):
+    files = [f for f in git("ls-tree","-r","--name-only",ref).split("\n")
+             if re.search(r"src/tools/.*\.rs$", f)]
+    names = set()
+    for f in files:
+        txt = git("show", f"{ref}:{f}")
+        names |= set(TOOL.findall(re.sub(r"//.*", "", strip_test_mods(txt))))
+    return names
+
+up   = tools_at("upstream/master")
+ours = tools_at("HEAD")
+
+# CONTROL: an empty or tiny read is a broken scan, not a small upstream. Without this the buckets
+# below would report "we ported everything" from a renamed path or a moved crate directory.
+if len(up) < 40 or len(ours) < 40:
+    print()
+    print(f"UPSTREAM SURFACE: NOT CHECKED — scan returned upstream={len(up)} ours={len(ours)}, "
+          "which cannot be right. Refusing to report buckets from a broken read.")
+    sys.exit(0)
+
+src = open(f"{ROOT}/crates/iris-agentic-dev-core/src/tools/mod.rs").read()
+km = re.search(r"INTEROP_TOOLS[^=]*=\s*&?\[(.*?)\];", src, re.S)
+profile = set(re.findall(r'"([a-z_][a-z_0-9]*)"', km.group(1))) if km else set()
+
+advertised_upstream = sorted(profile & up)
+fork_local          = sorted(profile - up)
+pruned              = sorted((ours & up) - profile)
+absent              = sorted(up - ours)
+
+print()
+print("UPSTREAM SURFACE (#353)")
+print(f"  upstream implemented          {len(up)}")
+print(f"  ours implemented              {len(ours)}")
+print(f"  ours advertised               {len(profile)}  = {len(advertised_upstream)} upstream "
+      f"+ {len(fork_local)} fork-local")
+print(f"  PRUNED   (ported, not advertised, adopting = one line)   {len(pruned)}")
+print(f"  ABSENT   (not ported, adopting = a port)                 {len(absent)}")
+print(f"  arithmetic: {len(advertised_upstream)} + {len(pruned)} + {len(absent)} = "
+      f"{len(advertised_upstream)+len(pruned)+len(absent)} (upstream total {len(up)})")
+if fork_local:
+    print(f"  fork-local: {', '.join(fork_local)}")
+print(f"  pruned: {', '.join(pruned)}")
+print(f"  absent: {', '.join(absent)}")
+PY
