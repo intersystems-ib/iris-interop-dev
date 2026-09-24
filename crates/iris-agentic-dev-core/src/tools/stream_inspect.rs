@@ -39,7 +39,7 @@
 //!    and has a helper for. The body goes through [`crate::objectscript::write_marker_lines`] with a
 //!    declared line count, so a short arrival is detectable instead of plausible.
 
-use crate::objectscript::{os_str_expr, write_marker_lines, Declared};
+use crate::objectscript::os_str_expr;
 
 /// #211: `stream_id` is the advertised name and the only one the schema publishes. `oid` is
 /// upstream's spelling and `id` the obvious guess, both accepted as a rescue path so a caller
@@ -71,288 +71,342 @@ pub const BINARY_CLASS: &str = "%Stream.GlobalBinary";
 pub const M_FOUND: &str = "SI_FOUND:";
 pub const M_CLASS: &str = "SI_CLASS:";
 pub const M_SIZE: &str = "SI_SIZE:";
-pub const M_WHY_LINES: &str = "SI_WHY_LINES:";
-pub const M_WHY: &str = "SI_WHY:";
-pub const M_BODY_LINES: &str = "SI_BODY_LINES:";
-pub const M_BODY: &str = "SI_BODY:";
+/// Declared length in characters of what was read, before encoding — a short arrival is then
+/// detectable against the decoded length.
+pub const M_BODY_LEN: &str = "SI_BODY_LEN:";
+/// The body, base64. One line by construction: the alphabet contains no newline.
+pub const M_BODY_B64: &str = "SI_BODY_B64:";
 
 /// What inspecting one stream amounted to.
 ///
-/// `NotFound` and `Unreadable` are separate from a stream that is genuinely empty, and neither is
-/// reported as one: "this id opens nothing" and "this stream holds nothing" send a caller to
-/// different places, and answering the first with the second is the negative fact CLAUDE.md is about.
+/// `NotFound` is separate from a stream that is genuinely empty, and neither is reported as the
+/// other: "this id holds nothing" and "there is no such id" send a caller to different places, and
+/// the measured reason this needs saying is that `%OpenId` cannot tell them apart — it hands back a
+/// usable empty object for an unknown id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamRead {
-    /// Neither stream class opened this id. Carries what IRIS said, when it said anything.
-    NotFound { why: String },
+    /// `%ExistsId` said no.
+    NotFound,
     /// The program produced no usable answer — no `SI_FOUND` marker at all.
     Unreadable,
     /// Opened and read.
     Read {
-        class: String,
+        /// The class the read went through. NOT a claim about the data's kind: character and binary
+        /// streams share storage, so which class opens an id says nothing about what is in it.
+        opened_as: String,
         size: u64,
-        /// The characters that arrived. Empty for a binary stream, which is reported by size only.
-        body: String,
-        /// Declared line count of the body, and how many arrived. Unequal means the output was cut.
-        lines_declared: usize,
-        lines_received: usize,
+        /// The exact bytes that arrived, base64-decoded.
+        bytes: Vec<u8>,
+        /// Characters IRIS said it read, against `bytes.len()`. Unequal means the reply was cut.
+        declared_len: usize,
     },
 }
 
 impl StreamRead {
-    /// Whether the body arrived whole. A binary stream declares no body, so it is complete by
-    /// construction — `size` is the answer there, not the bytes.
+    /// Whether as much arrived as IRIS declared.
     pub fn body_complete(&self) -> bool {
         match self {
             StreamRead::Read {
-                lines_declared,
-                lines_received,
+                bytes,
+                declared_len,
                 ..
-            } => lines_declared == lines_received,
+            } => bytes.len() == *declared_len,
             _ => false,
         }
     }
 }
 
-/// The program. Reads `Size` BEFORE the body, because the measurement above shows reading size moves
-/// nothing and the size is the half that is always reportable.
+/// The program.
 ///
-/// The not-found branch ends in `Quit`, which returns from the METHOD — measured on IRIS 2026.1, and
-/// the behaviour wanted here: there is nothing further to report.
+/// Every line of this is a MEASURED correction of a first version that ran only in unit tests
+/// (IRIS 2026.1, throwaway streams on a scratch instance):
+///
+/// * **`%ExistsId`, not `'$IsObject`.** `%OpenId("999")` on an unknown id returns `$IsObject` 1
+///   with an OK status — a usable EMPTY stream object. So the not-found arm never fired and a
+///   missing id was reported as `size: 0, empty: true`, which is precisely the confusion this tool
+///   exists to prevent. `%ExistsId` gives 1 / 0 / 0 for present / missing / blank.
+/// * **Always read through `%Stream.GlobalBinary`.** Character and binary streams share storage:
+///   `%Stream.GlobalCharacter.%OpenId` on a binary stream SUCCEEDS and `$classname` reports the
+///   class you opened with, so the data's kind is not knowable from here. Measured, the binary read
+///   returns a character stream's bytes intact (106 chars, both CRs) and a binary stream's first
+///   `$CHAR(0)` without truncating.
+/// * **Base64, not a line protocol.** `write_marker_lines` deletes CR by design — correct for a
+///   CRLF `%Status` chain, destructive for a CR-separated HL7 v2 body, which collapsed to one line
+///   with its segment boundaries gone while the declared count still said "complete".
+///   `$System.Encryption.Base64Encode(raw, 1)` round-trips losslessly and needs no line protocol.
 pub fn build_inspect_code(id: &str, max_chars: usize) -> String {
     let id_e = os_str_expr(id);
     format!(
         "set tId={id_e}\n\
-         set tS=##class({ch}).%OpenId(tId,,.tSC1)\n\
-         set tCls={ch_e}\n\
-         if '$IsObject(tS) {{ set tS=##class({bin}).%OpenId(tId,,.tSC2) set tCls={bin_e} }}\n\
-         if '$IsObject(tS) {{ write {found}_\"0\"_$CHAR(10) set tWhy=$SYSTEM.Status.GetErrorText(tSC1) {why} Quit }}\n\
+         if '##class({bin}).%ExistsId(tId) {{ write {found}_\"0\"_$CHAR(10) Quit }}\n\
+         set tS=##class({bin}).%OpenId(tId,,.tSC1)\n\
+         if '$IsObject(tS) {{ write {found}_\"0\"_$CHAR(10) Quit }}\n\
          write {found}_\"1\"_$CHAR(10)\n\
-         write {cls}_tCls_$CHAR(10)\n\
+         write {cls}_{bin_e}_$CHAR(10)\n\
          write {size}_tS.Size_$CHAR(10)\n\
-         set tBody=\"\"\n\
-         if tCls={ch_e} {{ set tBody=tS.Read({max}) }}\n\
-         {body}",
-        ch = CHARACTER_CLASS,
+         set tBody=tS.Read({max})\n\
+         write {blen}_$LENGTH(tBody)_$CHAR(10)\n\
+         write {b64}_$SYSTEM.Encryption.Base64Encode(tBody,1)_$CHAR(10)",
         bin = BINARY_CLASS,
-        ch_e = os_str_expr(CHARACTER_CLASS),
         bin_e = os_str_expr(BINARY_CLASS),
         found = os_str_expr(M_FOUND),
         cls = os_str_expr(M_CLASS),
         size = os_str_expr(M_SIZE),
+        blen = os_str_expr(M_BODY_LEN),
+        b64 = os_str_expr(M_BODY_B64),
         max = max_chars,
-        why = write_marker_lines("tWhy", M_WHY_LINES, M_WHY, Declared::Lines).replace('\n', " "),
-        body = write_marker_lines("tBody", M_BODY_LINES, M_BODY, Declared::Lines),
     )
 }
 
 /// Read the framed output back.
 pub fn parse_inspect_output(out: &str) -> StreamRead {
     let mut found: Option<bool> = None;
-    let mut class = String::new();
+    let mut opened_as = String::new();
     let mut size: u64 = 0;
-    let mut why: Vec<String> = Vec::new();
-    let mut body: Vec<String> = Vec::new();
-    let mut declared: Option<usize> = None;
+    let mut declared_len: Option<usize> = None;
+    let mut b64: Option<String> = None;
     for line in out.lines() {
         let l = line.trim_end_matches('\r');
         if let Some(v) = l.strip_prefix(M_FOUND) {
             found = Some(v.trim() == "1");
         } else if let Some(v) = l.strip_prefix(M_CLASS) {
-            class = v.trim().to_string();
+            opened_as = v.trim().to_string();
         } else if let Some(v) = l.strip_prefix(M_SIZE) {
             size = v.trim().parse().unwrap_or(0);
-        } else if let Some(v) = l.strip_prefix(M_BODY_LINES) {
-            declared = v.trim().parse().ok();
-        } else if let Some(v) = l.strip_prefix(M_BODY) {
-            body.push(v.to_string());
-        } else if let Some(v) = l.strip_prefix(M_WHY) {
-            why.push(v.to_string());
+        } else if let Some(v) = l.strip_prefix(M_BODY_LEN) {
+            declared_len = v.trim().parse().ok();
+        } else if let Some(v) = l.strip_prefix(M_BODY_B64) {
+            b64 = Some(v.trim().to_string());
         }
     }
     match found {
         None => StreamRead::Unreadable,
-        Some(false) => StreamRead::NotFound {
-            why: why.join("\n"),
-        },
+        Some(false) => StreamRead::NotFound,
         Some(true) => {
-            // A body of "" is written by write_marker_lines as ONE empty line, so an empty stream
-            // declares 1 and receives 1. That is why emptiness is read off `size`, never off the
-            // line count.
-            let lines_declared = declared.unwrap_or(0);
+            // A body that does not decode is NOT an empty body: the transport mangled it, and
+            // saying "this stream holds nothing" about that is the whole failure mode here.
+            let Some(enc) = b64 else {
+                return StreamRead::Unreadable;
+            };
+            let Ok(bytes) = base64_decode(&enc) else {
+                return StreamRead::Unreadable;
+            };
             StreamRead::Read {
-                class,
+                opened_as,
                 size,
-                body: body.join("\n"),
-                lines_declared,
-                lines_received: body.len(),
+                bytes,
+                declared_len: declared_len.unwrap_or(0),
             }
         }
     }
 }
 
-/// The payload. `truncated` is set from `size` versus what was asked for, so a prefix is never
-/// presented as the whole stream.
+/// Standard base64 with padding, as `$SYSTEM.Encryption.Base64Encode(x, 1)` emits it (the `1`
+/// suppresses the line breaks it otherwise inserts every 76 characters).
+fn base64_decode(s: &str) -> Result<Vec<u8>, ()> {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut val = [255u8; 256];
+    for (i, c) in T.iter().enumerate() {
+        val[*c as usize] = i as u8;
+    }
+    let clean: Vec<u8> = s
+        .bytes()
+        .filter(|b| !b.is_ascii_whitespace() && *b != b'=')
+        .collect();
+    if clean.iter().any(|b| val[*b as usize] == 255) {
+        return Err(());
+    }
+    let mut out = Vec::with_capacity(clean.len() * 3 / 4);
+    for chunk in clean.chunks(4) {
+        let mut acc: u32 = 0;
+        for (i, b) in chunk.iter().enumerate() {
+            acc |= (val[*b as usize] as u32) << (18 - 6 * i);
+        }
+        let take = match chunk.len() {
+            4 => 3,
+            3 => 2,
+            2 => 1,
+            _ => return Err(()),
+        };
+        for i in 0..take {
+            out.push((acc >> (16 - 8 * i)) as u8);
+        }
+    }
+    Ok(out)
+}
+
+/// The payload.
 pub fn payload(id: &str, max_chars: usize, r: &StreamRead) -> serde_json::Value {
     match r {
         StreamRead::Unreadable => serde_json::json!({
             "stream_id": id, "error_code": "STREAM_UNREADABLE",
-            "error": "the inspect program produced no answer for this stream — not an empty \
+            "error": "the inspect program produced no usable answer for this stream — not an empty \
                       stream, an unusable reply. Retry; if it persists the namespace may be wrong."
         }),
-        StreamRead::NotFound { why } => {
-            let mut v = serde_json::json!({
-                "stream_id": id, "error_code": "STREAM_NOT_FOUND",
-                "error": format!(
-                    "no {CHARACTER_CLASS} or {BINARY_CLASS} with id '{id}' in this namespace. \
-                     This is NOT an empty stream. Check the id (it is the %Id of the stream, which \
-                     for a message body comes from the body's own property) and check the \
-                     namespace — a stream id is only meaningful in the namespace that holds it."
-                ),
-            });
-            if !why.trim().is_empty() {
-                v["iris_status"] = serde_json::Value::String(why.clone());
-            }
-            v
-        }
+        StreamRead::NotFound => serde_json::json!({
+            "stream_id": id, "error_code": "STREAM_NOT_FOUND",
+            "error": format!(
+                "%ExistsId says there is no stream with id '{id}' in this namespace. This is NOT an \
+                 empty stream — an empty one reports success with size 0. Check the id (it is the \
+                 %Id of the stream, which for a message body comes from the body's own property) \
+                 and check the namespace: a stream id is only meaningful in the namespace holding it."
+            ),
+        }),
         StreamRead::Read {
-            class,
+            opened_as,
             size,
-            body,
-            lines_declared,
-            lines_received,
+            bytes,
+            declared_len,
         } => {
-            let binary = class == BINARY_CLASS;
             let mut v = serde_json::json!({
                 "success": true,
                 "stream_id": id,
-                "class": class,
+                // Which class the read went through — NOT what the data is. Character and binary
+                // streams share storage, so no read here can tell you which it "really" is.
+                "opened_as": opened_as,
                 "size": size,
                 "empty": *size == 0,
+                "body_bytes": bytes.len(),
             });
-            if binary {
-                // Bytes do not survive a line-oriented protocol, and a mangled body is worse than
-                // none. The size still answers "did the relay write anything".
-                v["body_omitted"] = serde_json::Value::String(
-                    "binary stream: size is reported, content is not, because arbitrary bytes \
-                     cannot be carried on a text protocol without corrupting them."
-                        .into(),
-                );
-            } else {
-                v["body"] = serde_json::Value::String(body.clone());
-                v["body_chars"] = serde_json::json!(body.chars().count());
-                let asked = max_chars as u64;
-                if *size > asked {
-                    v["truncated"] = serde_json::Value::Bool(true);
-                    v["max_chars"] = serde_json::json!(max_chars);
+            // Exact, always: base64 survives CR, NUL and anything else a body can hold.
+            v["body_base64"] = serde_json::Value::String(base64_encode(bytes));
+            // And a readable rendering when the bytes are text. `from_utf8_lossy` would hide binary
+            // behind replacement characters, so a body that is not valid UTF-8 gets no `body` field
+            // rather than a mangled one.
+            match std::str::from_utf8(bytes) {
+                Ok(text) => {
+                    v["body"] = serde_json::Value::String(text.to_string());
+                    v["body_chars"] = serde_json::json!(text.chars().count());
                 }
-                if lines_declared != lines_received {
-                    v["body_incomplete"] = serde_json::Value::Bool(true);
-                    v["lines_declared"] = serde_json::json!(lines_declared);
-                    v["lines_received"] = serde_json::json!(lines_received);
+                Err(_) => {
+                    v["body_not_text"] = serde_json::Value::String(
+                        "these bytes are not valid UTF-8, so no `body` is given — read \
+                         `body_base64`, which is exact."
+                            .into(),
+                    );
                 }
+            }
+            if *size > max_chars as u64 {
+                v["truncated"] = serde_json::Value::Bool(true);
+                v["max_chars"] = serde_json::json!(max_chars);
+            }
+            if bytes.len() != *declared_len {
+                v["body_incomplete"] = serde_json::Value::Bool(true);
+                v["declared_len"] = serde_json::json!(declared_len);
+                v["received_len"] = serde_json::json!(bytes.len());
             }
             v
         }
     }
+}
+
+/// Base64 with padding, so the exact bytes can be handed back to a caller.
+fn base64_encode(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let acc = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(T[((acc >> (18 - 6 * i)) & 0x3F) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn the_program_never_writes_to_the_stream() {
-        let code = build_inspect_code("4", 4096);
-        for mutation in ["Rewind", "MoveTo", "Write", "%Save", "Clear", "%Delete"] {
-            assert!(
-                !code.contains(mutation),
-                "the program calls {mutation}, which mutates an object the caller asked us to \
-                 LOOK at:\n{code}"
-            );
+    /// Fixtures are the bytes a real instance returned. `MULTILINE` is a CR-separated HL7 v2 body
+    /// written to a `%Stream.GlobalCharacter` and read back through `%Stream.GlobalBinary`: 106
+    /// characters, two CRs, which the previous line protocol silently deleted.
+    const HL7: &str = "MSH|^~\\&|HIS|H|DIET|D|20260924||ADT^A01|1|P|2.5\rPID|1||123456^^^H||DOE^JOHN||19700101|M\rPV1|1|I|WARD^01^02";
+
+    fn reply(found: bool, size: u64, bytes: &[u8]) -> String {
+        if !found {
+            return format!("{M_FOUND}0\n");
         }
-        // CONTROL: it does read, so the assertions above are not passing on an empty program.
-        assert!(code.contains(".Read("), "{code}");
-        assert!(code.contains(".Size"), "{code}");
+        format!(
+            "{M_FOUND}1\n{M_CLASS}{BINARY_CLASS}\n{M_SIZE}{size}\n{M_BODY_LEN}{}\n{M_BODY_B64}{}\n",
+            bytes.len(),
+            base64_encode(bytes)
+        )
+    }
+
+    /// The encoder pinned against RFC 4648's own vectors, NOT against my decoder.
+    ///
+    /// A mutation dropping the `=` padding SURVIVED the round-trip test below, because
+    /// `base64_decode` filters padding out — so encoder and decoder agreed with each other while
+    /// the encoder's output would have been rejected by any standard consumer. `body_base64` goes to
+    /// a caller that will use a real base64 library, so the padding is part of the contract.
+    #[test]
+    fn the_encoder_matches_the_standard_vectors_padding_included() {
+        for (raw, expect) in [
+            (&b""[..], ""),
+            (&b"f"[..], "Zg=="),
+            (&b"fo"[..], "Zm8="),
+            (&b"foo"[..], "Zm9v"),
+            (&b"foob"[..], "Zm9vYg=="),
+            (&b"fooba"[..], "Zm9vYmE="),
+            (&b"foobar"[..], "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64_encode(raw), expect, "raw={raw:?}");
+        }
+        // Length is always a multiple of 4 — the property a consumer relies on.
+        for n in 0..20 {
+            let v: Vec<u8> = (0..n).map(|i| i as u8).collect();
+            assert_eq!(base64_encode(&v).len() % 4, 0, "n={n}");
+        }
     }
 
     #[test]
-    fn size_is_read_before_the_body() {
-        let code = build_inspect_code("4", 100);
-        let size_at = code.find(".Size").expect("reads Size");
-        let read_at = code.find(".Read(").expect("reads the body");
-        assert!(
-            size_at < read_at,
-            "Size must be read first — it is the half that is always reportable:\n{code}"
-        );
+    fn base64_round_trips_every_byte_including_cr_and_nul() {
+        for case in [
+            HL7.as_bytes().to_vec(),
+            vec![0u8, 1, 2, 255, 254],
+            b"".to_vec(),
+            b"a".to_vec(),
+            b"ab".to_vec(),
+            b"abc".to_vec(),
+            (0u8..=255).collect::<Vec<u8>>(),
+        ] {
+            let enc = base64_encode(&case);
+            assert!(
+                !enc.contains('\n'),
+                "the encoding must stay on one line: {enc}"
+            );
+            assert_eq!(base64_decode(&enc).expect("decodes"), case, "enc={enc}");
+        }
+        // CONTROL: a string that is not base64 must fail rather than decode to something.
+        assert!(base64_decode("not base64!!").is_err());
     }
 
+    /// The defect that shipped: a CR-separated body came back with its segment boundaries deleted.
     #[test]
-    fn the_body_read_is_capped_at_what_was_asked_for() {
-        let code = build_inspect_code("4", 512);
-        assert!(code.contains(".Read(512)"), "{code}");
-        // The whole-stream loop upstream uses must not appear: it is what hits <MAXSTRING>.
-        assert!(!code.contains("AtEnd"), "no read-to-the-end loop:\n{code}");
-        assert!(!code.contains("While"), "{code}");
-    }
-
-    #[test]
-    fn a_body_with_newlines_is_carried_line_by_line_with_a_declared_count() {
-        let code = build_inspect_code("4", 4096);
-        assert!(
-            code.contains(M_BODY_LINES),
-            "the count must be declared:\n{code}"
-        );
-        assert!(code.contains(M_BODY), "{code}");
-        // The single-line form is the #347 defect.
-        assert!(
-            !code.contains("write \"SI_BODY:\"_tBody"),
-            "the body is written as one line, so an HL7 message loses every segment after the \
-             first:\n{code}"
-        );
-    }
-
-    /// An HL7 v2 body: CR-separated segments. `write_marker_lines` deletes CR and splits on LF, so
-    /// the reader sees one line per segment.
-    #[test]
-    fn every_line_of_a_multi_line_body_is_reassembled() {
-        let out = "SI_FOUND:1\nSI_CLASS:%Stream.GlobalCharacter\nSI_SIZE:42\n\
-                   SI_BODY_LINES:3\nSI_BODY:MSH|^~\\&|HIS\nSI_BODY:PID|1||123\nSI_BODY:PV1|1|I\n";
-        let r = parse_inspect_output(out);
-        let StreamRead::Read { body, size, .. } = &r else {
-            panic!("expected Read, got {r:?}")
-        };
-        assert_eq!(*size, 42);
-        assert_eq!(body, "MSH|^~\\&|HIS\nPID|1||123\nPV1|1|I");
+    fn a_cr_separated_body_keeps_its_separators() {
+        let r = parse_inspect_output(&reply(true, 106, HL7.as_bytes()));
+        let v = payload("5", 4096, &r);
+        assert_eq!(v["body"], HL7, "the CRs must survive the round trip");
+        assert_eq!(v["body"].as_str().unwrap().matches('\r').count(), 2);
+        assert_eq!(v["body_bytes"], 106);
         assert!(r.body_complete());
     }
 
-    /// Fewer lines than declared: the body is a PREFIX, and saying so is the point.
+    /// The other defect: an id that does not exist came back as an empty stream, because `%OpenId`
+    /// hands out a usable empty object for an unknown id. `%ExistsId` is what distinguishes them.
     #[test]
-    fn a_body_that_arrives_short_is_flagged_not_silently_shortened() {
-        let out = "SI_FOUND:1\nSI_CLASS:%Stream.GlobalCharacter\nSI_SIZE:42\n\
-                   SI_BODY_LINES:3\nSI_BODY:MSH|^~\\&|HIS\n";
-        let r = parse_inspect_output(out);
-        assert!(!r.body_complete());
-        let v = payload("4", 4096, &r);
-        assert_eq!(v["body_incomplete"], true);
-        assert_eq!(v["lines_declared"], 3);
-        assert_eq!(v["lines_received"], 1);
-    }
-
-    /// An id that opens nothing is NOT an empty stream, and the message has to say so out loud —
-    /// this is the confusion #352 was filed about.
-    #[test]
-    fn an_id_that_opens_nothing_is_not_an_empty_stream() {
-        let r = parse_inspect_output(
-            "SI_FOUND:0\nSI_WHY_LINES:1\nSI_WHY:ERROR #5809: Object not found\n",
-        );
-        assert_eq!(
-            r,
-            StreamRead::NotFound {
-                why: "ERROR #5809: Object not found".into()
-            }
-        );
+    fn a_missing_id_is_not_an_empty_stream() {
+        let r = parse_inspect_output(&reply(false, 0, b""));
+        assert_eq!(r, StreamRead::NotFound);
         let v = payload("999", 4096, &r);
         assert_eq!(v["error_code"], "STREAM_NOT_FOUND");
         assert!(v.get("empty").is_none(), "must not report emptiness: {v}");
@@ -361,88 +415,130 @@ mod tests {
             "must not report a size it never read: {v}"
         );
         assert!(
-            v["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("NOT an empty stream"),
+            v["error"].as_str().unwrap().contains("NOT an empty stream"),
             "{v}"
+        );
+        // CONTROL: a stream that EXISTS and holds nothing is the other answer.
+        let e = payload("5", 4096, &parse_inspect_output(&reply(true, 0, b"")));
+        assert_eq!(e["success"], true);
+        assert_eq!(e["empty"], true);
+        assert_eq!(e["size"], 0);
+    }
+
+    /// The program must use the primitive that can tell them apart, and read through the class that
+    /// preserves bytes.
+    #[test]
+    fn the_program_uses_existsid_and_reads_through_the_binary_class() {
+        let code = build_inspect_code("5", 4096);
+        assert!(code.contains("%ExistsId(tId)"), "{code}");
+        assert!(
+            code.matches(BINARY_CLASS).count() >= 2,
+            "the read must go through the binary class, which preserves CR and NUL: {code}"
         );
         assert!(
-            v["iris_status"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("5809"),
-            "{v}"
+            !code.contains(CHARACTER_CLASS),
+            "opening as character truncates a binary body at the first NUL, and says nothing about \
+             what the data is: {code}"
         );
+        assert!(code.contains("Base64Encode(tBody,1)"), "{code}");
+        // The defect that shipped: `write_marker_lines` deletes CR, so a CR-separated HL7 body
+        // collapsed to one line with its segment boundaries gone. A mutation re-adding that
+        // translate SURVIVED every parser test, because those feed hand-written marker text and
+        // cannot see the ObjectScript. This is the assertion that can.
+        assert!(
+            !code.contains("$TRANSLATE"),
+            "nothing may rewrite the body before it is encoded — deleting CR destroys an HL7 v2 \
+             message's segment boundaries silently: {code}"
+        );
+        assert!(
+            !code.contains("$CHAR(13)"),
+            "the body must not be split or filtered on CR: {code}"
+        );
+        // And the body must go out through the encoder rather than any line protocol.
+        assert!(!code.contains("$PIECE(tBody"), "{code}");
+        assert!(code.contains(".Read(4096)"), "{code}");
+        for mutation in ["Rewind", "MoveTo", ".Write(", "%Save", "Clear", "%Delete"] {
+            assert!(
+                !code.contains(mutation),
+                "the program mutates the stream: {mutation}\n{code}"
+            );
+        }
     }
 
-    /// A genuinely empty stream is a DIFFERENT answer: it opened, and it holds nothing.
+    /// Binary bytes come back exactly, and are NOT offered as text.
     #[test]
-    fn a_stream_that_opened_and_holds_nothing_says_empty() {
-        let r = parse_inspect_output(
-            "SI_FOUND:1\nSI_CLASS:%Stream.GlobalCharacter\nSI_SIZE:0\nSI_BODY_LINES:1\nSI_BODY:\n",
-        );
-        let v = payload("4", 4096, &r);
-        assert_eq!(v["success"], true);
-        assert_eq!(v["empty"], true);
-        assert_eq!(v["size"], 0);
-        assert_eq!(v["body"], "");
-        assert_ne!(v["error_code"], "STREAM_NOT_FOUND");
-    }
-
-    /// No marker at all: the program said nothing usable. Not found, and not empty either.
-    #[test]
-    fn a_reply_with_no_marker_is_unreadable_not_empty() {
-        let r = parse_inspect_output("some unrelated output\n");
-        assert_eq!(r, StreamRead::Unreadable);
-        let v = payload("4", 4096, &r);
-        assert_eq!(v["error_code"], "STREAM_UNREADABLE");
-        assert!(v.get("empty").is_none(), "{v}");
-    }
-
-    /// A stream longer than what was asked for is a PREFIX and says so.
-    #[test]
-    fn a_stream_longer_than_max_chars_is_reported_as_truncated() {
-        let r = parse_inspect_output(
-            "SI_FOUND:1\nSI_CLASS:%Stream.GlobalCharacter\nSI_SIZE:100000\nSI_BODY_LINES:1\nSI_BODY:abc\n",
-        );
-        let v = payload("4", 10, &r);
-        assert_eq!(v["truncated"], true);
-        assert_eq!(v["max_chars"], 10);
-        assert_eq!(v["size"], 100000);
-        // CONTROL: a stream that FITS must not be flagged.
-        let fits = parse_inspect_output(
-            "SI_FOUND:1\nSI_CLASS:%Stream.GlobalCharacter\nSI_SIZE:3\nSI_BODY_LINES:1\nSI_BODY:abc\n",
-        );
-        assert!(payload("4", 10, &fits).get("truncated").is_none());
-    }
-
-    /// Binary: size only. A mangled body is worse than none, and the size still answers "did the
-    /// relay write anything".
-    #[test]
-    fn a_binary_stream_reports_its_size_and_omits_its_bytes() {
-        let r = parse_inspect_output(
-            "SI_FOUND:1\nSI_CLASS:%Stream.GlobalBinary\nSI_SIZE:2048\nSI_BODY_LINES:1\nSI_BODY:\n",
-        );
-        let v = payload("4", 4096, &r);
-        assert_eq!(v["size"], 2048);
-        assert_eq!(v["empty"], false);
+    fn binary_bytes_are_returned_exactly_and_not_as_text() {
+        let raw = vec![0u8, 1, 2, 255, 254];
+        let v = payload("6", 4096, &parse_inspect_output(&reply(true, 5, &raw)));
+        assert_eq!(v["body_bytes"], 5);
         assert!(
             v.get("body").is_none(),
-            "bytes must not be reported as text: {v}"
+            "invalid UTF-8 must not be offered as text: {v}"
         );
         assert!(
-            v["body_omitted"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("binary"),
+            v["body_not_text"].as_str().unwrap().contains("body_base64"),
             "{v}"
         );
-        // And the program only reads a body for the character class.
-        let code = build_inspect_code("4", 99);
+        assert_eq!(
+            base64_decode(v["body_base64"].as_str().unwrap()).unwrap(),
+            raw
+        );
+        // CONTROL: text DOES get a body field.
+        let t = payload("5", 4096, &parse_inspect_output(&reply(true, 3, b"abc")));
+        assert_eq!(t["body"], "abc");
+        assert!(t.get("body_not_text").is_none());
+    }
+
+    #[test]
+    fn a_body_longer_than_max_chars_is_flagged_truncated() {
+        let v = payload(
+            "7",
+            20,
+            &parse_inspect_output(&reply(true, 500, b"01234567890123456789")),
+        );
+        assert_eq!(v["truncated"], true);
+        assert_eq!(v["max_chars"], 20);
+        assert_eq!(v["size"], 500);
+        // CONTROL: one that fits is not flagged.
+        let f = payload("5", 20, &parse_inspect_output(&reply(true, 3, b"abc")));
+        assert!(f.get("truncated").is_none(), "{f}");
+    }
+
+    /// Fewer bytes than IRIS declared: a prefix, said out loud.
+    #[test]
+    fn a_short_arrival_is_flagged_not_silently_shortened() {
+        let short = format!(
+            "{M_FOUND}1\n{M_CLASS}{BINARY_CLASS}\n{M_SIZE}100\n{M_BODY_LEN}100\n{M_BODY_B64}{}\n",
+            base64_encode(b"abc")
+        );
+        let r = parse_inspect_output(&short);
+        assert!(!r.body_complete());
+        let v = payload("5", 4096, &r);
+        assert_eq!(v["body_incomplete"], true);
+        assert_eq!(v["declared_len"], 100);
+        assert_eq!(v["received_len"], 3);
+    }
+
+    /// A body that does not decode is NOT an empty body.
+    #[test]
+    fn an_undecodable_body_is_unreadable_not_empty() {
+        let bad = format!("{M_FOUND}1\n{M_CLASS}{BINARY_CLASS}\n{M_SIZE}5\n{M_BODY_LEN}5\n{M_BODY_B64}!!!not!!!\n");
+        assert_eq!(parse_inspect_output(&bad), StreamRead::Unreadable);
+        let v = payload("5", 4096, &parse_inspect_output(&bad));
+        assert_eq!(v["error_code"], "STREAM_UNREADABLE");
+        assert!(v.get("empty").is_none(), "{v}");
+        // And a reply with no marker at all is the same outcome.
+        assert_eq!(parse_inspect_output("unrelated\n"), StreamRead::Unreadable);
+    }
+
+    /// `opened_as` is which class the read used, not a claim about the data.
+    #[test]
+    fn opened_as_does_not_claim_what_the_data_is() {
+        let v = payload("6", 4096, &parse_inspect_output(&reply(true, 15, b"text")));
+        assert_eq!(v["opened_as"], BINARY_CLASS);
         assert!(
-            code.contains(&format!("if tCls={}", os_str_expr(CHARACTER_CLASS))),
-            "{code}"
+            v.get("class").is_none(),
+            "the old field claimed a kind it cannot know: {v}"
         );
     }
 }
