@@ -839,9 +839,71 @@ pub struct LogsParams {
     pub since_id: Option<i64>,
     #[serde(default = "default_limit")]
     pub limit: u32,
+    /// Comma-separated, as IRIS names them. #112: the accepted set belongs in the SCHEMA, not only
+    /// in the refusal — a guessed value costs a round trip otherwise.
+    #[schemars(extend("examples" = ["error,warning", "error", "info", "assert,error,warning,info,trace,alert"]))]
     #[serde(default = "default_log_type")]
     pub log_type: String,
 }
+/// The `Ens_Util.Log.Type` numbers a `log_type=` word selects.
+///
+/// MEASURED, because the mapping this replaces was wrong on every value. IRIS's own definition, read
+/// from `%Dictionary.CompiledProperty` for `Ens.Util.Log::Type` (an `Ens.DataType.LogType`):
+///
+/// ```text
+/// DISPLAYLIST = ,Assert,Error,Warning,Info,Trace,Alert
+///   => Assert 1, Error 2, Warning 3, Info 4, Trace 5, Alert 6
+/// ```
+///
+/// Confirmed against a live production's own log — 6 rows of `ERROR <Ens>ErrProductionAlreadyRunning`
+/// at Type 2, and 29 `$$$LOGINFO` rows at Type 4.
+///
+/// What the old mapping did, driven through the tool against that data:
+///
+/// | asked for | returned | rows that existed |
+/// |---|---|---|
+/// | `error` | **0 rows** | 6 |
+/// | `warning` | the 6 ERROR rows | 0 |
+/// | `info` | **0 rows** | 29 |
+/// | `alert` | the 29 INFO rows | 0 |
+/// | `trace`, `assert` | all 35, silently unfiltered | — |
+///
+/// `log_type=error` finding nothing while six errors sit in the log is the negative-fact shape
+/// CLAUDE.md is about, in the tool a caller reaches for precisely when something is broken. The
+/// DEFAULT (`error,warning`) happened to work: it asked for Types 3 and 2, and 2 is really Error — so
+/// the tool was right until a caller named what they wanted.
+///
+/// An unrecognised word is now refused rather than dropped. Dropping it removed the WHERE clause
+/// entirely, so `log_type=trace` returned every row of every type and looked like a successful filter.
+pub fn log_type_conditions(spec: &str) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    let mut unknown = Vec::new();
+    for word in spec.split(',') {
+        let w = word.trim().to_lowercase();
+        if w.is_empty() {
+            continue;
+        }
+        match w.as_str() {
+            "assert" => out.push("Type = 1".to_string()),
+            "error" => out.push("Type = 2".to_string()),
+            "warning" => out.push("Type = 3".to_string()),
+            "info" => out.push("Type = 4".to_string()),
+            "trace" => out.push("Type = 5".to_string()),
+            "alert" => out.push("Type = 6".to_string()),
+            _ => unknown.push(w),
+        }
+    }
+    if !unknown.is_empty() {
+        return Err(format!(
+            "log_type does not accept {unknown:?}. Accepted, as IRIS names them: assert, error, \
+             warning, info, trace, alert (comma-separated). An unrecognised word used to be dropped, \
+             which removed the filter entirely and returned every log row as though it had been \
+             applied."
+        ));
+    }
+    Ok(out)
+}
+
 fn default_limit() -> u32 {
     10
 }
@@ -1362,16 +1424,10 @@ pub async fn interop_logs_impl(
         None => return err_json("IRIS_UNREACHABLE", "No IRIS connection"),
     };
     let client = IrisConnection::http_client().map_err(|_| iris_unreachable())?;
-    let mut conditions = vec![];
-    for lt in params.log_type.split(',') {
-        match lt.trim().to_lowercase().as_str() {
-            "error" => conditions.push("Type = 3"),
-            "warning" => conditions.push("Type = 2"),
-            "info" => conditions.push("Type = 1"),
-            "alert" => conditions.push("Type = 4"),
-            _ => {}
-        }
-    }
+    let conditions = match log_type_conditions(&params.log_type) {
+        Ok(c) => c,
+        Err(why) => return err_json("INVALID_PARAMS", &why),
+    };
     let type_filter = if conditions.is_empty() {
         String::new()
     } else {
