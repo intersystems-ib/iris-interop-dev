@@ -2504,6 +2504,61 @@ pub struct CredentialManageParams {
     pub namespace: String,
 }
 
+/// Is this credential action's `id` usable, and if not, what should the caller be told?
+///
+/// `Described` deserialises infallibly over any JSON object — deliberately, so that "the
+/// handler validates it and answers with a message that names the valid values". A call
+/// with no `id` key at all therefore arrives here as an empty string, and checking it is
+/// the handler's declared job. Measured 2026-09-24 (#384): an empty id reached
+/// `SetCredential` and came back as `ERROR #5659: Property
+/// 'Ens.Config.Credentials::SystemName(77@Ens.Config.Credentials,ID=)' required` under
+/// CREDENTIAL_EXISTS — the opposite of the truth, since nothing existed. The sibling check
+/// for `password` ("create requires password") already answers this shape correctly; `id`
+/// was simply never wired into it.
+///
+/// The id is only inspected, never rewritten: a non-empty id is passed through exactly as
+/// the caller sent it, so this makes no normalisation claim.
+pub fn credential_id_refusal(action: &str, id: &str) -> Option<String> {
+    let undone = match action {
+        "create" => "Nothing was created.",
+        "update" => "Nothing was updated.",
+        "delete" => "Nothing was deleted.",
+        // Any other action is answered by INVALID_ACTION, which names the valid set —
+        // more use to the caller than a complaint about a missing id.
+        _ => return None,
+    };
+    if !id.trim().is_empty() {
+        return None;
+    }
+    Some(format!(
+        "action={action} needs 'id' — the NAME of the credential (the SystemName that \
+         Ens.Config.Credentials requires). {undone} Use iris_credential_list to see which \
+         ids are defined."
+    ))
+}
+
+/// The program `create` runs: a duplicate id is named as such, every other failure is not.
+///
+/// A taken id is only ONE of the reasons `SetCredential` returns an error, but the marker
+/// used to be hardcoded to CREDENTIAL_EXISTS, so every failure claimed a duplicate (#384).
+/// The `%ExistsId` precheck names the one condition it can actually prove — the same
+/// structural check `delete` already makes, rather than parsing the error text — and
+/// anything else falls through to the generic arm. `Quit` inside `If { }` returns from the
+/// generated method, which is what keeps the precheck from falling through to the write.
+///
+/// All three arguments are already ObjectScript expressions, not raw values.
+pub fn build_credential_create_code(
+    id_expr: &str,
+    username_expr: &str,
+    password_expr: &str,
+) -> String {
+    format!(
+        r#"If ##class(Ens.Config.Credentials).%ExistsId({id_expr}) {{ Write "ERROR:CREDENTIAL_EXISTS:A credential named "_{id_expr}_" is already defined. Use action=update to change it, or action=delete it first." Quit }}
+Set tSC=##class(Ens.Config.Credentials).SetCredential({id_expr},{username_expr},{password_expr},0)
+If $$$ISERR(tSC) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC) }} Else {{ Write "OK" }}"#
+    )
+}
+
 pub async fn interop_credential_list_impl(
     iris: Option<&IrisConnection>,
     params: CredentialListParams,
@@ -2562,6 +2617,11 @@ pub async fn interop_credential_manage_impl(
     let id = os_str_expr(&params.id);
     let ns = &params.namespace;
 
+    // #384: every action below needs a real id; without this an empty one reached IRIS.
+    if let Some(msg) = credential_id_refusal(&params.action, &params.id) {
+        return err_json("INVALID_PARAMS", &msg);
+    }
+
     match params.action.as_str() {
         "create" => {
             let username = match &params.username {
@@ -2572,10 +2632,7 @@ pub async fn interop_credential_manage_impl(
                 Some(p) => os_str_expr(p),
                 None => return err_json("INVALID_PARAMS", "create requires password"),
             };
-            let code = format!(
-                r#"Set tSC=##class(Ens.Config.Credentials).SetCredential({id},{username},{password},0)
-If $$$ISERR(tSC) {{ Write "ERROR:CREDENTIAL_EXISTS:"_$System.Status.GetErrorText(tSC) }} Else {{ Write "OK" }}"#
-            );
+            let code = build_credential_create_code(&id, &username, &password);
             match iris.execute_via_generator(&code, ns, &client).await {
                 Ok(out) => {
                     let out = out.trim();
