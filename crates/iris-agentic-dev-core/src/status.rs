@@ -122,6 +122,14 @@ pub enum StatusChain {
         errors: Vec<StatusError>,
         undecoded: Vec<String>,
         preamble: String,
+        /// Whether the CALLER already knows this is a failing status.
+        ///
+        /// `true` only from [`decode_known_error`], where IRIS's own `$$$ISOK` supplied the verdict —
+        /// there `ok: false` is measured even when no element parses. `decode_chain` sets it `false`,
+        /// because it sees only what a script chose to print: measured by running `iris_execute` on
+        /// `write "see ERROR #5002 in the docs for details"`, which has the marker, decodes nothing,
+        /// and must not come back asserting a failing status about prose.
+        known_error: bool,
     },
 }
 
@@ -143,15 +151,35 @@ impl StatusChain {
                 errors,
                 undecoded,
                 preamble,
+                known_error,
             } => {
-                let mut v = serde_json::json!({
+                // `ok` is a CLAIM, and with nothing decoded there is nothing to base it on. Measured
+                // by running iris_execute on `write "see ERROR #5002 in the docs for details"`: the
+                // marker is there, no element parses, and the block came back `ok: false` — asserting
+                // a failing status about prose, on a call that succeeded. A truncated chain
+                // (`ERROR #63`) is indistinguishable from prose at the text level, so the block still
+                // appears and still says it could not read what it found; it just stops claiming a
+                // verdict it cannot support.
+                let mut v = if errors.is_empty() && !known_error {
+                    serde_json::json!({
+                        "errors": errors,
+                        "complete": false,
+                        "undecoded": undecoded,
+                        "note": "something here begins with the ERROR # marker and no element of it \
+                                 could be decoded, so this is NOT reported as a failing status. It is \
+                                 either a %Status chain cut mid-element or text that merely mentions \
+                                 an error code.",
+                    })
+                } else {
+                    serde_json::json!({
                     "ok": false,
                     "errors": errors,
                     // Named so a reader that only looks at `errors` still cannot mistake a prefix
                     // for the chain: `complete` is false and the rest is right there.
                     "complete": false,
                     "undecoded": undecoded,
-                });
+                    })
+                };
                 Self::add_preamble(&mut v, preamble);
                 Some(v)
             }
@@ -199,6 +227,7 @@ pub fn decode_chain(text: &str) -> StatusChain {
             errors,
             undecoded,
             preamble,
+            known_error: false,
         }
     }
 }
@@ -219,6 +248,7 @@ pub fn decode_known_error(text: &str) -> StatusChain {
                 vec![text.trim().to_string()]
             },
             preamble: String::new(),
+            known_error: true,
         },
         other => other,
     }
@@ -365,6 +395,7 @@ mod tests {
                 }],
                 undecoded: vec!["ERROR #63".into()],
                 preamble: String::new(),
+                known_error: false,
             },
             "{chain:?}"
         );
@@ -532,5 +563,53 @@ mod tests {
             StatusChain::Partial { errors, .. } => assert!(errors.is_empty()),
             other => panic!("an id with spaces in it is not an id, got {other:?}"),
         }
+    }
+
+    /// MEASURED by running `iris_execute` on `write "see ERROR #5002 in the docs for details"`: the
+    /// marker is there, nothing decodes, and the block used to come back `ok: false` — asserting a
+    /// failing status about prose, on a call that succeeded. `ok` is a claim; with nothing decoded and
+    /// no verdict from IRIS there is nothing to base it on.
+    #[test]
+    fn prose_that_merely_mentions_an_error_code_is_not_reported_as_a_failing_status() {
+        let v = decode_chain("see ERROR #5002 in the docs for details")
+            .payload()
+            .expect("the marker is there, so something is reported");
+        assert!(
+            v.get("ok").is_none(),
+            "no verdict may be claimed when nothing decoded: {v}"
+        );
+        assert_eq!(v["complete"], false);
+        assert_eq!(v["errors"].as_array().map(|a| a.len()), Some(0));
+        assert!(
+            v["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("NOT reported as a failing status"),
+            "the payload must say why there is no verdict: {v}"
+        );
+        // CONTROL: a chain that DOES decode still carries the verdict.
+        let real = decode_chain("ERROR #5002: boom")
+            .payload()
+            .expect("a payload");
+        assert_eq!(real["ok"], false);
+    }
+
+    /// And the measured-verdict path is unaffected: `iris_execute_method` reads IRIS's own `$$$ISOK`,
+    /// so there `ok: false` holds even when the text cannot be parsed.
+    #[test]
+    fn a_known_error_still_claims_the_verdict_it_measured() {
+        let v = decode_known_error("no marker anywhere in here")
+            .payload()
+            .expect("a payload");
+        assert_eq!(
+            v["ok"], false,
+            "the caller read $$$ISOK, so the verdict is measured rather than guessed: {v}"
+        );
+        assert_eq!(v["complete"], false);
+        // The two paths must DIFFER on this, or the distinction is not being made.
+        let guessed = decode_chain("see ERROR #5002 in the docs")
+            .payload()
+            .expect("a payload");
+        assert!(guessed.get("ok").is_none());
     }
 }
