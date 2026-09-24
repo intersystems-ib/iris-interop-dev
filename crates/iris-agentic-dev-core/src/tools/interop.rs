@@ -3579,6 +3579,35 @@ pub fn extract_xdata(source: &str, name: &str) -> Option<String> {
     None
 }
 
+/// The action a call to `iris_business_rule_info` MEANS when it did not name one.
+///
+/// The default was an unconditional `"list"`, and the list path never reads `rule_name` — so a caller
+/// who passed a rule name and omitted `action` had that name silently discarded and got a listing.
+/// Measured against a live instance:
+///
+/// ```text
+/// {rule_name: "No.Such.Rule"}               -> success: true, count: 0, rules: []
+/// {action: "get", rule_name: "No.Such.Rule"} -> RULE_NOT_FOUND, "call action=list to see what is there"
+/// ```
+///
+/// The first reads as "your rule does not exist" when the tool never looked for it — and on a
+/// namespace that DOES hold rules it returns all of them, where a caller may not notice their name
+/// was ignored at all. Same shape as `require_name` in `doc.rs` (#327: a supplied `names` array
+/// discarded while `success: true` came back) and `item_name_arg` (#218).
+///
+/// So a non-blank `rule_name` with no explicit action means `get`: it is the only reading under which
+/// the parameter the caller supplied does anything. With neither given, `list` remains right — it is
+/// the action that needs no arguments.
+pub fn rule_action_for(explicit: Option<&str>, rule_name: Option<&str>) -> String {
+    if let Some(a) = explicit.map(str::trim).filter(|a| !a.is_empty()) {
+        return a.to_string();
+    }
+    match rule_name.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(_) => "get".to_string(),
+        None => "list".to_string(),
+    }
+}
+
 pub async fn handle_iris_business_rule_info(
     iris: Option<&IrisConnection>,
     params: &BusinessRuleInfoParams,

@@ -9281,11 +9281,12 @@ Methods:
         let result = interop::handle_iris_business_rule_info(
             iris_opt,
             &interop::BusinessRuleInfoParams {
-                action: p
-                    .get("action")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("list")
-                    .to_string(),
+                // NOT `unwrap_or("list")`: the list path does not read `rule_name`, so that
+                // default silently discarded a name the caller supplied. See `rule_action_for`.
+                action: interop::rule_action_for(
+                    p.get("action").and_then(|v| v.as_str()),
+                    p.get("rule_name").and_then(|v| v.as_str()),
+                ),
                 rule_name: p
                     .get("rule_name")
                     .and_then(|v| v.as_str())
