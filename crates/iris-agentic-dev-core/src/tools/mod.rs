@@ -6958,7 +6958,9 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
             return envelope::fail(
                 "INVALID_PARAMS",
                 &format!(
-                    "namespace_a and namespace_b are both '{ns_a}'. Comparing a namespace with                      itself always reports in_sync, which says nothing — name the two namespaces                      you actually want compared."
+                    "namespace_a and namespace_b are both '{ns_a}'. Comparing a namespace with \
+                     itself always reports in_sync, which says nothing — name the two namespaces \
+                     you actually want compared."
                 ),
             );
         }
@@ -7003,7 +7005,8 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
             self.record_call("compare_document", false);
             return envelope::fail(
                 "MISSING_PARAMS",
-                "compare_document needs document, namespace_a and namespace_b. Nothing was                  compared.",
+                "compare_document needs document, namespace_a and namespace_b. Nothing was \
+                 compared.",
             );
         }
         let fetch = |ns: &str| {
