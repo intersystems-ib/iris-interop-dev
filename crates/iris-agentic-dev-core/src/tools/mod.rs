@@ -9148,6 +9148,8 @@ Methods:
         // #327 item 3: every name this call addresses. `item` first, then `items` — a caller who
         // passes both means both, and nothing is discarded.
         let all_items = interop::item_names_arg(&p);
+        // Did the CALLER pass a list, as opposed to a single `item` that `item_names_arg` folded in?
+        let list_given = interop::list_parameter_given(&p);
         // A caller who named exactly one item in `items` and nothing in `item` named one item. Every
         // action can act on that, so it is filled in rather than refused for the absence of a
         // spelling the caller had no reason to prefer.
@@ -9209,7 +9211,12 @@ Methods:
             interop::ProductionItemParams {
                 action,
                 item,
-                items: all_items,
+                // ONLY what a list parameter carried. `item_names_arg` unions the single `item` in,
+                // which is right for the >1 refusal above but wrong here: `items` non-empty is what
+                // selects the batch RESPONSE shape, so threading the union through gave every
+                // single-item caller the new shape. Measured against a live production — the
+                // pure-function test could not see it, because it sets the flag by hand.
+                items: if list_given { all_items } else { Vec::new() },
                 namespace,
                 settings,
                 apply,
@@ -18658,8 +18665,15 @@ mod production_item_list_tests {
              would be acted on and the rest dropped"
         );
         assert!(
-            body.contains("items: all_items"),
-            "the names read from the request never reach the impl"
+            body.contains("items: if list_given { all_items }"),
+            "the names read from the request must reach the impl — and only when a LIST was given, \
+             because `items` non-empty is what selects the batch RESPONSE shape and `item_names_arg` \
+             folds a single `item` into the same vector. Passing the union unconditionally gave every \
+             existing single-item caller the new `results[]` payload (measured live)."
+        );
+        assert!(
+            body.contains("interop::list_parameter_given(&p)"),
+            "the shape flag must come from the LIST keys, not from whether any name was named"
         );
         // CONTROL: the window is the handler, not the file.
         assert!(
