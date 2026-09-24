@@ -339,16 +339,16 @@ pub use scm::ScmParams;
 /// Read from `IRIS_TOOLSET` env var or `--toolset` CLI flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Toolset {
-    /// 61 tools advertised (measured 2026-09-22). NOT this fork's default —
+    /// 62 tools advertised (measured 2026-09-24, +1 for stream_inspect). NOT this fork's default —
     /// `--toolset` defaults to `interop`; baseline is opt-in via IRIS_TOOLSET/--toolset.
     /// Note this is already a pruned router: the tools the `#[tool_router]` macro
     /// registers minus the 4 merged-only ones. Was 54 of 58 before iris_execute_method.
     Baseline,
-    /// 57 tools advertised (measured 2026-09-22). Baseline minus the 4 NOT_IMPLEMENTED
+    /// 58 tools advertised (measured 2026-09-24). Baseline minus the 4 NOT_IMPLEMENTED
     /// stubs (skill_propose, skill_optimize, skill_share, skill_community_install).
     /// No merged dispatchers. Not this fork's default.
     Nostub,
-    /// 53 tools advertised (measured 2026-09-22). Nostub minus 8 — the 4 debug_*
+    /// 54 tools advertised (measured 2026-09-24). Nostub minus 8 — the 4 debug_*
     /// folded into iris_debug, the 3 container tools folded into iris_containers, and
     /// agent_info dropped outright — plus the 4 merged-only tools iris_debug,
     /// iris_containers, iris_admin, iris_get_log.
