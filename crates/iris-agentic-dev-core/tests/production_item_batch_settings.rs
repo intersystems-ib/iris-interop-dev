@@ -277,7 +277,7 @@ fn the_program_resolves_items_from_config_not_from_the_runtime_index() {
     // over-specific count of GetAt references was wrong here (it fails on correct code, which is how
     // a guard gets loosened), so this counts the per-item loops instead.
     assert_eq!(
-        code.matches("For zpi=1:1:tProd.Items.Count()").count(),
+        code.matches("For zfi=1:1:tProd.Items.Count()").count(),
         ITEMS.len(),
         "expected one config walk per item asked for:\n{code}"
     );

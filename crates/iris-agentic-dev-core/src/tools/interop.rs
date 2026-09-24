@@ -2164,7 +2164,7 @@ pub fn build_get_settings_batch_code(production: &str, items: &[String]) -> Stri
         let e = os_str_expr(item);
         code.push_str(&format!(
             "\nWrite \"{mi}\"_{e}_$C(10)\n\
-             Set tItem=\"\" For zpi=1:1:tProd.Items.Count() {{ If tProd.Items.GetAt(zpi).Name={e} {{ Set tItem=tProd.Items.GetAt(zpi) Quit }} }}\n\
+             Set tItem=\"\" For zfi=1:1:tProd.Items.Count() {{ If tProd.Items.GetAt(zfi).Name={e} {{ Set tItem=tProd.Items.GetAt(zfi) Quit }} }}\n\
              If '$IsObject(tItem) {{ Write \"{mm}1\"_$C(10) }} Else {{ Write \"{mn}\"_tItem.Settings.Count()_$C(10) Set zk=\"\" For {{ Set tS=tItem.Settings.GetNext(.zk) Quit:zk=\"\"  Write \"{ms}\"_tS.Name_\"=\"_tS.Value_$C(10) }} }}",
             mi = M_PI_ITEM,
             mm = M_PI_MISSING,
@@ -2386,6 +2386,34 @@ pub fn get_settings_payload(batch: &BatchSettings, legacy_single: bool) -> GetSe
     }))
 }
 
+/// The loop every config-item lookup uses, so a test can prove all of them do.
+///
+/// `FindItemByConfigName` resolves through `^Ens.Runtime("DispatchName")`, which is only populated
+/// once a production has been started or updated. Measured on IRIS 2026.1 against a production
+/// configured, compiled and never started:
+///
+/// ```text
+/// tProd.Items.Count()                         -> 1, the name present
+/// tProd.FindItemByConfigName("Dup.BO.Target")  -> NO object, ERROR #00: (no error description)
+/// ^Ens.Runtime("DispatchName")                -> does not exist, 0 entries
+/// ```
+///
+/// Driven through the real tool against that production, before this change:
+///
+/// | action | result |
+/// |---|---|
+/// | `enable` on an item that exists | `ITEM_NOT_FOUND` — and the message then lists that very item |
+/// | `set_settings` on an item that exists | the same |
+/// | `add` of an item that ALREADY exists | **`success: true`, and the production then held TWO items of that name** |
+///
+/// The last is why all three sites move together: the duplicate guard is an EXISTENCE test, so the
+/// same broken lookup fails in the OPPOSITE direction and corrupts the config rather than refusing.
+///
+/// Each site inlines the loop (it needs only `{item}`, already in scope there) and
+/// `every_item_lookup_walks_the_config_items` asserts that all of them do and that none has drifted
+/// back — the enforcement #119 had to add after four sites each kept their own copy.
+pub const ITEM_WALK_MARKER: &str = "For zfi=1:1:tProd.Items.Count()";
+
 /// The ObjectScript prologue that resolves `tProd`, the production every
 /// `iris_production_item` action operates on (pure → unit-testable).
 ///
@@ -2443,7 +2471,8 @@ pub fn build_add_item_code(
     }
     format!(
         r#"{prologue}
-If $IsObject(tProd.FindItemByConfigName({item})) {{ Write "ERROR:ITEM_EXISTS:Item already exists: "_{item} Quit }}
+Set tDupe="" For zfi=1:1:tProd.Items.Count() {{ If tProd.Items.GetAt(zfi).Name={item} {{ Set tDupe=tProd.Items.GetAt(zfi) Quit }} }}
+If $IsObject(tDupe) {{ Write "ERROR:ITEM_EXISTS:Item already exists: "_{item} Quit }}
 Set tItem=##class(Ens.Config.Item).%New()
 Set tItem.Name={item}
 Set tItem.ClassName={class}
@@ -2527,7 +2556,7 @@ Set tS.Value={value}
     };
     format!(
         r#"{prologue}
-Set tItem=tProd.FindItemByConfigName({item},,.tSC3)
+Set tItem="" For zfi=1:1:tProd.Items.Count() {{ If tProd.Items.GetAt(zfi).Name={item} {{ Set tItem=tProd.Items.GetAt(zfi) Quit }} }}
 If '$IsObject(tItem) {{
 {not_found}
 }}
@@ -2596,7 +2625,8 @@ pub async fn interop_production_item_impl(
     if ACTIONS_NEEDING_AN_ITEM.contains(&params.action.as_str()) && named_nothing {
         return crate::tools::envelope::fail_with(
             "MISSING_PARAMETER",
-            "iris_production_item needs the config item name — nothing was sent to FindItemByConfigName.",
+            "iris_production_item needs the config item name — no name was given, so no config item \
+             was looked up.",
             serde_json::json!({
                 "accepted_parameters": ITEM_NAME_KEYS,
                 "accepted_list_parameters": ITEM_LIST_KEYS,
@@ -2638,7 +2668,7 @@ pub async fn interop_production_item_impl(
             let enabled_val = if params.action == "enable" { "1" } else { "0" };
             let code = format!(
                 r#"{prologue}
-Set tItem=tProd.FindItemByConfigName({item},,.tSC3)
+Set tItem="" For zfi=1:1:tProd.Items.Count() {{ If tProd.Items.GetAt(zfi).Name={item} {{ Set tItem=tProd.Items.GetAt(zfi) Quit }} }}
 If '$IsObject(tItem) {{
 {not_found}
 }}
