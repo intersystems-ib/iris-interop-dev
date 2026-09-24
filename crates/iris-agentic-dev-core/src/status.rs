@@ -24,12 +24,26 @@
 //! (which is what `builtin_hint` does today), and a caller that wants error 2 has to split on
 //! `$C(13,10)` and re-parse the prefix itself. This module does that once, here, correctly.
 //!
-//! ## Why only `ERROR #NNNN:`
+//! ## Which forms are elements, measured
 //!
-//! That is the form measured coming out of `GetErrorText`. Compile consoles also carry
-//! `ERROR <EnsSearchTable>PropCollision: …`, which has no number and which nothing has shown to be
-//! a `%Status` element — so it is deliberately NOT a marker here. It stays in the text it was found
-//! in rather than being promoted to a decoded error this module cannot describe.
+//! `ERROR #<id>:` is the marker, and **the id is not always a number**. Measured on IRIS 2026.1:
+//!
+//! ```text
+//! $System.Status.Error(5001,"numeric one")        -> ERROR #5001: numeric one
+//! $System.Status.Error("MyErrName","named one")   -> ERROR #MyErrName: Unknown status code: <UserErrors>MyErrName (named one)
+//! AppendStatus of the two                         -> both, CRLF-joined, DecomposeStatus counts 2
+//! ```
+//!
+//! So one chain carries both shapes under one marker. An earlier version of this module required
+//! digits after `ERROR #`, which made the named element parse to nothing, land in `undecoded`, and
+//! turn that intact two-element chain into `Partial` — a truncation report about a chain that arrived
+//! whole. [`StatusId`] carries either.
+//!
+//! What is still NOT a marker: `ERROR <EnsSearchTable>PropCollision: …`, the angle-bracket form that
+//! appears in COMPILE CONSOLE output. `GetErrorText` does not render a status that way — the probe
+//! above shows the domain landing inside the element's TEXT (`<UserErrors>MyErrName`) while the id
+//! slot holds the bare name — so promoting a console line to a status element would be a claim
+//! nothing here has measured.
 //!
 //! ## The three cases
 //!
@@ -42,12 +56,42 @@
 /// The marker `GetErrorText` puts in front of every element of a chain.
 pub const MARKER: &str = "ERROR #";
 
+/// The id an element carries. Two shapes, because IRIS produces two and only one of them is a key
+/// a remedy can be looked up by.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(untagged)]
+pub enum StatusId {
+    /// `ERROR #5002:` — the form a hint arm can key on.
+    Number(u32),
+    /// `ERROR #MyErrName:` — a named id from a non-`%ObjectErrors` domain. Carried as it arrived;
+    /// NOT an undecodable element.
+    Name(String),
+}
+
+impl StatusId {
+    /// The number, when there is one. `None` for a named id — which is the honest answer, and the
+    /// reason a caller keying remedies on numbers cannot be silently handed a name.
+    pub fn number(&self) -> Option<u32> {
+        match self {
+            StatusId::Number(n) => Some(*n),
+            StatusId::Name(_) => None,
+        }
+    }
+}
+
 /// One decoded element of a `%Status` chain.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct StatusError {
-    /// The `NNNN` of `ERROR #NNNN:`.
-    pub code: u32,
-    /// Everything after `ERROR #NNNN: `, trailing whitespace trimmed. Newlines inside an element
+    /// The id between `ERROR #` and `:`. Usually a number; sometimes a NAME.
+    ///
+    /// MEASURED on IRIS 2026.1: `$System.Status.Error("MyErrName", "named one")` renders as
+    /// `ERROR #MyErrName: Unknown status code: <UserErrors>MyErrName (named one)` — the same
+    /// `ERROR #` marker with a non-numeric id, and `DecomposeStatus` counts it as a normal element
+    /// of a chain alongside a numeric one. A first version of this module required digits here, so
+    /// a named element parsed to nothing, landed in `undecoded`, and turned an intact two-element
+    /// chain into `Partial` — a truncation report about a chain that arrived whole.
+    pub code: StatusId,
+    /// Everything after `ERROR #<id>: `, trailing whitespace trimmed. Newlines inside an element
     /// are kept: an ObjectScript error's text can run to several lines and cutting it at the first
     /// would be the very loss this module exists to prevent.
     pub text: String,
@@ -186,16 +230,22 @@ pub fn decode_known_error(text: &str) -> StatusChain {
 /// after it — both are what a chain cut mid-element looks like, and neither describes an error.
 fn decode_element(element: &str) -> Option<StatusError> {
     let rest = element.strip_prefix(MARKER)?;
-    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    if digits.is_empty() {
+    // The id runs to the first colon. It is NOT required to be numeric — see `StatusId`.
+    let (id, after) = rest.split_once(':')?;
+    let id = id.trim();
+    if id.is_empty() || id.contains(char::is_whitespace) {
+        // No id at all, or something that is not an id — `ERROR #: x`, or a colon so far away that
+        // what precedes it is prose. Both are what a chain cut mid-element looks like.
         return None;
     }
-    let code: u32 = digits.parse().ok()?;
-    let after = &rest[digits.len()..];
-    let text = after.strip_prefix(':')?.trim();
+    let text = after.trim();
     if text.is_empty() {
         return None;
     }
+    let code = match id.parse::<u32>() {
+        Ok(n) => StatusId::Number(n),
+        Err(_) => StatusId::Name(id.to_string()),
+    };
     Some(StatusError {
         code,
         text: text.to_string(),
@@ -225,11 +275,11 @@ mod tests {
             errors,
             vec![
                 StatusError {
-                    code: 5002,
+                    code: StatusId::Number(5002),
                     text: "ObjectScript error: first problem".into()
                 },
                 StatusError {
-                    code: 6301,
+                    code: StatusId::Number(6301),
                     text: "SAX XML Parser Error: second problem".into()
                 },
             ],
@@ -248,7 +298,7 @@ mod tests {
     fn a_label_before_the_first_element_is_kept_not_dropped() {
         let (errors, preamble) = decoded("Stop: ERROR #5002: ObjectScript error: boom");
         assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].code, 5002);
+        assert_eq!(errors[0].code, StatusId::Number(5002));
         assert_eq!(preamble, "Stop: ");
         let p = decode_chain("Stop: ERROR #5002: ObjectScript error: boom")
             .payload()
@@ -263,7 +313,7 @@ mod tests {
         assert_eq!(
             errors,
             vec![StatusError {
-                code: 6062,
+                code: StatusId::Number(6062),
                 text: "The Monitor is already running".into()
             }]
         );
@@ -310,7 +360,7 @@ mod tests {
             chain,
             StatusChain::Partial {
                 errors: vec![StatusError {
-                    code: 5002,
+                    code: StatusId::Number(5002),
                     text: "ObjectScript error: first problem".into()
                 }],
                 undecoded: vec!["ERROR #63".into()],
@@ -421,5 +471,66 @@ mod tests {
         assert_eq!(p["ok"], false);
         assert_eq!(p["errors"].as_array().map(|a| a.len()), Some(0));
         assert_eq!(p["complete"], false);
+    }
+
+    /// MEASURED on IRIS 2026.1, and the defect this fixes: a named id is a normal element of a
+    /// chain, not a truncation. The earlier version reported this chain as `Partial`.
+    #[test]
+    fn a_named_error_id_is_an_element_not_an_undecoded_fragment() {
+        let measured = "ERROR #5001: numeric one\r\n\
+                        ERROR #MyErrName: Unknown status code: <UserErrors>MyErrName (named one)";
+        let chain = decode_chain(measured);
+        let StatusChain::Decoded { errors, .. } = &chain else {
+            panic!("an intact two-element chain must not be Partial: {chain:?}")
+        };
+        assert!(chain.is_complete());
+        assert_eq!(errors.len(), 2);
+        assert_eq!(errors[0].code, StatusId::Number(5001));
+        assert_eq!(errors[1].code, StatusId::Name("MyErrName".into()));
+        assert!(
+            errors[1].text.contains("<UserErrors>MyErrName"),
+            "{:?}",
+            errors[1].text
+        );
+        // A remedy keyed on numbers gets a number for one and honest nothing for the other.
+        assert_eq!(errors[0].code.number(), Some(5001));
+        assert_eq!(errors[1].code.number(), None);
+    }
+
+    /// The payload mirrors IRIS: one `code` slot carrying whichever shape arrived. Pinned in both
+    /// directions so a caller can rely on the type telling it which.
+    #[test]
+    fn the_payload_code_is_a_number_for_a_numeric_id_and_a_string_for_a_named_one() {
+        let p = decode_chain("ERROR #5001: a\nERROR #MyErrName: b")
+            .payload()
+            .expect("a payload");
+        assert_eq!(p["errors"][0]["code"], 5001);
+        assert!(p["errors"][0]["code"].is_number());
+        assert_eq!(p["errors"][1]["code"], "MyErrName");
+        assert!(p["errors"][1]["code"].is_string());
+    }
+
+    /// And the truncation cases still ARE truncation — the widening must not swallow them.
+    #[test]
+    fn widening_the_id_did_not_turn_truncation_into_an_element() {
+        for cut in [
+            "ERROR #63",
+            "ERROR #:",
+            "ERROR #: x",
+            "ERROR #5002:",
+            "ERROR #5002",
+        ] {
+            match decode_chain(cut) {
+                StatusChain::Partial { errors, .. } => {
+                    assert!(errors.is_empty(), "{cut:?} decoded something: {errors:?}")
+                }
+                other => panic!("{cut:?} must stay Partial, got {other:?}"),
+            }
+        }
+        // And prose that merely contains the marker plus a distant colon is not an element either.
+        match decode_chain("ERROR #the compile failed: see the console") {
+            StatusChain::Partial { errors, .. } => assert!(errors.is_empty()),
+            other => panic!("an id with spaces in it is not an id, got {other:?}"),
+        }
     }
 }
