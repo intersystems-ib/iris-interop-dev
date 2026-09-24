@@ -9130,7 +9130,7 @@ Methods:
     // ─── 024-interop-depth: Production item control (US1) ───
 
     #[tool(
-        description = "Add, remove, enable, disable, or inspect/modify settings of an Interoperability production config item — the typed way to build/manipulate a production without hand-rolling ##class(Ens.Config.*) ObjectScript. action: add|remove|enable|disable|get_settings|set_settings. item: exact config item name. For add: class_name (the BS/BO/BP/adapter class the item runs, required), optional enabled (default true), production (defaults to the running one), pool_size, category, and settings (key-value; prefix a key with 'Adapter.' to target the adapter, e.g. 'Adapter.FilePath', otherwise it targets the Host). For remove: item (+ optional production). settings: key-value map for set_settings. namespace: optional — defaults to the connection namespace (IRIS_NAMESPACE); must be an interop-enabled namespace, and it is the parameter that matters when an item is 'not found'. Changes apply live via Ens.Director.UpdateProduction when the target production is running (set_settings honours apply=false to batch). Works via HTTP, no Docker required."
+        description = "Add, remove, enable, disable, or inspect/modify settings of an Interoperability production config item — the typed way to build/manipulate a production without hand-rolling ##class(Ens.Config.*) ObjectScript. action: add|remove|enable|disable|get_settings|set_settings. item: exact config item name. action=get_settings also takes items: ['A','B'] and reads them all in ONE round trip — the response then carries results[] with one entry per item, missing[] naming any the production does not hold, and all_found. Every other action addresses a single item and refuses a list of more than one rather than acting on the first. For add: class_name (the BS/BO/BP/adapter class the item runs, required), optional enabled (default true), production (defaults to the running one), pool_size, category, and settings (key-value; prefix a key with 'Adapter.' to target the adapter, e.g. 'Adapter.FilePath', otherwise it targets the Host). For remove: item (+ optional production). settings: key-value map for set_settings. namespace: optional — defaults to the connection namespace (IRIS_NAMESPACE); must be an interop-enabled namespace, and it is the parameter that matters when an item is 'not found'. Changes apply live via Ens.Director.UpdateProduction when the target production is running (set_settings honours apply=false to batch). Works via HTTP, no Docker required."
     )]
     async fn iris_production_item(
         &self,
@@ -9145,6 +9145,19 @@ Methods:
         // tool accepts for the PRODUCTION name — sent "" into FindItemByConfigName and
         // got a raw <SUBSCRIPT>. One reader, every spelling; the impl refuses blank.
         let item = interop::item_name_arg(&p).unwrap_or_default();
+        // #327 item 3: every name this call addresses. `item` first, then `items` — a caller who
+        // passes both means both, and nothing is discarded.
+        let all_items = interop::item_names_arg(&p);
+        // Did the CALLER pass a list, as opposed to a single `item` that `item_names_arg` folded in?
+        let list_given = interop::list_parameter_given(&p);
+        // A caller who named exactly one item in `items` and nothing in `item` named one item. Every
+        // action can act on that, so it is filled in rather than refused for the absence of a
+        // spelling the caller had no reason to prefer.
+        let item = if item.is_empty() && all_items.len() == 1 {
+            all_items[0].clone()
+        } else {
+            item
+        };
         let _iris_arc_hold = self.iris_arc();
         let namespace = interop::resolve_namespace(
             p.get("namespace").and_then(|v| v.as_str()),
@@ -9182,11 +9195,28 @@ Methods:
             .get("category")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        // #327 item 3: only get_settings reads a list. On every other action a list of more than
+        // one name would be acted on for the first and the rest silently dropped — the partial-write
+        // shape `require_name` records in doc.rs. Refuse and name the action that does take one.
+        if let Some(why) = interop::list_refused_for_action(&action, &all_items) {
+            self.record_call("iris_production_item", false);
+            return envelope::fail_with(
+                "INVALID_PARAMS",
+                &why,
+                serde_json::json!({"action": action, "items": all_items}),
+            );
+        }
         let result = interop::interop_production_item_impl(
             self.iris_arc().as_deref(),
             interop::ProductionItemParams {
                 action,
                 item,
+                // ONLY what a list parameter carried. `item_names_arg` unions the single `item` in,
+                // which is right for the >1 refusal above but wrong here: `items` non-empty is what
+                // selects the batch RESPONSE shape, so threading the union through gave every
+                // single-item caller the new shape. Measured against a live production — the
+                // pure-function test could not see it, because it sets the flag by hand.
+                items: if list_given { all_items } else { Vec::new() },
                 namespace,
                 settings,
                 apply,
@@ -18551,6 +18581,104 @@ mod record_call_survives_a_poisoned_history {
             guard.back().map(|e| e.tool.as_str()),
             Some("iris_compile"),
             "the recorded entry must be the one just made"
+        );
+    }
+}
+
+/// #327 item 3: the `items` list reaches the wire, and the handler reads it.
+///
+/// `production_item_batch_settings.rs` covers the codegen, the parser and the response assembly —
+/// all pure. What it cannot see is whether the parameter is advertised (a list nobody discovers is
+/// no saving) or whether the handler unions it with `item` instead of reading `item` alone.
+#[cfg(test)]
+mod production_item_list_tests {
+    use super::*;
+
+    #[test]
+    fn the_items_list_is_advertised_on_iris_production_item() {
+        let t = IrisTools::new_with_toolset(None, Toolset::Interop).expect("build");
+        let tool = t
+            .advertised_tools()
+            .into_iter()
+            .find(|x| x.name == "iris_production_item")
+            .expect("iris_production_item is in the interop profile");
+        let schema = serde_json::to_value(&*tool.input_schema).expect("schema");
+        let props = schema["properties"].as_object().expect("properties");
+        assert!(
+            props.contains_key("items"),
+            "no `items` in the advertised schema, so no caller discovers the batch read. Got: {:?}",
+            props.keys().collect::<Vec<_>>()
+        );
+        // CONTROL: a name never added must be absent, or contains_key is not discriminating.
+        assert!(!props.contains_key("item_bundle"));
+        // The single `item` must survive: every other action still addresses one.
+        assert!(props.contains_key("item"));
+
+        let d = tool.description.unwrap_or_default().to_string();
+        // The whole SENTENCE containing `items:`, not the text after it: the action that reads the
+        // list is named before the parameter is ("action=get_settings also takes items: …"), so a
+        // window that starts at the parameter cannot see it. Bounded at both ends.
+        let at = d
+            .find("items:")
+            .expect("the description must document `items` by name");
+        let from = d[..at].rfind(". ").map(|i| i + 2).unwrap_or(0);
+        let to = at + d[at..].find(". ").map(|i| i + 1).unwrap_or(d.len() - at);
+        let claim = &d[from..to];
+        assert!(
+            claim.len() < d.len() / 2,
+            "the sentence window is {} of {} chars — not one sentence",
+            claim.len(),
+            d.len()
+        );
+        assert!(
+            claim.contains("get_settings"),
+            "the sentence introducing `items` must say which action reads it: {claim}"
+        );
+        for field in ["results", "missing", "all_found"] {
+            assert!(
+                claim.contains(field),
+                "it must name `{field}`, which the caller reads back: {claim}"
+            );
+        }
+    }
+
+    /// The wiring, read at the source because driving it needs a live instance.
+    #[test]
+    fn the_handler_unions_item_with_items_and_refuses_a_list_where_one_is_meant() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tools/mod.rs"),
+        )
+        .expect("mod.rs");
+        let start = src
+            .find("async fn iris_production_item(")
+            .expect("the handler");
+        let rest = &src[start..];
+        let body = &rest[..rest.find("\n    }\n").unwrap_or(rest.len())];
+
+        assert!(
+            body.contains("interop::item_names_arg(&p)"),
+            "the handler reads `item` alone, so `items` is accepted and silently ignored (#327)"
+        );
+        assert!(
+            body.contains("interop::list_refused_for_action("),
+            "nothing refuses a list of several names on an action that addresses one, so the first \
+             would be acted on and the rest dropped"
+        );
+        assert!(
+            body.contains("items: if list_given { all_items }"),
+            "the names read from the request must reach the impl — and only when a LIST was given, \
+             because `items` non-empty is what selects the batch RESPONSE shape and `item_names_arg` \
+             folds a single `item` into the same vector. Passing the union unconditionally gave every \
+             existing single-item caller the new `results[]` payload (measured live)."
+        );
+        assert!(
+            body.contains("interop::list_parameter_given(&p)"),
+            "the shape flag must come from the LIST keys, not from whether any name was named"
+        );
+        // CONTROL: the window is the handler, not the file.
+        assert!(
+            !body.contains("async fn iris_production("),
+            "the window ran past the handler's body"
         );
     }
 }

@@ -114,6 +114,58 @@ pub fn item_name_arg(p: &serde_json::Value) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// #327 item 3: the spellings a caller might use for a LIST of item names.
+///
+/// `items` is the advertised one; the other two are the rescue path #211 and #218 established on
+/// this same tool, where a caller reasoning from the domain rather than the schema sent a synonym
+/// and serde failed before the handler could name what was wrong.
+pub const ITEM_LIST_KEYS: [&str; 3] = ["items", "item_names", "itemNames"];
+
+/// Every item name this call addresses, in the order the caller gave them.
+///
+/// The single `item` comes FIRST and the list is appended, because a caller who passes both means
+/// both: `require_name` in `doc.rs` records what the other shape of this cost — a caller who passed
+/// `name` AND `names` had the single one written, the rest discarded, and `success: true` returned.
+/// Nothing here is discarded, and duplicates collapse rather than being fetched twice.
+pub fn item_names_arg(p: &serde_json::Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |name: &str| {
+        let n = name.trim();
+        if !n.is_empty() && !out.iter().any(|e| e == n) {
+            out.push(n.to_string());
+        }
+    };
+    if let Some(one) = item_name_arg(p) {
+        push(&one);
+    }
+    for key in ITEM_LIST_KEYS {
+        if let Some(arr) = p.get(key).and_then(|v| v.as_array()) {
+            for v in arr {
+                if let Some(s) = v.as_str() {
+                    push(s);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Whether the caller passed a LIST parameter, as opposed to a single `item` that
+/// [`item_names_arg`] folds into the same vector.
+///
+/// This is what selects the batch RESPONSE shape, and it must not be `!item_names_arg(p).is_empty()`:
+/// that is true for a plain `item=` too, so threading it through gave every existing single-item
+/// caller the new `results[]` payload. Measured against a live production — the pure-function test
+/// could not see it, because it sets the flag by hand.
+pub fn list_parameter_given(p: &serde_json::Value) -> bool {
+    ITEM_LIST_KEYS.iter().any(|k| {
+        p.get(k).and_then(|v| v.as_array()).is_some_and(|a| {
+            a.iter()
+                .any(|x| x.as_str().is_some_and(|s| !s.trim().is_empty()))
+        })
+    })
+}
+
 /// The production name WITHOUT `name`, for tools where `name` addresses something
 /// else. On `iris_production_item` the item owns `name` (#218); leaving both readers
 /// reaching for one key is what makes a bare `name=` ambiguous.
@@ -1980,6 +2032,11 @@ pub struct ProductionItemParams {
     // per-action refusal below is what enforces it where it IS required.
     #[serde(default)]
     pub item: String,
+    /// get_settings: read several items in ONE round trip. `item` and `items` are additive — pass
+    /// both and both are read. Other actions address a single item and refuse a list of more than
+    /// one rather than acting on the first and discarding the rest.
+    #[serde(default)]
+    pub items: Vec<String>,
     #[serde(default = "default_ns")]
     pub namespace: String,
     #[serde(default)]
@@ -2006,6 +2063,327 @@ pub struct ProductionItemParams {
     /// add: optional Category for portal grouping.
     #[serde(default)]
     pub category: Option<String>,
+}
+
+// ── #327 item 3: reading several config items' settings in ONE round trip ────────────────────
+//
+// Measured over 31,009 parsed tool calls: `iris_production_item` arrives in bursts (53 runs of 2, 14
+// of 3, up to 8), and `get_settings` is 296 of the 513 action invocations inside them — the bursts
+// are mostly reading the settings of several items one at a time. 174 calls disappear if the action
+// takes a list.
+//
+// The framing below exists because the single-item program writes BARE `Name=Value` lines. With more
+// than one item those lines cannot be attributed, and a value is free text: the real production read
+// for these fixtures has `ReplyCodeActions` = `:?R=F,:?E=F,:~=S,…`, so splitting on every `=` is
+// already wrong, and a value containing a newline would land on a line belonging to nothing. Each
+// section therefore declares how many settings to expect, exactly as #347 made the `%Status` chain
+// detectable when it arrived short.
+
+/// Marker for the start of one item's section. Carries the name as the caller gave it.
+pub const M_PI_ITEM: &str = "PI_ITEM:";
+/// `FindItemByConfigName` returned nothing for this name.
+pub const M_PI_MISSING: &str = "PI_MISSING:";
+/// How many settings this item holds, per IRIS's own `Settings.Count()`.
+pub const M_PI_NSET: &str = "PI_NSET:";
+/// One setting, `Name=Value`.
+pub const M_PI_SET: &str = "PI_SET:";
+
+/// What one item's section amounted to.
+///
+/// `Missing` and `Unreadable` are separate states, and neither is an empty settings map: an item
+/// that does not exist and an item whose section arrived malformed need different things from the
+/// caller, and reporting either as "this item has no settings" would be a failure answered as a
+/// fact (#310).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ItemSettings {
+    /// Settings arrived, in order, with the count IRIS declared alongside them.
+    Read {
+        settings: Vec<(String, String)>,
+        declared: usize,
+    },
+    /// The production holds no item by this name.
+    Missing,
+    /// The section carried neither a count nor a missing marker. Carries why.
+    Unreadable(String),
+}
+
+impl ItemSettings {
+    /// Whether as many settings arrived as IRIS declared. False for both directions: fewer means the
+    /// output was cut, more means the framing was mis-read, and neither is a settings list.
+    pub fn complete(&self) -> bool {
+        match self {
+            ItemSettings::Read { settings, declared } => settings.len() == *declared,
+            _ => false,
+        }
+    }
+}
+
+/// Every item's section, plus the trailing candidate block kept verbatim so the ITEM_NOT_FOUND
+/// envelope is still built by the one reader that has always built it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchSettings {
+    pub items: Vec<(String, ItemSettings)>,
+    /// The `ITEM_CANDIDATES_N:` / `ITEM_CANDIDATE:` lines, unparsed.
+    pub candidate_block: String,
+}
+
+/// The program that reads several items in one round trip.
+///
+/// **Not `FindItemByConfigName`.** Measured on IRIS 2026.1 against a production that exists in
+/// config and has never been started:
+///
+/// ```text
+/// %OpenId("IOProbe.Produccion")        -> object, no error
+/// tProd.Items.Count()                  -> 3   (Probe.BS.Feed, Probe.BO.Out, Probe.BO.NoSettings)
+/// tProd.FindItemByConfigName("Probe.BS.Feed") -> NO object, status ERROR #00: (no error description)
+/// ^Ens.Runtime("DispatchName")         -> does not exist, 0 entries
+/// Ens.Director.GetProductionStatus     -> running production '' , state 2
+/// ```
+///
+/// `FindItemByConfigName` resolves through the RUNTIME dispatch index, which is only populated once
+/// a production has been started or updated. On a production being built — which is this fork's
+/// whole workflow: configure the items, then run the tests — it returns nothing for an item that is
+/// demonstrably there, and the refusal even lists that item among the production's own items. And
+/// the status it sets carries no text, so there is nothing to report.
+///
+/// Walking `tProd.Items` and matching `.Name` is config-level, needs no runtime index, and is what
+/// `build_list_items_code` already does successfully. Measured on the same never-started production:
+/// the item with 4 settings, the item with 0 settings, and a name that does not exist all resolve
+/// correctly.
+///
+///
+/// No `Quit` anywhere inside the per-item `If`: measured on IRIS 2026.1, a `Quit` inside an `If`
+/// block returns from the METHOD, so one missing item would end the run and every later item would
+/// be silently absent from the output. That is why `item_not_found_block` — which ends in `Quit` by
+/// design — is not reused per item here; its candidate block is emitted once, at the end.
+///
+/// Every `For` stays on ONE line: `build_exec_class` splits generated code on `\n`.
+pub fn build_get_settings_batch_code(production: &str, items: &[String]) -> String {
+    let mut code = resolve_production_prologue(production);
+    for item in items {
+        let e = os_str_expr(item);
+        code.push_str(&format!(
+            "\nWrite \"{mi}\"_{e}_$C(10)\n\
+             Set tItem=\"\" For zpi=1:1:tProd.Items.Count() {{ If tProd.Items.GetAt(zpi).Name={e} {{ Set tItem=tProd.Items.GetAt(zpi) Quit }} }}\n\
+             If '$IsObject(tItem) {{ Write \"{mm}1\"_$C(10) }} Else {{ Write \"{mn}\"_tItem.Settings.Count()_$C(10) Set zk=\"\" For {{ Set tS=tItem.Settings.GetNext(.zk) Quit:zk=\"\"  Write \"{ms}\"_tS.Name_\"=\"_tS.Value_$C(10) }} }}",
+            mi = M_PI_ITEM,
+            mm = M_PI_MISSING,
+            mn = M_PI_NSET,
+            ms = M_PI_SET,
+        ));
+    }
+    // Once, at the end: what the production actually holds. Used for the ITEM_NOT_FOUND envelope
+    // and — new here — reported alongside a PARTIAL result, where the near-miss is the whole answer.
+    code.push_str(
+        "\nWrite \"ITEM_CANDIDATES_N:\"_tProd.Items.Count()_$C(10)\n\
+         For zcand=1:1:tProd.Items.Count() { Write \"ITEM_CANDIDATE:\"_tProd.Items.GetAt(zcand).Name_$C(10) }",
+    );
+    code
+}
+
+/// Read the framed output back.
+///
+/// A line inside a section that matches no marker is appended to the PREVIOUS setting's value: a
+/// setting value may contain a newline, and dropping the remainder would lose content silently while
+/// leaving a plausible shorter value behind. The declared count is what makes a genuinely short
+/// arrival visible.
+pub fn parse_get_settings_batch(out: &str) -> BatchSettings {
+    let mut items: Vec<(String, ItemSettings)> = Vec::new();
+    let mut candidate_block = String::new();
+    // The section being filled: name, declared count, settings so far, and whether it said MISSING.
+    let mut name: Option<String> = None;
+    let mut declared: Option<usize> = None;
+    let mut settings: Vec<(String, String)> = Vec::new();
+    let mut missing = false;
+
+    fn finish(
+        items: &mut Vec<(String, ItemSettings)>,
+        name: Option<String>,
+        declared: Option<usize>,
+        settings: Vec<(String, String)>,
+        missing: bool,
+    ) {
+        let Some(n) = name else { return };
+        let state = if missing {
+            ItemSettings::Missing
+        } else {
+            match declared {
+                Some(d) => ItemSettings::Read {
+                    settings,
+                    declared: d,
+                },
+                None => ItemSettings::Unreadable(
+                    "the server reported neither a setting count nor a missing marker for this item"
+                        .to_string(),
+                ),
+            }
+        };
+        items.push((n, state));
+    }
+
+    for line in out.lines() {
+        let l = line.trim_end_matches('\r');
+        if let Some(v) = l.strip_prefix(M_PI_ITEM) {
+            finish(
+                &mut items,
+                name.take(),
+                declared.take(),
+                std::mem::take(&mut settings),
+                std::mem::take(&mut missing),
+            );
+            name = Some(v.trim().to_string());
+        } else if l.strip_prefix(M_PI_MISSING).is_some() {
+            missing = true;
+        } else if let Some(v) = l.strip_prefix(M_PI_NSET) {
+            declared = v.trim().parse::<usize>().ok();
+        } else if let Some(v) = l.strip_prefix(M_PI_SET) {
+            let mut parts = v.splitn(2, '=');
+            let k = parts.next().unwrap_or("").trim().to_string();
+            let val = parts.next().unwrap_or("").to_string();
+            if !k.is_empty() {
+                settings.push((k, val));
+            }
+        } else if l.starts_with("ITEM_CANDIDATES_N:") || l.starts_with("ITEM_CANDIDATE:") {
+            candidate_block.push_str(l);
+            candidate_block.push('\n');
+        } else if let Some(last) = settings.last_mut() {
+            // A continuation of the previous value: keep it rather than drop it.
+            last.1.push('\n');
+            last.1.push_str(l);
+        }
+    }
+    finish(&mut items, name, declared, settings, missing);
+    BatchSettings {
+        items,
+        candidate_block,
+    }
+}
+
+/// Rebuild the payload `item_not_found` has always parsed, so the ITEM_NOT_FOUND envelope — message,
+/// candidate list, its three-state `Candidates` reader — keeps being built in exactly one place
+/// rather than gaining a second copy here.
+pub fn synthesise_not_found_payload(missing: &[String], candidate_block: &str) -> String {
+    // NO `ERROR:ITEM_NOT_FOUND:` prefix. The single-item arm strips that wire marker before handing
+    // the payload to `item_not_found`, so synthesising it WITH the marker put it in the caller's
+    // message — measured: `error` came back as "ERROR:ITEM_NOT_FOUND:Item not found: …", the same
+    // marker leak #358 fixed for INTEROP_ERROR.
+    format!(
+        "Item not found: {}\n{}",
+        missing.join(", "),
+        candidate_block
+    )
+}
+
+/// One item's section as a JSON object, with the losses named.
+///
+/// Two different losses, reported separately because they need different fixes:
+/// `settings_incomplete` means fewer (or more) settings arrived than IRIS declared — the output was
+/// cut. `duplicate_setting_names` means the settings that DID arrive collapsed in the map, which
+/// happens because this program writes `Name=Value` and drops `Setting.Target`: an item carrying
+/// both a Host and an Adapter setting of the same name has two rows and one key.
+pub fn item_settings_payload(name: &str, state: &ItemSettings) -> serde_json::Value {
+    match state {
+        ItemSettings::Missing => serde_json::json!({
+            "item": name, "found": false, "error_code": "ITEM_NOT_FOUND"
+        }),
+        ItemSettings::Unreadable(why) => serde_json::json!({
+            "item": name, "found": false, "error_code": "ITEM_UNREADABLE", "error": why
+        }),
+        ItemSettings::Read { settings, declared } => {
+            let map: std::collections::HashMap<&str, &str> = settings
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            let mut v = serde_json::json!({
+                "item": name, "found": true,
+                "settings": map,
+                "settings_declared": declared,
+            });
+            if settings.len() != *declared {
+                v["settings_incomplete"] = serde_json::Value::Bool(true);
+                v["settings_received"] = serde_json::json!(settings.len());
+            }
+            if map.len() != settings.len() {
+                v["duplicate_setting_names"] = serde_json::json!(settings.len() - map.len());
+            }
+            v
+        }
+    }
+}
+
+/// #327 item 3: whether a list of item names is acceptable for this action, and if not, why.
+///
+/// Only `get_settings` reads a list. Acting on the first name and dropping the rest is the
+/// partial-write shape `doc.rs`'s `require_name` records — a true `success: true` covering work that
+/// did not happen — so a list of MORE THAN ONE is refused, by name, on every other action. A list of
+/// exactly one addresses one item and is accepted everywhere.
+pub fn list_refused_for_action(action: &str, items: &[String]) -> Option<String> {
+    if items.len() < 2 || action == "get_settings" {
+        return None;
+    }
+    Some(format!(
+        "action={action} addresses ONE item, and {} were given. Only action=get_settings reads a \
+         list; call {action} once per item, or drop the extra names.",
+        items.len()
+    ))
+}
+
+/// What a batch `get_settings` read amounts to.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GetSettingsOutcome {
+    /// Every name asked for is absent. The same answer, under the same code, a single-item call has
+    /// always given — carrying the payload `item_not_found` parses.
+    NoneFound(String),
+    /// Nothing came back framed. NOT "these items have no settings": the program ran and said
+    /// nothing this build can read.
+    Unreadable,
+    /// A payload to return.
+    Payload(serde_json::Value),
+}
+
+/// Assemble the response.
+///
+/// `legacy_single` asks for the shape a one-item call has always returned (`item` + `settings`, no
+/// `results` array), so adding the list parameter changes nothing for a caller that does not use it.
+pub fn get_settings_payload(batch: &BatchSettings, legacy_single: bool) -> GetSettingsOutcome {
+    if batch.items.is_empty() {
+        return GetSettingsOutcome::Unreadable;
+    }
+    let missing: Vec<String> = batch
+        .items
+        .iter()
+        .filter(|(_, st)| matches!(st, ItemSettings::Missing))
+        .map(|(n, _)| n.clone())
+        .collect();
+    if missing.len() == batch.items.len() {
+        return GetSettingsOutcome::NoneFound(synthesise_not_found_payload(
+            &missing,
+            &batch.candidate_block,
+        ));
+    }
+    let results: Vec<serde_json::Value> = batch
+        .items
+        .iter()
+        .map(|(n, st)| item_settings_payload(n, st))
+        .collect();
+    if legacy_single && results.len() == 1 {
+        let mut v = results.into_iter().next().unwrap_or_default();
+        if let Some(obj) = v.as_object_mut() {
+            obj.remove("found");
+            obj.insert("success".into(), serde_json::Value::Bool(true));
+        }
+        return GetSettingsOutcome::Payload(v);
+    }
+    // `all_found` is about the ANSWER, not the call: `success` stays true because the read happened.
+    // A caller reading only `success` must not conclude every item came back whole.
+    let all_found = missing.is_empty() && batch.items.iter().all(|(_, st)| st.complete());
+    GetSettingsOutcome::Payload(serde_json::json!({
+        "success": true,
+        "count": results.len(),
+        "results": results,
+        "missing": missing,
+        "all_found": all_found,
+    }))
 }
 
 /// The ObjectScript prologue that resolves `tProd`, the production every
@@ -2208,12 +2586,20 @@ pub async fn interop_production_item_impl(
     // #204 narrowed this from "every action" to "every action that names one item". `list`
     // enumerates and takes no item, so it is exempt — the invariant #218 was written on
     // stopped being true the moment an enumeration action existed.
-    if ACTIONS_NEEDING_AN_ITEM.contains(&params.action.as_str()) && params.item.trim().is_empty() {
+    //
+    // #327 item 3: `items` counts as naming an item. The guard read `item` alone, so a caller who
+    // passed `items: ["A","B"]` and no `item` — the shape the new list parameter invites — was told
+    // "nothing was sent to FindItemByConfigName" while having named two things. A true sentence
+    // about the wrong parameter is the failure mode this whole issue is about.
+    let named_nothing =
+        params.item.trim().is_empty() && params.items.iter().all(|i| i.trim().is_empty());
+    if ACTIONS_NEEDING_AN_ITEM.contains(&params.action.as_str()) && named_nothing {
         return crate::tools::envelope::fail_with(
             "MISSING_PARAMETER",
             "iris_production_item needs the config item name — nothing was sent to FindItemByConfigName.",
             serde_json::json!({
                 "accepted_parameters": ITEM_NAME_KEYS,
+                "accepted_list_parameters": ITEM_LIST_KEYS,
                 "action": &params.action,
                 "namespace": &params.namespace,
                 "hint": "Pass item=<ConfigItemName> (item_name, config_name and name are also accepted). \
@@ -2283,44 +2669,45 @@ Write "OK""#
                 Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
             }
         }
+        // #327 item 3: ONE program for one item or twenty. Not two paths — a second copy of the
+        // read is the #105 shape, where the copy nobody exercises keeps the old behaviour and looks
+        // more trustworthy for having a sibling that works. The RESPONSE shape still differs: a
+        // single-item call reports exactly what it always did, so no existing caller has to change.
         "get_settings" => {
-            let code = format!(
-                r#"{prologue}
-Set tItem=tProd.FindItemByConfigName({item},,.tSC3)
-If '$IsObject(tItem) {{
-{not_found}
-}}
-Set tKey="" For {{ Set tSetting=tItem.Settings.GetNext(.tKey) Quit:tKey=""
-  Write tSetting.Name_"="_tSetting.Value_$CHAR(10) }}"#
-            );
+            let names: Vec<String> = if params.items.is_empty() {
+                vec![params.item.clone()]
+            } else {
+                let mut v = vec![params.item.clone()];
+                v.retain(|x| !x.trim().is_empty());
+                for it in &params.items {
+                    let t = it.trim();
+                    if !t.is_empty() && !v.iter().any(|e| e == t) {
+                        v.push(t.to_string());
+                    }
+                }
+                v
+            };
+            let code =
+                build_get_settings_batch_code(params.production.as_deref().unwrap_or(""), &names);
             match iris.execute_via_generator(&code, ns, &client).await {
                 Ok(out) => {
                     let out = out.trim();
-                    if let Some(msg) = out.strip_prefix("ERROR:ITEM_NOT_FOUND:") {
-                        return item_not_found(msg);
-                    }
                     if let Some(msg) = out.strip_prefix("ERROR:NO_PRODUCTION:") {
                         return err_json("NO_PRODUCTION", msg);
                     }
                     if out.starts_with("ERROR:") {
                         return interop_fail(out, params.production.as_deref());
                     }
-                    let settings: std::collections::HashMap<String, String> = out
-                        .lines()
-                        .filter_map(|line| {
-                            let mut parts = line.splitn(2, '=');
-                            let k = parts.next()?.trim().to_string();
-                            let v = parts.next().unwrap_or("").to_string();
-                            if k.is_empty() {
-                                None
-                            } else {
-                                Some((k, v))
-                            }
-                        })
-                        .collect();
-                    ok_json(
-                        serde_json::json!({"success":true,"item":params.item,"settings":settings}),
-                    )
+                    let batch = parse_get_settings_batch(out);
+                    match get_settings_payload(&batch, params.items.is_empty()) {
+                        GetSettingsOutcome::Unreadable => err_json(
+                            "ITEM_UNREADABLE",
+                            "the settings program produced no item sections — nothing can be \
+                             reported about these items. Retry, or read one item at a time.",
+                        ),
+                        GetSettingsOutcome::NoneFound(payload) => item_not_found(&payload),
+                        GetSettingsOutcome::Payload(v) => ok_json(v),
+                    }
                 }
                 Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
             }
