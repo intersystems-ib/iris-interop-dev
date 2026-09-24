@@ -6893,7 +6893,8 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
             self.record_call("stream_inspect", false);
             return envelope::fail(
                 "MISSING_PARAMS",
-                "stream_inspect needs the stream's %Id in `stream_id` (oid and id are also                  accepted). Nothing was sent, so nothing was opened.",
+                "stream_inspect needs the stream's %Id in `stream_id` (oid and id are also \
+                 accepted). Nothing was sent, so nothing was opened.",
             );
         }
         let code = stream_inspect::build_inspect_code(&id, p.max_chars);

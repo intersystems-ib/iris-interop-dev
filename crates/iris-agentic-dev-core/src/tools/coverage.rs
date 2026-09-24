@@ -515,19 +515,25 @@ pub fn report_json(rep: &CoverageReport, namespace: &str) -> serde_json::Value {
 pub fn report_hint(rep: &CoverageReport) -> Option<String> {
     if !rep.stopped {
         return Some(
-            "THE MONITOR DID NOT STOP. It is instance-wide and exclusive, so it is still costing              every process on this instance performance and the next iris_coverage call will be              refused. Stop it: Do ##class(%Monitor.System.LineByLine).Stop()"
+            "THE MONITOR DID NOT STOP. It is instance-wide and exclusive, so it is still costing \
+             every process on this instance performance and the next iris_coverage call will be \
+             refused. Stop it: Do ##class(%Monitor.System.LineByLine).Stop()"
                 .into(),
         );
     }
     if rep.routines_monitored == 0 {
         return Some(
-            "No routine matched, so nothing was measured. A CLASS does not name a routine:              `Pkg.Cls` compiles to `Pkg.Cls.1`, `Pkg.Cls.2` …, so pass `Pkg.Cls*`. The monitor              reports no error for a pattern that matches nothing — an empty result IS the symptom."
+            "No routine matched, so nothing was measured. A CLASS does not name a routine: \
+             `Pkg.Cls` compiles to `Pkg.Cls.1`, `Pkg.Cls.2` …, so pass `Pkg.Cls*`. The monitor \
+             reports no error for a pattern that matches nothing — an empty result IS the symptom."
                 .into(),
         );
     }
     if rep.routines.iter().all(|r| r.routine_lines_hit == 0) {
         return Some(
-            "Routines were monitored but no line ran. Most often the test did not exercise this              code at all, or the test spec matched no test class — check the %UnitTest output in              `output`. Coverage of 0% is a real measurement; it is not a tool failure."
+            "Routines were monitored but no line ran. Most often the test did not exercise this \
+             code at all, or the test spec matched no test class — check the %UnitTest output in \
+             `output`. Coverage of 0% is a real measurement; it is not a tool failure."
                 .into(),
         );
     }
