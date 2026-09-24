@@ -215,16 +215,6 @@
       "category": "covered-here",
       "why": "Captures error state plus recent log entries as one bundle. Its two halves are what iris_debug and iris_get_log already return."
     },
-    "compare_namespace": {
-      "category": "wanted",
-      "why": "Diffs all classes across two namespaces. The drift report a reviewer writes by hand today, and the fork's own conformance pass needs exactly this answer.",
-      "tracking": "intersystems-ib/iris-interop-dev#351"
-    },
-    "compare_document": {
-      "category": "wanted",
-      "why": "Diffs one document across two servers. The per-class half of the same drift question, and the direct check for 'the file on disk and the class in IRIS have diverged'.",
-      "tracking": "intersystems-ib/iris-interop-dev#351"
-    },
     "iris_generate_test": {
       "category": "not-interop",
       "why": "Declined on #352's own precondition, which cannot be met: it asks the model to \"Extend %UnitTest.TestCase\", while this fork's tdd skill requires %UnitTest.TestProduction with Parameter PRODUCTION and TestControl neutralised. Its only output check is validate_cls_syntax \u2014 contains \"Class \", contains a brace, braces balanced \u2014 so the shape is a request to an LLM, not a guarantee, and \"verify the output shape before adopting\" has no answer for a non-deterministic generator."
