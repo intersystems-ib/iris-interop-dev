@@ -74,6 +74,7 @@ const REMEDIES: &[(&str, &str)] = &[
     ("NAMESPACE_NOT_FOUND", "list the available namespaces with check_config and pass one of those — an omitted namespace defaults to USER, which is rarely the interop one"),
     ("NOT_FOUND", "the document or resource is not in that namespace; the message names what IS there when it can — check the namespace and the exact name, suffix included"),
     ("NO_PRODUCTION", "no production is running in that namespace; start one with iris_production, or pass the production name explicitly"),
+    ("PARAM_NOT_FOR_ACTION", "the action does not read that argument, so it was refused rather than silently ignored; the message names the action that DOES read it — reissue with that action, or drop the argument"),
     ("PARSE_ERROR", "the server's own output could not be parsed; this is a fault in this server or a version mismatch — report it with the message text"),
     ("QUERY_ERROR", "the SQL reached IRIS and IRIS refused it; the message carries the SQLCODE and text — fix the statement rather than retrying"),
     ("SCM_CHECKOUT_FAILED", "the source-control checkout was attempted and refused; the message carries the provider's reason — the document was NOT checked out, so do not write on the assumption that it was"),

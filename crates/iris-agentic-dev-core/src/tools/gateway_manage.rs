@@ -3088,6 +3088,37 @@ fn connection_json(c: &ConnectionFacts) -> serde_json::Value {
     })
 }
 
+/// `probe` takes no connection. Is the caller passing one anyway, and what should they be told?
+///
+/// #385: the probe program deliberately reads the Java side and nothing else — that is asserted by
+/// `the_probe_program_reads_the_java_side_and_no_connection`, and it is the right design: "a probe
+/// is about the gateway, not about a target". So a `connection` argument could never affect the
+/// answer. The problem was that the answer it gave was `GATEWAY_OK`, `success: true` — exactly what
+/// a caller was hoping to hear about the connection they had just named.
+///
+/// Measured 2026-09-24 against an instance with no connections defined:
+/// `action=probe, connection="ZzNoSuchGateway"` returned `GATEWAY_OK` with no `connection` key
+/// anywhere in the reply, while `action=test` on the same name returned
+/// GATEWAY_CONNECTION_NOT_DEFINED and `action=delete` likewise. The instance-level answer was true;
+/// it answered a different question than the one asked.
+///
+/// This is the call this repo already made twice: #356 (`iris_doc(put)` refuses a `names` array
+/// instead of discarding it) and #382 (`rule_name` was discarded when no action was given).
+///
+/// Returns `None` when nothing was passed, or when what was passed is blank — a blank string names
+/// no connection, so there is nothing to refuse and nothing was discarded.
+pub fn probe_ignores_connection(connection: Option<&str>) -> Option<String> {
+    let named = connection.map(str::trim).filter(|s| !s.is_empty())?;
+    Some(format!(
+        "action=probe does not take a connection: it asks whether a JDBC SQL Gateway can run on \
+         this instance at all — whether the Java external language server is defined and its Java \
+         runtime is present and supported — and never looks at any one connection. '{named}' was \
+         NOT checked, so this call was refused rather than answered about something else. Use \
+         action=test with connection='{named}' to take that connection all the way to its \
+         database, or action=list to see which names are defined here."
+    ))
+}
+
 pub async fn handle_gateway_manage(
     iris: &crate::iris::connection::IrisConnection,
     client: &reqwest::Client,
@@ -3098,6 +3129,18 @@ pub async fn handle_gateway_manage(
 
     match parse_action(&action_raw) {
         Some(Action::Probe) => {
+            // #385: accepting a connection here and answering GATEWAY_OK told the caller the
+            // connection they named was fine, about a name this action never reads.
+            if let Some(msg) = probe_ignores_connection(p.connection.as_deref()) {
+                // The code literal stays ADJACENT to `fail_with(` deliberately. The #329 remedy
+                // gate finds codes by scanning for `fail_with("`, so a rustfmt-wrapped call is
+                // invisible to it and its REMEDIES row reads as stale (#361). Measured: 0 of the 11
+                // `fail_with(` calls in this file are visible to that scan, which is why none of
+                // the GATEWAY_* codes carry a remedy on record. If this line is ever re-wrapped the
+                // gate fails loudly naming PARAM_NOT_FOR_ACTION, which is the intended tripwire.
+                let extra = serde_json::json!({ "namespace": namespace, "action": "probe" });
+                return crate::tools::envelope::fail_with("PARAM_NOT_FOR_ACTION", &msg, extra);
+            }
             let out = match iris
                 .execute_via_generator(&build_probe_code(), &namespace, client)
                 .await
