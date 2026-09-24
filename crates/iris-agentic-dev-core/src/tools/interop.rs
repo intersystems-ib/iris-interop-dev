@@ -150,6 +150,22 @@ pub fn item_names_arg(p: &serde_json::Value) -> Vec<String> {
     out
 }
 
+/// Whether the caller passed a LIST parameter, as opposed to a single `item` that
+/// [`item_names_arg`] folds into the same vector.
+///
+/// This is what selects the batch RESPONSE shape, and it must not be `!item_names_arg(p).is_empty()`:
+/// that is true for a plain `item=` too, so threading it through gave every existing single-item
+/// caller the new `results[]` payload. Measured against a live production — the pure-function test
+/// could not see it, because it sets the flag by hand.
+pub fn list_parameter_given(p: &serde_json::Value) -> bool {
+    ITEM_LIST_KEYS.iter().any(|k| {
+        p.get(k).and_then(|v| v.as_array()).is_some_and(|a| {
+            a.iter()
+                .any(|x| x.as_str().is_some_and(|s| !s.trim().is_empty()))
+        })
+    })
+}
+
 /// The production name WITHOUT `name`, for tools where `name` addresses something
 /// else. On `iris_production_item` the item owns `name` (#218); leaving both readers
 /// reaching for one key is what makes a bare `name=` ambiguous.
@@ -2113,6 +2129,29 @@ pub struct BatchSettings {
 
 /// The program that reads several items in one round trip.
 ///
+/// **Not `FindItemByConfigName`.** Measured on IRIS 2026.1 against a production that exists in
+/// config and has never been started:
+///
+/// ```text
+/// %OpenId("IOProbe.Produccion")        -> object, no error
+/// tProd.Items.Count()                  -> 3   (Probe.BS.Feed, Probe.BO.Out, Probe.BO.NoSettings)
+/// tProd.FindItemByConfigName("Probe.BS.Feed") -> NO object, status ERROR #00: (no error description)
+/// ^Ens.Runtime("DispatchName")         -> does not exist, 0 entries
+/// Ens.Director.GetProductionStatus     -> running production '' , state 2
+/// ```
+///
+/// `FindItemByConfigName` resolves through the RUNTIME dispatch index, which is only populated once
+/// a production has been started or updated. On a production being built — which is this fork's
+/// whole workflow: configure the items, then run the tests — it returns nothing for an item that is
+/// demonstrably there, and the refusal even lists that item among the production's own items. And
+/// the status it sets carries no text, so there is nothing to report.
+///
+/// Walking `tProd.Items` and matching `.Name` is config-level, needs no runtime index, and is what
+/// `build_list_items_code` already does successfully. Measured on the same never-started production:
+/// the item with 4 settings, the item with 0 settings, and a name that does not exist all resolve
+/// correctly.
+///
+///
 /// No `Quit` anywhere inside the per-item `If`: measured on IRIS 2026.1, a `Quit` inside an `If`
 /// block returns from the METHOD, so one missing item would end the run and every later item would
 /// be silently absent from the output. That is why `item_not_found_block` — which ends in `Quit` by
@@ -2125,7 +2164,7 @@ pub fn build_get_settings_batch_code(production: &str, items: &[String]) -> Stri
         let e = os_str_expr(item);
         code.push_str(&format!(
             "\nWrite \"{mi}\"_{e}_$C(10)\n\
-             Set tItem=tProd.FindItemByConfigName({e},,.tSC3)\n\
+             Set tItem=\"\" For zpi=1:1:tProd.Items.Count() {{ If tProd.Items.GetAt(zpi).Name={e} {{ Set tItem=tProd.Items.GetAt(zpi) Quit }} }}\n\
              If '$IsObject(tItem) {{ Write \"{mm}1\"_$C(10) }} Else {{ Write \"{mn}\"_tItem.Settings.Count()_$C(10) Set zk=\"\" For {{ Set tS=tItem.Settings.GetNext(.zk) Quit:zk=\"\"  Write \"{ms}\"_tS.Name_\"=\"_tS.Value_$C(10) }} }}",
             mi = M_PI_ITEM,
             mm = M_PI_MISSING,
@@ -2224,8 +2263,12 @@ pub fn parse_get_settings_batch(out: &str) -> BatchSettings {
 /// candidate list, its three-state `Candidates` reader — keeps being built in exactly one place
 /// rather than gaining a second copy here.
 pub fn synthesise_not_found_payload(missing: &[String], candidate_block: &str) -> String {
+    // NO `ERROR:ITEM_NOT_FOUND:` prefix. The single-item arm strips that wire marker before handing
+    // the payload to `item_not_found`, so synthesising it WITH the marker put it in the caller's
+    // message — measured: `error` came back as "ERROR:ITEM_NOT_FOUND:Item not found: …", the same
+    // marker leak #358 fixed for INTEROP_ERROR.
     format!(
-        "ERROR:ITEM_NOT_FOUND:Item not found: {}\n{}",
+        "Item not found: {}\n{}",
         missing.join(", "),
         candidate_block
     )

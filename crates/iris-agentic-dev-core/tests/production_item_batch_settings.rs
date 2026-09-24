@@ -244,6 +244,45 @@ fn a_missing_item_does_not_end_the_program() {
     );
 }
 
+/// The defect a live run found, which every parser test was blind to: `FindItemByConfigName`
+/// resolves through the RUNTIME dispatch index, so on a production that has never been started it
+/// returns nothing for an item that is demonstrably there.
+///
+/// Measured on IRIS 2026.1 against `IOProbe.Produccion` (configured, never started):
+///
+/// ```text
+/// tProd.Items.Count()                         -> 3, all three names present
+/// tProd.FindItemByConfigName("Probe.BS.Feed") -> NO object, ERROR #00: (no error description)
+/// ^Ens.Runtime("DispatchName")                -> does not exist, 0 entries
+/// walking tProd.Items and matching .Name      -> resolves all three correctly
+/// ```
+///
+/// A mutation restoring `FindItemByConfigName` passed all 25 other tests in this file, because they
+/// feed the PARSER hand-written marker text and cannot see the ObjectScript. This is the assertion
+/// that can.
+#[test]
+fn the_program_resolves_items_from_config_not_from_the_runtime_index() {
+    let names: Vec<String> = ITEMS.iter().map(|s| s.to_string()).collect();
+    let code = build_get_settings_batch_code("IOProbe.Produccion", &names);
+    assert!(
+        !code.contains("FindItemByConfigName"),
+        "this resolves through ^Ens.Runtime(\"DispatchName\"), which is empty until a production \
+         has been started — so every item of a production being BUILT reports ITEM_NOT_FOUND:\n{code}"
+    );
+    assert!(
+        code.contains("tProd.Items.Count()") && code.contains(".Name="),
+        "the lookup must walk the CONFIG items and match on Name:\n{code}"
+    );
+    // CONTROL: the walk is emitted once PER ITEM asked for, not once for the whole program — an
+    // over-specific count of GetAt references was wrong here (it fails on correct code, which is how
+    // a guard gets loosened), so this counts the per-item loops instead.
+    assert_eq!(
+        code.matches("For zpi=1:1:tProd.Items.Count()").count(),
+        ITEMS.len(),
+        "expected one config walk per item asked for:\n{code}"
+    );
+}
+
 /// Every `For` on one line: `build_exec_class` splits generated code on `\n`, so a loop whose body
 /// is on the next line is split from it.
 #[test]
@@ -272,8 +311,12 @@ fn the_not_found_payload_keeps_the_shape_its_reader_parses() {
     );
     let first = p.lines().next().expect("a first line");
     assert!(
-        first.starts_with("ERROR:ITEM_NOT_FOUND:"),
+        first.starts_with("Item not found:"),
         "the reader takes the message from line 0: {first}"
+    );
+    assert!(
+        !first.starts_with("ERROR:"),
+        "and that message is what the caller reads, so the wire marker must not be in it: {first}"
     );
     assert!(
         first.contains("Nope") && first.contains("AlsoNope"),
@@ -406,7 +449,14 @@ fn every_item_absent_is_reported_as_item_not_found() {
                ITEM_CANDIDATES_N:1\nITEM_CANDIDATE:Censo.Router\n";
     match get_settings_payload(&parse_get_settings_batch(out), false) {
         GetSettingsOutcome::NoneFound(p) => {
-            assert!(p.starts_with("ERROR:ITEM_NOT_FOUND:"), "{p}");
+            // NO wire marker. `item_not_found` takes its message from line 0, and the single-item arm
+            // strips `ERROR:ITEM_NOT_FOUND:` before handing the payload over — synthesising it WITH
+            // the marker put it in the caller's `error`, measured against a live production.
+            assert!(
+                !p.starts_with("ERROR:"),
+                "the wire marker must not reach the caller's message: {p}"
+            );
+            assert!(p.starts_with("Item not found:"), "{p}");
             assert!(p.contains("Nope") && p.contains("AlsoNope"), "{p}");
             assert!(
                 p.contains("ITEM_CANDIDATE:Censo.Router"),
@@ -476,4 +526,38 @@ fn a_list_of_one_is_accepted_everywhere() {
         assert_eq!(list_refused_for_action(action, &one), None, "{action}");
     }
     assert_eq!(list_refused_for_action("add", &[]), None);
+}
+
+// ── which RESPONSE shape a call gets ──────────────────────────────────────────────────────
+
+use iris_agentic_dev_core::tools::interop::list_parameter_given;
+
+/// The regression a live run caught and the pure-function test could not: `items` non-empty selects
+/// the batch payload, and `item_names_arg` folds a single `item` INTO `items` — so keying the shape
+/// on the union handed every existing single-item caller the new `results[]` payload.
+#[test]
+fn a_single_item_parameter_is_not_a_list() {
+    assert!(!list_parameter_given(&json!({"item": "A"})));
+    assert!(!list_parameter_given(&json!({"item_name": "A"})));
+    assert!(!list_parameter_given(&json!({"action": "get_settings"})));
+    // A list key that carries nothing usable is not a list either.
+    assert!(!list_parameter_given(&json!({"items": []})));
+    assert!(!list_parameter_given(&json!({"items": ["", "   "]})));
+    // CONTROL: a real list IS one, under every accepted spelling.
+    for key in ["items", "item_names", "itemNames"] {
+        assert!(
+            list_parameter_given(&json!({key: ["A"]})),
+            "{key} must count as a list"
+        );
+    }
+    // And `item` alongside a real list is still a list call.
+    assert!(list_parameter_given(&json!({"item": "A", "items": ["B"]})));
+}
+
+/// The two predicates answer different questions, and conflating them is the regression above.
+#[test]
+fn naming_an_item_and_passing_a_list_are_different_questions() {
+    let single = json!({"item": "A"});
+    assert_eq!(item_names_arg(&single), vec!["A"], "the name is read");
+    assert!(!list_parameter_given(&single), "but no list was given");
 }
