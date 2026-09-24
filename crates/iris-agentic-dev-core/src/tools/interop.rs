@@ -2659,6 +2659,91 @@ If $$$ISERR(tSC) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC
 // 024-interop-depth: Lookup tables (US3)
 // ═══════════════════════════════════════════════════════════════════
 
+/// The marker `get` writes its value behind, so an empty value is not an empty reply.
+///
+/// #386: `get` used to `Write tVal` bare. A key holding an empty string therefore produced an
+/// empty program output — and `execute_via_generator` returns `Ok("")` for a SqlProc that failed
+/// at runtime as well (#362), so "the value is blank" and "the call failed" were the same
+/// observation. With the marker they are different: output that does not carry it is a failure,
+/// never a blank value.
+pub const LOOKUP_VALUE_MARKER: &str = "LK_VALUE:";
+
+/// The two presence checks `get` and `delete` share, in one place so they cannot drift apart.
+///
+/// Measured 2026-09-24 against a live instance, with its own control:
+///
+/// ```text
+/// $DATA(^Ens.LookupTable(T))        = 11   the table
+/// $DATA(^Ens.LookupTable(T,"kE"))   = 1    key whose stored value is ""
+/// $DATA(^Ens.LookupTable(T,"kN"))   = 1    key whose stored value is "v"
+/// $DATA(^Ens.LookupTable(T,"kZ"))   = 0    key never set          <- the control
+/// $GET(^Ens.LookupTable(T,"kE"))    = ""   indistinguishable from kZ by value
+/// ```
+///
+/// So `$DATA` answers existence and `$GET` does not. `get` used `If tVal=""` as its existence
+/// test, which reported a legitimately empty value as absence — and `set value=""` is accepted
+/// and reported `success: true`, so "" is a value a caller can deliberately store. `delete`
+/// checked the table but not the key at all, and fell through to `%RemoveValue`, which answered
+/// with a raw `ERROR #5810 ... ID 'Table||key'` carrying an internal composite ID.
+fn lookup_presence_prechecks(t: &str, k: &str) -> String {
+    format!(
+        r#"If '$DATA(^Ens.LookupTable({t})) {{ Write "ERROR:TABLE_NOT_FOUND:Table not found: "_{t} Quit }}
+If '$DATA(^Ens.LookupTable({t},{k})) {{ Write "ERROR:KEY_NOT_FOUND:Key not found: "_{k}_" in table "_{t}_". Use action=list_keys to see which keys this table holds." Quit }}"#
+    )
+}
+
+/// What a `get` program's output means. Four outcomes, because there are four.
+///
+/// #386: the old code had three of these collapsed into two. A key holding `""` and a program
+/// that produced nothing both arrived as an empty string, and `If tVal=""` then reported the
+/// first as KEY_NOT_FOUND — a stored value answered as a fact about the store's contents.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LookupValue<'a> {
+    /// The key exists and this is what it holds — possibly the empty string.
+    Value(&'a str),
+    /// No such table.
+    TableNotFound(&'a str),
+    /// The table exists, the key does not.
+    KeyNotFound(&'a str),
+    /// The program did not report any of the above, so nothing can be concluded about the key.
+    /// `execute_via_generator` returns `Ok("")` for a SqlProc that failed at runtime (#362), so
+    /// this case is reachable and must not be read as a blank value.
+    ProgramFailed(&'a str),
+}
+
+/// Decode a `get` program's output. The marker is what separates a blank value from no reply.
+pub fn read_lookup_get_output(out: &str) -> LookupValue<'_> {
+    if let Some(m) = out.strip_prefix("ERROR:TABLE_NOT_FOUND:") {
+        return LookupValue::TableNotFound(m);
+    }
+    if let Some(m) = out.strip_prefix("ERROR:KEY_NOT_FOUND:") {
+        return LookupValue::KeyNotFound(m);
+    }
+    match out.strip_prefix(LOOKUP_VALUE_MARKER) {
+        Some(v) => LookupValue::Value(v),
+        None => LookupValue::ProgramFailed(out),
+    }
+}
+
+/// The program `get` runs. Both arguments are already ObjectScript expressions.
+pub fn build_lookup_get_code(t: &str, k: &str) -> String {
+    format!(
+        "{}\nWrite \"{}\"_$GET(^Ens.LookupTable({t},{k}))",
+        lookup_presence_prechecks(t, k),
+        LOOKUP_VALUE_MARKER
+    )
+}
+
+/// The program `delete` runs. Both arguments are already ObjectScript expressions.
+pub fn build_lookup_delete_code(t: &str, k: &str) -> String {
+    format!(
+        r#"{}
+Set tSC=##class(Ens.Util.LookupTable).%RemoveValue({t},{k})
+If $$$ISERR(tSC) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC) }} Else {{ Write "OK" }}"#,
+        lookup_presence_prechecks(t, k)
+    )
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct LookupManageParams {
     // #112: the enum belongs in the SCHEMA, not only in the INVALID_ACTION message.
@@ -2743,26 +2828,19 @@ pub async fn interop_lookup_manage_impl(
                     )
                 }
             };
-            let code = format!(
-                r#"If '$DATA(^Ens.LookupTable({t})) {{ Write "ERROR:TABLE_NOT_FOUND:Table not found: "_{t} Quit }}
-Set tVal=$GET(^Ens.LookupTable({t},{k}))
-If tVal="" {{ Write "ERROR:KEY_NOT_FOUND:Key not found: "_{k} Quit }}
-Write tVal"#,
-                t = table,
-                k = key
-            );
+            let code = build_lookup_get_code(&table, &key);
             match iris.execute_via_generator(&code, ns, &client).await {
                 Ok(out) => {
                     let out = out.trim();
-                    if let Some(msg) = out.strip_prefix("ERROR:TABLE_NOT_FOUND:") {
-                        return err_json("TABLE_NOT_FOUND", msg);
+                    // #386: a stored "" is a value; a marker-less reply is a failed program.
+                    match read_lookup_get_output(out) {
+                        LookupValue::TableNotFound(msg) => err_json("TABLE_NOT_FOUND", msg),
+                        LookupValue::KeyNotFound(msg) => err_json("KEY_NOT_FOUND", msg),
+                        LookupValue::Value(value) => ok_json(
+                            serde_json::json!({"success":true,"table":params.table,"key":params.key,"value":value}),
+                        ),
+                        LookupValue::ProgramFailed(raw) => interop_fail(raw, None),
                     }
-                    if let Some(msg) = out.strip_prefix("ERROR:KEY_NOT_FOUND:") {
-                        return err_json("KEY_NOT_FOUND", msg);
-                    }
-                    ok_json(
-                        serde_json::json!({"success":true,"table":params.table,"key":params.key,"value":out}),
-                    )
                 }
                 Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
             }
@@ -2807,13 +2885,7 @@ If $$$ISERR(tSC) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC
                 Some(k) => os_str_expr(k),
                 None => return err_json("INVALID_PARAMS", "delete requires key"),
             };
-            let code = format!(
-                r#"If '$DATA(^Ens.LookupTable({t})) {{ Write "ERROR:TABLE_NOT_FOUND:Table not found: "_{t} Quit }}
-Set tSC=##class(Ens.Util.LookupTable).%RemoveValue({t},{k})
-If $$$ISERR(tSC) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC) }} Else {{ Write "OK" }}"#,
-                t = table,
-                k = key
-            );
+            let code = build_lookup_delete_code(&table, &key);
             match iris.execute_via_generator(&code, ns, &client).await {
                 Ok(out) => {
                     let out = out.trim();
@@ -2823,6 +2895,9 @@ If $$$ISERR(tSC) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC
                         )
                     } else if let Some(msg) = out.strip_prefix("ERROR:TABLE_NOT_FOUND:") {
                         err_json("TABLE_NOT_FOUND", msg)
+                    } else if let Some(msg) = out.strip_prefix("ERROR:KEY_NOT_FOUND:") {
+                        // #386: without this the precheck's refusal would fall to the generic arm.
+                        err_json("KEY_NOT_FOUND", msg)
                     } else {
                         interop_fail(out, None)
                     }
