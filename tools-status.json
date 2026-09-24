@@ -28,6 +28,18 @@
       "status": "profile-only"
     },
     {
+      "tool": "compare_document",
+      "unit": "compare::tests",
+      "e2e": null,
+      "status": "unit-ok"
+    },
+    {
+      "tool": "compare_namespace",
+      "unit": "compare::tests",
+      "e2e": null,
+      "status": "unit-ok"
+    },
+    {
       "tool": "docs_introspect",
       "unit": null,
       "e2e": null,

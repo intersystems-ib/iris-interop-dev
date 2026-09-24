@@ -271,7 +271,9 @@ numbers), `iris_execute` (run ObjectScript), `iris_query` (SQL → JSON rows), `
 `iris_execute_method` (invoke a ClassMethod by name), `iris_coverage` (line coverage of a `%UnitTest`
 run, via `%Monitor.System.LineByLine`), `stream_inspect` (read a stream body by id — size plus the
 first `max_chars` as exact bytes; an id that does not exist is reported as such rather than as an
-empty stream, and a CR-separated HL7 body keeps its segments).
+empty stream, and a CR-separated HL7 body keeps its segments),
+`compare_namespace` / `compare_document` (diff two namespaces on the connected instance, or one
+document across them — `in_sync` is never claimed by a comparison that examined nothing).
 
 **Introspection** — `docs_introspect` (methods/properties/XData/superclasses), `iris_symbols` (search
 classes/methods), `iris_table_info` (real projected table + columns), `check_config` (active connection
