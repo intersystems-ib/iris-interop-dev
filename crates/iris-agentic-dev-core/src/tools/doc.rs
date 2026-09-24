@@ -787,19 +787,24 @@ impl TestGate {
         match self {
             TestGate::NotRequested | TestGate::Run(_) => None,
             TestGate::SkippedCallFailed => Some(
-                "not run: this call did not succeed, so a test run would report a red for a class                  that was never written or never compiled. Fix what `error`/`error_code` names,                  then call again."
+                "not run: this call did not succeed, so a test run would report a red for a class \
+                 that was never written or never compiled. Fix what `error`/`error_code` names, \
+                 then call again."
                     .into(),
             ),
             TestGate::SkippedNotCompiled {
                 compile_requested: false,
             } => Some(
-                "not run: `test` needs a COMPILED class and this call did not compile. Pass                  compile=true in the same call, or run iris_test yourself once the class is                  compiled."
+                "not run: `test` needs a COMPILED class and this call did not compile. Pass \
+                 compile=true in the same call, or run iris_test yourself once the class is \
+                 compiled."
                     .into(),
             ),
             TestGate::SkippedNotCompiled {
                 compile_requested: true,
             } => Some(
-                "not run: a compile was requested but the payload does not report a compiled                  class. Read `compile_errors` / `compile_console`, then call again."
+                "not run: a compile was requested but the payload does not report a compiled \
+                 class. Read `compile_errors` / `compile_console`, then call again."
                     .into(),
             ),
         }

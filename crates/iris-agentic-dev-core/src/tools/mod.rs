@@ -6975,7 +6975,8 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                                 payload["test_pattern"] =
                                     serde_json::Value::String(pattern.clone());
                                 payload["test_skipped"] = serde_json::Value::String(
-                                    "the test ran but its result could not be parsed — call                                      iris_test directly to see it."
+                                    "the test ran but its result could not be parsed — call \
+                                     iris_test directly to see it."
                                         .into(),
                                 );
                             }
@@ -18914,6 +18915,4 @@ mod doc_test_parameter_tests {
             "the sequencer window ran past its body"
         );
     }
-}
-
 }
