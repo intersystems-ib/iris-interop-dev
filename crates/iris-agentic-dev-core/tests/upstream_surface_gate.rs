@@ -142,3 +142,57 @@ fn the_section_restates_no_current_count() {
         offenders.join("\n  ")
     );
 }
+
+/// #352: both halves of the comparison must read the SAME ref.
+///
+/// `ours` comes from `git show HEAD:…`, and INTEROP_TOOLS was read from the WORKTREE. While a change
+/// was uncommitted the two disagreed: a tool implemented and advertised in the working tree appeared
+/// as advertised AND never-ported at once, and the #353 join then reported it UNCLASSIFIED — a gate
+/// failure about a tool that is in the profile. Measured while adding `stream_inspect`: exit 1 before
+/// the commit, exit 0 after, with no source change in between.
+///
+/// One source, and the caveat printed, rather than two that agree only after a commit.
+#[test]
+fn both_halves_of_the_surface_comparison_read_the_same_ref() {
+    let s = script();
+    // The UPSTREAM section only. This file has two python blocks and each has its own `src =` and its
+    // own INTEROP_TOOLS parse — the first version of this test matched the drift check's worktree read
+    // and failed on correct code, which is how a guard gets loosened until it catches nothing.
+    let section_at = s
+        .find("# ── #353: the upstream surface")
+        .expect("the upstream section must be findable");
+    let section = &s[section_at..];
+    let profile_at = section
+        .find("INTEROP_TOOLS[^=]")
+        .unwrap_or_else(|| panic!("the upstream section must parse INTEROP_TOOLS"));
+    // The assignment that feeds it: the nearest `src =` BEFORE the parse, inside this section.
+    let before = &section[..profile_at];
+    let src_at = before
+        .rfind("src = ")
+        .unwrap_or_else(|| panic!("no `src =` assignment precedes the INTEROP_TOOLS parse"));
+    let src_assign = section[src_at..]
+        .lines()
+        .next()
+        .expect("the assignment line");
+    // CONTROL: the window really is the upstream section, not the whole file.
+    assert!(
+        !section.contains("Per-tool validation gate"),
+        "the section window ran back into the earlier block"
+    );
+    assert!(
+        src_assign.contains("git(") && src_assign.contains("HEAD:"),
+        "INTEROP_TOOLS is read from the worktree while `ours` is read from HEAD, so the buckets \
+         disagree until the change is committed and the #353 join reports a false UNCLASSIFIED: \
+         {src_assign}"
+    );
+    assert!(
+        !src_assign.contains("open("),
+        "reading the file directly is the worktree read this guards against: {src_assign}"
+    );
+    // The caveat must be stated, because "at HEAD" is a real limitation for anyone running this on
+    // a dirty tree.
+    assert!(
+        s.contains("uncommitted changes are not included"),
+        "the section compares committed refs and must say so"
+    );
+}
