@@ -70,6 +70,7 @@ const REMEDIES: &[(&str, &str)] = &[
     ("ITEM_EXISTS", "a config item of that name is already in the production; update it, or choose another name"),
     ("ITEM_NOT_FOUND", "list the production's items with iris_production_item and use one of those names — the name must match exactly, including package"),
     ("KEY_NOT_FOUND", "the lookup table has no such key; list the table's keys first, or add the key before reading it"),
+    ("MESSAGE_BODY_CLASS_MISSING", "the message header is present but its body class is not compiled in that namespace; compile the class there, or read the header fields with iris_interop_query(what=messages), which does not open the body"),
     ("NAMESPACE_EXISTS", "a namespace of that name is already defined; use it, or pick another name"),
     ("NAMESPACE_NOT_FOUND", "list the available namespaces with check_config and pass one of those — an omitted namespace defaults to USER, which is rarely the interop one"),
     ("NOT_FOUND", "the document or resource is not in that namespace; the message names what IS there when it can — check the namespace and the exact name, suffix included"),
