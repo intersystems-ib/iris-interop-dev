@@ -2659,6 +2659,93 @@ If $$$ISERR(tSC) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC
 // 024-interop-depth: Lookup tables (US3)
 // ═══════════════════════════════════════════════════════════════════
 
+/// The two lookup listings frame each entry as `<length>:<entry>`, with no separator.
+///
+/// #394: both loops used to write `entry_$CHAR(10)` and the Rust side split on newlines, so a key
+/// or table name containing a line feed was reported as TWO entries and inflated the count.
+/// Measured 2026-09-25 in namespace USER:
+///
+/// ```text
+/// one key "a\nb"          ($ORDER says: key len=3, hasLF=1)
+///   list_keys  -> {"count":2,"keys":["a","b"]}
+///   get "a\nb" -> success, value "v"     <- the real key
+///   get "a"    -> KEY_NOT_FOUND          <- neither reported name exists
+///   get "b"    -> KEY_NOT_FOUND
+///
+/// one table "ZzA\nZzB"    ($ORDER says: table len=7, hasLF=1)
+///   list_tables -> {"count":3,"total_count":3,"tables":["%IRIS_X12ReplyType","ZzA","ZzB"]}
+/// ```
+///
+/// `set`, `get`, `delete` and the value path were all correct — the defect was only the framing.
+/// It matters because these listings exist so a caller can feed names back into `get`/`delete`,
+/// and the KEY_NOT_FOUND refusal points them here.
+///
+/// A length prefix rather than base64 because `base64_encode` is not on this branch, and rather
+/// than a rarer delimiter because no byte is safe: the entry can contain anything the global can.
+/// `$LENGTH` counts characters and so does the Rust walk, and the transport already restores the
+/// newlines faithfully (it encodes them as `$CHAR(1)` and decodes them back).
+pub fn build_lookup_list_tables_code() -> String {
+    r#"Set tTable="" For { Set tTable=$ORDER(^Ens.LookupTable(tTable)) Quit:tTable=""  Write $LENGTH(tTable)_":"_tTable }"#
+        .to_string()
+}
+
+/// The `list_keys` program. `table_expr` is already an ObjectScript expression.
+pub fn build_lookup_list_keys_code(table_expr: &str) -> String {
+    format!(
+        r#"If '$DATA(^Ens.LookupTable({t})) {{ Write "ERROR:TABLE_NOT_FOUND:Table not found: "_{t} Quit }}
+Set tKey="" For {{ Set tKey=$ORDER(^Ens.LookupTable({t},tKey)) Quit:tKey=""  Write $LENGTH(tKey)_":"_tKey }}"#,
+        t = table_expr
+    )
+}
+
+/// Decode a `<length>:<entry>` stream.
+///
+/// Returns `Err` on anything it cannot account for. That matters more than it looks: the previous
+/// framing degraded silently — a mis-split produced a plausible list — and a parser that skipped
+/// what it could not read would do the same, reporting FEWER keys than the table holds as though
+/// that were the answer. Trailing whitespace from the transport is tolerated; anything else is a
+/// fault in this server's own output.
+pub fn parse_length_prefixed_entries(out: &str) -> Result<Vec<String>, String> {
+    let chars: Vec<char> = out.chars().collect();
+    let mut i = 0usize;
+    let mut entries: Vec<String> = Vec::new();
+    while i < chars.len() {
+        if chars[i..].iter().all(|c| c.is_whitespace()) {
+            break;
+        }
+        let digits_start = i;
+        while i < chars.len() && chars[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == digits_start {
+            return Err(format!(
+                "expected an entry length at character {digits_start}, found {:?}",
+                chars[digits_start]
+            ));
+        }
+        let len: usize = chars[digits_start..i]
+            .iter()
+            .collect::<String>()
+            .parse()
+            .map_err(|_| format!("the entry length at character {digits_start} is not a number"))?;
+        if i >= chars.len() || chars[i] != ':' {
+            return Err(format!(
+                "expected ':' after the entry length at character {i}"
+            ));
+        }
+        i += 1;
+        if i + len > chars.len() {
+            return Err(format!(
+                "the entry at character {i} claims {len} characters but only {} remain",
+                chars.len() - i
+            ));
+        }
+        entries.push(chars[i..i + len].iter().collect::<String>());
+        i += len;
+    }
+    Ok(entries)
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct LookupManageParams {
     // #112: the enum belongs in the SCHEMA, not only in the INVALID_ACTION message.
@@ -2702,14 +2789,14 @@ pub async fn interop_lookup_manage_impl(
 
     match params.action.as_str() {
         "list_tables" => {
-            let code = r#"Set tTable="" Set tOut="" Set tCount=0 For { Set tTable=$ORDER(^Ens.LookupTable(tTable)) Quit:tTable=""  Set tOut=tOut_tTable_$CHAR(10) Set tCount=tCount+1 } Write tOut"#;
-            match iris.execute_via_generator(code, ns, &client).await {
+            let code = build_lookup_list_tables_code();
+            match iris.execute_via_generator(&code, ns, &client).await {
                 Ok(out) => {
-                    let tables: Vec<String> = out
-                        .lines()
-                        .map(|l| l.trim().to_string())
-                        .filter(|l| !l.is_empty())
-                        .collect();
+                    // #394: a malformed reply is a server fault, not a shorter list of tables.
+                    let tables: Vec<String> = match parse_length_prefixed_entries(&out) {
+                        Ok(v) => v,
+                        Err(why) => return err_json("PARSE_ERROR", &why),
+                    };
                     let total = tables.len();
                     let truncated = total > 100;
                     let tables: Vec<String> = tables.into_iter().take(100).collect();
@@ -2835,22 +2922,18 @@ If $$$ISERR(tSC) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC
                 Some(t) => os_str_expr(t),
                 None => return err_json("INVALID_PARAMS", "list_keys requires table"),
             };
-            let code = format!(
-                r#"If '$DATA(^Ens.LookupTable({t})) {{ Write "ERROR:TABLE_NOT_FOUND:Table not found: "_{t} Quit }}
-Set tKey="" For {{ Set tKey=$ORDER(^Ens.LookupTable({t},tKey)) Quit:tKey=""  Write tKey_$CHAR(10) }}"#,
-                t = table
-            );
+            let code = build_lookup_list_keys_code(&table);
             match iris.execute_via_generator(&code, ns, &client).await {
                 Ok(out) => {
-                    let out = out.trim();
-                    if let Some(msg) = out.strip_prefix("ERROR:TABLE_NOT_FOUND:") {
+                    if let Some(msg) = out.trim().strip_prefix("ERROR:TABLE_NOT_FOUND:") {
                         return err_json("TABLE_NOT_FOUND", msg);
                     }
-                    let keys: Vec<String> = out
-                        .lines()
-                        .map(|l| l.trim().to_string())
-                        .filter(|l| !l.is_empty())
-                        .collect();
+                    // #394: no .trim() on the entries — the length prefix delimits them exactly,
+                    // so a name with leading or trailing space now survives the round trip.
+                    let keys: Vec<String> = match parse_length_prefixed_entries(&out) {
+                        Ok(v) => v,
+                        Err(why) => return err_json("PARSE_ERROR", &why),
+                    };
                     ok_json(
                         serde_json::json!({"success":true,"table":params.table,"keys":keys,"count":keys.len()}),
                     )
