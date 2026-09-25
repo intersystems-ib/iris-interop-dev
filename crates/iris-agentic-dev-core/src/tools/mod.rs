@@ -3258,6 +3258,34 @@ pub async fn list_iris_containers_pub(workspace_basename: &str) -> Vec<serde_jso
     list_iris_containers(workspace_basename).await
 }
 
+/// Take `limit` rows and say whether more were available.
+///
+/// #398: `iris_symbols` and `iris_doc_search` returned a capped list with `count` equal to the
+/// number returned and nothing distinguishing a complete answer from a truncated one. Measured in
+/// namespace USER: `iris_symbols(query="Ens*")` returned 20 with `count: 20` while 1518 classes
+/// match in `%Dictionary.ClassDefinition`, and `iris_doc_search(term="string")` returned 20 of 133.
+/// So `count: 20` meant "20 matched" and "20 of 1518 matched" identically.
+///
+/// The cap itself was documented and is not the problem — `iris_doc_search`'s `limit` schema even
+/// gives a rationale ("a documentation search is for orienting"). The problem was the response.
+/// `iris_lookup_manage(list_tables)` and `iris_credential_list` both already carry `truncated` and
+/// report it even when false, so a caller can always tell; these searches were the outliers.
+///
+/// The probe row is why no second query is needed: ask for `limit + 1`, and if that extra row comes
+/// back there is at least one more match. `doc_search`'s own comment makes the case for the zero
+/// end of this — "a real zero is a real answer, but it is also the point at which a caller needs to
+/// know what was and was NOT searched" — and a truncated list is the same argument at the other end.
+pub fn take_with_truncation<T>(mut rows: Vec<T>, limit: usize) -> (Vec<T>, bool) {
+    let truncated = rows.len() > limit;
+    rows.truncate(limit);
+    (rows, truncated)
+}
+
+/// The row count to ASK for when `limit` rows are wanted, so truncation is detectable.
+pub fn probe_limit(limit: usize) -> usize {
+    limit.saturating_add(1)
+}
+
 /// Translate an iris_symbols query string into a SQL fragment and parameters.
 /// Supports: plain substring, `Pkg.*` prefix, `Pkg.` trailing dot, mid-glob `Pkg.*.Name`, bare `*`.
 pub fn translate_symbols_query(limit: usize, query: &str) -> (String, Vec<serde_json::Value>) {
@@ -6451,13 +6479,15 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
 
         let mut classes = Vec::new();
         let mut methods = Vec::new();
+        // #398: true when either list hit the cap, so a caller can tell 20-of-133 from 20-of-20.
+        let mut truncated = false;
         // Classes first: cheap in every case, and the answer to "which class does X" more often than a
         // method description is.
         if matches!(
             scope,
             doc_search::DocScope::Classes | doc_search::DocScope::Both
         ) {
-            let sql = doc_search::class_sql(&p.term, p.within.as_deref(), limit);
+            let sql = doc_search::class_sql(&p.term, p.within.as_deref(), probe_limit(limit));
             match iris.query(&sql, vec![], &namespace, client).await {
                 Err(e) => {
                     self.record_call("iris_doc_search", false);
@@ -6468,6 +6498,8 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                         .as_array()
                         .cloned()
                         .unwrap_or_default();
+                    let (rows, more) = take_with_truncation(rows, limit);
+                    truncated = truncated || more;
                     classes = doc_search::hits_from_rows(&rows, false, &p.term, width);
                 }
             }
@@ -6475,7 +6507,7 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
         if scope.needs_scope() {
             // `validate` has already refused an absent or blank `within`, so this cannot run unscoped.
             let within = p.within.as_deref().unwrap_or_default();
-            let sql = doc_search::method_sql(&p.term, within, limit);
+            let sql = doc_search::method_sql(&p.term, within, probe_limit(limit));
             match iris.query(&sql, vec![], &namespace, client).await {
                 Err(e) => {
                     self.record_call("iris_doc_search", false);
@@ -6486,6 +6518,8 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                         .as_array()
                         .cloned()
                         .unwrap_or_default();
+                    let (rows, more) = take_with_truncation(rows, limit);
+                    truncated = truncated || more;
                     methods = doc_search::hits_from_rows(&rows, true, &p.term, width);
                 }
             }
@@ -6501,6 +6535,7 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
             "classes": classes,
             "methods": methods,
             "count": total,
+            "truncated": truncated,
         });
         // A real zero is a real answer, but it is also the point at which a caller needs to know what
         // was and was NOT searched — otherwise "nothing found" reads as "nothing exists".
@@ -7552,15 +7587,25 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
     ) -> Result<CallToolResult, McpError> {
         let iris = self.get_iris_reloaded().await?;
         let client = self.http_client();
-        let (sql, params) = translate_symbols_query(p.limit, &p.query);
+        // #398: ask for one more than wanted, so a truncated answer can say so.
+        let (sql, params) = translate_symbols_query(probe_limit(p.limit), &p.query);
         let namespace = interop::resolve_namespace(p.namespace.as_deref(), Some(&iris));
         match iris.query(&sql, params, &namespace, client).await {
-            Ok(resp) => ok_json(serde_json::json!({
-                "source": "iris_dictionary",
-                "symbols": resp["result"]["content"],
-                "count": resp["result"]["content"].as_array().map(|a| a.len()).unwrap_or(0),
-                "query_hint": "Supports: plain text (substring), 'Pkg.*' (package prefix), 'Pkg.*.Name' (glob)",
-            })),
+            Ok(resp) => {
+                let rows = resp["result"]["content"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                let (symbols, truncated) = take_with_truncation(rows, p.limit);
+                let count = symbols.len();
+                ok_json(serde_json::json!({
+                    "source": "iris_dictionary",
+                    "symbols": symbols,
+                    "count": count,
+                    "truncated": truncated,
+                    "query_hint": "Supports: plain text (substring), 'Pkg.*' (package prefix), 'Pkg.*.Name' (glob)",
+                }))
+            }
             Err(e) => {
                 // #102: this said IRIS_UNREACHABLE for BOTH a missing namespace and a wrong
                 // password — and, because `query_once` never looked at the status, the message
@@ -7623,10 +7668,11 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
             );
         }
 
-        let result = symbols_local::scan_workspace(&workspace, &p.query, limit);
+        // #398: scan for one more than wanted so a capped scan can say it was capped.
+        let result = symbols_local::scan_workspace(&workspace, &p.query, probe_limit(limit));
 
-        let symbols_json: Vec<serde_json::Value> = result
-            .symbols
+        let (scanned, local_truncated) = take_with_truncation(result.symbols, limit);
+        let symbols_json: Vec<serde_json::Value> = scanned
             .iter()
             .map(|s| serde_json::to_value(s).unwrap_or_default())
             .collect();
@@ -7641,6 +7687,7 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
             "source": "local_filesystem",
             "symbols": symbols_json,
             "count": count,
+            "truncated": local_truncated,
             "query_hint": "Supports: plain text (exact), 'Pkg.*' (package prefix), '*Suffix' (suffix), 'Pkg.*.Name' (glob)",
             "parse_warnings": warnings_json,
         }))
