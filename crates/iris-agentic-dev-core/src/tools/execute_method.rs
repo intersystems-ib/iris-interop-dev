@@ -498,6 +498,146 @@ pub fn classify(r: &InvokeResult) -> Outcome {
     }
 }
 
+/// The method of the generated wrapper that the user's call is made from.
+///
+/// `execute_via_generator` builds a scratch class whose `RunUser()` holds the invocation, so an
+/// error raised because the TARGET is absent carries a frame in `RunUser`, while an error raised
+/// INSIDE the target method carries a frame in that method. That difference is the only way to
+/// tell "the class I asked for is not here" from "the method ran and hit a missing class of its
+/// own", and `the_wrapper_frame_anchor_still_matches_the_generator` pins the name.
+const WRAPPER_FRAME: &str = "RunUser+";
+
+/// Which of three conditions a failed invocation actually hit.
+///
+/// #396: all three were reported as `METHOD_THREW`, a code that asserts the method RAN and raised.
+/// For two of them the method never ran. Measured 2026-09-25 in namespace USER, with a working
+/// call as the control:
+///
+/// ```text
+/// Zz.No.Such::Foo            -> METHOD_THREW  <CLASS DOES NOT EXIST> 150 RunUser+7^… Zz.No.Such
+/// %Library.String::ZzNope    -> METHOD_THREW  <METHOD DOES NOT EXIST> 148 RunUser+7^… ZzNope,%Library.String
+/// %Library.String::IsValid   -> success                                            (the control)
+/// %Library.String::IsValid() -> METHOD_THREW  <FUNCTION> 6 RunUser+7^…             (really threw)
+/// ```
+///
+/// In the #323 failure corpus (559 recorded failures) `<METHOD DOES NOT EXIST>` is the single most
+/// frequent identifier at 54 failures and `<CLASS DOES NOT EXIST>` is third at 23 — so the two
+/// conditions that were collapsed are the two a caller meets most often.
+///
+/// This reads IRIS's own verdict rather than pre-checking the dictionary, deliberately. The
+/// dictionary cannot be trusted for absence here: per the `MethodMeta` contract and #242, a class
+/// written AND compiled in one process still reads as absent from `%Dictionary.*` until a later
+/// one, and "write it, then call it" is a normal sequence. Nothing is refused that would have
+/// worked — the call happens exactly as before and only the label on the failure changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThrewKind {
+    /// The class is not in this namespace, so the method never ran.
+    ClassMissing,
+    /// The class is here and has no such method, so the method never ran.
+    MethodMissing,
+    /// The method ran and raised. `METHOD_THREW` is true of this one.
+    Raised,
+}
+
+/// Decide which condition an invocation error describes.
+///
+/// Both the signal AND the offending name are required, and the frame must be the wrapper: a
+/// `<CLASS DOES NOT EXIST>` raised inside the target method mentions a DIFFERENT class and carries
+/// that method's frame, and must stay `Raised` — misattributing it would tell the caller their
+/// target is absent when it is present and failing.
+pub fn classify_threw(class: &str, method: &str, error: &str) -> ThrewKind {
+    if !error.contains(WRAPPER_FRAME) {
+        return ThrewKind::Raised;
+    }
+    if error.contains("<CLASS DOES NOT EXIST>") && error.contains(class) {
+        ThrewKind::ClassMissing
+    } else if error.contains("<METHOD DOES NOT EXIST>") && error.contains(method) {
+        ThrewKind::MethodMissing
+    } else {
+        ThrewKind::Raised
+    }
+}
+
+/// The code and caller-facing message for each condition.
+pub fn threw_report(
+    class: &str,
+    method: &str,
+    namespace: &str,
+    kind: ThrewKind,
+) -> (&'static str, String) {
+    match kind {
+        ThrewKind::ClassMissing => (
+            "CLASS_NOT_FOUND",
+            format!(
+                "'{class}' is not compiled in namespace '{namespace}', so '{method}' never ran. \
+                 This is not a method failure. Find the class with iris_symbols, or compile it \
+                 here with iris_doc(mode=put, compile=true)."
+            ),
+        ),
+        ThrewKind::MethodMissing => (
+            "METHOD_NOT_FOUND",
+            format!(
+                "'{class}' is compiled in namespace '{namespace}' but has no method '{method}', \
+                 so nothing ran. This is not a method failure. List what it does have with \
+                 docs_introspect(class_name={class}) — a renamed method or a stale compile looks \
+                 the same from here."
+            ),
+        ),
+        ThrewKind::Raised => ("METHOD_THREW", String::new()),
+    }
+}
+
+/// Drop the generated wrapper's frame from an error before quoting it to a caller.
+///
+/// #396: for an absent class or method the frame is always `RunUser+N^IrisDevTmp.Run<uuid>.1` —
+/// this server's own scratch class. It is not actionable, and the uuid differs on every call, so
+/// two identical requests produce two different messages. #392 and #329 removed the same leak
+/// elsewhere. The full text is kept in `error_detail` regardless, so nothing is lost.
+///
+/// Splitting on single spaces rather than `split_whitespace` so that any other whitespace inside a
+/// token survives untouched.
+pub fn without_wrapper_frame(error: &str) -> String {
+    let mut out = String::with_capacity(error.len());
+    for tok in error.split(' ') {
+        if tok.contains(WRAPPER_FRAME) {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(tok);
+    }
+    out
+}
+
+/// Assemble the caller-facing message for a failed invocation.
+///
+/// The frame strip applies to EVERY case, `Raised` included. That is safe — and better — because
+/// `without_wrapper_frame` removes only tokens naming the generated wrapper: a frame inside the
+/// caller's own method does not contain `RunUser+`, so it survives untouched, and that frame is
+/// the diagnosis. Meanwhile a genuine throw AT the call site carries the wrapper frame too
+/// (measured: a wrong-arity call returns `<FUNCTION> 6 RunUser+7^IrisDevTmp.Run…`), so exempting
+/// `Raised` preserved noise in the one case the exemption was meant to protect. A mutation that
+/// stripped `Raised` as well SURVIVED, which is what identified the exemption as dead complexity
+/// rather than a safeguard.
+pub fn threw_message(
+    class: &str,
+    method: &str,
+    kind: ThrewKind,
+    named: &str,
+    error: &str,
+    cut: &str,
+) -> String {
+    // IRIS's own text ends with a trailing space (measured: `<FUNCTION> 6 RunUser+…1 `), which
+    // sat mid-string before the frame was removed and would be exposed at the end afterwards.
+    let e = without_wrapper_frame(error);
+    let e = e.trim_end();
+    match kind {
+        ThrewKind::Raised => format!("'{class}::{method}' raised: {e}{cut}"),
+        _ => format!("{named} IRIS reported: {e}{cut}"),
+    }
+}
+
 /// A `<...>` thrown inside the method is the method's answer, not a transport failure, so it is
 /// reported as a named outcome rather than swallowed into the value.
 fn report_threw(
@@ -519,16 +659,28 @@ fn report_threw(
     } else {
         String::new()
     };
-    crate::tools::envelope::fail_with(
-        "METHOD_THREW",
-        &format!("'{class}::{method}' raised: {}{cut}", r.error),
-        serde_json::json!({
-            "class": class, "method": method, "namespace": namespace,
-            "return_type": r.return_type, "error_detail": r.error,
-            "error_detail_complete": !r.error_truncated,
-            "error_detail_len": r.error_len,
-        }),
-    )
+    let detail = serde_json::json!({
+        "class": class, "method": method, "namespace": namespace,
+        "return_type": r.return_type, "error_detail": r.error,
+        "error_detail_complete": !r.error_truncated,
+        "error_detail_len": r.error_len,
+    });
+    // #396: "raised" is only true when the method ran. An absent class or method never did.
+    //
+    // Three explicit arms rather than one `fail_with(code, ..)`: the #329 remedy gate finds codes
+    // by scanning for `fail_with("`, so a code passed as a VARIABLE is invisible to it and a
+    // REMEDIES row for it reads as stale (#361, measured). Keeping each literal adjacent is what
+    // lets CLASS_NOT_FOUND and METHOD_NOT_FOUND carry remedies on record.
+    let kind = classify_threw(class, method, &r.error);
+    let (_, named) = threw_report(class, method, namespace, kind);
+    let m = threw_message(class, method, kind, &named, &r.error, &cut);
+    match kind {
+        ThrewKind::ClassMissing => crate::tools::envelope::fail_with("CLASS_NOT_FOUND", &m, detail),
+        ThrewKind::MethodMissing => {
+            crate::tools::envelope::fail_with("METHOD_NOT_FOUND", &m, detail)
+        }
+        ThrewKind::Raised => crate::tools::envelope::fail_with("METHOD_THREW", &m, detail),
+    }
 }
 
 /// IRIS measured the value longer than what arrived. Reporting the short value as the answer is the

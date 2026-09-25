@@ -89,6 +89,9 @@ const REMEDIES: &[(&str, &str)] = &[
     ("WEBAPP_EXISTS", "a web application is already mapped at that path; edit it, or choose a different path"),
     // Emitted via `envelope::fail_with`, which this file did not scan until #329 — see the note in
     // `vocabulary()`. These four had no remedy on record while being fully reachable.
+    ("CLASS_NOT_FOUND", "the class is not compiled in that namespace, so nothing ran; find it with iris_symbols, or compile it there with iris_doc(mode=put, compile=true)"),
+    ("METHOD_THREW", "the method RAN and raised; the message carries the ObjectScript signal and location, which is the diagnosis — fix the method or the arguments rather than retrying unchanged. If the class or the method does not exist, the code is CLASS_NOT_FOUND or METHOD_NOT_FOUND instead"),
+    ("METHOD_NOT_FOUND", "the class is compiled but has no such method, so nothing ran; list the methods it does have with docs_introspect — a rename or a stale compile looks the same from the call site"),
     ("COMPILE_ERROR", "the source was written but IRIS refused to compile it; the message and compile_console carry the ObjectScript errors — fix those rather than retrying the same source"),
     ("IRIS_RUNTIME_ERROR", "the code ran and IRIS raised an error mid-execution; the message carries the ObjectScript error and location — this will not succeed on retry unchanged"),
     ("SQL_ERROR", "IRIS rejected the SQL; the message carries the SQLCODE and its text — resolve real table and column names with iris_table_info or docs_introspect rather than guessing, then correct the statement"),
