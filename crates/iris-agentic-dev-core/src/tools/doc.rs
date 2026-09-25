@@ -233,6 +233,25 @@ pub const ATELIER_DOC_SUFFIXES: [&str; 10] = [
     "cls", "mac", "int", "inc", "bas", "mvb", "mvi", "dfi", "csp", "csr",
 ];
 
+/// The three counts a batch `get` reports about itself.
+///
+/// #400: a partial batch returned `success: true`, `documents`, `namespace` and nothing else, so a
+/// caller's cheap check could not tell "all ten read" from "three read, seven missing". Measured in
+/// namespace USER: a request for 10 names with 3 present came back `success: true` with 7 of the 10
+/// `documents` entries carrying an error and no top-level indication at all.
+///
+/// `success: true` is kept deliberately — the comment at the return site has always said why, and
+/// it is right: some documents WERE read, and flipping it would change the contract for callers
+/// relying on it. That is a breaking-vs-additive decision, so this is the additive half: the
+/// summary now states what happened, and `success` keeps its meaning.
+///
+/// `mode=delete` reports `success: false` for the same condition. The two modes still disagree on
+/// that, which is recorded on the issue rather than changed here.
+pub fn batch_counts(requested: usize, read: usize) -> (usize, usize, usize) {
+    let read = read.min(requested);
+    (requested, read, requested - read)
+}
+
 pub fn has_doc_suffix(name: &str) -> bool {
     name.rsplit_once('.')
         .map(|(_, ext)| ATELIER_DOC_SUFFIXES.contains(&ext.to_ascii_lowercase().as_str()))
@@ -495,15 +514,29 @@ async fn handle_get(
                      '{namespace}' — see `documents` for the per-document status.",
                     p.names.len()
                 ),
-                serde_json::json!({"documents": results, "namespace": namespace}),
+                serde_json::json!({
+                    "documents": results,
+                    "namespace": namespace,
+                    "requested": p.names.len(),
+                    "read": 0,
+                    "failed": p.names.len(),
+                }),
             );
         }
         // A partial failure keeps success:true — some documents WERE read — but names the
         // namespace it read them from, which the baseline never did either.
+        //
+        // #400: and it now states the counts. `success: true` alone could not distinguish "all ten
+        // read" from "three read, seven missing", and a caller iterating `documents` for `content`
+        // had no warning that some entries carry an error instead.
+        let (requested, read, failed) = batch_counts(p.names.len(), ok_count);
         return ok_json(serde_json::json!({
             "success": true,
             "documents": results,
             "namespace": namespace,
+            "requested": requested,
+            "read": read,
+            "failed": failed,
         }));
     }
 
