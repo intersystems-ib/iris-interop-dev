@@ -3289,6 +3289,32 @@ fn extract_xml_attr(line: &str, attr: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
+/// What to tell a caller whose message exists but whose body class does not.
+///
+/// #392: `$ClassMethod(bodyClass,"%OpenId",bodyId)` raises `<CLASS DOES NOT EXIST>` when the
+/// header names a class this namespace has not compiled, and that escaped as a raw
+/// `IRIS_EXECUTE_ERROR` carrying an ObjectScript frame and the generated scratch class name.
+/// Measured 2026-09-25 in namespace USER: message 18 names `IOP.MSG.Req`, absent from
+/// `%Dictionary.CompiledClass`, while message 19 names `Ens.Response`, present, and reads fine.
+/// **9 of the 19 messages** on that instance named an absent body class — the normal end state
+/// once a production's classes are removed while its `Ens` data persists.
+///
+/// This must not collapse into `MESSAGE_NOT_FOUND`: the header IS there, and the two conditions
+/// have different remedies. A caller told "no such message" would go looking for a wrong id.
+pub fn message_body_class_missing_message(
+    message_id: i64,
+    body_class: &str,
+    namespace: &str,
+) -> String {
+    format!(
+        "message {message_id} exists and its header names body class '{body_class}', but that \
+         class is not compiled in namespace '{namespace}', so the body cannot be opened. This is \
+         NOT a missing message — the header is there. Either compile '{body_class}' into this \
+         namespace, or read the header fields with iris_interop_query(what=messages), which does \
+         not need the body class."
+    )
+}
+
 /// Read an Ensemble message body (`Ens.StringContainer`, `Ens.StreamContainer`,
 /// `%Stream.Object`). `data_policy` gates PHI: `block` refuses outright, `allow`
 /// requires an explicit acknowledgement, `redact` blanks known HL7 v2 PHI fields.
@@ -3318,6 +3344,7 @@ If '$IsObject(hdr) {{ Write "ERROR:MESSAGE_NOT_FOUND" Quit }}
 Set bodyClass=hdr.MessageBodyClassName
 Set bodyId=hdr.MessageBodyId
 If bodyClass="" {{ Write "ERROR:MESSAGE_NOT_FOUND" Quit }}
+If '##class(%Dictionary.CompiledClass).%ExistsId(bodyClass) {{ Write "ERROR:MESSAGE_BODY_CLASS_MISSING:"_bodyClass Quit }}
 Set body=$ClassMethod(bodyClass,"%OpenId",bodyId)
 If '$IsObject(body) {{ Write "ERROR:MESSAGE_NOT_FOUND" Quit }}
 If body.%Extends("Ens.StreamContainer") {{
@@ -3457,6 +3484,11 @@ pub async fn handle_iris_message_body(
                     "MESSAGE_NOT_FOUND",
                     &format!("No body found for message ID {message_id}"),
                 );
+            }
+            if let Some(cls) = out.strip_prefix("ERROR:MESSAGE_BODY_CLASS_MISSING:") {
+                let msg =
+                    message_body_class_missing_message(message_id, cls.trim(), &params.namespace);
+                return err_json("MESSAGE_BODY_CLASS_MISSING", &msg);
             }
             if let Some(rest) = out.strip_prefix("ERROR:STREAM_READ_ERROR:") {
                 return err_json("STREAM_READ_ERROR", rest.trim());
