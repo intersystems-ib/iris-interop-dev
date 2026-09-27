@@ -177,6 +177,60 @@ pub fn apply_workspace_config_with_path(
     }
 }
 
+/// #410: whether `check_config` should report a config file that exists but is not in use.
+///
+/// `Some(path)` = there is a real file at the watched path and the connection did not come
+/// from it. Three conditions, and each one is a different reason to stay silent:
+///
+/// * `config_file` is `Some` — the file IS the source, nothing to report.
+/// * the source is not explicit — that is the `fallback_warning` case, which already has its
+///   own message; reporting both would say two different things about one connection.
+/// * nothing exists at the watched path — then the watcher is simply waiting, and claiming a
+///   file is being ignored would be a fabrication.
+///
+/// The existence check is deliberately a real filesystem read rather than a flag carried on
+/// the connection: the file can be created *after* startup, and that is exactly the case that
+/// becomes a silent retarget on the next tool call.
+pub fn ignored_config_path(
+    config_file: Option<&std::path::Path>,
+    source_is_explicit: bool,
+    watch_path: Option<&str>,
+) -> Option<String> {
+    if config_file.is_some() || !source_is_explicit {
+        return None;
+    }
+    let p = watch_path?;
+    std::path::Path::new(p).is_file().then(|| p.to_string())
+}
+
+/// #410: what `check_config` says when a workspace config file exists at the watched
+/// path but is not the connection's source.
+///
+/// Both halves of this are surprising, and the report that prompted it hit them in
+/// order. The file is ignored NOW because [`apply_workspace_config_with_path`]
+/// short-circuits on an explicit flag or `IRIS_HOST` *before the file is read*, and
+/// returns `None` for the path — which is why `config_file` is null rather than naming
+/// the file it declined. And an edit to that same file IS adopted on the next tool call,
+/// because the hot-reload path calls [`load_workspace_config`] directly and that loader
+/// takes no `explicit` argument, so it cannot honour the short-circuit.
+///
+/// So whether a session reaches the flag's instance or the file's depends on whether the
+/// file happened to be touched after startup. Which of the two precedences the fork wants
+/// is an open decision (#410); saying nothing about it is not, because today the three
+/// facts — `connection_source`, a null `config_file`, and a `config_watch_path` pointing at
+/// a real file — are all reported and nothing connects them.
+pub fn ignored_config_warning(path: &str, source: &str) -> String {
+    format!(
+        "A workspace config file exists at {path} but is NOT in use: this connection came from \
+         {source}, which outranks the file at startup (an explicit --host flag or the IRIS_* \
+         environment variables are read instead, and the file is never opened). Note the \
+         asymmetry: if that file is EDITED, the change IS picked up on the next tool call and \
+         WILL replace this connection, including the namespace. To pin one target \
+         deterministically, either delete the file or stop passing the flag/environment \
+         variables — do not rely on which of the two currently wins."
+    )
+}
+
 /// Load `.iris-agentic-dev.toml` from the resolved workspace root.
 ///
 /// `Ok(None)` means the file does not exist — the defaults apply, which is legitimate.
