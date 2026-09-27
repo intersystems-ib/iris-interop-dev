@@ -2033,6 +2033,114 @@ If '$IsObject(tProd) {{ Write "ERROR:INTEROP_ERROR:Cannot open production "_tPro
     )
 }
 
+/// #408: the ObjectScript that writes the production CLASS back after the extent was
+/// saved — the step the Portal performs via `SaveToClass()`, and the one every mutating
+/// action here omitted.
+///
+/// `%Save()` writes the extent (`Ens_Config.Item`), which is the LIVE configuration.
+/// The class's `XData ProductionDefinition` keeps the old item list. Staleness is the
+/// mild half of that. The sharp half, measured on IRIS for Health 2026.1: the XData is
+/// what a **compile** of the production class replays into the extent, so recompiling
+/// the stale class DELETED a just-added item from the live configuration —
+///
+/// ```text
+/// after Items.Insert + %Save()   extent [Added, First, Ghost]   XData 2 items
+/// recompile the stale class      extent [Added, First]          XData 2 items
+/// ```
+///
+/// with no error and `success: true` already reported. And the skills plugin's drift
+/// guidance ("iris_doc get the production class and write it to src/") writes that
+/// stale class to disk first, making it the source of truth.
+///
+/// Emitted after `%Save()` succeeded and before `UpdateProduction` — the Portal's order.
+pub const PRODUCTION_CLASS_SAVE: &str = "Set tSCC=tProd.SaveToClass()\nSet tClsErr=\"\" If $$$ISERR(tSCC) { Set tClsErr=$System.Status.GetErrorText(tSCC) }\n";
+
+/// #408: reports the class save AFTER the OK line, never before it.
+///
+/// Two reasons for the order. A `%Status` chain's text is multi-line, so a marker written
+/// first would push the OK line past where the reader looks — the truncation #347 fixed
+/// elsewhere. And a class that could not be saved is NOT a failed action: by the time this
+/// runs the live change has landed, so reporting failure would tell the caller to retry a
+/// mutation that already happened.
+pub const PRODUCTION_CLASS_SAVE_REPORT: &str =
+    "\nIf tClsErr'=\"\" { Write !,\"CLASS_NOT_SAVED:\"_tClsErr }";
+
+/// #408: splits a mutating action's output into the line the existing parsers read and the
+/// class-save reason that may follow it.
+///
+/// The reason is everything after the marker, so a multi-line `%Status` chain survives
+/// whole. `None` means the class WAS saved: the marker is written only on failure, so its
+/// absence is a positive statement rather than a missing field. An empty reason still
+/// returns `Some`, because decaying to `None` would report a class that was not saved as
+/// saved.
+pub fn read_class_save_marker(out: &str) -> (&str, Option<&str>) {
+    const MARKER: &str = "CLASS_NOT_SAVED:";
+    match out.find(MARKER) {
+        None => (out.trim(), None),
+        Some(i) => {
+            let reason = out[i + MARKER.len()..].trim();
+            (
+                out[..i].trim(),
+                Some(if reason.is_empty() {
+                    "(no reason reported)"
+                } else {
+                    reason
+                }),
+            )
+        }
+    }
+}
+
+/// #408: the success envelope's account of whether the production CLASS now matches the
+/// live configuration. One place, so the five actions cannot drift apart.
+pub fn attach_class_save(env: &mut serde_json::Value, class_error: Option<&str>) {
+    env["class_saved"] = serde_json::Value::Bool(class_error.is_none());
+    if let Some(reason) = class_error {
+        env["class_error"] = serde_json::Value::String(reason.to_string());
+        env["warning"] = serde_json::Value::String(class_not_saved_warning(reason));
+    }
+}
+
+/// #408: what the caller is told when the live configuration changed but the class did not.
+///
+/// It names the consequence (a recompile reverts this) and the way out, because the obvious
+/// next step — `iris_doc(mode=get)` then writing the class to `src/` — is precisely the step
+/// that makes the stale class authoritative.
+pub fn class_not_saved_warning(reason: &str) -> String {
+    format!(
+        "The live configuration was changed and applied, but the production CLASS could not be re-saved, so its XData ProductionDefinition no longer matches: {reason}. Do NOT write this class to disk from iris_doc(mode=get) — the stale XData is what a later compile replays into the configuration, which would revert this change. Fix the cause (a deployed or read-only production class is the usual one), then re-run this action to bring the class back in step."
+    )
+}
+
+/// Build the ObjectScript that enables or disables a config item (pure → unit-testable).
+///
+/// #408: extracted from an inline `format!` in the handler. It was the one mutating action
+/// whose codegen was not a named function, so it was the one a parity test over the
+/// builders could not see — and #409, in this same file, was exactly a guard that one
+/// sibling had and the other did not.
+pub fn build_set_enabled_code(production: &str, item: &str, enabled: bool) -> String {
+    let item_e = os_str_expr(item);
+    format!(
+        r#"{prologue}
+Set tItem=tProd.FindItemByConfigName({item},,.tSC3)
+If '$IsObject(tItem) {{
+{not_found}
+}}
+Set tItem.Enabled={enabled_val}
+Set tSC4=tProd.%Save()
+If $$$ISERR(tSC4) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC4) Quit }}
+{class_save}Set tSC5=##class(Ens.Director).UpdateProduction(10,0)
+If $$$ISERR(tSC5) {{ Write "ERROR:UPDATE_FAILED:"_$System.Status.GetErrorText(tSC5) Quit }}
+Write "OK"{class_save_report}"#,
+        prologue = resolve_production_prologue(production),
+        item = item_e,
+        not_found = item_not_found_block(&item_e),
+        enabled_val = if enabled { "1" } else { "0" },
+        class_save = PRODUCTION_CLASS_SAVE,
+        class_save_report = PRODUCTION_CLASS_SAVE_REPORT,
+    )
+}
+
 /// Build the ObjectScript that adds a config item to a production (pure → unit-testable).
 /// `production` empty ⇒ resolve the running production. Settings keys prefixed `Adapter.` target
 /// the adapter; otherwise the Host. Applies live only if the target production is the one running.
@@ -2073,12 +2181,14 @@ Set tItem.Enabled={enabled}
 {extra}Do tProd.Items.Insert(tItem)
 Set tSC4=tProd.%Save()
 If $$$ISERR(tSC4) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC4) Quit }}
-Set tRun="" Do ##class(Ens.Director).GetProductionStatus(.tRun,.s2)
+{class_save}Set tRun="" Do ##class(Ens.Director).GetProductionStatus(.tRun,.s2)
 If tRun=tProdName {{ Set tSC5=##class(Ens.Director).UpdateProduction(10,0) If $$$ISERR(tSC5) {{ Write "ERROR:UPDATE_FAILED:"_$System.Status.GetErrorText(tSC5) Quit }} }}
-Write "OK:"_tProdName"#,
+Write "OK:"_tProdName{class_save_report}"#,
         prologue = resolve_production_prologue(production),
         item = item_e,
         class = class_e,
+        class_save = PRODUCTION_CLASS_SAVE,
+        class_save_report = PRODUCTION_CLASS_SAVE_REPORT,
         enabled = if enabled { 1 } else { 0 },
         extra = extra
     )
@@ -2096,12 +2206,14 @@ If tIdx=0 {{
 Do tProd.Items.RemoveAt(tIdx)
 Set tSC4=tProd.%Save()
 If $$$ISERR(tSC4) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC4) Quit }}
-Set tRun="" Do ##class(Ens.Director).GetProductionStatus(.tRun,.s2)
+{class_save}Set tRun="" Do ##class(Ens.Director).GetProductionStatus(.tRun,.s2)
 If tRun=tProdName {{ Set tSC5=##class(Ens.Director).UpdateProduction(10,0) If $$$ISERR(tSC5) {{ Write "ERROR:UPDATE_FAILED:"_$System.Status.GetErrorText(tSC5) Quit }} }}
-Write "OK:"_tProdName"#,
+Write "OK:"_tProdName{class_save_report}"#,
         prologue = resolve_production_prologue(production),
         item = item_e,
-        not_found = item_not_found_block(&item_e)
+        not_found = item_not_found_block(&item_e),
+        class_save = PRODUCTION_CLASS_SAVE,
+        class_save_report = PRODUCTION_CLASS_SAVE_REPORT,
     )
 }
 
@@ -2155,11 +2267,13 @@ If '$IsObject(tItem) {{
 }}
 {setting_lines}Set tSC4=tProd.%Save()
 If $$$ISERR(tSC4) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC4) Quit }}
-{update_line}Write "OK""#,
+{class_save}{update_line}Write "OK"{class_save_report}"#,
         prologue = resolve_production_prologue(production),
         item = item_e,
         setting_lines = setting_lines,
         update_line = update_line,
+        class_save = PRODUCTION_CLASS_SAVE,
+        class_save_report = PRODUCTION_CLASS_SAVE_REPORT,
         not_found = item_not_found_block(&item_e)
     )
 }
@@ -2249,27 +2363,18 @@ pub async fn interop_production_item_impl(
 
     match params.action.as_str() {
         "enable" | "disable" => {
-            let enabled_val = if params.action == "enable" { "1" } else { "0" };
-            let code = format!(
-                r#"{prologue}
-Set tItem=tProd.FindItemByConfigName({item},,.tSC3)
-If '$IsObject(tItem) {{
-{not_found}
-}}
-Set tItem.Enabled={enabled_val}
-Set tSC4=tProd.%Save()
-If $$$ISERR(tSC4) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC4) Quit }}
-Set tSC5=##class(Ens.Director).UpdateProduction(10,0)
-If $$$ISERR(tSC5) {{ Write "ERROR:UPDATE_FAILED:"_$System.Status.GetErrorText(tSC5) Quit }}
-Write "OK""#
+            let code = build_set_enabled_code(
+                params.production.as_deref().unwrap_or(""),
+                &params.item,
+                params.action == "enable",
             );
             match iris.execute_via_generator(&code, ns, &client).await {
                 Ok(out) => {
-                    let out = out.trim();
+                    let (out, class_error) = read_class_save_marker(&out);
                     if out == "OK" {
-                        ok_json(
-                            serde_json::json!({"success":true,"item":params.item,"enabled":params.action=="enable"}),
-                        )
+                        let mut env = serde_json::json!({"success":true,"item":params.item,"enabled":params.action=="enable"});
+                        attach_class_save(&mut env, class_error);
+                        ok_json(env)
                     } else if let Some(msg) = out.strip_prefix("ERROR:ITEM_NOT_FOUND:") {
                         item_not_found(msg)
                     } else if let Some(msg) = out.strip_prefix("ERROR:NO_PRODUCTION:") {
@@ -2365,7 +2470,7 @@ Set tKey="" For {{ Set tSetting=tItem.Settings.GetNext(.tKey) Quit:tKey=""
             let warnings = unknown_prefix_warnings(&params.settings);
             match iris.execute_via_generator(&code, ns, &client).await {
                 Ok(out) => {
-                    let out = out.trim();
+                    let (out, class_error) = read_class_save_marker(&out);
                     if out == "OK" {
                         let mut env = serde_json::json!({
                             "success": true,
@@ -2383,6 +2488,7 @@ Set tKey="" For {{ Set tSetting=tItem.Settings.GetNext(.tKey) Quit:tKey=""
                         if !warnings.is_empty() {
                             env["warnings"] = serde_json::json!(warnings);
                         }
+                        attach_class_save(&mut env, class_error);
                         ok_json(env)
                     } else if let Some(msg) = out.strip_prefix("ERROR:ITEM_NOT_FOUND:") {
                         item_not_found(msg)
@@ -2419,15 +2525,18 @@ Set tKey="" For {{ Set tSetting=tItem.Settings.GetNext(.tKey) Quit:tKey=""
             );
             match iris.execute_via_generator(&code, ns, &client).await {
                 Ok(out) => {
-                    let out = out.trim();
+                    // #408: the class-save verdict rides on its own line after the OK line.
+                    let (out, class_error) = read_class_save_marker(&out);
                     if let Some(prod) = out.strip_prefix("OK:") {
-                        ok_json(serde_json::json!({
+                        let mut env = serde_json::json!({
                             "success": true,
                             "item": params.item,
                             "class_name": class_name,
                             "enabled": enabled,
                             "production": prod,
-                        }))
+                        });
+                        attach_class_save(&mut env, class_error);
+                        ok_json(env)
                     } else if let Some(msg) = out.strip_prefix("ERROR:ITEM_EXISTS:") {
                         err_json("ITEM_EXISTS", msg)
                     } else if let Some(msg) = out.strip_prefix("ERROR:NO_PRODUCTION:") {
@@ -2449,14 +2558,16 @@ Set tKey="" For {{ Set tSetting=tItem.Settings.GetNext(.tKey) Quit:tKey=""
                 build_remove_item_code(params.production.as_deref().unwrap_or(""), &params.item);
             match iris.execute_via_generator(&code, ns, &client).await {
                 Ok(out) => {
-                    let out = out.trim();
+                    let (out, class_error) = read_class_save_marker(&out);
                     if let Some(prod) = out.strip_prefix("OK:") {
-                        ok_json(serde_json::json!({
+                        let mut env = serde_json::json!({
                             "success": true,
                             "item": params.item,
                             "removed": true,
                             "production": prod,
-                        }))
+                        });
+                        attach_class_save(&mut env, class_error);
+                        ok_json(env)
                     } else if let Some(msg) = out.strip_prefix("ERROR:ITEM_NOT_FOUND:") {
                         item_not_found(msg)
                     } else if let Some(msg) = out.strip_prefix("ERROR:NO_PRODUCTION:") {
