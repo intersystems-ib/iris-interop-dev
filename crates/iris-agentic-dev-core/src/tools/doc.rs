@@ -770,7 +770,9 @@ async fn handle_put(
         return crate::tools::envelope::fail_with(
             "INVALID_PARAMS",
             &format!(
-                "iris_doc mode=put writes ONE document and does not read `names`, so the {} name(s)                  you passed there would have been silently discarded. Pass a single `name` with its                  `content`, one call per document. `names` is for mode=get and mode=delete.",
+                "iris_doc mode=put writes ONE document and does not read `names`, so the {} name(s) \
+                 you passed there would have been silently discarded. Pass a single `name` with its \
+                 `content`, one call per document. `names` is for mode=get and mode=delete.",
                 p.names.len()
             ),
             serde_json::json!({

@@ -305,6 +305,7 @@ impl<S: JsonSchema> JsonSchema for Described<S> {
     }
 }
 pub mod admin;
+pub mod compare;
 pub mod concurrency;
 pub mod coverage;
 pub mod dict;
@@ -327,6 +328,7 @@ pub mod search;
 pub mod skills_tools;
 pub mod sql_lint;
 pub mod sql_mode;
+pub mod stream_inspect;
 pub mod symbols_local;
 pub mod unittest_result;
 pub mod wildcard;
@@ -338,16 +340,16 @@ pub use scm::ScmParams;
 /// Read from `IRIS_TOOLSET` env var or `--toolset` CLI flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Toolset {
-    /// 61 tools advertised (measured 2026-09-22). NOT this fork's default —
+    /// 64 tools advertised (measured 2026-09-24, +1 stream_inspect, +2 compare_*). NOT this fork's default —
     /// `--toolset` defaults to `interop`; baseline is opt-in via IRIS_TOOLSET/--toolset.
     /// Note this is already a pruned router: the tools the `#[tool_router]` macro
     /// registers minus the 4 merged-only ones. Was 54 of 58 before iris_execute_method.
     Baseline,
-    /// 57 tools advertised (measured 2026-09-22). Baseline minus the 4 NOT_IMPLEMENTED
+    /// 60 tools advertised (measured 2026-09-24). Baseline minus the 4 NOT_IMPLEMENTED
     /// stubs (skill_propose, skill_optimize, skill_share, skill_community_install).
     /// No merged dispatchers. Not this fork's default.
     Nostub,
-    /// 53 tools advertised (measured 2026-09-22). Nostub minus 8 — the 4 debug_*
+    /// 56 tools advertised (measured 2026-09-24). Nostub minus 8 — the 4 debug_*
     /// folded into iris_debug, the 3 container tools folded into iris_containers, and
     /// agent_info dropped outright — plus the 4 merged-only tools iris_debug,
     /// iris_containers, iris_admin, iris_get_log.
@@ -405,7 +407,10 @@ pub const INTEROP_TOOLS: &[&str] = &[
     "iris_execute",
     "iris_compile",
     "iris_test",
+    "compare_document",
+    "compare_namespace",
     "iris_coverage",
+    "stream_inspect",
     // diagnostics / introspection
     "iris_symbols",
     "docs_introspect",
@@ -4517,6 +4522,10 @@ const GENERATOR_WRITE_TOOLS: &[&str] = &[
     "iris_gateway_manage",
     "iris_message_body",
     "iris_production_diff",
+    // #352: reads a stream through a scratch class, because %Stream.GlobalCharacter has no SQL
+    // projection to read a body through. Read-only in intent — nothing here writes to the stream —
+    // but honest about the scratch class, which is what this list is for.
+    "stream_inspect",
     // iris_gateway_query and iris_table_info each already carry an explicit `=> None` arm in
     // `mutating_call`, reasoned about the REMOTE database being opened SetReadOnly(1) with
     // SELECT-only grants. That reasoning is correct and does not reach the local scratch class,
@@ -4585,6 +4594,13 @@ pub(crate) fn mutating_call(tool: &str, args: &serde_json::Value) -> Option<&'st
         // so this is mutating even for a test suite that only reads.
         "iris_coverage" => Some("run tests under the line-by-line monitor"),
         // Every action of this tool writes a credential.
+        // DELIBERATELY ABSENT: stream_inspect (#352) and compare_namespace / compare_document
+        // (#351). All three only read — two SELECTs and a GET between them — so none is write-gated.
+        // `stream_inspect` is in GENERATOR_WRITE_TOOLS because it reaches a stream through a scratch
+        // class, and that list is SEPARATE from this one: `iris_gateway_query` sits in it and not
+        // here for the same reason. Adding them here (which a first pass did) write-gates a
+        // read-only inspector, so it is refused on a production instance and whenever the write gate
+        // is closed — exactly the instance where diagnosing a relay matters most.
         "iris_credential_manage" => Some("change credentials"),
 
         // Mode/action-aware: the read half must keep working.
@@ -4798,7 +4814,10 @@ pub(crate) const CLASSIFIED_TOOLS: &[&str] = &[
     "find_subclass_implementations",
     "iris_business_rule_info",
     "iris_compile",
+    "compare_document",
+    "compare_namespace",
     "iris_coverage",
+    "stream_inspect",
     "iris_credential_list",
     "iris_credential_manage",
     "iris_debug",
@@ -6868,6 +6887,171 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
         .await;
         self.record_call("iris_doc", Self::call_ok(&result));
         result
+    }
+
+    #[tool(
+        description = "Read an IRIS stream by id — size first, then up to max_chars of its content, returned EXACTLY. THE question it answers: a relay wrote an empty file, so is the body empty or was it never written? An id that does not exist reports STREAM_NOT_FOUND and says out loud that this is NOT an empty stream (the existence check is %ExistsId — %OpenId hands back a usable EMPTY object for an unknown id, which is why the two are easy to confuse); a stream that exists and holds nothing reports success with size 0 and empty: true. Read-only: nothing writes to the stream, and read position is per-instance in IRIS (measured), so inspecting does not consume what a later reader needs. `body_base64` is always the exact bytes — the read goes through %Stream.GlobalBinary, so CR, NUL and arbitrary bytes all survive, and an HL7 v2 message keeps its CR-separated segments. `body` is the same bytes as text and is present only when they are valid UTF-8; otherwise `body_not_text` says to read `body_base64`. Only max_chars are read, never the whole stream, so a multi-megabyte body is inspectable rather than failing <MAXSTRING>; `truncated` plus `size` tell you it is a prefix, and `body_incomplete` that less arrived than IRIS declared. `opened_as` is the class the read used, NOT a claim about the data: character and binary streams share storage, so no read can tell you which kind an id \"really\" holds. stream_id is the stream %Id. namespace: optional — defaults to the connection namespace."
+    )]
+    async fn stream_inspect(
+        &self,
+        Parameters(p): Parameters<stream_inspect::StreamInspectParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let iris = self.get_iris_reloaded().await?;
+        let client = self.http_client();
+        let namespace = interop::resolve_namespace(p.namespace.as_deref(), Some(&iris));
+        let id = p.stream_id.trim().to_string();
+        if id.is_empty() {
+            self.record_call("stream_inspect", false);
+            return envelope::fail(
+                "MISSING_PARAMS",
+                "stream_inspect needs the stream's %Id in `stream_id` (oid and id are also \
+                 accepted). Nothing was sent, so nothing was opened.",
+            );
+        }
+        let code = stream_inspect::build_inspect_code(&id, p.max_chars);
+        let out = match iris.execute_via_generator(&code, &namespace, client).await {
+            Ok(out) => out,
+            Err(e) => {
+                self.record_call("stream_inspect", false);
+                return envelope::transport_fail("stream_inspect", &e.to_string());
+            }
+        };
+        let read = stream_inspect::parse_inspect_output(&out);
+        let payload = stream_inspect::payload(&id, p.max_chars, &read);
+        match &read {
+            stream_inspect::StreamRead::Read { .. } => {
+                self.record_call("stream_inspect", true);
+                ok_json(payload)
+            }
+            // A stream that could not be opened or read is a FAILURE, not a stream with no content.
+            _ => {
+                self.record_call("stream_inspect", false);
+                let code = payload["error_code"]
+                    .as_str()
+                    .unwrap_or("STREAM_UNREADABLE")
+                    .to_string();
+                let msg = payload["error"].as_str().unwrap_or("").to_string();
+                envelope::fail_with(&code, &msg, payload)
+            }
+        }
+    }
+
+    #[tool(
+        description = "Compare the application classes of TWO NAMESPACES on the connected instance — a deployment check: what is in dev that never reached test. Returns only_in_a, only_in_b, differ (by %Dictionary.CompiledClass.Hash), same_count, common_count and unchecked_count. Read-only, two SQL reads, no scratch class. `in_sync: true` is claimed ONLY when nothing differs, nothing is one-sided and nothing went unchecked — a comparison that examined nothing never reports sync: both namespaces listing no class is its own error (COMPARE_BOTH_SIDES_EMPTY), and a namespace that could not be listed is COMPARE_SIDE_UNREADABLE naming which side, never a match report. Pass `package` (a class-name PREFIX) — a real namespace holds five figures of non-system classes; % system classes are always excluded. max_compare defaults to 200 and anything past it is counted in unchecked_count, never dropped. This does NOT compare disk against a namespace: this server reaches IRIS over HTTP and cannot see your project directory."
+    )]
+    async fn compare_namespace(
+        &self,
+        Parameters(p): Parameters<compare::CompareNamespaceParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let iris = self.get_iris_reloaded().await?;
+        let client = self.http_client();
+        let (ns_a, ns_b) = (p.namespace_a.trim(), p.namespace_b.trim());
+        if ns_a.is_empty() || ns_b.is_empty() {
+            self.record_call("compare_namespace", false);
+            return envelope::fail(
+                "MISSING_PARAMS",
+                "compare_namespace needs both namespace_a and namespace_b. Nothing was compared.",
+            );
+        }
+        if ns_a.eq_ignore_ascii_case(ns_b) {
+            self.record_call("compare_namespace", false);
+            return envelope::fail(
+                "INVALID_PARAMS",
+                &format!(
+                    "namespace_a and namespace_b are both '{ns_a}'. Comparing a namespace with \
+                     itself always reports in_sync, which says nothing — name the two namespaces \
+                     you actually want compared."
+                ),
+            );
+        }
+        let (sql, params) = compare::class_list_sql(p.package.as_deref());
+        let args: Vec<serde_json::Value> =
+            params.into_iter().map(serde_json::Value::String).collect();
+        let a = compare::side_from_query(iris.query(&sql, args.clone(), ns_a, client).await);
+        let b = compare::side_from_query(iris.query(&sql, args, ns_b, client).await);
+        let c = compare::compare(&a, &b, p.max_compare);
+        let payload = compare::payload(ns_a, ns_b, &c);
+        match &c {
+            compare::Comparison::Compared { .. } => {
+                self.record_call("compare_namespace", true);
+                ok_json(payload)
+            }
+            // Nothing was compared. That is a failure of the comparison, not a verdict about the
+            // namespaces, so it must not arrive wearing `success: true`.
+            _ => {
+                self.record_call("compare_namespace", false);
+                let code = payload["error_code"]
+                    .as_str()
+                    .unwrap_or("COMPARE_SIDE_UNREADABLE")
+                    .to_string();
+                let msg = payload["error"].as_str().unwrap_or("").to_string();
+                envelope::fail_with(&code, &msg, payload)
+            }
+        }
+    }
+
+    #[tool(
+        description = "Compare ONE document's source across two namespaces on the connected instance. Returns same: true/false with both line counts when they differ. Read-only. A document that could not be read from either side is COMPARE_DOC_UNREADABLE naming the side — never reported as a difference and never as a match, because 'I could not read it' is neither. document takes the Atelier suffix, e.g. 'Hospital.BO.Db.cls'. Use compare_namespace first to find WHICH documents differ, then this to see that one differs at source level rather than only by compiled hash."
+    )]
+    async fn compare_document(
+        &self,
+        Parameters(p): Parameters<compare::CompareDocumentParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let iris = self.get_iris_reloaded().await?;
+        let client = self.http_client();
+        let (ns_a, ns_b) = (p.namespace_a.trim(), p.namespace_b.trim());
+        let name = p.document.trim();
+        if name.is_empty() || ns_a.is_empty() || ns_b.is_empty() {
+            self.record_call("compare_document", false);
+            return envelope::fail(
+                "MISSING_PARAMS",
+                "compare_document needs document, namespace_a and namespace_b. Nothing was \
+                 compared.",
+            );
+        }
+        let fetch = |ns: &str| {
+            let url = iris.versioned_ns_url(ns, &format!("/doc/{}", urlencoding::encode(name)));
+            let req = client
+                .get(&url)
+                .basic_auth(&iris.username, Some(&iris.password));
+            async move {
+                let resp = req.send().await.map_err(|e| e.to_string())?;
+                if !resp.status().is_success() {
+                    return Err(format!("HTTP {}", resp.status().as_u16()));
+                }
+                let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+                match body["result"]["content"].as_array() {
+                    Some(lines) => Ok(lines
+                        .iter()
+                        .filter_map(|l| l.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n")),
+                    None => Err("the reply carried no result.content array".to_string()),
+                }
+            }
+        };
+        let sa = fetch(ns_a).await;
+        let sb = fetch(ns_b).await;
+        let v = compare::document_verdict(
+            sa.as_deref().map_err(|e| e.clone()),
+            sb.as_deref().map_err(|e| e.clone()),
+        );
+        let payload = compare::document_payload(name, ns_a, ns_b, &v);
+        match &v {
+            compare::DocVerdict::Unreadable { .. } => {
+                self.record_call("compare_document", false);
+                let code = payload["error_code"]
+                    .as_str()
+                    .unwrap_or("COMPARE_DOC_UNREADABLE")
+                    .to_string();
+                let msg = payload["error"].as_str().unwrap_or("").to_string();
+                envelope::fail_with(&code, &msg, payload)
+            }
+            _ => {
+                self.record_call("compare_document", true);
+                ok_json(payload)
+            }
+        }
     }
 
     #[tool(
@@ -11920,10 +12104,15 @@ mod tool_annotation_tests {
     #[test]
     fn the_read_only_split_is_pinned_per_toolset() {
         for (label, ts, total, ro_expected) in [
-            ("interop", Toolset::Interop, 32_usize, 9_usize),
-            ("nostub", Toolset::Nostub, 57, 34),
-            ("merged", Toolset::Merged, 53, 29),
-            ("baseline", Toolset::Baseline, 61, 38),
+            // #352: every row is +1 for `stream_inspect`, which every toolset picks up. The
+            // read-only figures are UNCHANGED and that is the measured point, not an oversight: it
+            // is in GENERATOR_WRITE_TOOLS because it reads a stream through a scratch class, so it
+            // is honestly not advertised readOnlyHint:true even though it writes nothing to the
+            // stream. Recorded by running the gate row by row, not by arithmetic.
+            ("interop", Toolset::Interop, 35_usize, 11_usize),
+            ("nostub", Toolset::Nostub, 60, 36),
+            ("merged", Toolset::Merged, 56, 31),
+            ("baseline", Toolset::Baseline, 64, 40),
         ] {
             let t = IrisTools::new_with_toolset(None, ts).expect("build");
             let all = t.advertised_tools();
