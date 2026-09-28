@@ -118,6 +118,7 @@ const REMEDIES: &[(&str, &str)] = &[
     ("NOT_IMPLEMENTED", "this entry point is a stub in this build and does nothing; perform the step by hand and do not wait on it to appear"),
     ("NOT_SQL", "iris_query runs SQL statements only; send ObjectScript through iris_execute instead"),
     ("NO_PRODUCTION", "no production is running in that namespace; start one with iris_production, or pass the production name explicitly"),
+    ("PARAM_NOT_FOR_ACTION", "the action does not read that argument, so it was refused rather than silently ignored; the message names the action that DOES read it — reissue with that action, or drop the argument"),
     ("PARSE_ERROR", "the server's own output could not be parsed; this is a fault in this server or a version mismatch — report it with the message text"),
     ("PHI_ACK_REQUIRED", "an unredacted body needs acknowledgePhi=true alongside dataPolicy=allow; set both deliberately, or use dataPolicy=redact"),
     ("PHI_POLICY_BLOCKED", "the policy in force blocks message bodies; pass dataPolicy=redact for a masked body, or dataPolicy=allow with acknowledgePhi=true if you are authorised to read PHI"),
