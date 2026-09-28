@@ -213,7 +213,7 @@ fn a_write_disallowed_connection_still_lists_every_tool() {
         .collect();
     assert_eq!(
         names.len(),
-        32,
+        33,
         "the write gate must not shrink the tool list — it used to advertise 21 here, and \
          the two it removed took their read actions with them: {names:?}"
     );
@@ -652,12 +652,12 @@ fn mcp_server_tools_list_returns_interop_profile() {
 
     let tool_names: Vec<_> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
-    // Interop profile (this fork's default toolset) exposes exactly the 32-tool
-    // interop keep-list (INTEROP_TOOLS).
+    // Interop profile (this fork's default toolset) exposes exactly the interop keep-list
+    // (INTEROP_TOOLS). #352 re-recorded this from 32 to 33 for `stream_inspect`.
     assert_eq!(
         tool_names.len(),
-        32,
-        "expected the 32-tool interop profile, got {}: {:?}",
+        33,
+        "expected the 33-tool interop profile, got {}: {:?}",
         tool_names.len(),
         tool_names
     );

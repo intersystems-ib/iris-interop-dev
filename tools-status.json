@@ -120,15 +120,15 @@
       "status": "OK"
     },
     {
-      "tool": "iris_gateway_query",
-      "unit": "tools::gateway::tests::* (13)",
-      "e2e": "interop_e2e_tests::gateway_query_reads_the_external_postgres_table",
-      "status": "OK"
-    },
-    {
       "tool": "iris_gateway_manage",
       "unit": "tools::gateway_manage::tests::*",
       "e2e": "interop_e2e_tests::gateway_manage_names_which_failure_mode_the_gateway_is_in + gateway_manage_creates_and_deletes_without_ever_echoing_the_password",
+      "status": "OK"
+    },
+    {
+      "tool": "iris_gateway_query",
+      "unit": "tools::gateway::tests::* (13)",
+      "e2e": "interop_e2e_tests::gateway_query_reads_the_external_postgres_table",
       "status": "OK"
     },
     {
@@ -214,6 +214,12 @@
       "unit": "test_iris_test_http (12)",
       "e2e": "test_iris_test_e2e::test_e2e_us1/us2/us3",
       "status": "OK"
+    },
+    {
+      "tool": "stream_inspect",
+      "unit": "stream_inspect::tests",
+      "e2e": null,
+      "status": "unit-ok"
     }
   ]
 }

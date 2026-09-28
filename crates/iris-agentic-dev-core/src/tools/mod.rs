@@ -327,6 +327,7 @@ pub mod search;
 pub mod skills_tools;
 pub mod sql_lint;
 pub mod sql_mode;
+pub mod stream_inspect;
 pub mod symbols_local;
 pub mod unittest_result;
 pub mod wildcard;
@@ -338,16 +339,16 @@ pub use scm::ScmParams;
 /// Read from `IRIS_TOOLSET` env var or `--toolset` CLI flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Toolset {
-    /// 61 tools advertised (measured 2026-09-22). NOT this fork's default —
+    /// 62 tools advertised (measured 2026-09-24, +1 for stream_inspect). NOT this fork's default —
     /// `--toolset` defaults to `interop`; baseline is opt-in via IRIS_TOOLSET/--toolset.
     /// Note this is already a pruned router: the tools the `#[tool_router]` macro
     /// registers minus the 4 merged-only ones. Was 54 of 58 before iris_execute_method.
     Baseline,
-    /// 57 tools advertised (measured 2026-09-22). Baseline minus the 4 NOT_IMPLEMENTED
+    /// 58 tools advertised (measured 2026-09-24). Baseline minus the 4 NOT_IMPLEMENTED
     /// stubs (skill_propose, skill_optimize, skill_share, skill_community_install).
     /// No merged dispatchers. Not this fork's default.
     Nostub,
-    /// 53 tools advertised (measured 2026-09-22). Nostub minus 8 — the 4 debug_*
+    /// 54 tools advertised (measured 2026-09-24). Nostub minus 8 — the 4 debug_*
     /// folded into iris_debug, the 3 container tools folded into iris_containers, and
     /// agent_info dropped outright — plus the 4 merged-only tools iris_debug,
     /// iris_containers, iris_admin, iris_get_log.
@@ -406,6 +407,7 @@ pub const INTEROP_TOOLS: &[&str] = &[
     "iris_compile",
     "iris_test",
     "iris_coverage",
+    "stream_inspect",
     // diagnostics / introspection
     "iris_symbols",
     "docs_introspect",
@@ -4517,6 +4519,10 @@ const GENERATOR_WRITE_TOOLS: &[&str] = &[
     "iris_gateway_manage",
     "iris_message_body",
     "iris_production_diff",
+    // #352: reads a stream through a scratch class, because %Stream.GlobalCharacter has no SQL
+    // projection to read a body through. Read-only in intent — nothing here writes to the stream —
+    // but honest about the scratch class, which is what this list is for.
+    "stream_inspect",
     // iris_gateway_query and iris_table_info each already carry an explicit `=> None` arm in
     // `mutating_call`, reasoned about the REMOTE database being opened SetReadOnly(1) with
     // SELECT-only grants. That reasoning is correct and does not reach the local scratch class,
@@ -4584,6 +4590,7 @@ pub(crate) fn mutating_call(tool: &str, args: &serde_json::Value) -> Option<&'st
         // is instance-wide, exclusive, and degrades performance for every process while it runs —
         // so this is mutating even for a test suite that only reads.
         "iris_coverage" => Some("run tests under the line-by-line monitor"),
+        "stream_inspect" => Some("read a stream by id"),
         // Every action of this tool writes a credential.
         "iris_credential_manage" => Some("change credentials"),
 
@@ -4799,6 +4806,7 @@ pub(crate) const CLASSIFIED_TOOLS: &[&str] = &[
     "iris_business_rule_info",
     "iris_compile",
     "iris_coverage",
+    "stream_inspect",
     "iris_credential_list",
     "iris_credential_manage",
     "iris_debug",
@@ -6868,6 +6876,53 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
         .await;
         self.record_call("iris_doc", Self::call_ok(&result));
         result
+    }
+
+    #[tool(
+        description = "Read an IRIS stream by id — size first, then up to max_chars of its content, returned EXACTLY. THE question it answers: a relay wrote an empty file, so is the body empty or was it never written? An id that does not exist reports STREAM_NOT_FOUND and says out loud that this is NOT an empty stream (the existence check is %ExistsId — %OpenId hands back a usable EMPTY object for an unknown id, which is why the two are easy to confuse); a stream that exists and holds nothing reports success with size 0 and empty: true. Read-only: nothing writes to the stream, and read position is per-instance in IRIS (measured), so inspecting does not consume what a later reader needs. `body_base64` is always the exact bytes — the read goes through %Stream.GlobalBinary, so CR, NUL and arbitrary bytes all survive, and an HL7 v2 message keeps its CR-separated segments. `body` is the same bytes as text and is present only when they are valid UTF-8; otherwise `body_not_text` says to read `body_base64`. Only max_chars are read, never the whole stream, so a multi-megabyte body is inspectable rather than failing <MAXSTRING>; `truncated` plus `size` tell you it is a prefix, and `body_incomplete` that less arrived than IRIS declared. `opened_as` is the class the read used, NOT a claim about the data: character and binary streams share storage, so no read can tell you which kind an id \"really\" holds. stream_id is the stream %Id. namespace: optional — defaults to the connection namespace."
+    )]
+    async fn stream_inspect(
+        &self,
+        Parameters(p): Parameters<stream_inspect::StreamInspectParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let iris = self.get_iris_reloaded().await?;
+        let client = self.http_client();
+        let namespace = interop::resolve_namespace(p.namespace.as_deref(), Some(&iris));
+        let id = p.stream_id.trim().to_string();
+        if id.is_empty() {
+            self.record_call("stream_inspect", false);
+            return envelope::fail(
+                "MISSING_PARAMS",
+                "stream_inspect needs the stream's %Id in `stream_id` (oid and id are also \
+                 accepted). Nothing was sent, so nothing was opened.",
+            );
+        }
+        let code = stream_inspect::build_inspect_code(&id, p.max_chars);
+        let out = match iris.execute_via_generator(&code, &namespace, client).await {
+            Ok(out) => out,
+            Err(e) => {
+                self.record_call("stream_inspect", false);
+                return envelope::transport_fail("stream_inspect", &e.to_string());
+            }
+        };
+        let read = stream_inspect::parse_inspect_output(&out);
+        let payload = stream_inspect::payload(&id, p.max_chars, &read);
+        match &read {
+            stream_inspect::StreamRead::Read { .. } => {
+                self.record_call("stream_inspect", true);
+                ok_json(payload)
+            }
+            // A stream that could not be opened or read is a FAILURE, not a stream with no content.
+            _ => {
+                self.record_call("stream_inspect", false);
+                let code = payload["error_code"]
+                    .as_str()
+                    .unwrap_or("STREAM_UNREADABLE")
+                    .to_string();
+                let msg = payload["error"].as_str().unwrap_or("").to_string();
+                envelope::fail_with(&code, &msg, payload)
+            }
+        }
     }
 
     #[tool(
@@ -11920,10 +11975,15 @@ mod tool_annotation_tests {
     #[test]
     fn the_read_only_split_is_pinned_per_toolset() {
         for (label, ts, total, ro_expected) in [
-            ("interop", Toolset::Interop, 32_usize, 9_usize),
-            ("nostub", Toolset::Nostub, 57, 34),
-            ("merged", Toolset::Merged, 53, 29),
-            ("baseline", Toolset::Baseline, 61, 38),
+            // #352: every row is +1 for `stream_inspect`, which every toolset picks up. The
+            // read-only figures are UNCHANGED and that is the measured point, not an oversight: it
+            // is in GENERATOR_WRITE_TOOLS because it reads a stream through a scratch class, so it
+            // is honestly not advertised readOnlyHint:true even though it writes nothing to the
+            // stream. Recorded by running the gate row by row, not by arithmetic.
+            ("interop", Toolset::Interop, 33_usize, 9_usize),
+            ("nostub", Toolset::Nostub, 58, 34),
+            ("merged", Toolset::Merged, 54, 29),
+            ("baseline", Toolset::Baseline, 62, 38),
         ] {
             let t = IrisTools::new_with_toolset(None, ts).expect("build");
             let all = t.advertised_tools();
