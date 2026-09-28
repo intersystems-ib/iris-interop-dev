@@ -4405,6 +4405,82 @@ pub struct IrisTools {
 /// every `action`/`mode` value its `matches!` arms name, and `force` for `iris_query`. Kept beside it
 /// on purpose: a new write arm means a new probe, and `the_probe_battery_detects_every_write_arm`
 /// fails until one is added.
+/// #303: which tools STRICT read-only refuses, and — the part that matters — which SOFT still
+/// allows.
+#[cfg(test)]
+mod strict_read_only_tests {
+    use super::*;
+    use crate::iris::connection::ReadOnlyMode;
+
+    #[test]
+    fn strict_refuses_every_tool_that_answers_by_writing_a_scratch_class() {
+        // CONTROL first: a loop over an empty list asserts nothing, and this list has changed twice
+        // (#343 added iris_gateway_manage, #282 removed two once their reads stopped needing a
+        // generator), so its size is not a constant to hard-code. Derived, never restated.
+        assert!(
+            GENERATOR_WRITE_TOOLS.len() >= 5,
+            "the scratch-class list collapsed to {} entries — this loop would pass vacuously",
+            GENERATOR_WRITE_TOOLS.len()
+        );
+        for tool in GENERATOR_WRITE_TOOLS {
+            assert!(
+                strict_refuses_scratch_write(ReadOnlyMode::Strict, tool),
+                "strict must refuse {tool}: it answers by writing a class to IrisDevTmp"
+            );
+        }
+        eprintln!(
+            "strict refuses {} scratch-class tools: {:?}",
+            GENERATOR_WRITE_TOOLS.len(),
+            GENERATOR_WRITE_TOOLS
+        );
+    }
+
+    #[test]
+    fn soft_allows_every_one_of_them() {
+        // THE CONTROL for the test above, and the reason two levels exist at all. "Strict refuses
+        // these" is equally satisfied by a build where nothing works; only this separates the two.
+        // If this ever goes red, soft has silently become strict and the useful level is gone.
+        for tool in GENERATOR_WRITE_TOOLS {
+            assert!(
+                !strict_refuses_scratch_write(ReadOnlyMode::Soft, tool),
+                "soft must still allow {tool} — refusing it here collapses the two levels into one"
+            );
+        }
+    }
+
+    #[test]
+    fn no_level_refuses_a_tool_that_needs_no_scratch_class() {
+        // A read that reaches its data through plain SQL or Atelier is untouched by either level.
+        // iris_doc is the sharpest case: its `put` mode mutates and is gated by `mutating_call`,
+        // but it does not write a SCRATCH class, so this refusal must not be what stops it — two
+        // separate mechanisms, and conflating them would refuse reads under soft.
+        for tool in [
+            "iris_query",
+            "check_config",
+            "iris_doc",
+            "iris_symbols",
+            "iris_get_log",
+        ] {
+            for mode in [ReadOnlyMode::Off, ReadOnlyMode::Soft, ReadOnlyMode::Strict] {
+                assert!(
+                    !strict_refuses_scratch_write(mode, tool),
+                    "{tool} writes no scratch class; {mode:?} must not refuse it here"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nothing_is_refused_when_no_level_was_requested() {
+        for tool in GENERATOR_WRITE_TOOLS {
+            assert!(
+                !strict_refuses_scratch_write(ReadOnlyMode::Off, tool),
+                "{tool} must be unaffected when read-only was never requested — #303 is additive"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) const MUTATING_PROBES_SRC: &[&str] = &[
     "put",
@@ -4529,6 +4605,20 @@ const GENERATOR_WRITE_TOOLS: &[&str] = &[
 /// [`GENERATOR_WRITE_TOOLS`] for why this is separate from `tool_can_mutate`.
 pub(crate) fn tool_writes_via_generator(tool: &str) -> bool {
     GENERATOR_WRITE_TOOLS.contains(&tool)
+}
+
+/// #303: whether STRICT read-only refuses `tool` because answering it writes a scratch class.
+///
+/// Pure, and used by BOTH the advertised-list filter and the call-time refusal, so the two cannot
+/// drift into disagreeing about which tools exist. Taking the mode as an argument rather than
+/// reading it is what lets the SOFT case be asserted as a control: "strict refuses these ten" is
+/// also satisfied by a build where nothing works, and only "soft still allows them" separates the
+/// two.
+pub(crate) fn strict_refuses_scratch_write(
+    mode: crate::iris::connection::ReadOnlyMode,
+    tool: &str,
+) -> bool {
+    mode == crate::iris::connection::ReadOnlyMode::Strict && tool_writes_via_generator(tool)
 }
 
 /// Attach `readOnlyHint` to one advertised tool.
@@ -4875,7 +4965,28 @@ impl IrisTools {
     /// integration point was the one thing not covered, and it is the only part a client sees.
     /// `list_tools` needs a `RequestContext` to call, which is why the loop lives here instead.
     pub fn advertised_tools(&self) -> Vec<rmcp::model::Tool> {
+        self.advertised_tools_with(crate::iris::connection::read_only_mode())
+    }
+
+    /// `advertised_tools` with the read-only level supplied rather than read.
+    ///
+    /// #303: the level is cached for the life of the process, so no in-process test can vary it —
+    /// which would leave the one line that actually removes the tools untested, and a deleted
+    /// `retain` looks exactly like a working filter when the level is `Off`. Taking it as an
+    /// argument is what lets the STRICT and SOFT surfaces be compared directly.
+    pub(crate) fn advertised_tools_with(
+        &self,
+        requested: crate::iris::connection::ReadOnlyMode,
+    ) -> Vec<rmcp::model::Tool> {
         let mut tools = self.tool_router.list_all();
+        // #303: under an explicit STRICT request, the tools that write a scratch class to answer are
+        // not offered. This deliberately differs from the inferred write gate, which prunes nothing
+        // (see `call_tool`) because it follows the CURRENT connection and a tool hidden by a
+        // heuristic that may flip is worse friction than a refusal. A mode read from the
+        // environment at startup cannot flip, so hiding is stable — and a model does not reach for
+        // a tool it cannot see. The refusal in `call_tool` is still the boundary: a client may call
+        // a tool that was never advertised.
+        tools.retain(|t| !strict_refuses_scratch_write(requested, &t.name));
         for tool in tools.iter_mut() {
             let schema = std::sync::Arc::make_mut(&mut tool.input_schema);
             normalize_schema_openapi3(schema);
@@ -7438,6 +7549,12 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                 .map(|c| self.write_gate_open(c))
                 .unwrap_or(conn.write_tools_enabled),
             "write_gate_latched": self.write_gate_is_latched(),
+            // #303: WHY the gate is shut, which `write_tools_enabled: false` alone cannot say —
+            // a Live instance and an explicit request look identical through that flag, and only
+            // one of them can be lifted. "strict" additionally means the scratch-class readers are
+            // refused and absent from the advertised list, so a caller comparing tool counts has
+            // the reason rather than a mystery.
+            "read_only_requested": crate::iris::connection::read_only_mode().as_str(),
             "config_watch_path": config_watcher_path,
             // The MCP server's OWN version + active toolset, so the loaded build can be validated
             // from a tool call (the serverInfo version shown by Claude Code's /mcp is the same value).
@@ -9680,6 +9797,13 @@ impl ServerHandler for IrisTools {
                 return Err(self.write_gated_error(&request.name, action));
             }
         }
+        // #303: STRICT additionally refuses the tools that answer by writing a scratch class. They
+        // are read-only in INTENT and `mutating_call` does not cover them, which is exactly why a
+        // closed write gate was never a guarantee that nothing is written. Refused here as well as
+        // hidden from `advertised_tools`, because a client can call a tool that was never offered.
+        if strict_refuses_scratch_write(crate::iris::connection::read_only_mode(), &request.name) {
+            return Err(self.scratch_write_blocked_error(&request.name));
+        }
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         self.tool_router.call(tcc).await
     }
@@ -9720,28 +9844,84 @@ impl IrisTools {
                 None => ("Unknown".to_string(), String::new()),
             }
         };
+        let requested = crate::iris::connection::read_only_mode();
         // Operator-facing remediation, deliberately NOT in the envelope (#169).
-        tracing::warn!(
-            tool = %tool,
-            mode = %mode,
-            namespace = %namespace,
-            latched = latched,
-            "iris-agentic-dev: write refused by the gate. If writing to this instance is \
-             intended, set IRIS_ALLOW_PROD=1 and restart the server. A gate that has closed \
-             once stays closed until restart."
-        );
-        McpError::invalid_params(
+        //
+        // #303: the remediation depends on WHY the gate is shut. Advising IRIS_ALLOW_PROD when the
+        // operator explicitly asked for read-only would be false — that variable no longer wins —
+        // and it would hand the caller a bypass for a decision that was made deliberately. So an
+        // explicit request is reported as a request, with no way around it named.
+        if requested.is_read_only() {
+            tracing::warn!(
+                tool = %tool,
+                requested_mode = requested.as_str(),
+                "iris-agentic-dev: write refused because read-only was requested for this server. \
+                 This is not a heuristic and IRIS_ALLOW_PROD does not override it."
+            );
+        } else {
+            tracing::warn!(
+                tool = %tool,
+                mode = %mode,
+                namespace = %namespace,
+                latched = latched,
+                "iris-agentic-dev: write refused by the gate. If writing to this instance is \
+                 intended, set IRIS_ALLOW_PROD=1 and restart the server. A gate that has closed \
+                 once stays closed until restart."
+            );
+        }
+        let message = if requested.is_read_only() {
+            format!(
+                "'{tool}' would {action}, and this server was started read-only \
+                 ({} mode), so it was not called. Reads are never blocked — the read actions \
+                 of this tool still work.",
+                requested.as_str()
+            )
+        } else {
             format!(
                 "'{tool}' would {action} on a connection that is not write-allowed \
                  (system mode {mode}, namespace '{namespace}'), so it was not called. \
                  Reads are never blocked — the read actions of this tool still work."
-            ),
+            )
+        };
+        McpError::invalid_params(
+            message,
             Some(serde_json::json!({
                 "error_code": "WRITE_GATED",
                 "tool": tool,
                 "would": action,
                 "system_mode": mode,
                 "namespace": namespace,
+                // So a caller can tell a deliberate request from a heuristic about the instance.
+                "requested_read_only": requested.as_str(),
+            })),
+        )
+    }
+
+    /// #303: STRICT refused a tool that answers by writing a scratch class.
+    ///
+    /// Deliberately a DIFFERENT code from `WRITE_GATED`. The caller did not ask to mutate anything —
+    /// these tools are reads — so "your write was refused" would misdescribe what happened and give
+    /// no usable next step. What the caller needs to know is that the answer requires writing at
+    /// all, and that soft mode allows exactly this.
+    fn scratch_write_blocked_error(&self, tool: &str) -> McpError {
+        tracing::warn!(
+            tool = %tool,
+            "iris-agentic-dev: refused under IRIS_STRICT_READ_ONLY — this tool answers by writing a \
+             scratch class to IrisDevTmp."
+        );
+        McpError::invalid_params(
+            format!(
+                "'{tool}' reads, but it answers by writing, compiling and deleting a scratch class \
+                 in the IrisDevTmp package — the data it reads has no SQL projection to reach it \
+                 through. This server was started with IRIS_STRICT_READ_ONLY, which refuses that. \
+                 Use IRIS_SOFT_READ_ONLY instead if a temporary class is acceptable; it still \
+                 refuses every declared mutation."
+            ),
+            Some(serde_json::json!({
+                "error_code": "SCRATCH_WRITE_BLOCKED",
+                "tool": tool,
+                "writes": "a temporary class in the IrisDevTmp package",
+                "requested_read_only": "strict",
             })),
         )
     }
@@ -11703,6 +11883,61 @@ mod tool_annotation_tests {
     /// `list_tools` passed, because this test called `annotate_tool` itself. It was testing the
     /// function while the wiring — the only part a client actually sees — was uncovered. It now goes
     /// through `advertised_tools()`, which is what `list_tools` returns.
+    /// #303: strict read-only actually removes the scratch-class tools from the advertised surface,
+    /// and soft actually keeps them.
+    ///
+    /// This is the WIRING, which the pure-helper tests cannot reach: they prove the predicate answers
+    /// correctly, not that `advertised_tools` consults it. Deleting the `retain` line leaves every
+    /// one of those tests green, because in-process the level is always `Off`.
+    #[test]
+    fn strict_removes_the_scratch_class_tools_from_the_advertised_surface() {
+        use crate::iris::connection::ReadOnlyMode;
+        let t = IrisTools::new_with_toolset(None, Toolset::Interop).expect("build");
+
+        let soft: std::collections::HashSet<String> = t
+            .advertised_tools_with(ReadOnlyMode::Soft)
+            .into_iter()
+            .map(|x| x.name.to_string())
+            .collect();
+        let strict: std::collections::HashSet<String> = t
+            .advertised_tools_with(ReadOnlyMode::Strict)
+            .into_iter()
+            .map(|x| x.name.to_string())
+            .collect();
+
+        // The interop profile does not advertise every tool in the crate, so only compare over the
+        // ones it does — asserting on the whole list would fail for reasons unrelated to #303.
+        let advertised_writers: Vec<&str> = GENERATOR_WRITE_TOOLS
+            .iter()
+            .copied()
+            .filter(|n| soft.contains(*n))
+            .collect();
+        assert!(
+            !advertised_writers.is_empty(),
+            "no scratch-class tool is advertised in this toolset, so this test would pass vacuously"
+        );
+
+        for name in &advertised_writers {
+            assert!(
+                !strict.contains(*name),
+                "{name} must not be advertised under strict — it answers by writing a scratch class"
+            );
+        }
+        assert!(
+            strict.len() < soft.len(),
+            "strict advertised {} tools and soft {}; the filter did nothing",
+            strict.len(),
+            soft.len()
+        );
+        // And strict must not remove anything ELSE: a filter that over-reaches would hide reads.
+        let removed: Vec<&String> = soft.difference(&strict).collect();
+        assert_eq!(
+            removed.len(),
+            advertised_writers.len(),
+            "strict removed {removed:?}, which is more than the scratch-class tools it should"
+        );
+    }
+
     #[test]
     fn every_advertised_tool_carries_a_read_only_hint() {
         let t = IrisTools::new_with_toolset(None, Toolset::Interop).expect("build");
