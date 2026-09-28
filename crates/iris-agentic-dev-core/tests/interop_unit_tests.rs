@@ -976,6 +976,7 @@ mod production_item_name_arg {
         ProductionItemParams {
             action: action.into(),
             item: item.into(),
+            items: Vec::new(),
             namespace: "APP".into(),
             settings: HashMap::new(),
             apply: true,
@@ -1267,6 +1268,7 @@ mod enumeration_redirect_tests {
                 action: "items".into(),
                 // #218's refusal must not pre-empt this: the ACTION is the error here.
                 item: "Any.Item".into(),
+                items: Vec::new(),
                 namespace: "APP".into(),
                 settings: HashMap::new(),
                 apply: true,
@@ -1310,6 +1312,7 @@ mod enumeration_redirect_tests {
             ProductionItemParams {
                 action: "list".into(),
                 item: String::new(),
+                items: Vec::new(),
                 namespace: "APP".into(),
                 settings: HashMap::new(),
                 apply: true,
@@ -1338,6 +1341,7 @@ mod enumeration_redirect_tests {
             ProductionItemParams {
                 action: "get_settings".into(),
                 item: String::new(),
+                items: Vec::new(),
                 namespace: "APP".into(),
                 settings: HashMap::new(),
                 apply: true,
@@ -1351,6 +1355,62 @@ mod enumeration_redirect_tests {
         assert_eq!(
             v["error_code"], "MISSING_PARAMETER",
             "#218 must still hold: {v}"
+        );
+    }
+
+    /// #327 item 3: `items` names items. The `#218` guard read `item` alone, so a caller who passed
+    /// only the new list parameter was told "nothing was sent to FindItemByConfigName" while having
+    /// named two things — a true sentence about the wrong parameter, which is the failure mode the
+    /// whole issue is about.
+    #[test]
+    fn a_list_of_items_counts_as_naming_an_item() {
+        // passed only the new list parameter was told "nothing was sent to FindItemByConfigName"
+        // while having named two things — a true sentence about the wrong parameter.
+        let v = envelope(rt().block_on(interop_production_item_impl(
+            None,
+            ProductionItemParams {
+                action: "get_settings".into(),
+                item: String::new(),
+                items: vec!["Censo.BS.HL7".into(), "Censo.Router".into()],
+                namespace: "APP".into(),
+                settings: HashMap::new(),
+                apply: true,
+                class_name: None,
+                enabled: None,
+                production: None,
+                pool_size: None,
+                category: None,
+            },
+        )));
+        assert_ne!(
+            v["error_code"], "MISSING_PARAMETER",
+            "two items were named in `items`; refusing for a missing `item` names the wrong \
+             parameter: {v}"
+        );
+        assert_eq!(
+            v["error_code"], "IRIS_UNREACHABLE",
+            "it must get as far as the connection, like any other well-formed call: {v}"
+        );
+        // And a list of nothing but blanks still names nothing, so the refusal still applies.
+        let v = envelope(rt().block_on(interop_production_item_impl(
+            None,
+            ProductionItemParams {
+                action: "get_settings".into(),
+                item: String::new(),
+                items: vec!["".into(), "   ".into()],
+                namespace: "APP".into(),
+                settings: HashMap::new(),
+                apply: true,
+                class_name: None,
+                enabled: None,
+                production: None,
+                pool_size: None,
+                category: None,
+            },
+        )));
+        assert_eq!(
+            v["error_code"], "MISSING_PARAMETER",
+            "a list of empty strings names no item: {v}"
         );
     }
 
