@@ -46,16 +46,42 @@ use std::path::{Path, PathBuf};
 /// Adding a code without adding a row here fails `every_emitted_code_has_a_remedy`. That is the
 /// whole point: the gate is at authoring time, when the author still knows what the caller should do.
 const REMEDIES: &[(&str, &str)] = &[
+    ("ADMIN_WRITE_DISABLED", "admin write tools are off unless asked for; set IRIS_ADMIN_TOOLS=1 in the server's environment and restart it, or make the change in the Management Portal instead"),
+    ("BASELINE_UNAVAILABLE", "the committed side of the comparison could not be read, so no verdict exists; check the production class is readable with iris_doc(mode=get) and retry — an unread baseline is not an empty production"),
+    ("BODY_CLASS_NOT_FOUND", "the message's body class is not compiled in this namespace, so the body cannot be projected; compile it with iris_compile, or read the header alone"),
     ("BODY_READ_ERROR", "the response began but could not be read to the end; retry, and if it repeats capture the partial body — this is a transport fault, not a rejection"),
+    ("CHECKIN_BLOCKED", "check-in is disabled unless asked for; set IRIS_SCM_ALLOW_CHECKIN=1 to enable it, or check the document in through your own source-control client"),
+    ("CLASS_NOT_COMPILED", "the class exists but has no compiled members to read; compile it with iris_compile and retry — nothing was read, so do not conclude it has no methods"),
+    ("COMPILE_ERROR", "the source was written but IRIS refused to compile it; the message and compile_console carry the ObjectScript errors — fix those rather than retrying the same source"),
+    ("COMPILE_TIME_CODE_BLOCKED", "the write carries a body that runs at compile time; read the generator, then either drop CodeMode=objectgenerator or unset IRIS_BLOCK_CODEGEN for code you have audited"),
+    ("CONFIG_ITEM_INVALID", "a config item names a business type IRIS cannot run; the payload names the item — fix its class or remove it from the production, then recompile"),
+    ("CONTAINER_NOT_FOUND", "no running container matched that name; the payload lists the ones that are up — pass one of those, or start the container first"),
+    ("CONTAINER_UNREACHABLE", "the container exists but its web server did not answer; wait for startup to finish and check the web port is published, then retry"),
     ("CREDENTIAL_EXISTS", "a credential of that name is already defined; pick another name, or update the existing one instead of creating it"),
     ("CREDENTIAL_NOT_FOUND", "list the defined credentials with iris_credential_list and use one of those names, or create it first"),
     ("DELETE_FAILED", "the delete was attempted and refused; the message carries the server's reason — check for a lock or a dependent item before retrying"),
     ("DOCKER_REQUIRED", "this path needs a reachable Docker daemon and IRIS_CONTAINER set; start the daemon, or use the HTTP path by setting IRIS_HOST and IRIS_WEB_PORT"),
+    ("ELICITATION_EXPIRED", "pending dialogs are held for five minutes only; re-run the original write to get a fresh one and confirm it promptly"),
+    ("ELICITATION_NOT_FOUND", "no pending dialog has that id; re-run the write to get a new one, and note a server restart discards the in-memory store"),
+    ("EMPTY_QUERY", "the statement was empty once comments were stripped; send the SQL itself rather than a comment block"),
+    ("EXECUTE_FAILED", "the method could not be run at all; the message carries IRIS's reason — check the class is compiled and the arguments match the signature before retrying"),
     ("EXECUTION_FAILED", "the code reached IRIS and IRIS refused it; the message carries the ObjectScript error — fix the code, do not retry unchanged"),
+    ("GATEWAY_BAD_OUTPUT", "the connection test returned something that is not a verdict, so whether the gateway works is unknown and no query was sent; re-run the test and treat this as unknown, not as a failed connection"),
+    ("GATEWAY_LIST_UNAVAILABLE", "the instance's gateway connections could not be read, so this is NOT an empty list; fix the read failure named in the message, or look at the connections in the Management Portal before concluding none exist"),
+    ("GATEWAY_QUERY_FAILED", "the external database rejected the statement and its own error is passed through unchanged; correct the SQL for that database's dialect and retry"),
+    ("HL7_EMPTY_SCHEMA_READ", "the read returned no fields, which is not the same as a segment having none; check the version and segment names and re-read before concluding the segment is empty"),
+    ("HL7_NOT_AVAILABLE", "the HL7 schema classes are not present in that namespace; work in a namespace where EnsLib HL7 is installed, or install schema support there first"),
+    ("HL7_SCHEMA_ERROR", "IRIS refused the schema request and its message is carried through; check the version identifier exists on this instance, then retry"),
+    ("INSUFFICIENT_HISTORY", "a skill is mined from recent tool calls and there are too few so far; keep working and retry later, or author the skill by hand"),
     ("INTERNAL_ERROR", "a bug in this server, not in the request; the message names the failing step — please report it with that text"),
     ("INTEROP_ERROR", "the interop call reached IRIS and failed; the message carries the Ens error — check the production is running and the item name is exact"),
+    ("INTEROP_NOT_AVAILABLE", "Interoperability is not enabled in that namespace; pick an interop namespace (check_config lists them) or enable interop there before retrying"),
+    ("INVALID_ACTION", "the action argument is not one this tool accepts; the message lists the accepted values — resend with one of those"),
+    ("INVALID_MESSAGE_ID", "message_id must be the numeric Ens.MessageHeader ID; get it from iris_interop_query what=messages and pass that number"),
+    ("INVALID_OUTPUT", "the generated text is not a compilable class and nothing was written; the raw output is in the payload — regenerate it, or fix it and write it with iris_doc"),
     ("INVALID_PARAM", "one argument is malformed; the message names which — correct it and retry"),
     ("INVALID_PARAMS", "a required argument is missing or empty; the message names which one — supply it and retry"),
+    ("INVALID_WHAT", "`what` selects which interop view to read; the message lists the valid values — pass one of them"),
     ("INVALID_XML", "the document is not well-formed XML; the message carries the parser's position — fix it there"),
     ("IRIS_AUTH_FAILED", "IRIS rejected the credentials; check IRIS_USERNAME and IRIS_PASSWORD, and that the account is not expired or locked"),
     ("IRIS_BAD_REQUEST", "IRIS rejected the request as malformed; the message carries its reason — this will not succeed on retry unchanged"),
@@ -65,35 +91,73 @@ const REMEDIES: &[(&str, &str)] = &[
     ("IRIS_HTTP_ERROR", "IRIS answered with an unexpected HTTP status; the message carries it — treat as a server fault and check the instance log"),
     ("IRIS_LOCKED", "the document is checked out or locked by another process; release it, or wait and retry"),
     ("IRIS_REQUEST_FAILED", "the request reached IRIS and came back unusable; the message carries what arrived — check the instance log for the matching entry"),
+    ("IRIS_RUNTIME_ERROR", "the code ran and IRIS raised an error mid-execution; the message carries the ObjectScript error and location — this will not succeed on retry unchanged"),
     ("IRIS_SERVER_ERROR", "IRIS raised a 5xx; this is an instance fault, not a bad request — check the instance log, then retry"),
     ("IRIS_UNREACHABLE", "nothing answered at the configured address; check IRIS_HOST and IRIS_WEB_PORT, and that the instance is up — this is NOT evidence that what you asked for is absent"),
     ("ITEM_EXISTS", "a config item of that name is already in the production; update it, or choose another name"),
     ("ITEM_NOT_FOUND", "list the production's items with iris_production_item and use one of those names — the name must match exactly, including package"),
     ("KEY_NOT_FOUND", "the lookup table has no such key; list the table's keys first, or add the key before reading it"),
+    ("LEARNING_DISABLED", "the skills tools are opt-in; set OBJECTSCRIPT_LEARNING=true in the server's environment and restart before using them"),
+    ("LISTING_UNAVAILABLE", "the namespace's document list could not be read, so the wildcard was NOT expanded and nothing ran; fix the listing failure named in the message, or name the documents explicitly"),
+    ("LOG_EXPIRED", "stored output is kept for a limited time and this entry is past it; re-run the tool that produced it — the entry is gone, not empty"),
+    ("LOG_NOT_FOUND", "no stored output has that id; use the id from the response that offered it, and note a server restart clears the store"),
+    ("MALFORMED_RESULT", "IRIS answered with something this server cannot parse, so no result is reported; the first bytes are in the message — retry, and if it repeats treat it as a bug here rather than as an empty answer"),
+    ("MESSAGE_NOT_FOUND", "no body is stored for that message id; confirm the id with iris_interop_query what=messages, and note bodies can be purged while headers remain"),
+    ("METHOD_THREW", "the method ran and raised; the exception text is in the payload — fix the cause rather than retrying unchanged"),
+    ("MISSING_CLASS", "the production references a class that is not compiled in this namespace; the payload names it — compile that class with iris_compile, then retry"),
+    ("MISSING_PARAMETER", "a required argument was absent and nothing was sent to IRIS; the payload lists the accepted parameter names — supply one and retry"),
+    ("MISSING_PARAMS", "the mode you asked for needs an argument you did not send; the message names which one — add it and retry"),
+    ("MISSING_SESSION_ID", "a trace is read one session at a time; pass the numeric session_id that iris_interop_query what=messages reports for each message"),
+    ("MISSING_WHAT", "this tool dispatches on `what` and none was given; the message lists the values — pass one of them"),
     ("NAMESPACE_EXISTS", "a namespace of that name is already defined; use it, or pick another name"),
     ("NAMESPACE_NOT_FOUND", "list the available namespaces with check_config and pass one of those — an omitted namespace defaults to USER, which is rarely the interop one"),
+    ("NAMESPACE_NOT_INTEROP", "that namespace has no Ens.* classes, so no interop tool can run in it; choose an interop namespace (check_config lists them) or enable Interoperability there"),
+    ("NOT_A_CLASS_METHOD", "this tool calls class methods only; either make the method a ClassMethod, or instantiate the object and call it through iris_execute"),
     ("NOT_FOUND", "the document or resource is not in that namespace; the message names what IS there when it can — check the namespace and the exact name, suffix included"),
+    ("NOT_IMPLEMENTED", "this entry point is a stub in this build and does nothing; perform the step by hand and do not wait on it to appear"),
+    ("NOT_SQL", "iris_query runs SQL statements only; send ObjectScript through iris_execute instead"),
     ("NO_PRODUCTION", "no production is running in that namespace; start one with iris_production, or pass the production name explicitly"),
     ("PARSE_ERROR", "the server's own output could not be parsed; this is a fault in this server or a version mismatch — report it with the message text"),
+    ("PHI_ACK_REQUIRED", "an unredacted body needs acknowledgePhi=true alongside dataPolicy=allow; set both deliberately, or use dataPolicy=redact"),
+    ("PHI_POLICY_BLOCKED", "the policy in force blocks message bodies; pass dataPolicy=redact for a masked body, or dataPolicy=allow with acknowledgePhi=true if you are authorised to read PHI"),
+    ("PRODUCTION_ALREADY_RUNNING", "another production is already running in that namespace and IRIS will not start a second; the payload names it — stop that one first, or work in the namespace where yours runs"),
+    ("PRODUCTION_NOT_FOUND", "no production of that name exists in the namespace; list them with iris_query \"SELECT ID FROM Ens_Config.Production\", then use one of those names or compile the missing class"),
     ("QUERY_ERROR", "the SQL reached IRIS and IRIS refused it; the message carries the SQLCODE and text — fix the statement rather than retrying"),
+    ("READ_ERROR", "the document could not be read, so nothing downstream ran; the message carries the reason — check the name and namespace, then retry"),
+    ("READ_TRUNCATED", "the document came back cut short and editing it would write the truncation back; do not retry the edit — report this, and make any change through a full put"),
+    ("READ_UNREADABLE", "the read returned no content, so the edit was refused rather than applied to nothing; confirm the document with iris_doc(mode=get) first"),
+    ("ROUTINE_NOT_FOUND", "the frame names a class that is not compiled here, so it cannot be mapped; compile the class, or read the frame as raw .INT text"),
+    ("RULE_NOT_FOUND", "no business rule of that name is in the namespace; call action=list to see which rules are there and use one of those names"),
+    ("RULE_NOT_PROJECTED", "the rule class is compiled but neither its Ens_Rule.RuleSet row nor its XData could be read; recompile the rule class so IRIS reprojects it, then retry"),
     ("SCM_CHECKOUT_FAILED", "the source-control checkout was attempted and refused; the message carries the provider's reason — the document was NOT checked out, so do not write on the assumption that it was"),
     ("SCM_ERROR", "the source-control hook raised an error; the message carries it — resolve it in the provider before retrying the write"),
     ("SCM_REJECTED", "source control declined the operation by policy; the message carries the provider's reason — this needs a change in the provider, not a retry"),
     ("SCM_UNAVAILABLE", "no source-control provider answered; this means UNKNOWN, not 'not under source control' — check the provider is configured before treating the document as free"),
+    ("SCOPE_REQUIRED", "the pattern would select on its tail alone, which is the whole namespace; qualify it with at least one package level and retry"),
+    ("SEARCH_PROP_NOT_FOUND", "that property is not registered on the Search Table extent; the payload lists the ones that are — use one of those"),
+    ("SEARCH_TABLE_NOT_FOUND", "the search-table class is not registered or not compiled here; compile it, or drop the search_table filter — do not read this as no matches"),
+    ("SEARCH_TIMEOUT", "the asynchronous search did not finish in its window, so nothing can be concluded about matches; narrow the document scope or the pattern and run it again"),
+    ("SKILLS_PARSE_FAILED", "the registry was read but could not be parsed; IRIS was reachable, so this is NOT an empty registry — inspect the stored content before writing over it"),
+    ("SQL_ERROR", "IRIS rejected the SQL; the message carries the SQLCODE and its text — resolve real table and column names with iris_table_info or docs_introspect rather than guessing, then correct the statement"),
+    ("SQL_NOT_READ_ONLY", "the statement is not read-only and this path runs SELECTs only; rewrite it as a SELECT, or make the change through a tool that is allowed to write"),
+    ("SQL_WRITE_BLOCKED", "a destructive keyword was rejected; resend with force: true if the write is intended, otherwise rewrite the statement as a SELECT"),
     ("STREAM_READ_ERROR", "the stream could not be read; retry, and if it repeats the document may be corrupt on the server"),
     ("TABLE_NOT_FOUND", "resolve the real table name with iris_table_info or docs_introspect — IRIS table names differ from class names and the separator is not a dot"),
+    ("TIMEOUT", "the operation did not finish inside its budget and may STILL be running on the server; check the instance's state, then raise timeout or narrow the work before retrying"),
+    ("TOO_BROAD", "the wildcard matched more documents than one request may queue and nothing ran; add the next package level to narrow it and proceed in parts"),
+    ("UNKNOWN_ACTION", "the action is not one this tool accepts; the payload lists the valid actions — resend with one of them"),
+    ("UNKNOWN_SEGMENT_OR_CATEGORY", "the segment or category is not defined in that schema version; list what the version defines and use one of those names"),
+    ("UNSUPPORTED_BODY_CLASS", "this tool projects only the body families the message lists; read the body through iris_query against its own table, or convert it first"),
+    ("UNSUPPORTED_IRIS_VERSION", "this IRIS build lacks the API the feature needs; the payload names the missing method — use a newer instance or take the manual route"),
     ("UPDATE_FAILED", "the update was attempted and refused; the message carries the server's reason — re-read the current value before retrying"),
     ("UPLOAD_FAILED", "the document was sent and not accepted; the message carries the server's reason — this is not a transport fault, so retrying unchanged will fail again"),
     ("USER_EXISTS", "a user of that name already exists; modify that account rather than creating it"),
     ("USER_NOT_FOUND", "list users with iris_credential_list or check_config and use an existing name, or create the account first"),
+    ("VALUE_TRUNCATED", "the value arrived incomplete and is therefore not reported as the result; re-read it in pieces or through a stream rather than using the partial text"),
     ("WEBAPP_EXISTS", "a web application is already mapped at that path; edit it, or choose a different path"),
-    // Emitted via `envelope::fail_with`, which this file did not scan until #329 — see the note in
-    // `vocabulary()`. These four had no remedy on record while being fully reachable.
-    ("COMPILE_ERROR", "the source was written but IRIS refused to compile it; the message and compile_console carry the ObjectScript errors — fix those rather than retrying the same source"),
-    ("IRIS_RUNTIME_ERROR", "the code ran and IRIS raised an error mid-execution; the message carries the ObjectScript error and location — this will not succeed on retry unchanged"),
-    ("SQL_ERROR", "IRIS rejected the SQL; the message carries the SQLCODE and its text — resolve real table and column names with iris_table_info or docs_introspect rather than guessing, then correct the statement"),
-    ("WRITE_ABORTED", "the write was cancelled before anything changed — you declined the source-control checkout it needed; re-issue and approve it, or check the document out first"),
     ("WEBAPP_NOT_FOUND", "list the defined web applications and use one of those paths — the path must include its leading slash"),
+    ("WORKSPACE_NOT_FOUND", "the path does not exist on the host running this server; pass a path that exists there — a path on your own machine is not visible to this process"),
+    ("WRITE_ABORTED", "the write was cancelled before anything changed — you declined the source-control checkout it needed; re-issue and approve it, or check the document out first"),
 ];
 
 /// Below this many literal codes, assume the scan broke rather than that the server stopped
@@ -215,23 +279,40 @@ fn strip_line_comments(text: &str) -> String {
         .join("\n")
 }
 
-/// The upper-case token in `pat"CODE"`, for every occurrence.
+/// The `"SCREAMING_SNAKE"` literal passed as the FIRST ARGUMENT of `pat`, for every occurrence.
+///
+/// #361: this used to be handed the pattern with the opening quote attached — `err_json("` — so it
+/// saw only calls whose code sits on the same line as the paren. `rustfmt` moves the first argument
+/// onto its own line as soon as the message is long, so whether a code was ever reviewed depended
+/// on how long its message happened to be. It read 36 of the tree's 90 literal codes while all four
+/// tests here were green, and the ones it skipped were the long-message refusals most worth
+/// reviewing. Skipping the whitespace between the paren and the literal is the whole fix.
 fn codes_after(code: &str, pat: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut from = 0usize;
     while let Some(rel) = code[from..].find(pat) {
         let at = from + rel + pat.len();
-        let tok: String = code[at..]
-            .chars()
-            .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_')
-            .collect();
-        let after = code[at + tok.len()..].chars().next();
-        if !tok.is_empty() && after == Some('"') {
+        if let Some(tok) = first_arg_code(&code[at..]) {
             out.push(tok);
         }
         from = at;
     }
     out
+}
+
+/// The code literal at the head of an argument list. `None` when the first argument is a classifier
+/// call, a variable, or a wrapper's context string — those carry a vocabulary somewhere else, which
+/// is what `EMITTER_ROUTES` below exists to keep honest.
+fn first_arg_code(args: &str) -> Option<String> {
+    let rest = args.trim_start().strip_prefix('"')?;
+    let tok: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_')
+        .collect();
+    if tok.is_empty() || !rest[tok.len()..].starts_with('"') {
+        return None;
+    }
+    Some(tok)
 }
 
 /// The `&'static str` fallback passed as the 2nd argument of `classify_iris_error_or(msg, "CODE")`.
@@ -302,10 +383,10 @@ fn vocabulary() -> Vec<(String, Vec<String>)> {
         let raw = std::fs::read_to_string(f)
             .unwrap_or_else(|e| panic!("cannot read {}: {e}", f.display()));
         let prod = strip_line_comments(&strip_test_mods(&raw));
-        for c in codes_after(&prod, "err_json(\"") {
+        for c in codes_after(&prod, "err_json(") {
             add(c, "literal");
         }
-        for c in codes_after(&prod, "err_json_with_url(\"") {
+        for c in codes_after(&prod, "err_json_with_url(") {
             add(c, "literal");
         }
         // #329: `envelope::fail_with` / `fail` are a THIRD emission route, and this scan missed them
@@ -314,10 +395,10 @@ fn vocabulary() -> Vec<(String, Vec<String>)> {
         // `no_remedy_entry_is_stale` declared the code unreachable while the server still emitted it.
         // Measuring the route turned up FOUR live codes with no remedy on record, so the guarantee
         // this file advertises was narrower than its name for as long as it has existed.
-        for c in codes_after(&prod, "fail_with(\"") {
+        for c in codes_after(&prod, "fail_with(") {
             add(c, "fail_with");
         }
-        for c in codes_after(&prod, "fail(\"") {
+        for c in codes_after(&prod, "fail(") {
             add(c, "fail");
         }
         for c in fallback_codes(&prod) {
@@ -335,6 +416,10 @@ fn vocabulary() -> Vec<(String, Vec<String>)> {
                 "transport_error_code",
             ],
             "admin.rs" => &["admin_error_code"],
+            // #361: `interop_fail` routes 14 sites through `classify_interop_failure`, whose five
+            // codes reached callers while no window here read them — the same population gap as
+            // the wrapped literals, arriving through a wrapper instead of through rustfmt.
+            "interop.rs" => &["classify_interop_failure"],
             _ => &[],
         };
         for t in tables {
@@ -469,6 +554,15 @@ pub(crate) const SOME_TABLE: &[&str] = &["NOT_A_CODE"];
 fn also_real() -> X {
     return err_json("SECOND_REAL", "m");
 }
+fn wrapped_by_rustfmt() -> X {
+    return err_json(
+        "WRAPPED_REAL",
+        &format!("a message long enough that rustfmt moved the code onto its own line"),
+    );
+}
+fn a_wrapper_passing_context_not_a_code() -> X {
+    return transport_fail("handle_something", &e);
+}
 #[cfg(test)]
 mod tests {
     #[test]
@@ -478,7 +572,7 @@ mod tests {
 }
 "#;
     let prod = strip_line_comments(&strip_test_mods(sample));
-    let found = codes_after(&prod, "err_json(\"");
+    let found = codes_after(&prod, "err_json(");
     assert!(
         found.iter().any(|c| c == "REAL_CODE"),
         "a production literal must be seen: {found:?}"
@@ -495,9 +589,121 @@ mod tests {
         !found.iter().any(|c| c == "COMMENTED_CODE"),
         "a code named in a comment must not count: {found:?}"
     );
+    assert!(
+        found.iter().any(|c| c == "WRAPPED_REAL"),
+        "#361: a call rustfmt wrapped is the same call — whether a code is scanned must not depend \
+         on where the literal sits relative to the paren: {found:?}"
+    );
     assert_eq!(
         found.len(),
-        2,
-        "exactly the two production codes, nothing else: {found:?}"
+        3,
+        "exactly the three production codes, nothing else — a wrapper's context string is not a \
+         code: {found:?}"
     );
+}
+
+/// The routes read as code emitters, kept beside the scan that uses them.
+const EMITTERS: &[&str] = &["err_json(", "err_json_with_url(", "fail_with(", "fail("];
+
+/// Every callee those patterns match, and where its codes come from. A wrapper that passes a
+/// context string rather than a code still emits one — from a classifier — and this table is where
+/// that is written down.
+const EMITTER_ROUTES: &[(&str, &str)] = &[
+    (
+        "err_json",
+        "first argument: a literal, or a classifier whose fallback is read",
+    ),
+    ("err_json_with_url", "first argument"),
+    ("fail", "first argument"),
+    ("fail_with", "first argument"),
+    (
+        "transport_fail",
+        "envelope::transport_error_code, read as a producer table",
+    ),
+    (
+        "http_status_fail",
+        "envelope::http_status_code, read as a producer table",
+    ),
+    (
+        "interop_fail",
+        "interop::classify_interop_failure, read as a producer table",
+    ),
+    (
+        "skills_read_fail",
+        "its own match arms, each a literal this scan reads directly",
+    ),
+    (
+        "dict_exec_fail",
+        "classify_iris_error_or, whose fallback this scan reads",
+    ),
+];
+
+/// #361: the control that fails on a PARTIAL scan, which `MIN_LITERAL_CODES` cannot.
+///
+/// A floor of N codes is cleared as easily by a scan reading 40% of the tree as by one reading all
+/// of it — and that floor was itself measured through the broken parse, so it moved with the
+/// defect. The population, not the count, is what has to be pinned: every call site these patterns
+/// match belongs to a callee named here, with its code source written beside it. A new wrapper —
+/// the shape that hid `classify_interop_failure`'s five codes — is then a red rather than a
+/// silently smaller number.
+#[test]
+fn every_emitter_names_where_its_codes_come_from() {
+    let mut files = Vec::new();
+    rust_files(&tools_dir(), &mut files);
+    let mut seen: std::collections::BTreeSet<String> = Default::default();
+    let mut unknown: Vec<String> = Vec::new();
+
+    for f in &files {
+        let raw = std::fs::read_to_string(f)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", f.display()));
+        let prod = strip_line_comments(&strip_test_mods(&raw));
+        for pat in EMITTERS {
+            let mut from = 0usize;
+            while let Some(rel) = prod[from..].find(pat) {
+                let at = from + rel;
+                // Walk back over the full path so `crate::tools::envelope::fail` and a bare `fail`
+                // are the same callee, and `interop_fail` is not mistaken for one.
+                let mut start = at;
+                while start > 0 {
+                    let c = prod[..start].chars().next_back().unwrap_or(' ');
+                    if c.is_alphanumeric() || c == '_' || c == ':' {
+                        start -= c.len_utf8();
+                    } else {
+                        break;
+                    }
+                }
+                let callee = prod[start..at + pat.len() - 1]
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                if EMITTER_ROUTES.iter().any(|(n, _)| *n == callee) {
+                    seen.insert(callee);
+                } else {
+                    let line = prod[..at].matches('\n').count() + 1;
+                    unknown.push(format!(
+                        "{}:{line} {callee}(",
+                        f.file_name().unwrap_or_default().to_string_lossy()
+                    ));
+                }
+                from = at + pat.len();
+            }
+        }
+    }
+
+    assert!(
+        unknown.is_empty(),
+        "these callees emit an error envelope and are not in EMITTER_ROUTES, so nothing here knows \
+         where their codes come from — add a row naming the source, and a producer table in \
+         `vocabulary()` if the codes are not literals:\n  {}",
+        unknown.join("\n  ")
+    );
+    // CONTROL: both kinds were actually walked. A broken walk finds neither, and a walk that finds
+    // only bare emitters is the #361 state — the wrappers unexamined.
+    assert!(
+        seen.contains("err_json") && seen.iter().any(|c| c != "err_json" && c.ends_with("fail")),
+        "the walk saw {seen:?} — it must meet both a bare emitter and a wrapper, or it is not \
+         reading the tree this test claims to cover"
+    );
+    eprintln!("emitter callees in the tree: {seen:?}");
 }
