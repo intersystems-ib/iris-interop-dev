@@ -110,6 +110,12 @@ pub struct IrisDocParams {
     /// Saves a round-trip vs calling iris_doc(put) then iris_compile separately.
     #[serde(default)]
     pub compile: bool,
+    /// The %UnitTest class to run once the write has COMPILED — same value iris_test takes as
+    /// `pattern`. Requires compile=true; nothing is run if the compile failed, because a red test
+    /// and a class that never compiled are different answers. The test result arrives under `test`,
+    /// with `test_ok` beside it; the write's own result is never overwritten by it.
+    #[serde(default)]
+    pub test: Option<String>,
     /// For mode=get: cap returned source to this many bytes (0 = unlimited). Large class source is
     /// the biggest iris_doc token sink — page through with `offset` + `max_bytes`.
     #[serde(default)]
@@ -747,6 +753,99 @@ fn result_payload(r: &rmcp::model::CallToolResult) -> Option<serde_json::Value> 
     }
 }
 
+/// #327 item 2: whether a `test` asked for on an `iris_doc` call should actually be run.
+///
+/// Measured over 31,009 tool calls: `iris_doc(put)` is immediately followed by `iris_test` **579
+/// times**. A boolean would only cover the 346 where the class written IS the class tested; a
+/// STRING covers all 579, because in the other 233 the test lives beside the class
+/// (`Hospital.BO.PatientDb` → `Hospital.Tests.BO.PatientDbTest`).
+///
+/// Keyed off the payload's `compiled`, not off the mode: every mode that compiles reports it the
+/// same way, and a mode that never compiles has no key to be true. So this needs no list of modes
+/// to keep in step with `DocMode`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TestGate {
+    /// No `test` was asked for. Nothing is added to the payload — a caller who did not ask for a
+    /// test must not have to read a field explaining that none ran.
+    NotRequested,
+    /// Run this pattern.
+    Run(String),
+    /// A test was asked for and the write itself did not succeed. The write's own envelope already
+    /// carries the reason — a compile error, an SCM elicitation, a refusal — and is returned
+    /// untouched; running the test would report a red for a class that is not there.
+    SkippedCallFailed,
+    /// The write succeeded and produced no compiled class. `compile_requested` separates the two
+    /// ways that happens, because "you did not ask for a compile" and "this mode does not compile"
+    /// need different fixes from the caller.
+    SkippedNotCompiled { compile_requested: bool },
+}
+
+impl TestGate {
+    /// The sentence that goes on the payload as `test_skipped`. `None` for the two cases that put
+    /// nothing there: nothing was asked for, or the test is about to run.
+    pub fn skipped_reason(&self) -> Option<String> {
+        match self {
+            TestGate::NotRequested | TestGate::Run(_) => None,
+            TestGate::SkippedCallFailed => Some(
+                "not run: this call did not succeed, so a test run would report a red for a class \
+                 that was never written or never compiled. Fix what `error`/`error_code` names, \
+                 then call again."
+                    .into(),
+            ),
+            TestGate::SkippedNotCompiled {
+                compile_requested: false,
+            } => Some(
+                "not run: `test` needs a COMPILED class and this call did not compile. Pass \
+                 compile=true in the same call, or run iris_test yourself once the class is \
+                 compiled."
+                    .into(),
+            ),
+            TestGate::SkippedNotCompiled {
+                compile_requested: true,
+            } => Some(
+                "not run: a compile was requested but the payload does not report a compiled \
+                 class. Read `compile_errors` / `compile_console`, then call again."
+                    .into(),
+            ),
+        }
+    }
+}
+
+/// Decide the gate from what the caller asked for and what the write actually reported.
+///
+/// `payload` is the write's own JSON, `None` when the result carried nothing parseable — which is
+/// treated as a failed call rather than as a class that compiled, since guessing the other way would
+/// run a test against a state this code cannot see.
+pub fn test_gate(test: Option<&str>, payload: Option<&serde_json::Value>) -> TestGate {
+    let Some(pattern) = test.map(str::trim).filter(|t| !t.is_empty()) else {
+        return TestGate::NotRequested;
+    };
+    let Some(v) = payload else {
+        return TestGate::SkippedCallFailed;
+    };
+    if v["success"] != serde_json::Value::Bool(true) {
+        return TestGate::SkippedCallFailed;
+    }
+    if v["compiled"] == serde_json::Value::Bool(true) {
+        return TestGate::Run(pattern.to_string());
+    }
+    TestGate::SkippedNotCompiled {
+        compile_requested: v["compile_requested"] == serde_json::Value::Bool(true),
+    }
+}
+
+/// Put the test's own payload on the write's, under names that keep the two verdicts apart.
+///
+/// The write's `success` is NOT touched. The write landed; a red test is a fact about the code, not
+/// about whether the document was stored, and collapsing them would make a red test look like a
+/// failed write (and a failed write look like a red test). `test_ok` is the test's verdict, `test`
+/// is its whole payload — error code, per-case failures and all.
+pub fn attach_test_result(payload: &mut serde_json::Value, pattern: &str, test: serde_json::Value) {
+    payload["test_pattern"] = serde_json::Value::String(pattern.to_string());
+    payload["test_ok"] = serde_json::Value::Bool(test["success"] == serde_json::Value::Bool(true));
+    payload["test"] = test;
+}
+
 async fn handle_put(
     iris: &IrisConnection,
     client: &reqwest::Client,
@@ -1247,6 +1346,12 @@ async fn do_write(
                 "name": name,
                 "open_uri": open_uri,
                 "compiled": false,
+                // #327 item 4: `compiled: false` alone cannot say WHY. Paired with
+                // `compile_requested` the three write outcomes are distinct without reading two
+                // other fields — (false,false) written and nobody asked, (false,true) the compile
+                // ran and failed, (true,true) compiled clean. A compile that was never run and a
+                // compile that failed are different states (#310).
+                "compile_requested": true,
                 "compile_errors": compile_errors,
                 "compile_console": compile_console,
             });
@@ -1287,6 +1392,7 @@ async fn do_write(
             "name": name,
             "open_uri": open_uri,
             "compiled": true,
+            "compile_requested": true,
             "compile_errors": compile_errors,
             "compile_console": compile_console,
         });
@@ -1306,7 +1412,19 @@ async fn do_write(
     // be structurally always-false — and a field that cannot vary is the defect #332 documented one
     // tool over: an advertised value that cannot occur teaches a caller to branch on something dead.
     // It was never named in the iris_doc description, so no documented contract changes here.
-    let mut payload = serde_json::json!({"success": true, "name": name, "open_uri": open_uri});
+    // #327 item 4: say out loud that nothing was compiled. Measured over 31,009 tool calls, 89
+    // `iris_doc(put)` → `iris_compile` pairs are a put that did not pass `compile` followed by a
+    // compile of the SAME class. The payload used to carry no `compiled` key at all on this branch,
+    // so "was it compiled?" was answerable only by noticing an absence — and an absence reads as
+    // "the field does not apply here", not as "no". Both keys are present on all three write
+    // outcomes now, so a caller can branch on them unconditionally.
+    let mut payload = serde_json::json!({
+        "success": true,
+        "name": name,
+        "open_uri": open_uri,
+        "compiled": false,
+        "compile_requested": false,
+    });
     note_compile_time_methods(&mut payload, &generators);
     ok_json(payload)
 }
