@@ -55,6 +55,30 @@ pub fn atelier_status(err: &anyhow::Error) -> Option<&AtelierHttpError> {
     err.downcast_ref::<AtelierHttpError>()
 }
 
+/// Whether a failed `execute_via_generator` attempt is worth repeating: a 5xx or a transport
+/// fault, never a 4xx and never a deterministic IRIS error.
+///
+/// #362: the 5xx arm reads the STATUS. It used to ask whether the error's Display text contained
+/// `"HTTP 5"` — a dependency on wording, which is the shape #102 had to fix once already in this
+/// same file.
+///
+/// This is deliberately extracted rather than left inline, because the change is **invisible to a
+/// behavioural test**: every 5xx message this file builds ("PUT doc failed: HTTP 503", "compile
+/// HTTP 502", "query HTTP 500") happens to contain `"HTTP 5"` today, so both spellings agree on
+/// every input the code can currently produce, and reverting it would survive any end-to-end
+/// assertion. What it protects against is a reworded message silently switching retries off — the
+/// failure the query step was already in when #362 was filed. The unit tests pin it by
+/// constructing the case a reword produces, which is the only way to tell the two apart.
+pub(crate) fn retryable_attempt(err: &anyhow::Error) -> bool {
+    if let Some(atelier) = atelier_status(err) {
+        return atelier.status >= 500;
+    }
+    let msg = err.to_string();
+    msg.contains("error sending request")
+        || msg.contains("connection refused")
+        || msg.contains("timed out")
+}
+
 /// Trim and cut a response body to `max` CHARACTERS (not bytes — a cut inside a UTF-8
 /// sequence would panic).
 pub(crate) fn truncate_body(body: &str, max: usize) -> String {
@@ -517,12 +541,7 @@ impl IrisConnection {
                 }
                 Err(e) => {
                     let msg = e.to_string();
-                    // Only retry on network errors or 5xx; 4xx are client errors, don't retry.
-                    let is_retryable = msg.contains("HTTP 5")
-                        || msg.contains("error sending request")
-                        || msg.contains("connection refused")
-                        || msg.contains("timed out");
-                    if !is_retryable || attempt == delays.len() - 1 {
+                    if !retryable_attempt(&e) || attempt == delays.len() - 1 {
                         return Err(e);
                     }
                     // Transient on cold-start (private web server still warming up) — debug only;
@@ -635,11 +654,46 @@ impl IrisConnection {
             .json(&serde_json::json!({"query": sql}))
             .send()
             .await?;
-        let query_body: serde_json::Value = query_resp.json().await.unwrap_or_default();
-        let output = query_body["result"]["content"][0]["result"]
-            .as_str()
-            .unwrap_or("")
-            .replace('\x01', "\n");
+        // #362: this was `query_resp.json().await.unwrap_or_default()` indexed into
+        // `result.content[0].result` with `unwrap_or("")`. A SqlProc that fails at RUNTIME answers
+        // HTTP 200 with the diagnosis in `status.errors` and no `content` key at all, so that chain
+        // produced `Ok("")` — and 66 call sites read an empty string as "the script produced no
+        // output" while the error text was discarded. Measured: a captured output of 3,600,000 chars
+        // returns fine and 3,700,000 fails with <MAXSTRING>, so the tool was correct right up to
+        // IRIS's limit and then reported *nothing found* for the one large document.
+        //
+        // The three cases are distinct in the RESPONSE, not in the value — `status.errors` empty
+        // with `content` present vs `status.errors` populated with `result: {}` — and
+        // `interpret_query_response` already draws exactly that line. The generator was the one
+        // request path in this file that never used it (#105's duplication, missing the error half
+        // rather than the retry).
+        let query_status = query_resp.status();
+        let query_text = query_resp.text().await?;
+        let output = match interpret_query_response(query_status, &query_text) {
+            // A successful SELECT with an empty value IS a script that wrote nothing. The
+            // `unwrap_or("")` is correct here, and only here.
+            QueryOutcome::Rows(body) => body["result"]["content"][0]["result"]
+                .as_str()
+                .unwrap_or("")
+                .replace('\x01', "\n"),
+            QueryOutcome::IrisError(msg) => {
+                let _ = self.delete_doc(&doc_name, namespace, client).await;
+                anyhow::bail!("the generated SqlProc failed: {msg}");
+            }
+            QueryOutcome::HttpError { status, snippet } => {
+                let _ = self.delete_doc(&doc_name, namespace, client).await;
+                return Err(anyhow::Error::new(AtelierHttpError::new(
+                    status,
+                    query_url,
+                    snippet,
+                    format!("query HTTP {status}"),
+                )));
+            }
+            QueryOutcome::NonJson { status, snippet } => {
+                let _ = self.delete_doc(&doc_name, namespace, client).await;
+                anyhow::bail!("non-JSON response from {query_url} (HTTP {status}): {snippet}");
+            }
+        };
 
         // 4. Delete the temp class (best-effort)
         let _ = self.delete_doc(&doc_name, namespace, client).await;
@@ -1381,6 +1435,77 @@ mod system_mode_tests {
 }
 
 // ── Issues #101 / #102: the query path must not destroy what IRIS said ───────
+/// #362: the retry predicate, pinned where behaviour cannot pin it.
+///
+/// `a_five_hundred_on_the_query_step_is_retried` in `tests/generator_sqlproc_failure.rs` proves the
+/// query step retries at all — that is the part that was genuinely broken. It cannot prove the
+/// predicate reads the STATUS, because every 5xx message this file builds also contains the literal
+/// "HTTP 5", so the old text match and the new status check agree on every input the code produces.
+/// These construct the inputs a reworded message would produce, where they disagree.
+#[cfg(test)]
+mod retryable_attempt_tests {
+    use super::*;
+
+    fn atelier_err(status: u16, message: &str) -> anyhow::Error {
+        anyhow::Error::new(AtelierHttpError::new(
+            reqwest::StatusCode::from_u16(status).expect("a valid status"),
+            "http://localhost/api/atelier/v1/USER/action/query",
+            "",
+            message,
+        ))
+    }
+
+    #[test]
+    fn a_five_hundred_is_retryable_however_its_message_is_worded() {
+        // THE DISTINGUISHING CASE. No "HTTP 5" anywhere in the text, so the predicate this
+        // replaced answered `false` and the attempt was silently not retried.
+        let e = atelier_err(503, "the gateway is restarting, try later");
+        assert!(
+            retryable_attempt(&e),
+            "a 503 is retryable because of its STATUS; reading the message means a reword turns \
+             retries off without a test noticing"
+        );
+        // CONTROL: the text matcher really would have missed it, so the case above is not
+        // hypothetical.
+        assert!(
+            !e.to_string().contains("HTTP 5"),
+            "this fixture only distinguishes the two predicates if its text lacks the old needle"
+        );
+    }
+
+    #[test]
+    fn a_four_hundred_is_not_retryable_even_when_its_message_mentions_http_five() {
+        // The mirror: text that would fool the old matcher into retrying a client error forever.
+        let e = atelier_err(404, "no route matched; upstream said HTTP 502 earlier");
+        assert!(
+            !retryable_attempt(&e),
+            "a 404 is deterministic — repeating it cannot change the answer"
+        );
+    }
+
+    #[test]
+    fn a_transport_failure_is_still_retryable() {
+        // Not an AtelierHttpError at all: no status to read, so the text is all there is, and that
+        // arm is deliberately unchanged.
+        let e = anyhow::anyhow!("error sending request for url (http://localhost:52773/)");
+        assert!(
+            retryable_attempt(&e),
+            "a dropped connection is worth repeating"
+        );
+    }
+
+    #[test]
+    fn a_deterministic_iris_error_is_not_retryable() {
+        // What #362 makes reachable: a SqlProc failure now arrives as an Err. Repeating it would
+        // re-run the whole PUT/compile/query cycle to get the same SQLCODE back.
+        let e = anyhow::anyhow!("the generated SqlProc failed: ERROR #5540: SQLCODE: -400");
+        assert!(
+            !retryable_attempt(&e),
+            "a SQLCODE is a verdict about the code, not a transient fault"
+        );
+    }
+}
+
 #[cfg(test)]
 mod atelier_http_error_tests {
     use super::*;
