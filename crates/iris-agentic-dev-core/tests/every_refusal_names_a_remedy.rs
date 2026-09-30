@@ -104,6 +104,7 @@ const REMEDIES: &[(&str, &str)] = &[
     ("LOG_EXPIRED", "stored output is kept for a limited time and this entry is past it; re-run the tool that produced it — the entry is gone, not empty"),
     ("LOG_NOT_FOUND", "no stored output has that id; use the id from the response that offered it, and note a server restart clears the store"),
     ("MALFORMED_RESULT", "IRIS answered with something this server cannot parse, so no result is reported; the first bytes are in the message — retry, and if it repeats treat it as a bug here rather than as an empty answer"),
+    ("MESSAGE_BODY_CLASS_MISSING", "the message header is present but its body class is not compiled in that namespace; compile the class there, or read the header fields with iris_interop_query(what=messages), which does not open the body"),
     ("MESSAGE_NOT_FOUND", "no body is stored for that message id; confirm the id with iris_interop_query what=messages, and note bodies can be purged while headers remain"),
     ("METHOD_THREW", "the method ran and raised; the exception text is in the payload — fix the cause rather than retrying unchanged"),
     ("MISSING_CLASS", "the production references a class that is not compiled in this namespace; the payload names it — compile that class with iris_compile, then retry"),
