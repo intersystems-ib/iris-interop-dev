@@ -97,6 +97,7 @@ const REMEDIES: &[(&str, &str)] = &[
     ("IRIS_UNREACHABLE", "nothing answered at the configured address; check IRIS_HOST and IRIS_WEB_PORT, and that the instance is up — this is NOT evidence that what you asked for is absent"),
     ("ITEM_EXISTS", "a config item of that name is already in the production; update it, or choose another name"),
     ("ITEM_NOT_FOUND", "list the production's items with iris_production_item and use one of those names — the name must match exactly, including package"),
+    ("ITEM_UNREADABLE", "the item is in the production but its settings could not be read, which is NOT the same as having none; for a single item the payload's `error` names the cause, and a whole batch reporting it means the settings program returned no sections at all — re-read the items one at a time to find which one fails, and confirm the item's class is compiled here with iris_compile"),
     ("KEY_NOT_FOUND", "the lookup table has no such key; list the table's keys first, or add the key before reading it"),
     ("LEARNING_DISABLED", "the skills tools are opt-in; set OBJECTSCRIPT_LEARNING=true in the server's environment and restart before using them"),
     ("LISTING_UNAVAILABLE", "the namespace's document list could not be read, so the wildcard was NOT expanded and nothing ran; fix the listing failure named in the message, or name the documents explicitly"),
