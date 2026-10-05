@@ -1580,7 +1580,7 @@ fn is_sql_identifier(s: &str) -> bool {
 /// Body-class join (issue #4). The join also pins h.MessageBodyClassName to
 /// the body class: MessageBodyId is only unique per body table, so without it
 /// same-numbered rows of OTHER body classes would match.
-fn build_body_join_sql(
+pub fn build_body_join_sql(
     limit: u32,
     mut filters: Vec<String>,
     body_class: &str,
@@ -1613,13 +1613,23 @@ fn build_body_join_sql(
 /// Search-Table join (issue #4) — the canonical shape from the issue: DocId IS
 /// MessageBodyId, and PropId must be resolved through Ens_Config.SearchTableProp
 /// first (PropId is only unique within one extent).
-fn build_search_table_sql(
+///
+/// `doc_classes` (#409) pins h.MessageBodyClassName the way the sibling
+/// `build_body_join_sql` already did. DocId is only unique within the document
+/// class's extent, so without the pin a custom body class whose numeric ID
+/// happens to collide with an indexed document's ID matches too. An EMPTY slice
+/// means the document class could not be resolved — the join is then emitted
+/// unpinned, exactly as before, and the caller is told so; it must never be
+/// turned into an impossible predicate, because zero rows would read as "no
+/// message matched".
+pub fn build_search_table_sql(
     limit: u32,
     mut filters: Vec<String>,
     extent_table: &str,
     prop_ids: &[i64],
     value: Option<&str>,
     value_like: Option<&str>,
+    doc_classes: &[String],
 ) -> String {
     let ids = prop_ids
         .iter()
@@ -1627,6 +1637,14 @@ fn build_search_table_sql(
         .collect::<Vec<_>>()
         .join(",");
     filters.push(format!("st.PropId IN ({ids})"));
+    if !doc_classes.is_empty() {
+        let list = doc_classes
+            .iter()
+            .map(|c| format!("'{}'", c.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(",");
+        filters.push(format!("h.MessageBodyClassName IN ({list})"));
+    }
     if let Some(v) = value {
         filters.push(format!("st.PropValue = '{}'", v.replace('\'', "''")));
     } else if let Some(v) = value_like {
@@ -1641,6 +1659,67 @@ fn build_search_table_sql(
         "SELECT TOP {limit} {header_cols}, st.PropValue FROM Ens.MessageHeader h JOIN {extent_table} st ON st.DocId = h.MessageBodyId WHERE {} ORDER BY h.ID DESC",
         filters.join(" AND ")
     )
+}
+
+/// What a caller is told when the extent's document class could not be resolved
+/// (#409). The search still answers — an impossible predicate would return zero
+/// rows, and zero rows read as "no message matched" — so the message has to say
+/// the guarantee is missing AND hand over the way to get it.
+pub fn unpinned_search_warning(extent: &str, ns: &str) -> String {
+    format!(
+        "Extent '{extent}' declares no DOCCLASS parameter that resolves to a compiled class in namespace '{ns}', so this search could NOT be constrained to the extent's document class. Rows whose MessageBodyClassName is a different class may be included: a Search Table DocId is unique only within its document class's extent. Pass message_class=<the body class you want> to constrain it yourself."
+    )
+}
+
+/// The document classes a Search-Table extent indexes (#409).
+///
+/// Every search-table family declares its document class as the `DOCCLASS` class
+/// parameter, and `%Dictionary.CompiledClass.PrimarySuper` is a `~`-delimited
+/// list that INCLUDES the class itself — so one LIKE returns DOCCLASS *and*
+/// every subclass of it, in a single round trip and with no HL7 special case.
+///
+/// Measured on IRIS for Health 2026.1 (`_Default`, not `Default` — that column
+/// name is reserved):
+///
+/// | extent | classes returned |
+/// |---|---|
+/// | `EnsLib.HL7.SearchTable` | 1 — `EnsLib.HL7.Message` |
+/// | `EnsLib.EDI.X12.SearchTable` | 1 — `EnsLib.EDI.X12.Document` |
+/// | `EnsLib.XML.SearchTable` | **5** — `Ens.StreamContainer` + 4 subclasses |
+/// | `Ens.MessageHeader` (no DOCCLASS) | 0 rows, not an error |
+///
+/// The XML row is why a bare `= DOCCLASS` is wrong: it would drop four real body
+/// classes. The last row is why `Ok(vec![])` must mean "cannot pin" and not
+/// "nothing matches".
+pub fn doc_class_family_sql(extent: &str) -> String {
+    let e = extent.replace('\'', "''");
+    format!(
+        "SELECT c.Name FROM %Dictionary.CompiledClass c, %Dictionary.CompiledParameter p WHERE p.parent = '{e}' AND p.Name = 'DOCCLASS' AND c.PrimarySuper LIKE '%~' || p._Default || '~%'"
+    )
+}
+
+/// Resolves [`doc_class_family_sql`]. An empty Vec is "could not resolve", which
+/// the caller reports rather than silently converting into an empty result.
+async fn resolve_doc_classes(
+    iris: &IrisConnection,
+    ns: &str,
+    client: &reqwest::Client,
+    extent: &str,
+) -> Result<Vec<String>, String> {
+    let resp = iris
+        .query(&doc_class_family_sql(extent), vec![], ns, client)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(resp["result"]["content"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| r["Name"].as_str())
+                .filter(|n| !n.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default())
 }
 
 /// SQL projection of a class via the dictionary (handles SqlTableName
@@ -1910,6 +1989,14 @@ pub async fn interop_message_search_impl(
                 )
             }
         };
+        // #409: pin the join to the extent's document class. DocId is unique only
+        // within that class's extent, so an unpinned join also matches bodies of
+        // OTHER classes whose numeric ID collides — which is what the sibling
+        // `build_body_join_sql` has always guarded against.
+        let doc_classes = match resolve_doc_classes(iris, ns, &client, &extent).await {
+            Ok(v) => v,
+            Err(e) => return err_json(net_err(&e), &e),
+        };
         let sql = build_search_table_sql(
             params.limit,
             header_filters(&params, "h."),
@@ -1917,6 +2004,7 @@ pub async fn interop_message_search_impl(
             &prop_ids,
             st.value.as_deref(),
             st.value_like.as_deref(),
+            &doc_classes,
         );
         return match iris.query(&sql, vec![], ns, &client).await {
             Ok(resp) => {
@@ -1930,6 +2018,15 @@ pub async fn interop_message_search_impl(
                     "prop_ids": prop_ids,
                     "sql": sql,
                 });
+                // #409: an unresolvable document class is reported, never hidden.
+                // Emitting an impossible predicate instead would answer the caller
+                // with zero rows, which reads as "no message matched".
+                if doc_classes.is_empty() {
+                    out["warning"] =
+                        serde_json::Value::String(unpinned_search_warning(&extent, ns));
+                } else {
+                    out["doc_classes"] = serde_json::json!(doc_classes);
+                }
                 if count == 0 {
                     // Issue #4: valid prop + zero rows is usually a config-time effect.
                     out["hint"] = serde_json::Value::String(
@@ -4810,6 +4907,7 @@ mod tests {
             &[4],
             Some("16284718"),
             None,
+            &["EnsLib.HL7.Message".to_string()],
         );
         assert!(sql.contains("JOIN EnsLib_HL7.SearchTable st ON st.DocId = h.MessageBodyId"));
         assert!(sql.contains("st.PropId IN (4)"));
@@ -4822,6 +4920,7 @@ mod tests {
             &[12, 14],
             None,
             Some("AMOX%"),
+            &[],
         );
         assert!(like.contains("st.PropId IN (12,14)"));
         assert!(like.contains("st.PropValue LIKE 'AMOX%'"));
