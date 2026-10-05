@@ -3258,6 +3258,34 @@ pub async fn list_iris_containers_pub(workspace_basename: &str) -> Vec<serde_jso
     list_iris_containers(workspace_basename).await
 }
 
+/// Take `limit` rows and say whether more were available.
+///
+/// #398: `iris_symbols` and `iris_doc_search` returned a capped list with `count` equal to the
+/// number returned and nothing distinguishing a complete answer from a truncated one. Measured in
+/// namespace USER: `iris_symbols(query="Ens*")` returned 20 with `count: 20` while 1518 classes
+/// match in `%Dictionary.ClassDefinition`, and `iris_doc_search(term="string")` returned 20 of 133.
+/// So `count: 20` meant "20 matched" and "20 of 1518 matched" identically.
+///
+/// The cap itself was documented and is not the problem — `iris_doc_search`'s `limit` schema even
+/// gives a rationale ("a documentation search is for orienting"). The problem was the response.
+/// `iris_lookup_manage(list_tables)` and `iris_credential_list` both already carry `truncated` and
+/// report it even when false, so a caller can always tell; these searches were the outliers.
+///
+/// The probe row is why no second query is needed: ask for `limit + 1`, and if that extra row comes
+/// back there is at least one more match. `doc_search`'s own comment makes the case for the zero
+/// end of this — "a real zero is a real answer, but it is also the point at which a caller needs to
+/// know what was and was NOT searched" — and a truncated list is the same argument at the other end.
+pub fn take_with_truncation<T>(mut rows: Vec<T>, limit: usize) -> (Vec<T>, bool) {
+    let truncated = rows.len() > limit;
+    rows.truncate(limit);
+    (rows, truncated)
+}
+
+/// The row count to ASK for when `limit` rows are wanted, so truncation is detectable.
+pub fn probe_limit(limit: usize) -> usize {
+    limit.saturating_add(1)
+}
+
 /// Translate an iris_symbols query string into a SQL fragment and parameters.
 /// Supports: plain substring, `Pkg.*` prefix, `Pkg.` trailing dot, mid-glob `Pkg.*.Name`, bare `*`.
 pub fn translate_symbols_query(limit: usize, query: &str) -> (String, Vec<serde_json::Value>) {
@@ -4328,6 +4356,42 @@ fn library_frame_hint(abort: &str) -> Option<&'static str> {
     None
 }
 
+/// #323: attach the decoded `%Status` chain to an `iris_execute` payload.
+///
+/// The model hand-writes this decode on every call — 785 of them across 364 transcripts, and the
+/// largest single failure cluster in the workshop cohort. `$SYSTEM.Status.GetErrorText` returns the
+/// whole chain CRLF-joined (measured on IRIS 2026.1; the issue's claim that it reads only the first
+/// element is wrong), so nothing is lost today — but it arrives as one string with no per-error
+/// code, so a caller wanting a remedy for error 6301 has to match a substring of a concatenation.
+/// [`crate::status::decode_chain`] splits it once, here.
+///
+/// **Strictly additive.** It writes exactly one key and only when a chain was recognised:
+///
+/// * `success` is still decided by [`runtime_abort_line`] alone, so a script that PRINTS the words
+///   "ERROR #5002" while succeeding still succeeds — it just also carries the block.
+/// * `output` is untouched, so the caller can still read what was actually printed.
+/// * `hint` is untouched: the slot is contended (#185) and this has no advice to give.
+/// * A recognised chain is by construction an ERROR chain — `GetErrorText` on an OK status returns
+///   "" — so nothing here can produce `ok: true`, and the ABSENCE of the block is not a claim that
+///   the script's status was OK. This path sees only what a script chose to write; it cannot tell
+///   an OK status from no status at all. `iris_execute_method`, which reads IRIS's own `$$$ISOK`,
+///   is the path where `ok: true` is a measured fact (see `execute_method::status_block`).
+///
+/// One function called from both transports, because the same call must not come back structured
+/// over HTTP and unstructured over docker exec — the #105 shape, where a second copy of a path
+/// quietly kept the old behaviour.
+///
+/// Returns whether a block was attached, so a caller can assert on it.
+pub(crate) fn attach_status_chain(resp: &mut serde_json::Value, output: &str) -> bool {
+    match crate::status::decode_chain(output).payload() {
+        Some(status) => {
+            resp["status"] = status;
+            true
+        }
+        None => false,
+    }
+}
+
 fn abort_hint(abort: &str) -> Option<&'static str> {
     // #209: known library frames first — they only match when there is no RunUser+ frame,
     // so this cannot take the slot from a per-line explanation.
@@ -4405,6 +4469,82 @@ pub struct IrisTools {
 /// every `action`/`mode` value its `matches!` arms name, and `force` for `iris_query`. Kept beside it
 /// on purpose: a new write arm means a new probe, and `the_probe_battery_detects_every_write_arm`
 /// fails until one is added.
+/// #303: which tools STRICT read-only refuses, and — the part that matters — which SOFT still
+/// allows.
+#[cfg(test)]
+mod strict_read_only_tests {
+    use super::*;
+    use crate::iris::connection::ReadOnlyMode;
+
+    #[test]
+    fn strict_refuses_every_tool_that_answers_by_writing_a_scratch_class() {
+        // CONTROL first: a loop over an empty list asserts nothing, and this list has changed twice
+        // (#343 added iris_gateway_manage, #282 removed two once their reads stopped needing a
+        // generator), so its size is not a constant to hard-code. Derived, never restated.
+        assert!(
+            GENERATOR_WRITE_TOOLS.len() >= 5,
+            "the scratch-class list collapsed to {} entries — this loop would pass vacuously",
+            GENERATOR_WRITE_TOOLS.len()
+        );
+        for tool in GENERATOR_WRITE_TOOLS {
+            assert!(
+                strict_refuses_scratch_write(ReadOnlyMode::Strict, tool),
+                "strict must refuse {tool}: it answers by writing a class to IrisDevTmp"
+            );
+        }
+        eprintln!(
+            "strict refuses {} scratch-class tools: {:?}",
+            GENERATOR_WRITE_TOOLS.len(),
+            GENERATOR_WRITE_TOOLS
+        );
+    }
+
+    #[test]
+    fn soft_allows_every_one_of_them() {
+        // THE CONTROL for the test above, and the reason two levels exist at all. "Strict refuses
+        // these" is equally satisfied by a build where nothing works; only this separates the two.
+        // If this ever goes red, soft has silently become strict and the useful level is gone.
+        for tool in GENERATOR_WRITE_TOOLS {
+            assert!(
+                !strict_refuses_scratch_write(ReadOnlyMode::Soft, tool),
+                "soft must still allow {tool} — refusing it here collapses the two levels into one"
+            );
+        }
+    }
+
+    #[test]
+    fn no_level_refuses_a_tool_that_needs_no_scratch_class() {
+        // A read that reaches its data through plain SQL or Atelier is untouched by either level.
+        // iris_doc is the sharpest case: its `put` mode mutates and is gated by `mutating_call`,
+        // but it does not write a SCRATCH class, so this refusal must not be what stops it — two
+        // separate mechanisms, and conflating them would refuse reads under soft.
+        for tool in [
+            "iris_query",
+            "check_config",
+            "iris_doc",
+            "iris_symbols",
+            "iris_get_log",
+        ] {
+            for mode in [ReadOnlyMode::Off, ReadOnlyMode::Soft, ReadOnlyMode::Strict] {
+                assert!(
+                    !strict_refuses_scratch_write(mode, tool),
+                    "{tool} writes no scratch class; {mode:?} must not refuse it here"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nothing_is_refused_when_no_level_was_requested() {
+        for tool in GENERATOR_WRITE_TOOLS {
+            assert!(
+                !strict_refuses_scratch_write(ReadOnlyMode::Off, tool),
+                "{tool} must be unaffected when read-only was never requested — #303 is additive"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) const MUTATING_PROBES_SRC: &[&str] = &[
     "put",
@@ -4529,6 +4669,20 @@ const GENERATOR_WRITE_TOOLS: &[&str] = &[
 /// [`GENERATOR_WRITE_TOOLS`] for why this is separate from `tool_can_mutate`.
 pub(crate) fn tool_writes_via_generator(tool: &str) -> bool {
     GENERATOR_WRITE_TOOLS.contains(&tool)
+}
+
+/// #303: whether STRICT read-only refuses `tool` because answering it writes a scratch class.
+///
+/// Pure, and used by BOTH the advertised-list filter and the call-time refusal, so the two cannot
+/// drift into disagreeing about which tools exist. Taking the mode as an argument rather than
+/// reading it is what lets the SOFT case be asserted as a control: "strict refuses these ten" is
+/// also satisfied by a build where nothing works, and only "soft still allows them" separates the
+/// two.
+pub(crate) fn strict_refuses_scratch_write(
+    mode: crate::iris::connection::ReadOnlyMode,
+    tool: &str,
+) -> bool {
+    mode == crate::iris::connection::ReadOnlyMode::Strict && tool_writes_via_generator(tool)
 }
 
 /// Attach `readOnlyHint` to one advertised tool.
@@ -4875,7 +5029,28 @@ impl IrisTools {
     /// integration point was the one thing not covered, and it is the only part a client sees.
     /// `list_tools` needs a `RequestContext` to call, which is why the loop lives here instead.
     pub fn advertised_tools(&self) -> Vec<rmcp::model::Tool> {
+        self.advertised_tools_with(crate::iris::connection::read_only_mode())
+    }
+
+    /// `advertised_tools` with the read-only level supplied rather than read.
+    ///
+    /// #303: the level is cached for the life of the process, so no in-process test can vary it —
+    /// which would leave the one line that actually removes the tools untested, and a deleted
+    /// `retain` looks exactly like a working filter when the level is `Off`. Taking it as an
+    /// argument is what lets the STRICT and SOFT surfaces be compared directly.
+    pub(crate) fn advertised_tools_with(
+        &self,
+        requested: crate::iris::connection::ReadOnlyMode,
+    ) -> Vec<rmcp::model::Tool> {
         let mut tools = self.tool_router.list_all();
+        // #303: under an explicit STRICT request, the tools that write a scratch class to answer are
+        // not offered. This deliberately differs from the inferred write gate, which prunes nothing
+        // (see `call_tool`) because it follows the CURRENT connection and a tool hidden by a
+        // heuristic that may flip is worse friction than a refusal. A mode read from the
+        // environment at startup cannot flip, so hiding is stable — and a model does not reach for
+        // a tool it cannot see. The refusal in `call_tool` is still the boundary: a client may call
+        // a tool that was never advertised.
+        tools.retain(|t| !strict_refuses_scratch_write(requested, &t.name));
         for tool in tools.iter_mut() {
             let schema = std::sync::Arc::make_mut(&mut tool.input_schema);
             normalize_schema_openapi3(schema);
@@ -6451,13 +6626,15 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
 
         let mut classes = Vec::new();
         let mut methods = Vec::new();
+        // #398: true when either list hit the cap, so a caller can tell 20-of-133 from 20-of-20.
+        let mut truncated = false;
         // Classes first: cheap in every case, and the answer to "which class does X" more often than a
         // method description is.
         if matches!(
             scope,
             doc_search::DocScope::Classes | doc_search::DocScope::Both
         ) {
-            let sql = doc_search::class_sql(&p.term, p.within.as_deref(), limit);
+            let sql = doc_search::class_sql(&p.term, p.within.as_deref(), probe_limit(limit));
             match iris.query(&sql, vec![], &namespace, client).await {
                 Err(e) => {
                     self.record_call("iris_doc_search", false);
@@ -6468,6 +6645,8 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                         .as_array()
                         .cloned()
                         .unwrap_or_default();
+                    let (rows, more) = take_with_truncation(rows, limit);
+                    truncated = truncated || more;
                     classes = doc_search::hits_from_rows(&rows, false, &p.term, width);
                 }
             }
@@ -6475,7 +6654,7 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
         if scope.needs_scope() {
             // `validate` has already refused an absent or blank `within`, so this cannot run unscoped.
             let within = p.within.as_deref().unwrap_or_default();
-            let sql = doc_search::method_sql(&p.term, within, limit);
+            let sql = doc_search::method_sql(&p.term, within, probe_limit(limit));
             match iris.query(&sql, vec![], &namespace, client).await {
                 Err(e) => {
                     self.record_call("iris_doc_search", false);
@@ -6486,6 +6665,8 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                         .as_array()
                         .cloned()
                         .unwrap_or_default();
+                    let (rows, more) = take_with_truncation(rows, limit);
+                    truncated = truncated || more;
                     methods = doc_search::hits_from_rows(&rows, true, &p.term, width);
                 }
             }
@@ -6501,6 +6682,7 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
             "classes": classes,
             "methods": methods,
             "count": total,
+            "truncated": truncated,
         });
         // A real zero is a real answer, but it is also the point at which a caller needs to know what
         // was and was NOT searched — otherwise "nothing found" reads as "nothing exists".
@@ -6610,7 +6792,7 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
     }
 
     #[tool(
-        description = "Execute arbitrary ObjectScript code on IRIS and return stdout. Uses pure-HTTP execution: your code is written into the RunUser() method of a temp class, compiled, run at CALL time by an Execute() SqlProc that captures the device output, then the class is deleted. Falls back to docker exec if IRIS_CONTAINER env var is set and HTTP fails. &sql(...) embedded SQL macros are automatically translated to %SQL.Statement calls (set translate_sql: false to disable). When translation fires, response includes sql_translated: true and translated_code. Example: code='write $ZVERSION,!' returns the IRIS version string. Use this for side-effecting ObjectScript only — for SELECTs use iris_query, for class/table introspection use docs_introspect/iris_symbols/iris_table_info, for production state use iris_production/iris_interop_query, and to create+compile a class use iris_doc(put,compile) over Atelier (never $SYSTEM.OBJ.Load from a file path — that needs IRIS to share this host's disk). When the code matches one of those, the response includes a `hint` naming the typed tool. namespace: optional — defaults to the connection namespace (IRIS_NAMESPACE), never a hardcoded USER; the response echoes the namespace it ran in."
+        description = "Execute arbitrary ObjectScript code on IRIS and return stdout. Uses pure-HTTP execution: your code is written into the RunUser() method of a temp class, compiled, run at CALL time by an Execute() SqlProc that captures the device output, then the class is deleted. Falls back to docker exec if IRIS_CONTAINER env var is set and HTTP fails. &sql(...) embedded SQL macros are automatically translated to %SQL.Statement calls (set translate_sql: false to disable). When translation fires, response includes sql_translated: true and translated_code. Example: code='write $ZVERSION,!' returns the IRIS version string. Use this for side-effecting ObjectScript only — for SELECTs use iris_query, for class/table introspection use docs_introspect/iris_symbols/iris_table_info, for production state use iris_production/iris_interop_query, and to create+compile a class use iris_doc(put,compile) over Atelier (never $SYSTEM.OBJ.Load from a file path — that needs IRIS to share this host's disk). When the code matches one of those, the response includes a `hint` naming the typed tool. When your code writes a %Status (`write $SYSTEM.Status.GetErrorText(sc)`), the response also carries `status`: that chain split into per-error {code, text}, so you never split it or re-parse the `ERROR #NNNN:` prefix yourself — `status.complete: false` means part of it did not decode and `status.undecoded` holds it verbatim. No `status` key means no %Status text was found in the output, which is NOT a claim that a status was OK. This tool can only decode a status your code actually writes, so for a ClassMethod that returns one prefer iris_execute_method, which reads the status itself. namespace: optional — defaults to the connection namespace (IRIS_NAMESPACE), never a hardcoded USER; the response echoes the namespace it ran in."
     )]
     async fn iris_execute(
         &self,
@@ -6675,6 +6857,7 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                     "namespace": namespace,
                     "method": "http",
                 });
+                attach_status_chain(&mut resp, trimmed);
                 if let Some(abort) = abort {
                     resp["error_code"] = serde_json::Value::String("IRIS_RUNTIME_ERROR".into());
                     if let Some(h) = abort_hint(abort) {
@@ -6813,6 +6996,7 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                     "namespace": namespace,
                     "method": "docker",
                 });
+                attach_status_chain(&mut resp, trimmed);
                 if let Some(abort) = abort {
                     resp["error_code"] = serde_json::Value::String("IRIS_RUNTIME_ERROR".into());
                     if let Some(h) = abort_hint(abort) {
@@ -6848,7 +7032,7 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
     }
 
     #[tool(
-        description = "Read, write, delete, or check an IRIS document. mode='get' fetches source, mode='put' writes (with automatic SCM checkout if needed), mode='delete' removes, mode='head' checks existence. POSITIONAL EDITS instead of a full re-upload: mode='insert_lines' inserts `lines` BEFORE the 1-based line `at` (at = one past the last line appends), and mode='delete_lines' removes `count` lines (default 1) starting at `at`. Both READ the document, edit it and write it back, so they are write-gated exactly like put. `expect` is the text you believe is currently at `at`: REQUIRED for delete_lines and refused on mismatch, because your line numbers came from an earlier read and a delete on the wrong line destroys content — optional for insert_lines, which loses nothing if misplaced. One operation per call: after an edit the lines below it have shifted, and the response returns the new count in `line_edit.lines_after` so you can place the next one. name needs the Atelier type suffix — 'MyApp.Patient.cls', not 'MyApp.Patient' (put adds it for you when the content starts with `Class <name>` or `ROUTINE <name>`). Batch via the 'names' array is supported by mode='get' and mode='delete' ONLY — put writes one document per call and refuses a 'names' array rather than discarding it. elicitation_id/elicitation_answer resume an SCM dialog. For large source, paginate get with max_bytes + offset (response includes next_offset), or prefer docs_introspect for signatures/structure instead of full source. With compile=true, compile_errors is cross-checked against IRIS's own `Detected N errors` tally — `errors_incomplete: true` means the list is a SUBSET and `compile_console` holds the rest. No Python required."
+        description = "Read, write, delete, or check an IRIS document. mode='get' fetches source, mode='put' writes (with automatic SCM checkout if needed), mode='delete' removes, mode='head' checks existence. POSITIONAL EDITS instead of a full re-upload: mode='insert_lines' inserts `lines` BEFORE the 1-based line `at` (at = one past the last line appends), and mode='delete_lines' removes `count` lines (default 1) starting at `at`. Both READ the document, edit it and write it back, so they are write-gated exactly like put. `expect` is the text you believe is currently at `at`: REQUIRED for delete_lines and refused on mismatch, because your line numbers came from an earlier read and a delete on the wrong line destroys content — optional for insert_lines, which loses nothing if misplaced. One operation per call: after an edit the lines below it have shifted, and the response returns the new count in `line_edit.lines_after` so you can place the next one. name needs the Atelier type suffix — 'MyApp.Patient.cls', not 'MyApp.Patient' (put adds it for you when the content starts with `Class <name>` or `ROUTINE <name>`). Batch via the 'names' array is supported by mode='get' and mode='delete' ONLY — put writes one document per call and refuses a 'names' array rather than discarding it. elicitation_id/elicitation_answer resume an SCM dialog. For large source, paginate get with max_bytes + offset (response includes next_offset), or prefer docs_introspect for signatures/structure instead of full source. With compile=true, compile_errors is cross-checked against IRIS's own `Detected N errors` tally — `errors_incomplete: true` means the list is a SUBSET and `compile_console` holds the rest. Every write reports both `compiled` and `compile_requested`, so a class nobody asked to compile is distinguishable from one whose compile failed. `test: '<%UnitTest class>'` runs that suite in the SAME call once the class has compiled (needs compile=true) — the result arrives under `test` with `test_ok` beside it, the write's own `success` is never overwritten by it, and if the test did not run `test_skipped` says why. No Python required."
     )]
     async fn iris_doc(
         &self,
@@ -6858,6 +7042,10 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
         let namespace = interop::resolve_namespace(p.namespace.as_deref(), Some(&iris));
         tracing::info!(namespace = %namespace, "iris_doc");
         let client = self.http_client();
+        // #327 item 2: `p` moves into the handler, so what the caller asked to test is captured
+        // first. 579 of the measured `iris_doc(put)` calls are followed immediately by `iris_test`.
+        let want_test = p.test.clone();
+        let test_namespace = p.namespace.clone();
         let result = doc::handle_iris_doc(
             &iris,
             client,
@@ -6867,7 +7055,88 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
         )
         .await;
         self.record_call("iris_doc", Self::call_ok(&result));
-        result
+        self.run_test_after_doc(want_test.as_deref(), test_namespace.as_deref(), result)
+            .await
+    }
+
+    /// #327 item 2: run the `test` a `iris_doc` call asked for, once the write has COMPILED.
+    ///
+    /// Sequenced here rather than inside `doc::handle_iris_doc` because running a `%UnitTest` suite
+    /// is `iris_test`'s whole 600-line job — polling, the result query, the per-case shaping (#233,
+    /// #273). Re-implementing it beside the writer would be a second copy that drifts; calling the
+    /// tool means the two paths cannot disagree about what a red test looks like.
+    ///
+    /// A failed write is returned EXACTLY as it came back. Its envelope already carries what the
+    /// caller must act on — a compile error, an SCM elicitation, a refusal — and rebuilding it to
+    /// add a note about a test that did not run would risk dropping the `isError` flag and hints
+    /// that are the actual answer.
+    async fn run_test_after_doc(
+        &self,
+        want_test: Option<&str>,
+        namespace: Option<&str>,
+        result: Result<CallToolResult, McpError>,
+    ) -> Result<CallToolResult, McpError> {
+        let Ok(ref ok) = result else { return result };
+        let payload = ok
+            .content
+            .first()
+            .and_then(|c| c.raw.as_text())
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t.text).ok());
+        match doc::test_gate(want_test, payload.as_ref()) {
+            doc::TestGate::NotRequested => result,
+            // The write failed: hand its own envelope back untouched.
+            doc::TestGate::SkippedCallFailed => result,
+            gate @ doc::TestGate::SkippedNotCompiled { .. } => {
+                let mut payload = match payload {
+                    Some(v) => v,
+                    None => return result,
+                };
+                if let Some(reason) = gate.skipped_reason() {
+                    payload["test_skipped"] = serde_json::Value::String(reason);
+                }
+                ok_json(payload)
+            }
+            doc::TestGate::Run(pattern) => {
+                let mut payload = match payload {
+                    Some(v) => v,
+                    None => return result,
+                };
+                let mut args = serde_json::json!({ "pattern": pattern });
+                if let Some(ns) = namespace {
+                    args["namespace"] = serde_json::Value::String(ns.to_string());
+                }
+                let run = self.iris_test(Parameters(Described::new(args))).await;
+                match run {
+                    Ok(r) => {
+                        let body = r
+                            .content
+                            .first()
+                            .and_then(|c| c.raw.as_text())
+                            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t.text).ok());
+                        match body {
+                            Some(b) => doc::attach_test_result(&mut payload, &pattern, b),
+                            // The run produced a result this code cannot read. Say that, rather
+                            // than leaving the caller to read the absence of `test` as a pass.
+                            None => {
+                                payload["test_pattern"] =
+                                    serde_json::Value::String(pattern.clone());
+                                payload["test_skipped"] = serde_json::Value::String(
+                                    "the test ran but its result could not be parsed — call \
+                                     iris_test directly to see it."
+                                        .into(),
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        payload["test_pattern"] = serde_json::Value::String(pattern.clone());
+                        payload["test_skipped"] =
+                            format!("the test could not be started: {e}").into();
+                    }
+                }
+                ok_json(payload)
+            }
+        }
     }
 
     #[tool(
@@ -7438,6 +7707,12 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                 .map(|c| self.write_gate_open(c))
                 .unwrap_or(conn.write_tools_enabled),
             "write_gate_latched": self.write_gate_is_latched(),
+            // #303: WHY the gate is shut, which `write_tools_enabled: false` alone cannot say —
+            // a Live instance and an explicit request look identical through that flag, and only
+            // one of them can be lifted. "strict" additionally means the scratch-class readers are
+            // refused and absent from the advertised list, so a caller comparing tool counts has
+            // the reason rather than a mystery.
+            "read_only_requested": crate::iris::connection::read_only_mode().as_str(),
             "config_watch_path": config_watcher_path,
             // The MCP server's OWN version + active toolset, so the loaded build can be validated
             // from a tool call (the serverInfo version shown by Claude Code's /mcp is the same value).
@@ -7453,6 +7728,27 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
         // non-explicit source came from Docker/port-scan discovery, which can silently
         // target the wrong instance (issue #21, upstream #82).
         let is_explicit = conn.source.is_explicit();
+
+        // #410: the COMPLEMENT of the fallback_warning below. That one covers
+        // `config_file.is_none() && !is_explicit`; this covers the other half of the same
+        // partition — an explicit flag/env won, and a config file is sitting at the watched
+        // path being ignored. Only one branch of the partition had a warning, so the state
+        // the reporter hit was reported as three unconnected fields.
+        if let Some(p) = crate::iris::workspace_config::ignored_config_path(
+            conn.config_file.as_deref(),
+            is_explicit,
+            response["config_watch_path"].as_str(),
+        ) {
+            let src = response["connection_source"]
+                .as_str()
+                .unwrap_or("an explicit flag or environment variable")
+                .to_string();
+            response["config_file_warning"] = serde_json::Value::String(
+                crate::iris::workspace_config::ignored_config_warning(&p, &src),
+            );
+            response["config_file_ignored"] = serde_json::Value::String(p);
+        }
+
         if conn.config_file.is_none() && !is_explicit && conn.iris.is_some() {
             response["fallback_warning"] = serde_json::Value::String(
                 "No .iris-agentic-dev.toml config file found. Connection established via \
@@ -7552,15 +7848,25 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
     ) -> Result<CallToolResult, McpError> {
         let iris = self.get_iris_reloaded().await?;
         let client = self.http_client();
-        let (sql, params) = translate_symbols_query(p.limit, &p.query);
+        // #398: ask for one more than wanted, so a truncated answer can say so.
+        let (sql, params) = translate_symbols_query(probe_limit(p.limit), &p.query);
         let namespace = interop::resolve_namespace(p.namespace.as_deref(), Some(&iris));
         match iris.query(&sql, params, &namespace, client).await {
-            Ok(resp) => ok_json(serde_json::json!({
-                "source": "iris_dictionary",
-                "symbols": resp["result"]["content"],
-                "count": resp["result"]["content"].as_array().map(|a| a.len()).unwrap_or(0),
-                "query_hint": "Supports: plain text (substring), 'Pkg.*' (package prefix), 'Pkg.*.Name' (glob)",
-            })),
+            Ok(resp) => {
+                let rows = resp["result"]["content"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                let (symbols, truncated) = take_with_truncation(rows, p.limit);
+                let count = symbols.len();
+                ok_json(serde_json::json!({
+                    "source": "iris_dictionary",
+                    "symbols": symbols,
+                    "count": count,
+                    "truncated": truncated,
+                    "query_hint": "Supports: plain text (substring), 'Pkg.*' (package prefix), 'Pkg.*.Name' (glob)",
+                }))
+            }
             Err(e) => {
                 // #102: this said IRIS_UNREACHABLE for BOTH a missing namespace and a wrong
                 // password — and, because `query_once` never looked at the status, the message
@@ -7623,10 +7929,11 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
             );
         }
 
-        let result = symbols_local::scan_workspace(&workspace, &p.query, limit);
+        // #398: scan for one more than wanted so a capped scan can say it was capped.
+        let result = symbols_local::scan_workspace(&workspace, &p.query, probe_limit(limit));
 
-        let symbols_json: Vec<serde_json::Value> = result
-            .symbols
+        let (scanned, local_truncated) = take_with_truncation(result.symbols, limit);
+        let symbols_json: Vec<serde_json::Value> = scanned
             .iter()
             .map(|s| serde_json::to_value(s).unwrap_or_default())
             .collect();
@@ -7641,6 +7948,7 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
             "source": "local_filesystem",
             "symbols": symbols_json,
             "count": count,
+            "truncated": local_truncated,
             "query_hint": "Supports: plain text (exact), 'Pkg.*' (package prefix), '*Suffix' (suffix), 'Pkg.*.Name' (glob)",
             "parse_warnings": warnings_json,
         }))
@@ -8524,7 +8832,7 @@ Methods:
     }
 
     #[tool(
-        description = "Invoke a ClassMethod directly by class + method + positional args, with no wrapper class to write. Returns the return value AND, for a method declared to return %Status, the decoded verdict (status_ok plus status_text) — so a failed status does not arrive as an opaque string. The method's declared return type drives the call: a method returning nothing is invoked without reading a value, an object comes back as its class name, and a value reported shorter than IRIS measured it is refused rather than returned incomplete. Runs arbitrary code, so it is write-gated exactly like iris_execute. Use iris_query for SELECTs and iris_doc(put,compile) to create a class. namespace: optional — defaults to the connection namespace (IRIS_NAMESPACE)."
+        description = "Invoke a ClassMethod directly by class + method + positional args, with no wrapper class to write. Returns the return value AND, for a method declared to return %Status, the decoded verdict (status_ok plus status_text) — so a failed status does not arrive as an opaque string. The chain also arrives structured as `status`: {ok, errors:[{code, text}]}, one entry per error, so you key a remedy on the error NUMBER instead of matching a substring of the joined text; `status.ok` comes from IRIS's own $$$ISOK, not from failing to find an error in the text. The method's declared return type drives the call: a method returning nothing is invoked without reading a value, an object comes back as its class name, and a value reported shorter than IRIS measured it is refused rather than returned incomplete. Runs arbitrary code, so it is write-gated exactly like iris_execute. Use iris_query for SELECTs and iris_doc(put,compile) to create a class. namespace: optional — defaults to the connection namespace (IRIS_NAMESPACE)."
     )]
     async fn iris_execute_method(
         &self,
@@ -8901,7 +9209,7 @@ Methods:
     }
 
     #[tool(
-        description = "Interoperability query dispatcher (merged). what (REQUIRED): logs=Event Log entries, queues=message queue depths, messages=message archive (Ens.MessageHeader), trace=ALL of one session (MessageHeader chain + Event Log events) by session_id, partners=configured Ens.Config.BusinessPartner rows. Filters: component=<config item> and session_id=<n> narrow logs/messages to one item/session; since_id=<n> tails only rows after a watermark (no MAX(ID) round-trip). what=messages can also search message CONTENT — the typed replacement for hand SQL against Ens.MessageHeader: (a) body_class=<msg class> + body_where=<SQL fragment on the body table> + body_select=[cols] joins the body table server-side (SQL name resolved for you); (b) search_table={prop, value|value_like, class?, extent?} searches an indexed Search Table field (extent default EnsLib.HL7.SearchTable; errors list the searchable props). Pass namespace=<production namespace> for a specific interop namespace (defaults to the connection's). SQL Gateway connections ARE in a table, just not one named after the class: iris_query(query=\"SELECT * FROM %Library.sys_SQLConnection\")."
+        description = "Interoperability query dispatcher (merged). what (REQUIRED): logs=Event Log entries, queues=message queue depths, messages=message archive (Ens.MessageHeader), trace=ALL of one session (MessageHeader chain + Event Log events) by session_id, partners=configured Ens.Config.BusinessPartner rows. Filters: log_type=<assert|error|warning|info|trace|alert, comma-separated, default error,warning> selects Event Log severities by IRIS's own names and refuses a word it does not know rather than returning everything unfiltered; component=<config item> and session_id=<n> narrow logs/messages to one item/session; since_id=<n> tails only rows after a watermark (no MAX(ID) round-trip). what=messages can also search message CONTENT — the typed replacement for hand SQL against Ens.MessageHeader: (a) body_class=<msg class> + body_where=<SQL fragment on the body table> + body_select=[cols] joins the body table server-side (SQL name resolved for you); (b) search_table={prop, value|value_like, class?, extent?} searches an indexed Search Table field (extent default EnsLib.HL7.SearchTable; errors list the searchable props). Pass namespace=<production namespace> for a specific interop namespace (defaults to the connection's). SQL Gateway connections ARE in a table, just not one named after the class: iris_query(query=\"SELECT * FROM %Library.sys_SQLConnection\")."
     )]
     async fn iris_interop_query(
         &self,
@@ -9130,7 +9438,7 @@ Methods:
     // ─── 024-interop-depth: Production item control (US1) ───
 
     #[tool(
-        description = "Add, remove, enable, disable, or inspect/modify settings of an Interoperability production config item — the typed way to build/manipulate a production without hand-rolling ##class(Ens.Config.*) ObjectScript. action: add|remove|enable|disable|get_settings|set_settings. item: exact config item name. For add: class_name (the BS/BO/BP/adapter class the item runs, required), optional enabled (default true), production (defaults to the running one), pool_size, category, and settings (key-value; prefix a key with 'Adapter.' to target the adapter, e.g. 'Adapter.FilePath', otherwise it targets the Host). For remove: item (+ optional production). settings: key-value map for set_settings. namespace: optional — defaults to the connection namespace (IRIS_NAMESPACE); must be an interop-enabled namespace, and it is the parameter that matters when an item is 'not found'. Changes apply live via Ens.Director.UpdateProduction when the target production is running (set_settings honours apply=false to batch). Works via HTTP, no Docker required."
+        description = "Add, remove, enable, disable, or inspect/modify settings of an Interoperability production config item — the typed way to build/manipulate a production without hand-rolling ##class(Ens.Config.*) ObjectScript. action: add|remove|enable|disable|get_settings|set_settings. item: exact config item name. action=get_settings also takes items: ['A','B'] and reads them all in ONE round trip — the response then carries results[] with one entry per item, missing[] naming any the production does not hold, and all_found. Every other action addresses a single item and refuses a list of more than one rather than acting on the first. For add: class_name (the BS/BO/BP/adapter class the item runs, required), optional enabled (default true), production (defaults to the running one), pool_size, category, and settings (key-value; prefix a key with 'Adapter.' to target the adapter, e.g. 'Adapter.FilePath', otherwise it targets the Host). For remove: item (+ optional production). settings: key-value map for set_settings. namespace: optional — defaults to the connection namespace (IRIS_NAMESPACE); must be an interop-enabled namespace, and it is the parameter that matters when an item is 'not found'. Changes apply live via Ens.Director.UpdateProduction when the target production is running (set_settings honours apply=false to batch). Works via HTTP, no Docker required."
     )]
     async fn iris_production_item(
         &self,
@@ -9145,6 +9453,19 @@ Methods:
         // tool accepts for the PRODUCTION name — sent "" into FindItemByConfigName and
         // got a raw <SUBSCRIPT>. One reader, every spelling; the impl refuses blank.
         let item = interop::item_name_arg(&p).unwrap_or_default();
+        // #327 item 3: every name this call addresses. `item` first, then `items` — a caller who
+        // passes both means both, and nothing is discarded.
+        let all_items = interop::item_names_arg(&p);
+        // Did the CALLER pass a list, as opposed to a single `item` that `item_names_arg` folded in?
+        let list_given = interop::list_parameter_given(&p);
+        // A caller who named exactly one item in `items` and nothing in `item` named one item. Every
+        // action can act on that, so it is filled in rather than refused for the absence of a
+        // spelling the caller had no reason to prefer.
+        let item = if item.is_empty() && all_items.len() == 1 {
+            all_items[0].clone()
+        } else {
+            item
+        };
         let _iris_arc_hold = self.iris_arc();
         let namespace = interop::resolve_namespace(
             p.get("namespace").and_then(|v| v.as_str()),
@@ -9182,11 +9503,28 @@ Methods:
             .get("category")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        // #327 item 3: only get_settings reads a list. On every other action a list of more than
+        // one name would be acted on for the first and the rest silently dropped — the partial-write
+        // shape `require_name` records in doc.rs. Refuse and name the action that does take one.
+        if let Some(why) = interop::list_refused_for_action(&action, &all_items) {
+            self.record_call("iris_production_item", false);
+            return envelope::fail_with(
+                "INVALID_PARAMS",
+                &why,
+                serde_json::json!({"action": action, "items": all_items}),
+            );
+        }
         let result = interop::interop_production_item_impl(
             self.iris_arc().as_deref(),
             interop::ProductionItemParams {
                 action,
                 item,
+                // ONLY what a list parameter carried. `item_names_arg` unions the single `item` in,
+                // which is right for the >1 refusal above but wrong here: `items` non-empty is what
+                // selects the batch RESPONSE shape, so threading the union through gave every
+                // single-item caller the new shape. Measured against a live production — the
+                // pure-function test could not see it, because it sets the flag by hand.
+                items: if list_given { all_items } else { Vec::new() },
                 namespace,
                 settings,
                 apply,
@@ -9281,11 +9619,12 @@ Methods:
         let result = interop::handle_iris_business_rule_info(
             iris_opt,
             &interop::BusinessRuleInfoParams {
-                action: p
-                    .get("action")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("list")
-                    .to_string(),
+                // NOT `unwrap_or("list")`: the list path does not read `rule_name`, so that
+                // default silently discarded a name the caller supplied. See `rule_action_for`.
+                action: interop::rule_action_for(
+                    p.get("action").and_then(|v| v.as_str()),
+                    p.get("rule_name").and_then(|v| v.as_str()),
+                ),
                 rule_name: p
                     .get("rule_name")
                     .and_then(|v| v.as_str())
@@ -9680,6 +10019,13 @@ impl ServerHandler for IrisTools {
                 return Err(self.write_gated_error(&request.name, action));
             }
         }
+        // #303: STRICT additionally refuses the tools that answer by writing a scratch class. They
+        // are read-only in INTENT and `mutating_call` does not cover them, which is exactly why a
+        // closed write gate was never a guarantee that nothing is written. Refused here as well as
+        // hidden from `advertised_tools`, because a client can call a tool that was never offered.
+        if strict_refuses_scratch_write(crate::iris::connection::read_only_mode(), &request.name) {
+            return Err(self.scratch_write_blocked_error(&request.name));
+        }
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         self.tool_router.call(tcc).await
     }
@@ -9720,28 +10066,84 @@ impl IrisTools {
                 None => ("Unknown".to_string(), String::new()),
             }
         };
+        let requested = crate::iris::connection::read_only_mode();
         // Operator-facing remediation, deliberately NOT in the envelope (#169).
-        tracing::warn!(
-            tool = %tool,
-            mode = %mode,
-            namespace = %namespace,
-            latched = latched,
-            "iris-agentic-dev: write refused by the gate. If writing to this instance is \
-             intended, set IRIS_ALLOW_PROD=1 and restart the server. A gate that has closed \
-             once stays closed until restart."
-        );
-        McpError::invalid_params(
+        //
+        // #303: the remediation depends on WHY the gate is shut. Advising IRIS_ALLOW_PROD when the
+        // operator explicitly asked for read-only would be false — that variable no longer wins —
+        // and it would hand the caller a bypass for a decision that was made deliberately. So an
+        // explicit request is reported as a request, with no way around it named.
+        if requested.is_read_only() {
+            tracing::warn!(
+                tool = %tool,
+                requested_mode = requested.as_str(),
+                "iris-agentic-dev: write refused because read-only was requested for this server. \
+                 This is not a heuristic and IRIS_ALLOW_PROD does not override it."
+            );
+        } else {
+            tracing::warn!(
+                tool = %tool,
+                mode = %mode,
+                namespace = %namespace,
+                latched = latched,
+                "iris-agentic-dev: write refused by the gate. If writing to this instance is \
+                 intended, set IRIS_ALLOW_PROD=1 and restart the server. A gate that has closed \
+                 once stays closed until restart."
+            );
+        }
+        let message = if requested.is_read_only() {
+            format!(
+                "'{tool}' would {action}, and this server was started read-only \
+                 ({} mode), so it was not called. Reads are never blocked — the read actions \
+                 of this tool still work.",
+                requested.as_str()
+            )
+        } else {
             format!(
                 "'{tool}' would {action} on a connection that is not write-allowed \
                  (system mode {mode}, namespace '{namespace}'), so it was not called. \
                  Reads are never blocked — the read actions of this tool still work."
-            ),
+            )
+        };
+        McpError::invalid_params(
+            message,
             Some(serde_json::json!({
                 "error_code": "WRITE_GATED",
                 "tool": tool,
                 "would": action,
                 "system_mode": mode,
                 "namespace": namespace,
+                // So a caller can tell a deliberate request from a heuristic about the instance.
+                "requested_read_only": requested.as_str(),
+            })),
+        )
+    }
+
+    /// #303: STRICT refused a tool that answers by writing a scratch class.
+    ///
+    /// Deliberately a DIFFERENT code from `WRITE_GATED`. The caller did not ask to mutate anything —
+    /// these tools are reads — so "your write was refused" would misdescribe what happened and give
+    /// no usable next step. What the caller needs to know is that the answer requires writing at
+    /// all, and that soft mode allows exactly this.
+    fn scratch_write_blocked_error(&self, tool: &str) -> McpError {
+        tracing::warn!(
+            tool = %tool,
+            "iris-agentic-dev: refused under IRIS_STRICT_READ_ONLY — this tool answers by writing a \
+             scratch class to IrisDevTmp."
+        );
+        McpError::invalid_params(
+            format!(
+                "'{tool}' reads, but it answers by writing, compiling and deleting a scratch class \
+                 in the IrisDevTmp package — the data it reads has no SQL projection to reach it \
+                 through. This server was started with IRIS_STRICT_READ_ONLY, which refuses that. \
+                 Use IRIS_SOFT_READ_ONLY instead if a temporary class is acceptable; it still \
+                 refuses every declared mutation."
+            ),
+            Some(serde_json::json!({
+                "error_code": "SCRATCH_WRITE_BLOCKED",
+                "tool": tool,
+                "writes": "a temporary class in the IrisDevTmp package",
+                "requested_read_only": "strict",
             })),
         )
     }
@@ -11703,6 +12105,61 @@ mod tool_annotation_tests {
     /// `list_tools` passed, because this test called `annotate_tool` itself. It was testing the
     /// function while the wiring — the only part a client actually sees — was uncovered. It now goes
     /// through `advertised_tools()`, which is what `list_tools` returns.
+    /// #303: strict read-only actually removes the scratch-class tools from the advertised surface,
+    /// and soft actually keeps them.
+    ///
+    /// This is the WIRING, which the pure-helper tests cannot reach: they prove the predicate answers
+    /// correctly, not that `advertised_tools` consults it. Deleting the `retain` line leaves every
+    /// one of those tests green, because in-process the level is always `Off`.
+    #[test]
+    fn strict_removes_the_scratch_class_tools_from_the_advertised_surface() {
+        use crate::iris::connection::ReadOnlyMode;
+        let t = IrisTools::new_with_toolset(None, Toolset::Interop).expect("build");
+
+        let soft: std::collections::HashSet<String> = t
+            .advertised_tools_with(ReadOnlyMode::Soft)
+            .into_iter()
+            .map(|x| x.name.to_string())
+            .collect();
+        let strict: std::collections::HashSet<String> = t
+            .advertised_tools_with(ReadOnlyMode::Strict)
+            .into_iter()
+            .map(|x| x.name.to_string())
+            .collect();
+
+        // The interop profile does not advertise every tool in the crate, so only compare over the
+        // ones it does — asserting on the whole list would fail for reasons unrelated to #303.
+        let advertised_writers: Vec<&str> = GENERATOR_WRITE_TOOLS
+            .iter()
+            .copied()
+            .filter(|n| soft.contains(*n))
+            .collect();
+        assert!(
+            !advertised_writers.is_empty(),
+            "no scratch-class tool is advertised in this toolset, so this test would pass vacuously"
+        );
+
+        for name in &advertised_writers {
+            assert!(
+                !strict.contains(*name),
+                "{name} must not be advertised under strict — it answers by writing a scratch class"
+            );
+        }
+        assert!(
+            strict.len() < soft.len(),
+            "strict advertised {} tools and soft {}; the filter did nothing",
+            strict.len(),
+            soft.len()
+        );
+        // And strict must not remove anything ELSE: a filter that over-reaches would hide reads.
+        let removed: Vec<&String> = soft.difference(&strict).collect();
+        assert_eq!(
+            removed.len(),
+            advertised_writers.len(),
+            "strict removed {removed:?}, which is more than the scratch-class tools it should"
+        );
+    }
+
     #[test]
     fn every_advertised_tool_carries_a_read_only_hint() {
         let t = IrisTools::new_with_toolset(None, Toolset::Interop).expect("build");
@@ -18551,6 +19008,343 @@ mod record_call_survives_a_poisoned_history {
             guard.back().map(|e| e.tool.as_str()),
             Some("iris_compile"),
             "the recorded entry must be the one just made"
+        );
+    }
+}
+
+/// #323: `iris_execute` hands back a decoded `%Status` chain, and the block is strictly additive.
+#[cfg(test)]
+mod status_chain_attachment_tests {
+    use super::*;
+
+    /// Measured on IRIS 2026.1 with a throwaway probe class: two errors joined by
+    /// `$system.Status.AppendStatus`, decoded by the real `$SYSTEM.Status.GetErrorText`. CRLF, and
+    /// both elements present — the issue's claim that only the first survives is wrong.
+    const PRINTED: &str = "Stop: ERROR #5002: ObjectScript error: first problem\r\n\
+                           ERROR #6301: SAX XML Parser Error: second problem";
+
+    fn payload(output: &str, success: bool) -> (serde_json::Value, bool) {
+        let mut resp = serde_json::json!({
+            "success": success,
+            "output": output,
+            "namespace": "APP",
+            "method": "http",
+        });
+        let attached = attach_status_chain(&mut resp, output);
+        (resp, attached)
+    }
+
+    #[test]
+    fn the_chain_arrives_as_per_error_codes_and_texts() {
+        let (resp, attached) = payload(PRINTED, true);
+        assert!(attached);
+        assert_eq!(resp["status"]["ok"], false);
+        let codes: Vec<u64> = resp["status"]["errors"]
+            .as_array()
+            .expect("errors")
+            .iter()
+            .map(|e| e["code"].as_u64().expect("a code"))
+            .collect();
+        assert_eq!(
+            codes,
+            vec![5002, 6301],
+            "a remedy keyed on 6301 cannot be found by matching a substring of the joined text"
+        );
+        assert_eq!(resp["status"]["preamble"], "Stop: ");
+    }
+
+    /// The additive rule. A script that PRINTS the words of an error while succeeding — a diagnostic
+    /// dump, a log tail, this repo's own test fixtures — must not be turned into a failure by the
+    /// presence of the block. `success` belongs to `runtime_abort_line`.
+    #[test]
+    fn attaching_the_block_does_not_touch_success_or_output() {
+        for success in [true, false] {
+            let (resp, _) = payload(PRINTED, success);
+            assert_eq!(resp["success"], success, "success was rewritten");
+            assert_eq!(resp["output"], PRINTED, "output was rewritten");
+            assert!(
+                resp.get("hint").is_none(),
+                "the hint slot is contended (#185) and this has no advice to give: {:?}",
+                resp.get("hint")
+            );
+            assert!(resp.get("error_code").is_none());
+        }
+    }
+
+    /// Output with no status text carries NO block. Not `ok: true`: this path sees only what the
+    /// script chose to write, so it cannot tell an OK status from no status at all, and answering
+    /// the absence with a success verdict is exactly the negative fact #310 is about.
+    #[test]
+    fn output_with_no_status_gets_no_block_rather_than_a_successful_one() {
+        for out in ["", "OK", "Stop: OK", "42"] {
+            let (resp, attached) = payload(out, true);
+            assert!(!attached, "{out:?}");
+            assert!(
+                resp.get("status").is_none(),
+                "{out:?} must carry no status key at all, got {:?}",
+                resp.get("status")
+            );
+        }
+        // CONTROL: the same helper DOES attach one for a real chain, so the four assertions above
+        // are not passing because nothing is ever attached.
+        assert!(
+            payload(PRINTED, true).1,
+            "control: a real chain must attach"
+        );
+    }
+
+    /// A chain cut mid-element reaches the caller as incomplete, with what did arrive kept. A
+    /// truncated chain silently reported as a shorter chain is the #347 shape.
+    #[test]
+    fn a_chain_cut_mid_element_says_so_on_the_payload() {
+        let (resp, attached) = payload("ERROR #5002: ObjectScript error: boom\r\nERROR #63", true);
+        assert!(attached);
+        assert_eq!(resp["status"]["complete"], false);
+        assert_eq!(resp["status"]["undecoded"][0], "ERROR #63");
+        assert_eq!(resp["status"]["errors"][0]["code"], 5002);
+    }
+}
+
+/// #327 item 2: the `test` a caller names on `iris_doc` reaches the wire and reaches `iris_test`.
+///
+/// `doc_put_runs_the_test.rs` covers the DECISION — pure, and mutation-checked there. What it cannot
+/// see is whether the parameter is advertised at all and whether the handler is wired to the tool
+/// that runs suites. A `test` the schema never publishes is a parameter no caller discovers, and a
+/// gate nothing calls is dead code that looks like a feature.
+#[cfg(test)]
+mod doc_test_parameter_tests {
+    use super::*;
+
+    fn iris_doc_schema() -> serde_json::Value {
+        let t = IrisTools::new_with_toolset(None, Toolset::Interop).expect("build");
+        let tool = t
+            .advertised_tools()
+            .into_iter()
+            .find(|x| x.name == "iris_doc")
+            .expect("iris_doc is in the interop profile");
+        serde_json::to_value(&*tool.input_schema).expect("schema serialises")
+    }
+
+    #[test]
+    fn the_test_parameter_is_advertised_on_iris_doc() {
+        let schema = iris_doc_schema();
+        let props = schema["properties"]
+            .as_object()
+            .expect("iris_doc publishes properties");
+        assert!(
+            props.contains_key("test"),
+            "the `test` parameter is not in the advertised schema, so no caller can discover it. \
+             Properties: {:?}",
+            props.keys().collect::<Vec<_>>()
+        );
+        // CONTROL: a name that was never added must be absent, or `contains_key` is not
+        // discriminating on this object at all.
+        assert!(!props.contains_key("test_teleport"));
+        // It must not be REQUIRED — 2,979 measured puts pass no test at all.
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        assert!(!required.contains(&"test"), "required: {required:?}");
+    }
+
+    /// The description has to say the compile gate exists, because the failure it prevents is
+    /// silent: a caller who passes `test` without `compile` gets a write, no test, and a
+    /// `test_skipped` they did not expect to need.
+    ///
+    /// Asserted on the SENTENCE that introduces `test`, not on the whole description. A bare
+    /// `description.contains("compile")` passes on any of the eight other places the word appears
+    /// (`compile=true` on the compile flag, `compile_errors`, `compile_console`, …) — measured: a
+    /// mutation that deleted "(needs compile=true)" from this very sentence left that assertion
+    /// green.
+    #[test]
+    fn the_description_says_the_test_needs_a_compile() {
+        let t = IrisTools::new_with_toolset(None, Toolset::Interop).expect("build");
+        let tool = t
+            .advertised_tools()
+            .into_iter()
+            .find(|x| x.name == "iris_doc")
+            .expect("iris_doc");
+        let d = tool.description.unwrap_or_default().to_string();
+        let at = d
+            .find("`test:")
+            .expect("the description must document the `test` parameter by name");
+        // To the end of that sentence: the claim is about what THIS sentence tells the caller.
+        let claim = &d[at..];
+        let claim = &claim[..claim.find(". ").map(|i| i + 1).unwrap_or(claim.len())];
+        assert!(
+            claim.len() < d.len() / 2,
+            "the sentence window is {} of {} chars — that is not one sentence, so this guard is \
+             not measuring what it claims",
+            claim.len(),
+            d.len()
+        );
+        assert!(
+            claim.contains("compile=true"),
+            "the sentence introducing `test` must say it needs compile=true. A caller who passes \
+             `test` without it gets a write, no test, and a `test_skipped` they did not expect to \
+             need. Sentence: {claim}"
+        );
+        assert!(
+            claim.contains("test_ok") && claim.contains("test_skipped"),
+            "it must name both fields the caller reads back — the verdict and the reason there is \
+             none: {claim}"
+        );
+        // CONTROL: the window really is a window. A phrase from elsewhere in the description must
+        // not be inside it, or the three assertions above are reading the whole text.
+        assert!(
+            !claim.contains("mode='get' fetches source"),
+            "the window ran past its sentence: {claim}"
+        );
+    }
+
+    /// The wiring, read at the source because driving it needs a live instance: `iris_doc` must hand
+    /// its result to the sequencer, and the sequencer must call the tool that actually runs suites.
+    /// Windows are bounded by the functions' own bodies, so neither claim can be satisfied by text
+    /// somewhere else in the file.
+    #[test]
+    fn iris_doc_hands_its_result_to_the_test_sequencer() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tools/mod.rs"),
+        )
+        .expect("mod.rs");
+        let body = |from: &str| -> String {
+            let start = src
+                .find(from)
+                .unwrap_or_else(|| panic!("no `{from}` in mod.rs"));
+            let rest = &src[start..];
+            let end = rest.find("\n    }\n").unwrap_or(rest.len());
+            rest[..end].to_string()
+        };
+
+        let doc = body("async fn iris_doc(");
+        assert!(
+            doc.contains("run_test_after_doc("),
+            "iris_doc returns without passing its result to the test sequencer, so `test` is \
+             accepted and silently ignored (#327)"
+        );
+        assert!(
+            doc.contains("p.test.clone()"),
+            "`p` moves into handle_iris_doc, so what the caller asked to test must be captured \
+             before the move — otherwise the sequencer is called with None on every call"
+        );
+
+        let seq = body("async fn run_test_after_doc(");
+        assert!(
+            seq.contains("self.iris_test("),
+            "the sequencer never calls iris_test, so a gate that says Run runs nothing"
+        );
+        assert!(
+            seq.contains("doc::test_gate("),
+            "the sequencer decides without the gate, so the compile check lives in two places"
+        );
+        // CONTROL: the windows are the functions, not the file. `iris_query` is a sibling tool that
+        // must NOT appear in either.
+        assert!(
+            !doc.contains("async fn iris_query("),
+            "the iris_doc window ran past its body"
+        );
+        assert!(
+            !seq.contains("async fn iris_query("),
+            "the sequencer window ran past its body"
+        );
+    }
+}
+
+/// #327 item 3: the `items` list reaches the wire, and the handler reads it.
+///
+/// `production_item_batch_settings.rs` covers the codegen, the parser and the response assembly —
+/// all pure. What it cannot see is whether the parameter is advertised (a list nobody discovers is
+/// no saving) or whether the handler unions it with `item` instead of reading `item` alone.
+#[cfg(test)]
+mod production_item_list_tests {
+    use super::*;
+
+    #[test]
+    fn the_items_list_is_advertised_on_iris_production_item() {
+        let t = IrisTools::new_with_toolset(None, Toolset::Interop).expect("build");
+        let tool = t
+            .advertised_tools()
+            .into_iter()
+            .find(|x| x.name == "iris_production_item")
+            .expect("iris_production_item is in the interop profile");
+        let schema = serde_json::to_value(&*tool.input_schema).expect("schema");
+        let props = schema["properties"].as_object().expect("properties");
+        assert!(
+            props.contains_key("items"),
+            "no `items` in the advertised schema, so no caller discovers the batch read. Got: {:?}",
+            props.keys().collect::<Vec<_>>()
+        );
+        // CONTROL: a name never added must be absent, or contains_key is not discriminating.
+        assert!(!props.contains_key("item_bundle"));
+        // The single `item` must survive: every other action still addresses one.
+        assert!(props.contains_key("item"));
+
+        let d = tool.description.unwrap_or_default().to_string();
+        // The whole SENTENCE containing `items:`, not the text after it: the action that reads the
+        // list is named before the parameter is ("action=get_settings also takes items: …"), so a
+        // window that starts at the parameter cannot see it. Bounded at both ends.
+        let at = d
+            .find("items:")
+            .expect("the description must document `items` by name");
+        let from = d[..at].rfind(". ").map(|i| i + 2).unwrap_or(0);
+        let to = at + d[at..].find(". ").map(|i| i + 1).unwrap_or(d.len() - at);
+        let claim = &d[from..to];
+        assert!(
+            claim.len() < d.len() / 2,
+            "the sentence window is {} of {} chars — not one sentence",
+            claim.len(),
+            d.len()
+        );
+        assert!(
+            claim.contains("get_settings"),
+            "the sentence introducing `items` must say which action reads it: {claim}"
+        );
+        for field in ["results", "missing", "all_found"] {
+            assert!(
+                claim.contains(field),
+                "it must name `{field}`, which the caller reads back: {claim}"
+            );
+        }
+    }
+
+    /// The wiring, read at the source because driving it needs a live instance.
+    #[test]
+    fn the_handler_unions_item_with_items_and_refuses_a_list_where_one_is_meant() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tools/mod.rs"),
+        )
+        .expect("mod.rs");
+        let start = src
+            .find("async fn iris_production_item(")
+            .expect("the handler");
+        let rest = &src[start..];
+        let body = &rest[..rest.find("\n    }\n").unwrap_or(rest.len())];
+
+        assert!(
+            body.contains("interop::item_names_arg(&p)"),
+            "the handler reads `item` alone, so `items` is accepted and silently ignored (#327)"
+        );
+        assert!(
+            body.contains("interop::list_refused_for_action("),
+            "nothing refuses a list of several names on an action that addresses one, so the first \
+             would be acted on and the rest dropped"
+        );
+        assert!(
+            body.contains("items: if list_given { all_items }"),
+            "the names read from the request must reach the impl — and only when a LIST was given, \
+             because `items` non-empty is what selects the batch RESPONSE shape and `item_names_arg` \
+             folds a single `item` into the same vector. Passing the union unconditionally gave every \
+             existing single-item caller the new `results[]` payload (measured live)."
+        );
+        assert!(
+            body.contains("interop::list_parameter_given(&p)"),
+            "the shape flag must come from the LIST keys, not from whether any name was named"
+        );
+        // CONTROL: the window is the handler, not the file.
+        assert!(
+            !body.contains("async fn iris_production("),
+            "the window ran past the handler's body"
         );
     }
 }
