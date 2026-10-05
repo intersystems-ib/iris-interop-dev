@@ -2889,13 +2889,11 @@ pub async fn interop_production_item_impl(
         Some(i) => i,
         None => return err_json("IRIS_UNREACHABLE", "No IRIS connection"),
     };
-    let item = os_str_expr(&params.item);
-    // #329: ONE candidate block, shared by the enable/disable and get_settings templates below, so
-    // the two cannot drift apart. `item` is already os_str_expr'd.
-    let not_found = item_not_found_block(&item);
-    // #119: every action resolves its target the same way — `production=` when given, the
-    // running production otherwise. `add`/`remove` get theirs inside build_*_item_code.
-    let prologue = resolve_production_prologue(params.production.as_deref().unwrap_or(""));
+    // #329/#119: the candidate block and the target prologue used to be built HERE and threaded
+    // into each template. They are now built inside each `build_*_code`, which is why neither is
+    // bound here any more: every arm passes the raw production name and the builder resolves it.
+    // Keeping outer copies would reintroduce exactly the drift #329 closed — two resolutions of
+    // the same thing, one of them unexercised.
     let ns = &params.namespace;
     let client = IrisConnection::http_client()
         .map_err(|_| McpError::invalid_request("IRIS_UNREACHABLE", None))?;
