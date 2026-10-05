@@ -22,14 +22,35 @@ jobs:
             target: x86_64-pc-windows-msvc
             asset: iris-interop-dev-windows-x64.exe
             bin: iris-interop-dev.exe
-          - os: macos-14
+            arch: x86_64
+          # macos-14 was DEPRECATED by actions/runner-images (#13518). A deprecated image is
+          # removed on a schedule nothing here controls, and the first symptom would be a tag
+          # push that cannot build the only macOS asset. macos-15 is the current arm64 label.
+          - os: macos-15
             target: aarch64-apple-darwin
             asset: iris-interop-dev-macos-arm64
             bin: iris-interop-dev
+            arch: arm64
+          # Intel Macs. Every other asset here was already x64; macOS was the one platform
+          # published for arm64 ONLY, so an Intel Mac had no asset at all — and the arm64 file
+          # downloads and hash-verifies before failing at exec, which reads as a broken release
+          # rather than a missing build.
+          #
+          # Built on an Intel RUNNER, not cross-compiled from arm64, so the `--version` guard
+          # below still executes the artifact it is vouching for. (Cross-compiling would need
+          # Rosetta on the runner just to run that guard, or the guard would have to be skipped
+          # for the one asset whose architecture is least verifiable.) macos-13 was the old
+          # Intel label and no longer exists; macos-15-intel is its replacement.
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            asset: iris-interop-dev-macos-x64
+            bin: iris-interop-dev
+            arch: x86_64
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             asset: iris-interop-dev-linux-x64
             bin: iris-interop-dev
+            arch: x86_64
           # #174: the gnu asset above links GLIBC_2.39 (ubuntu-latest), so it downloads,
           # hash-verifies and then dies at exec on AL2023 / RHEL 8-9 / Debian 12. A static
           # musl build has no libc floor and removes the class. Additive — the gnu asset
@@ -38,6 +59,7 @@ jobs:
             target: x86_64-unknown-linux-musl
             asset: iris-interop-dev-linux-x64-musl
             bin: iris-interop-dev
+            arch: x86_64
             zig: true
     runs-on: ${{ matrix.os }}
     steps:
@@ -90,10 +112,21 @@ jobs:
             exit 1
           fi
           echo "static confirmed"
+      # Every asset name states an architecture and nothing checked it. The matrix is the only
+      # thing tying a name to a --target, so a changed runner label or a copied row publishes a
+      # binary that downloads, hash-verifies and dies at exec — #174's failure one layer up,
+      # with the instruction set as the floor instead of GLIBC. The matcher is a script so that
+      # scripts/test-verify-asset-arch.sh can exercise it against recorded `file` output from
+      # all three platforms, including the empty and unrecognised cases.
+      - name: "guard: the asset is built for the architecture its name promises"
+        shell: bash
+        run: bash scripts/verify-asset-arch.sh "${{ matrix.arch }}" "$(file -b "${{ matrix.asset }}")"
       - name: ad-hoc codesign (macOS — avoids Gatekeeper quarantine hang)
         if: runner.os == 'macOS'
         run: codesign --force --deep --sign - "${{ matrix.asset }}"
-      # All three targets are native to their runner, so the staged asset is executable here.
+      # Every target except musl is native to its runner, so the staged asset is executable here —
+      # including the two macOS assets, which is why each is built on a runner of its own
+      # architecture rather than cross-compiled from the other.
       - name: "guard: binary --version matches Cargo.toml"
         shell: bash
         run: |
@@ -141,6 +174,14 @@ jobs:
           generate_release_notes: true
           body: |
             Streamlined **iris-interop-dev** MCP server (interop-focused fork of iris-agentic-dev).
+
+            | platform | asset |
+            |---|---|
+            | macOS, Apple Silicon | `iris-interop-dev-macos-arm64` |
+            | macOS, Intel | `iris-interop-dev-macos-x64` |
+            | Linux x64 | `iris-interop-dev-linux-x64` |
+            | Linux x64, older glibc (AL2023, RHEL 8-9, Debian 12) | `iris-interop-dev-linux-x64-musl` |
+            | Windows x64 | `iris-interop-dev-windows-x64.exe` |
 
             **Workshop VM (Windows):** download `iris-interop-dev-windows-x64.exe`, place it at
             `C:\iris-interop-dev\iris-interop-dev.exe`, then register the MCP:
