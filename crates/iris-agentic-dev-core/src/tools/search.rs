@@ -164,7 +164,27 @@ pub async fn handle_iris_search(
     let mut sync_refusal: Option<reqwest::StatusCode> = None;
     match sync_result {
         Ok(resp) if resp.status().is_success() => {
-            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            // A 200 whose body does not parse is NOT an empty result set. `unwrap_or_default()`
+            // here yielded `Value::Null`, and every step after that treats Null as "nothing
+            // found": `Null["result"]["workId"].is_null()` is true, so it took the sync path,
+            // and `flatten_results(&Null)` ends in its own `unwrap_or_default()` — so the caller
+            // received `success: true, total_found: 0`, a confident "no matches" for a search
+            // that never parsed. #106 hardened the REFUSAL path in this same function (see the
+            // comment above) and left this one, which is the sibling shape CLAUDE.md warns about.
+            let body: serde_json::Value = match resp.json().await {
+                Ok(b) => b,
+                Err(e) => {
+                    return crate::tools::envelope::fail_with(
+                        "PARSE_ERROR",
+                        &format!(
+                            "iris_search: IRIS answered 200 but the body could not be parsed \
+                             ({e}) — this is NOT a result of zero matches, and the search was \
+                             not performed as far as this server can tell."
+                        ),
+                        serde_json::json!({"query": p.query, "namespace": namespace}),
+                    );
+                }
+            };
             // If we got a workId, it's async — fall through to polling
             if body["result"]["workId"].is_null() {
                 return parse_search_results(body, &p.query, p.inline, &log_store);
@@ -320,7 +340,24 @@ async fn poll_async_search(
 
         match resp {
             Ok(r) if r.status().is_success() => {
-                let body: serde_json::Value = r.json().await.unwrap_or_default();
+                // Same as the sync leg: an unparseable poll response became Null, and a Null
+                // `workId` reads as "the search finished" rather than "still pending" or
+                // "failed" — so the loop returned zero results instead of polling on or
+                // reporting the fault.
+                let body: serde_json::Value = match r.json().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return crate::tools::envelope::fail_with(
+                            "PARSE_ERROR",
+                            &format!(
+                                "iris_search: the async poll returned 200 with a body that \
+                                 could not be parsed ({e}) — treating this as zero results \
+                                 would claim the search completed."
+                            ),
+                            serde_json::json!({"query": query, "namespace": namespace}),
+                        );
+                    }
+                };
                 if body["result"]["workId"].is_null() {
                     return parse_search_results(body, query, inline, log_store);
                 }

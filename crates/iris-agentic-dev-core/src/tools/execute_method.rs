@@ -447,22 +447,69 @@ pub async fn handle_iris_execute_method(
         Outcome::StatusTextUnreassembled => {
             report_status_text_unreassembled(class, method, &namespace, &r)
         }
-        Outcome::Answered => crate::tools::envelope::ok_json(serde_json::json!({
-            "success": true,
-            "class": class,
-            "method": method,
-            "namespace": namespace,
-            // "value" | "status" | "oref" | "void" — what the DECLARED return type made this.
-            "kind": r.kind,
-            "return_type": r.return_type,
-            "value": r.value,
-            "value_len": r.value_len,
-            // Present only for a method declared to return %Status: the decoded verdict, so the
-            // caller does not have to recognise a status string by eye.
-            "status_ok": r.status_ok,
-            "status_text": r.status_text,
-            "args_passed": p.args.len(),
-        })),
+        Outcome::Answered => crate::tools::envelope::ok_json(answered_payload(
+            class,
+            method,
+            &namespace,
+            &r,
+            p.args.len(),
+        )),
+    }
+}
+
+/// What one successful invocation reports.
+///
+/// Pure, and separate from the async handler for the same reason [`classify`] is: the `status` key's
+/// presence rule (#323) is only testable without a connection if the payload can be built without
+/// one. The handler had no test over this arm at all.
+pub fn answered_payload(
+    class: &str,
+    method: &str,
+    namespace: &str,
+    r: &InvokeResult,
+    args_passed: usize,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "success": true,
+        "class": class,
+        "method": method,
+        "namespace": namespace,
+        // "value" | "status" | "oref" | "void" — what the DECLARED return type made this.
+        "kind": r.kind,
+        "return_type": r.return_type,
+        "value": r.value,
+        "value_len": r.value_len,
+        // Present only for a method declared to return %Status: the decoded verdict, so the
+        // caller does not have to recognise a status string by eye.
+        "status_ok": r.status_ok,
+        "status_text": r.status_text,
+        "args_passed": args_passed,
+    });
+    // #323: the chain decoded into per-error {code, text}, so a caller keys on the number instead of
+    // matching a substring of the joined text. INSERTED rather than written into the literal above:
+    // `json!` turns a `None` into an explicit `null`, and a `status` key present-and-null on every
+    // method that does not return a %Status reads as "there was a status and it was nothing" — the
+    // absent case has to be absent.
+    if let Some(status) = status_block(r) {
+        payload["status"] = status;
+    }
+    payload
+}
+
+/// #323: the `status` block for an invocation — the chain split into per-error `{code, text}`.
+///
+/// Unlike `iris_execute`, which sees only what a script chose to print, this path reads IRIS's own
+/// `$$$ISOK` verdict off the generated program (`InvokeResult::status_ok`). So here an OK status is
+/// a MEASURED fact rather than an absence, and `Some(true)` is reported as `ok: true`.
+///
+/// `Some(false)` goes through [`crate::status::decode_known_error`] and never through the plain
+/// decoder: a failing status whose text this build cannot parse must not come back as "no status
+/// here". `None` — any method whose declared return type is not `%Status` — carries no block.
+pub fn status_block(r: &InvokeResult) -> Option<serde_json::Value> {
+    match r.status_ok {
+        None => None,
+        Some(true) => crate::status::StatusChain::Ok.payload(),
+        Some(false) => crate::status::decode_known_error(&r.status_text).payload(),
     }
 }
 
@@ -1063,5 +1110,94 @@ mod tests {
         let m = parse_method_meta(&serde_json::json!({"result":{"content":[]}}));
         assert!(!m.found);
         assert!(!m.is_class_method, "absence must not assert either way");
+    }
+
+    // ── #323: the decoded %Status block ─────────────────────────────────────────
+
+    fn status_result(status_ok: Option<bool>, status_text: &str) -> InvokeResult {
+        InvokeResult {
+            kind: if status_ok.is_some() {
+                "status"
+            } else {
+                "value"
+            }
+            .into(),
+            return_type: if status_ok.is_some() {
+                "%Status"
+            } else {
+                "%String"
+            }
+            .into(),
+            status_ok,
+            status_text: status_text.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Measured on IRIS 2026.1: a two-element chain built with `$system.Status.AppendStatus`,
+    /// reassembled by `parse_invoke_output` with its elements newline-joined (#347).
+    const CHAIN: &str = "ERROR #5002: ObjectScript error: first problem\n\
+                         ERROR #6301: SAX XML Parser Error: second problem";
+
+    /// The whole point: per-error CODES, so a caller keys a remedy on 6301 rather than matching a
+    /// substring of the joined text.
+    #[test]
+    fn a_failing_status_is_reported_element_by_element_with_its_codes() {
+        let p = answered_payload("Pkg.C", "M", "APP", &status_result(Some(false), CHAIN), 0);
+        assert_eq!(p["status"]["ok"], false);
+        let codes: Vec<u64> = p["status"]["errors"]
+            .as_array()
+            .expect("errors")
+            .iter()
+            .map(|e| e["code"].as_u64().expect("a code"))
+            .collect();
+        assert_eq!(codes, vec![5002, 6301]);
+        assert_eq!(
+            p["status"]["errors"][1]["text"],
+            "SAX XML Parser Error: second problem"
+        );
+        // The raw field stays, so nothing this build cannot parse is lost.
+        assert_eq!(p["status_text"], CHAIN);
+    }
+
+    /// Here — and only here — `ok: true` is a MEASURED fact: it comes off IRIS's own `$$$ISOK` in
+    /// the generated program, not from failing to find an error marker.
+    #[test]
+    fn an_ok_status_is_reported_as_ok_because_iris_said_so_not_because_the_text_was_empty() {
+        let p = answered_payload("Pkg.C", "M", "APP", &status_result(Some(true), ""), 0);
+        assert_eq!(p["status"]["ok"], true);
+        assert_eq!(p["status"]["errors"].as_array().map(|a| a.len()), Some(0));
+    }
+
+    /// A method whose declared return type is not `%Status` must carry NO `status` key — not a key
+    /// set to null, which reads as "there was a status and it was nothing".
+    #[test]
+    fn a_method_that_returns_no_status_carries_no_status_key_at_all() {
+        let p = answered_payload("Pkg.C", "M", "APP", &status_result(None, ""), 0);
+        assert!(
+            p.get("status").is_none(),
+            "expected the key to be ABSENT, got {:?}",
+            p.get("status")
+        );
+        // Control: the same builder DOES attach one when there is a status, so the assertion above
+        // is not passing because nothing is ever attached.
+        let with = answered_payload("Pkg.C", "M", "APP", &status_result(Some(false), CHAIN), 0);
+        assert!(with.get("status").is_some());
+    }
+
+    /// A status IRIS called an error, whose text this build cannot parse, must not lose the verdict.
+    /// Reporting no block would say "no status was involved" about a failure (#310).
+    #[test]
+    fn a_failing_status_with_unparseable_text_still_reports_a_failing_status() {
+        let p = answered_payload(
+            "Pkg.C",
+            "M",
+            "APP",
+            &status_result(Some(false), "no marker anywhere in here"),
+            0,
+        );
+        assert_eq!(p["status"]["ok"], false);
+        assert_eq!(p["status"]["complete"], false);
+        assert_eq!(p["status"]["undecoded"][0], "no marker anywhere in here");
     }
 }
