@@ -12602,10 +12602,20 @@ mod tool_annotation_tests {
             // is in GENERATOR_WRITE_TOOLS because it reads a stream through a scratch class, so it
             // is honestly not advertised readOnlyHint:true even though it writes nothing to the
             // stream. Recorded by running the gate row by row, not by arithmetic.
-            ("interop", Toolset::Interop, 35_usize, 11_usize),
-            ("nostub", Toolset::Nostub, 60, 36),
-            ("merged", Toolset::Merged, 56, 31),
-            ("baseline", Toolset::Baseline, 64, 40),
+            // #417 is +1 for `iris_source_control`, interop only — it was already implemented
+            // and so already in the wider toolsets. The read-only figure is UNCHANGED, and that is
+            // the measured point: with no `action` argument the gate's catch-all classifies the
+            // tool as mutating, so it is honestly not advertised readOnlyHint:true even though
+            // `status` and `menu` read.
+            ("interop", Toolset::Interop, 36_usize, 11_usize),
+            // The read-only figures for these three DROP by one, and the drop is the point.
+            // `iris_source_control` was already advertised in all three, and with no arm in
+            // `mutating_call` it fell through to the final `_ => None` — so it was announced
+            // readOnlyHint:TRUE while able to %CheckIn, %GetLatest and %Disconnect. Classifying it
+            // corrects that claim here too, not only in the interop profile.
+            ("nostub", Toolset::Nostub, 60, 35),
+            ("merged", Toolset::Merged, 56, 30),
+            ("baseline", Toolset::Baseline, 64, 39),
         ] {
             let t = IrisTools::new_with_toolset(None, ts).expect("build");
             let all = t.advertised_tools();
