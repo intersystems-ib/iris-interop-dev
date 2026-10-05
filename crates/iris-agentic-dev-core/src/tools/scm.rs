@@ -201,13 +201,44 @@ fn parse_action_msg(out: &str) -> ActionMsg<'_> {
     if out.trim().is_empty() {
         return ActionMsg::Empty;
     }
-    let mut parts = out.splitn(2, '|');
-    let head = parts.next().unwrap_or("").trim();
-    let msg = parts.next().map(str::trim).unwrap_or("");
+    // #418: the ACTION CODE is on the first line; the MESSAGE is not. Callers used to hand this
+    // function `out.lines().next()`, which truncated every message at its first newline — and an
+    // IRIS error text carries its chain on the following lines, so the part that says WHY was the
+    // part dropped. `Unparseable` was worse: it fed a truncated string to `scm_error_code`, which
+    // classifies on content, so a code whose distinguishing text sat on line 2 could not be reached.
+    //
+    // The message is sliced to the end of the WHOLE output rather than the end of the first line,
+    // which keeps it a borrow — no allocation, and the record stays contiguous.
+    let first_end = out.find('\n').unwrap_or(out.len());
+    let first = &out[..first_end];
+    let (head, msg) = match first.find('|') {
+        Some(i) => (first[..i].trim(), out[i + 1..].trim()),
+        // No pipe on the first line. `user_action_code` always writes one, so this is a provider
+        // that answered in its own shape; keep whatever followed as the message rather than
+        // discarding it.
+        None => (first.trim(), out[first_end..].trim()),
+    };
     match head.parse::<u8>() {
         Ok(code) => ActionMsg::Code(code, msg),
+        // The FULL text, so the classifier sees every line it might key on.
         Err(_) => ActionMsg::Unparseable(out.trim()),
     }
+}
+
+/// Did an `AfterUserAction` response mean "completed"?
+///
+/// Empty IS success on this path, and only this path: `after_user_action_code` ends with
+/// `write $system.Status.GetErrorText(sc)`, and GetErrorText returns the EMPTY STRING for a success
+/// status. The `UserAction` generator has the opposite convention — it always writes at least `0|`
+/// — which is why this is a separate named decision rather than a shared `is_empty()`.
+///
+/// #418: a named function because the call site read `out.lines().next().unwrap_or("").trim()` and
+/// then tested THAT for emptiness. An output whose first line is blank but which carries an error
+/// on the second therefore reported `{"success": true}` and discarded the error, on the one path in
+/// this module that claims success. Emptiness is a property of the whole output, and a test can only
+/// say so about something it can call.
+pub fn after_user_action_completed(out: &str) -> bool {
+    out.trim().is_empty()
 }
 
 /// Decide what the first line of a `UserAction` response means, for both call sites.
@@ -313,8 +344,8 @@ pub async fn handle_iris_source_control(
                 return err_json(ec, &emsg);
             }
         };
-        let out = out.lines().next().unwrap_or("").trim().to_string();
-        if out.is_empty() {
+        let out = out.trim().to_string();
+        if after_user_action_completed(&out) {
             // Any resumed SCM action (checkout/undo/checkin/disconnect) changes checkout state,
             // so drop the cached entry — the next write re-probes and re-caches if still ours.
             checkout_cache.invalidate(&pending.namespace, &pending.document);
@@ -423,7 +454,9 @@ pub async fn handle_iris_source_control(
                 Ok(o) => o,
                 Err(e) => return err_json(scm_error_code(&e.to_string()), &e.to_string()),
             };
-            let out = raw.lines().next().unwrap_or("").trim();
+            // #418: the WHOLE output. `lines().next()` truncated the message at its first
+            // newline, and `parse_action_msg` reads the code from the first line itself.
+            let out = raw.trim();
             let (action_code, msg) = match user_action_outcome(out) {
                 Ok(v) => v,
                 Err((code, detail)) => return err_json(code, detail),
@@ -496,7 +529,9 @@ pub async fn handle_iris_source_control(
                 Ok(o) => o,
                 Err(e) => return err_json(scm_error_code(&e.to_string()), &e.to_string()),
             };
-            let out = raw.lines().next().unwrap_or("").trim();
+            // #418: the WHOLE output. `lines().next()` truncated the message at its first
+            // newline, and `parse_action_msg` reads the code from the first line itself.
+            let out = raw.trim();
             let (action_code, msg) = match user_action_outcome(out) {
                 Ok(v) => v,
                 Err((code, detail)) => return err_json(code, detail),
@@ -875,6 +910,120 @@ mod tests {
         assert_eq!(
             parse_action_msg("7|Enter value:"),
             ActionMsg::Code(7, "Enter value:")
+        );
+    }
+
+    // ── #418: the output is a RECORD, not a line ──────────────────────────────
+
+    /// The code is on the first line. The message is not, and an IRIS error text puts the part that
+    /// says WHY on the lines after the first — exactly the part `lines().next()` dropped.
+    #[test]
+    fn a_multi_line_message_survives_the_parse() {
+        let out = "1|Cannot check out\nERROR #5803: Lock on MyApp.Patient.cls\n  held by 'alice'";
+        match parse_action_msg(out) {
+            ActionMsg::Code(1, msg) => {
+                assert!(
+                    msg.contains("ERROR #5803") && msg.contains("'alice'"),
+                    "the message was truncated at the first newline: {msg:?}"
+                );
+                assert!(
+                    msg.starts_with("Cannot check out"),
+                    "the first line's own text was dropped: {msg:?}"
+                );
+            }
+            other => panic!("expected Code(1, _), got {other:?}"),
+        }
+    }
+
+    /// `Unparseable` feeds `scm_error_code`, which classifies on CONTENT. Handing it one line means
+    /// a code whose distinguishing text is on a later line cannot be reached at all.
+    #[test]
+    fn unparseable_output_keeps_every_line_for_the_classifier() {
+        let out = "<PROTECT>\nProtected item: ^Ens.Config\nuser: _SYSTEM";
+        match parse_action_msg(out) {
+            ActionMsg::Unparseable(got) => {
+                assert_eq!(got, out, "the classifier sees only part of what IRIS said")
+            }
+            other => panic!("expected Unparseable, got {other:?}"),
+        }
+    }
+
+    /// A provider that answers in its own shape — no pipe — still said something on the lines after
+    /// the first, and it is not this parser's place to discard it.
+    #[test]
+    fn a_code_with_its_message_on_the_next_line_keeps_the_message() {
+        match parse_action_msg("0\nchecked out to /tmp/ws/MyApp.Patient.cls") {
+            ActionMsg::Code(0, msg) => assert_eq!(msg, "checked out to /tmp/ws/MyApp.Patient.cls"),
+            other => panic!("expected Code(0, _), got {other:?}"),
+        }
+    }
+
+    /// The site that decided SUCCESS. A response whose FIRST LINE is blank but which carries an
+    /// error on the second is a failure, and used to be reported as `{"success": true}` with the
+    /// error discarded — the one path in this module that claims success.
+    #[test]
+    fn a_blank_first_line_is_not_a_completed_action() {
+        assert!(
+            after_user_action_completed(""),
+            "control: empty IS success on the AfterUserAction path (GetErrorText returns \"\" \
+             for a success status), so a test that rejected this would be wrong"
+        );
+        assert!(after_user_action_completed("   \n  \n"));
+        for out in [
+            "\nERROR #5865: Cannot save item, it is locked by another user",
+            "\n<PROTECT>",
+            "\n\nERROR #5803: Lock could not be acquired",
+        ] {
+            assert!(
+                !after_user_action_completed(out),
+                "{out:?} reports a completed action, so the error is discarded and the caller is \
+                 told the resume succeeded"
+            );
+        }
+    }
+
+    /// #418 asked for a guard that fires when a further site appears. The population is this file's
+    /// own CODE lines — the fix is per-site, so a new call site reintroduces the defect silently.
+    ///
+    /// The needle is BUILT from fragments rather than written out, because the first version of this
+    /// test flagged its own control line: a string literal holding the forbidden text is not a
+    /// comment, so the scan counted it as an offender. Assembled this way the literal never appears
+    /// in this file at all.
+    #[test]
+    fn no_code_in_this_file_parses_scm_output_by_its_first_line() {
+        let needle = concat!("lines()", ".next()");
+        let src = include_str!("scm.rs");
+        let offenders: Vec<(usize, &str)> = src
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| {
+                let t = l.trim_start();
+                // Comments are stripped: this file DISCUSSES the construct in several places, and a
+                // guard that flags prose is one that gets loosened until it catches nothing.
+                !t.starts_with("//") && l.contains(needle)
+            })
+            .map(|(i, l)| (i + 1, l.trim()))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "these parse SCM output by its first line, which truncates the message and can report \
+             a failure as success: {offenders:?}"
+        );
+        // CONTROLS: the file was really read, the construct is still discussed in prose, and the
+        // predicate still matches a real call.
+        assert!(
+            src.contains(needle),
+            "no occurrence at all — the comments explaining why this is avoided have gone too, so \
+             an empty result above means the scan read nothing"
+        );
+        let sample = format!("        let out = raw.{needle}.unwrap_or(\"\");");
+        assert!(
+            sample.contains(needle),
+            "the predicate no longer matches the construct it exists to forbid"
+        );
+        assert!(
+            !sample.trim_start().starts_with("//"),
+            "control: the sample is a CODE line, so the comment filter would not exempt it"
         );
     }
 
