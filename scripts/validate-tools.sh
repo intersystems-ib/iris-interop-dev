@@ -175,4 +175,58 @@ if fork_local:
     print(f"  fork-local: {', '.join(fork_local)}")
 print(f"  pruned: {', '.join(pruned)}")
 print(f"  absent: {', '.join(absent)}")
+
+# ── #353: every upstream-only tool must carry a RECORDED REASON ────────────────────────
+#
+# The buckets above are mechanical — what we ported and pruned versus never ported. They say nothing
+# about WHY, and "why" is the whole difference between a profile and an omission. tools-excluded.json
+# records the judgement; this joins the two and refuses an unclassified tool.
+#
+# EXIT 1 here, unlike the not-fetched and broken-scan states above, because reaching this point means
+# both trees were read successfully: an unclassified tool is then a real gap, not a missing remote.
+# CI does not fetch `upstream`, so in CI this section never runs and cannot redden a PR for a tool
+# someone else added upstream — it is a maintainer gate. The half CI DOES enforce (the file parses,
+# every category is known, every reason is non-empty, nothing is both advertised and excluded) is a
+# Rust test, tests/tools_excluded_is_classified.rs, which runs in the required gate.
+import json
+EXCL = f"{ROOT}/tools-excluded.json"
+try:
+    doc = json.load(open(EXCL))
+except FileNotFoundError:
+    print()
+    print(f"GATE FAILED: {EXCL} is missing, so no upstream-only tool has a recorded reason (#353).")
+    sys.exit(1)
+except json.JSONDecodeError as e:
+    print()
+    print(f"GATE FAILED: tools-excluded.json does not parse: {e}")
+    sys.exit(1)
+
+classified = set(doc.get("tools", {}))
+upstream_only = set(pruned) | set(absent)
+unclassified = sorted(upstream_only - classified)
+stale = sorted(classified - upstream_only)
+also_advertised = sorted(classified & profile)
+
+print()
+print("EXCLUSION RATIONALE (#353)")
+print(f"  upstream-only tools           {len(upstream_only)}")
+print(f"  carrying a recorded reason    {len(upstream_only & classified)}")
+bad = 0
+if unclassified:
+    bad += len(unclassified)
+    print(f"  UNCLASSIFIED: {', '.join(unclassified)}")
+    print("    Add each to tools-excluded.json with a category and a one-line reason. An upstream")
+    print("    tool with no entry is an omission that looks like a decision.")
+if stale:
+    bad += len(stale)
+    print(f"  STALE (classified, but upstream no longer has it): {', '.join(stale)}")
+    print("    Remove the entry: a reason for a tool that does not exist is a claim about nothing.")
+if also_advertised:
+    bad += len(also_advertised)
+    print(f"  CONTRADICTORY (advertised AND excluded): {', '.join(also_advertised)}")
+    print("    A tool in INTEROP_TOOLS must not also carry an exclusion reason.")
+if bad:
+    print(f"GATE FAILED: {bad} unexplained or contradictory tool{'' if bad == 1 else 's'} above.")
+    sys.exit(1)
+print("  every upstream-only tool carries a reason, and no reason is stale or contradictory.")
 PY
