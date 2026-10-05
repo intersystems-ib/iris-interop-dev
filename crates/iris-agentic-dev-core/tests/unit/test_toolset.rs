@@ -231,8 +231,8 @@ fn test_merged_tool_count() {
     let tools = IrisTools::new_with_toolset(None, Toolset::Merged).expect("IrisTools::new");
     let count = tools.registered_tool_names().len();
     assert_eq!(
-        count, 54,
-        "Merged toolset must advertise exactly 54 tools, got {}",
+        count, 56,
+        "Merged toolset must advertise exactly 56 tools, got {}",
         count
     );
     // The derivation, executed. 8 folded away (4 debug_*, 3 container, agent_info) and 4
@@ -379,8 +379,8 @@ fn test_baseline_tool_count() {
         .registered_tool_names()
         .len();
     assert_eq!(
-        n, 62,
-        "Baseline must advertise exactly 62 tools (Toolset::Baseline doc comment says 62), got {}",
+        n, 64,
+        "Baseline must advertise exactly 64 tools (Toolset::Baseline doc comment says 64), got {}",
         n
     );
 }
@@ -393,7 +393,7 @@ fn test_nostub_tool_count_absolute() {
         .expect("IrisTools::new")
         .registered_tool_names()
         .len();
-    assert_eq!(n, 58, "Nostub must advertise exactly 58 tools, got {}", n);
+    assert_eq!(n, 60, "Nostub must advertise exactly 60 tools, got {}", n);
 }
 
 /// The single regression gate for the four doc-comment numbers. A failure here means the
@@ -402,10 +402,10 @@ fn test_nostub_tool_count_absolute() {
 #[test]
 fn test_toolset_counts_match_doc_comments() {
     for (ts, expected) in [
-        (Toolset::Baseline, 62usize),
-        (Toolset::Nostub, 58),
-        (Toolset::Merged, 54),
-        (Toolset::Interop, 33),
+        (Toolset::Baseline, 64usize),
+        (Toolset::Nostub, 60),
+        (Toolset::Merged, 56),
+        (Toolset::Interop, 35),
     ] {
         let n = IrisTools::new_with_toolset(None, ts)
             .expect("IrisTools::new")
@@ -421,7 +421,7 @@ fn test_toolset_counts_match_doc_comments() {
     // Two independent anchors for the interop number: the keep-list and the router.
     assert_eq!(
         iris_agentic_dev_core::tools::INTEROP_TOOLS.len(),
-        33,
+        35,
         "INTEROP_TOOLS is the interop profile — it must agree with the measured count"
     );
 }
@@ -467,7 +467,7 @@ fn test_new_uses_pruned_baseline_router() {
         .registered_tool_names();
     assert_eq!(
         via_new.len(),
-        62,
+        64,
         "new() claims Toolset::Baseline, so it must advertise the baseline surface"
     );
     assert_eq!(

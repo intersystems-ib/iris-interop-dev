@@ -110,10 +110,15 @@ fn a_tracking_reference_points_somewhere_real() {
             v["category"]
         );
     }
+    // A POSITIVE CONTROL, not a quota. This was `>= 3` and went red the moment #351 and #352 adopted
+    // three of the tracked tools — a test that fails because the thing it tracks got DONE punishes
+    // the outcome it exists to encourage, and the number has nowhere to go but down. What must hold
+    // is that the field is real and parsed: at least one entry exercises it, and every entry that
+    // does is well-formed and `wanted` (asserted in the loop above).
     assert!(
-        tracked >= 3,
-        "only {tracked} entries carry a tracking reference; the `wanted` ones with an open issue \
-         should name it"
+        tracked >= 1,
+        "no entry carries a tracking reference, so the two assertions in the loop above never ran \
+         and this test proves nothing about the field"
     );
 }
 
