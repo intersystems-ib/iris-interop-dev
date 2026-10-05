@@ -194,21 +194,104 @@ fn the_emitter_puts_the_names_on_their_own_lines() {
     );
 }
 
+/// Count CALLS to `name`, not every occurrence of the string.
+///
+/// Two things must not count, and a naive `matches(name)` counts both: the function's own
+/// declaration, and an identifier that merely ENDS with the name — `interop.rs` has a test called
+/// `production_item_error_mapping_item_not_found`, which is why the spelling-independent count first
+/// read 5 where 4 was right. A name appearing inside a longer identifier is the commonest false
+/// witness in a source-reading guard.
+fn call_sites(text: &str, name: &str) -> usize {
+    let needle = format!("{name}(");
+    text.lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            !(t.starts_with("fn ") || t.starts_with("pub fn ") || t.starts_with("async fn "))
+        })
+        .map(|l| {
+            let mut n = 0;
+            let mut from = 0;
+            while let Some(at) = l[from..].find(&needle) {
+                let abs = from + at;
+                let prev_is_ident = l[..abs]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_');
+                if !prev_is_ident {
+                    n += 1;
+                }
+                from = abs + needle.len();
+            }
+            n
+        })
+        .sum()
+}
+
+/// The sibling-defect guard: this fix is only correct if EVERY site carries it, because three out of
+/// four leaves the fourth looking more trustworthy than it is.
+///
+/// #327 item 3 changed the POPULATION, and that is what this test is for. `get_settings` no longer
+/// interpolates the shared block: it reads several items in one program, and the shared block ends in
+/// `Quit` by design — which returns from the METHOD, so one missing item would have ended the run and
+/// every later item would have been absent from the output. It emits the same declared-count
+/// candidate protocol itself, once, after the last item.
+///
+/// So the instrument counts what the claim is about — every generator that can report a missing item
+/// emits a DECLARED candidate count, and every reader routes through the one envelope builder — not
+/// one particular call spelling. The count stays 4 in both halves; the fourth member changed.
 #[test]
 fn all_four_sites_and_all_four_readers_use_the_shared_definitions() {
-    // The sibling-defect guard. This fix is only correct if EVERY site carries it; three out of four
-    // would leave the fourth looking more trustworthy than it is.
     let text =
         code_only(&std::fs::read_to_string(interop_rs()).expect("interop.rs must be readable"));
-    let emit = text.matches("{not_found}").count();
-    let readers = text.matches("item_not_found(msg)").count();
+    // Three single-item sites interpolate the shared block...
+    let shared = text.matches("{not_found}").count();
+    // ...and the batch reader emits the protocol inline, for the reason above. Identified by the
+    // marker only it writes, so this cannot be satisfied by any of the three above.
+    let inline = text
+        .matches(r#"Write \"ITEM_CANDIDATES_N:\"_tProd.Items.Count()"#)
+        .count();
+    let emit = shared + inline;
+    assert_eq!(
+        inline, 1,
+        "expected exactly one generator emitting the candidate protocol inline (the batch read), \
+         found {inline} — if get_settings went back to the shared block, one missing item now ends \
+         the whole program"
+    );
+    // Every CALL to the envelope builder — see `call_sites` for the two things that must not count.
+    let readers = call_sites(&text, "item_not_found");
     assert_eq!(
         emit, 4,
-        "expected 4 ObjectScript sites interpolating the shared block, found {emit}"
+        "expected 4 ObjectScript generators emitting a declared candidate count, found {emit} \
+         ({shared} via the shared block + {inline} inline)"
     );
     assert_eq!(
         readers, 4,
         "expected 4 readers routed through the shared envelope builder, found {readers}"
+    );
+    // CONTROLS for the counter itself.
+    assert!(
+        text.contains("fn item_not_found("),
+        "the definition must be in the file this test reads, or the counter is reading the wrong file"
+    );
+    assert_eq!(
+        call_sites("pub fn item_not_found(payload: &str) {}", "item_not_found"),
+        0,
+        "a declaration is not a call site"
+    );
+    assert_eq!(
+        call_sites(
+            "    fn production_item_error_mapping_item_not_found() {",
+            "item_not_found"
+        ),
+        0,
+        "an identifier that merely ENDS with the name is not a call site — this is the occurrence \
+         that made the first version of this counter read 5"
+    );
+    assert_eq!(
+        call_sites("        return item_not_found(msg);", "item_not_found"),
+        1,
+        "and a real call must still count, or the two negatives above are satisfied by counting \
+         nothing at all"
     );
     // CONTROL: no site still emits the bare form. Without this, adding a 5th site with the old
     // text would pass the two counts above.
