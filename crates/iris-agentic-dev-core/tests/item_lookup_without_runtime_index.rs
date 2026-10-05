@@ -28,7 +28,8 @@
 //! looking more trustworthy than it is.
 
 use iris_agentic_dev_core::tools::interop::{
-    build_add_item_code, build_get_settings_batch_code, build_set_settings_code, ITEM_WALK_MARKER,
+    build_add_item_code, build_get_settings_batch_code, build_set_enabled_code,
+    build_set_settings_code, ITEM_WALK_MARKER,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -133,40 +134,49 @@ fn the_duplicate_guard_tests_existence_through_the_config_walk() {
     );
 }
 
-/// The enable/disable arm is built inline in the dispatcher rather than by a named function, so it is
-/// checked at the source. The window is the arm itself, not the file.
+/// enable/disable, which #413 moved out of the dispatcher into `build_set_enabled_code`.
+///
+/// This test used to read the SOURCE of the `"enable" | "disable"` match arm, because the program
+/// was built inline there. Once the arm became a single call to a named builder, that window
+/// contained no generated ObjectScript at all — so the check and its own "is this the right arm"
+/// control both stopped being about anything. Asserting on the builder's OUTPUT is what the test
+/// always meant: source position cannot express "the walk is on every path", and the arm window
+/// was only ever a proxy for the program the arm produces.
 #[test]
-fn the_enable_disable_arm_walks_the_config_items_too() {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("src/tools/interop.rs");
-    let src = std::fs::read_to_string(&p).expect("interop.rs");
-    let at = src
-        .find("\"enable\" | \"disable\" => {")
-        .expect("the enable/disable arm must be findable");
-    let rest = &src[at..];
-    // To the end of that match arm: the next arm at the same indentation.
-    let end = rest[1..]
-        .find("\n        \"")
-        .map(|i| i + 1)
-        .unwrap_or(rest.len());
-    let arm = &rest[..end];
+fn the_enable_disable_program_walks_the_config_items_too() {
+    let code = build_set_enabled_code("P", "My.Item", true);
     assert!(
-        arm.contains(ITEM_WALK_MARKER),
-        "the enable/disable arm still resolves through the runtime index:\n{arm}"
+        code.contains(ITEM_WALK_MARKER),
+        "enable/disable still resolves through the runtime index:\n{code}"
     );
-    assert!(!arm.contains("FindItemByConfigName"), "{arm}");
-    // CONTROLS: the window is one arm, and it is the right one.
+    assert!(!code.contains("FindItemByConfigName"), "{code}");
+    // The walk must compare against the item ASKED FOR and keep what it matched — the same
+    // false-witness guard the batch programs get above.
+    let walk: Vec<&str> = code
+        .lines()
+        .filter(|l| l.contains(ITEM_WALK_MARKER))
+        .collect();
+    assert_eq!(walk.len(), 1, "expected exactly one walk:\n{code}");
     assert!(
-        arm.len() < src.len() / 4,
-        "the arm window is {} of {} bytes — not one match arm",
-        arm.len(),
-        src.len()
+        walk[0].contains(".Name=\"My.Item\""),
+        "the walk does not compare against the item asked for:\n{}",
+        walk[0]
     );
-    assert!(arm.contains("Set tItem.Enabled="), "wrong arm: {arm}");
     assert!(
-        !arm.contains("\"get_settings\" => {"),
-        "the window ran into the next arm"
+        walk[0].contains("Set tItem=tProd.Items.GetAt("),
+        "the walk does not keep the item it matched:\n{}",
+        walk[0]
     );
+    // CONTROLS: this is the enable/disable program, and it is a whole program.
+    assert!(
+        code.contains("Set tItem.Enabled=1"),
+        "not the enable/disable program: {code}"
+    );
+    assert!(
+        build_set_enabled_code("P", "My.Item", false).contains("Set tItem.Enabled=0"),
+        "the enabled flag is not driven by the argument"
+    );
+    assert!(code.len() > 100, "program suspiciously short: {code}");
 }
 
 /// No generated ObjectScript anywhere in the file may use the runtime-index lookup. This is the

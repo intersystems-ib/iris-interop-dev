@@ -55,6 +55,30 @@ pub fn atelier_status(err: &anyhow::Error) -> Option<&AtelierHttpError> {
     err.downcast_ref::<AtelierHttpError>()
 }
 
+/// Whether a failed `execute_via_generator` attempt is worth repeating: a 5xx or a transport
+/// fault, never a 4xx and never a deterministic IRIS error.
+///
+/// #362: the 5xx arm reads the STATUS. It used to ask whether the error's Display text contained
+/// `"HTTP 5"` — a dependency on wording, which is the shape #102 had to fix once already in this
+/// same file.
+///
+/// This is deliberately extracted rather than left inline, because the change is **invisible to a
+/// behavioural test**: every 5xx message this file builds ("PUT doc failed: HTTP 503", "compile
+/// HTTP 502", "query HTTP 500") happens to contain `"HTTP 5"` today, so both spellings agree on
+/// every input the code can currently produce, and reverting it would survive any end-to-end
+/// assertion. What it protects against is a reworded message silently switching retries off — the
+/// failure the query step was already in when #362 was filed. The unit tests pin it by
+/// constructing the case a reword produces, which is the only way to tell the two apart.
+pub(crate) fn retryable_attempt(err: &anyhow::Error) -> bool {
+    if let Some(atelier) = atelier_status(err) {
+        return atelier.status >= 500;
+    }
+    let msg = err.to_string();
+    msg.contains("error sending request")
+        || msg.contains("connection refused")
+        || msg.contains("timed out")
+}
+
 /// Trim and cut a response body to `max` CHARACTERS (not bytes — a cut inside a UTF-8
 /// sequence would panic).
 pub(crate) fn truncate_body(body: &str, max: usize) -> String {
@@ -294,17 +318,14 @@ impl IrisConnection {
     /// Returns true if write-capable tools should be registered.
     /// Checks SystemMode, namespace heuristics, and IRIS_ALLOW_PROD override (issue #26).
     pub fn is_write_allowed(&self) -> bool {
-        if std::env::var("IRIS_ALLOW_PROD")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-        {
-            return true;
-        }
-        match &self.system_mode {
-            SystemMode::Live => false,
-            SystemMode::Development | SystemMode::Test => true,
-            SystemMode::Unknown => !is_production_namespace(&self.namespace),
-        }
+        write_allowed_with(
+            read_only_mode(),
+            &self.system_mode,
+            &self.namespace,
+            std::env::var("IRIS_ALLOW_PROD")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+        )
     }
 
     /// Build the full Atelier REST URL for a given path suffix.
@@ -517,12 +538,7 @@ impl IrisConnection {
                 }
                 Err(e) => {
                     let msg = e.to_string();
-                    // Only retry on network errors or 5xx; 4xx are client errors, don't retry.
-                    let is_retryable = msg.contains("HTTP 5")
-                        || msg.contains("error sending request")
-                        || msg.contains("connection refused")
-                        || msg.contains("timed out");
-                    if !is_retryable || attempt == delays.len() - 1 {
+                    if !retryable_attempt(&e) || attempt == delays.len() - 1 {
                         return Err(e);
                     }
                     // Transient on cold-start (private web server still warming up) — debug only;
@@ -635,11 +651,46 @@ impl IrisConnection {
             .json(&serde_json::json!({"query": sql}))
             .send()
             .await?;
-        let query_body: serde_json::Value = query_resp.json().await.unwrap_or_default();
-        let output = query_body["result"]["content"][0]["result"]
-            .as_str()
-            .unwrap_or("")
-            .replace('\x01', "\n");
+        // #362: this was `query_resp.json().await.unwrap_or_default()` indexed into
+        // `result.content[0].result` with `unwrap_or("")`. A SqlProc that fails at RUNTIME answers
+        // HTTP 200 with the diagnosis in `status.errors` and no `content` key at all, so that chain
+        // produced `Ok("")` — and 66 call sites read an empty string as "the script produced no
+        // output" while the error text was discarded. Measured: a captured output of 3,600,000 chars
+        // returns fine and 3,700,000 fails with <MAXSTRING>, so the tool was correct right up to
+        // IRIS's limit and then reported *nothing found* for the one large document.
+        //
+        // The three cases are distinct in the RESPONSE, not in the value — `status.errors` empty
+        // with `content` present vs `status.errors` populated with `result: {}` — and
+        // `interpret_query_response` already draws exactly that line. The generator was the one
+        // request path in this file that never used it (#105's duplication, missing the error half
+        // rather than the retry).
+        let query_status = query_resp.status();
+        let query_text = query_resp.text().await?;
+        let output = match interpret_query_response(query_status, &query_text) {
+            // A successful SELECT with an empty value IS a script that wrote nothing. The
+            // `unwrap_or("")` is correct here, and only here.
+            QueryOutcome::Rows(body) => body["result"]["content"][0]["result"]
+                .as_str()
+                .unwrap_or("")
+                .replace('\x01', "\n"),
+            QueryOutcome::IrisError(msg) => {
+                let _ = self.delete_doc(&doc_name, namespace, client).await;
+                anyhow::bail!("the generated SqlProc failed: {msg}");
+            }
+            QueryOutcome::HttpError { status, snippet } => {
+                let _ = self.delete_doc(&doc_name, namespace, client).await;
+                return Err(anyhow::Error::new(AtelierHttpError::new(
+                    status,
+                    query_url,
+                    snippet,
+                    format!("query HTTP {status}"),
+                )));
+            }
+            QueryOutcome::NonJson { status, snippet } => {
+                let _ = self.delete_doc(&doc_name, namespace, client).await;
+                anyhow::bail!("non-JSON response from {query_url} (HTTP {status}): {snippet}");
+            }
+        };
 
         // 4. Delete the temp class (best-effort)
         let _ = self.delete_doc(&doc_name, namespace, client).await;
@@ -1034,6 +1085,118 @@ fn system_mode_from_global(raw: &str) -> SystemMode {
 ///
 /// See [`system_mode_from_global`] above: this function's case-insensitivity is the behaviour that
 /// the mode match was missing.
+/// An EXPLICIT read-only request, independent of what the instance looks like.
+///
+/// #303. The inferred write gate ([`IrisConnection::is_write_allowed`]) answers *"does this instance
+/// look like production?"* — a safety guess from `SystemMode` and a namespace heuristic. This answers
+/// a different question: *"the operator asked for read-only"*. That is not a guess, so no heuristic
+/// and no `IRIS_ALLOW_PROD` may override it.
+///
+/// Two levels, because "can it change my code?" and "can it touch my instance at all?" are different
+/// questions and only the asker knows which one they mean. The ten tools in `GENERATOR_WRITE_TOOLS`
+/// are read-only in INTENT but PUT, compile and delete a scratch class in `IrisDevTmp` to answer,
+/// because the data they read has no SQL projection to reach it through. `Soft` keeps them; `Strict`
+/// refuses them.
+///
+/// Neither level replaces SELECT-only grants on the MCP's IRIS user. These are enforced in this
+/// server; privileges are enforced by the database. For an instance that genuinely must not be
+/// written, do both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReadOnlyMode {
+    /// No explicit request — the inferred gate decides, exactly as it did before this existed.
+    #[default]
+    Off,
+    /// Every declared mutator is refused. The scratch-class readers still answer, and still write.
+    Soft,
+    /// Also refuses anything that writes a scratch class to answer.
+    Strict,
+}
+
+impl ReadOnlyMode {
+    /// Whether an explicit request is in force at all. `Off` means "ask the inferred gate".
+    pub fn is_read_only(self) -> bool {
+        !matches!(self, ReadOnlyMode::Off)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReadOnlyMode::Off => "off",
+            ReadOnlyMode::Soft => "soft",
+            ReadOnlyMode::Strict => "strict",
+        }
+    }
+}
+
+/// Resolve the mode from a variable getter.
+///
+/// Taking a getter rather than reading `std::env` directly is what makes the PRECEDENCE testable
+/// without mutating process environment. Tests that set shared env already race each other here —
+/// `admin_unit_tests::write_not_allowed_without_env` is the known case — and precedence is the part
+/// most worth pinning, so it is pinned by a pure function instead.
+pub(crate) fn resolve_read_only_mode(get: impl Fn(&str) -> Option<String>) -> ReadOnlyMode {
+    let on = |name: &str| {
+        get(name)
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                v == "1" || v == "true" || v == "yes"
+            })
+            .unwrap_or(false)
+    };
+    // Strict beats soft: asking for both is asking for the stronger one, never the weaker.
+    if on("IRIS_STRICT_READ_ONLY") {
+        return ReadOnlyMode::Strict;
+    }
+    if on("IRIS_SOFT_READ_ONLY") {
+        return ReadOnlyMode::Soft;
+    }
+    ReadOnlyMode::Off
+}
+
+/// This process's read-only mode, resolved once.
+///
+/// Once, deliberately: `is_write_allowed` reads `IRIS_ALLOW_PROD` from the environment on every
+/// call, and a gate that can change answer mid-process is a gate that cannot be reasoned about. A
+/// request made at startup holds for the life of the server.
+pub fn read_only_mode() -> ReadOnlyMode {
+    static MODE: std::sync::OnceLock<ReadOnlyMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| resolve_read_only_mode(|k| std::env::var(k).ok()))
+}
+
+/// The write decision, as a pure function of everything that feeds it.
+///
+/// Extracted so the PRECEDENCE can be tested without mutating process environment.
+/// [`read_only_mode`] is cached for the life of the process — deliberately, since a gate that can
+/// change its answer mid-run cannot be reasoned about — which also means no in-process test can vary
+/// it. A pure function is the only honest way to pin the order, and the order is the part that
+/// decides whether asking for read-only is trustworthy.
+///
+/// #303 precedence, strongest first:
+/// `IRIS_STRICT_READ_ONLY` > `IRIS_SOFT_READ_ONLY` > `IRIS_ALLOW_PROD` > the inferred gate.
+///
+/// The last two lines of that chain are unchanged, so a deployment setting neither new variable
+/// behaves exactly as it did before this existed.
+pub(crate) fn write_allowed_with(
+    requested: ReadOnlyMode,
+    system_mode: &SystemMode,
+    namespace: &str,
+    allow_prod: bool,
+) -> bool {
+    // An explicit request is not a guess and nothing below may override it. If `allow_prod` won
+    // here, an operator with IRIS_ALLOW_PROD exported — precisely the environment where asking for
+    // read-only matters — would silently get writes while believing they had asked for none.
+    if requested.is_read_only() {
+        return false;
+    }
+    if allow_prod {
+        return true;
+    }
+    match system_mode {
+        SystemMode::Live => false,
+        SystemMode::Development | SystemMode::Test => true,
+        SystemMode::Unknown => !is_production_namespace(namespace),
+    }
+}
+
 fn is_production_namespace(ns: &str) -> bool {
     let upper = ns.to_uppercase();
     matches!(upper.as_str(), "PROD" | "PRODUCTION" | "LIVE" | "PRD")
@@ -1381,6 +1544,206 @@ mod system_mode_tests {
 }
 
 // ── Issues #101 / #102: the query path must not destroy what IRIS said ───────
+/// #362: the retry predicate, pinned where behaviour cannot pin it.
+///
+/// `a_five_hundred_on_the_query_step_is_retried` in `tests/generator_sqlproc_failure.rs` proves the
+/// query step retries at all — that is the part that was genuinely broken. It cannot prove the
+/// predicate reads the STATUS, because every 5xx message this file builds also contains the literal
+/// "HTTP 5", so the old text match and the new status check agree on every input the code produces.
+/// These construct the inputs a reworded message would produce, where they disagree.
+#[cfg(test)]
+mod retryable_attempt_tests {
+    use super::*;
+
+    fn atelier_err(status: u16, message: &str) -> anyhow::Error {
+        anyhow::Error::new(AtelierHttpError::new(
+            reqwest::StatusCode::from_u16(status).expect("a valid status"),
+            "http://localhost/api/atelier/v1/USER/action/query",
+            "",
+            message,
+        ))
+    }
+
+    #[test]
+    fn a_five_hundred_is_retryable_however_its_message_is_worded() {
+        // THE DISTINGUISHING CASE. No "HTTP 5" anywhere in the text, so the predicate this
+        // replaced answered `false` and the attempt was silently not retried.
+        let e = atelier_err(503, "the gateway is restarting, try later");
+        assert!(
+            retryable_attempt(&e),
+            "a 503 is retryable because of its STATUS; reading the message means a reword turns \
+             retries off without a test noticing"
+        );
+        // CONTROL: the text matcher really would have missed it, so the case above is not
+        // hypothetical.
+        assert!(
+            !e.to_string().contains("HTTP 5"),
+            "this fixture only distinguishes the two predicates if its text lacks the old needle"
+        );
+    }
+
+    #[test]
+    fn a_four_hundred_is_not_retryable_even_when_its_message_mentions_http_five() {
+        // The mirror: text that would fool the old matcher into retrying a client error forever.
+        let e = atelier_err(404, "no route matched; upstream said HTTP 502 earlier");
+        assert!(
+            !retryable_attempt(&e),
+            "a 404 is deterministic — repeating it cannot change the answer"
+        );
+    }
+
+    #[test]
+    fn a_transport_failure_is_still_retryable() {
+        // Not an AtelierHttpError at all: no status to read, so the text is all there is, and that
+        // arm is deliberately unchanged.
+        let e = anyhow::anyhow!("error sending request for url (http://localhost:52773/)");
+        assert!(
+            retryable_attempt(&e),
+            "a dropped connection is worth repeating"
+        );
+    }
+
+    #[test]
+    fn a_deterministic_iris_error_is_not_retryable() {
+        // What #362 makes reachable: a SqlProc failure now arrives as an Err. Repeating it would
+        // re-run the whole PUT/compile/query cycle to get the same SQLCODE back.
+        let e = anyhow::anyhow!("the generated SqlProc failed: ERROR #5540: SQLCODE: -400");
+        assert!(
+            !retryable_attempt(&e),
+            "a SQLCODE is a verdict about the code, not a transient fault"
+        );
+    }
+}
+
+/// #303: the two explicit read-only levels, and the precedence that makes them trustworthy.
+///
+/// All of this is asserted through the pure functions, with no process environment touched. That is
+/// not convenience: `read_only_mode()` caches for the life of the process on purpose, so an
+/// in-process test cannot vary it, and tests here that set shared env would race each other the way
+/// `admin_unit_tests::write_not_allowed_without_env` already does.
+#[cfg(test)]
+mod read_only_mode_tests {
+    use super::*;
+
+    /// A getter over a fixed list, standing in for the environment. Owns its data so the closure
+    /// borrows nothing — the point is to resolve a mode without touching `std::env` at all.
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let owned: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k: &str| {
+            owned
+                .iter()
+                .find(|(name, _)| name == k)
+                .map(|(_, v)| v.clone())
+        }
+    }
+
+    #[test]
+    fn nothing_requested_leaves_the_inferred_gate_in_charge() {
+        assert_eq!(resolve_read_only_mode(env(&[])), ReadOnlyMode::Off);
+        // A deployment that sets neither variable must behave exactly as it did before #303, so
+        // this is the row that says the change is additive.
+        assert!(!ReadOnlyMode::Off.is_read_only());
+    }
+
+    #[test]
+    fn each_level_resolves_to_itself() {
+        assert_eq!(
+            resolve_read_only_mode(env(&[("IRIS_SOFT_READ_ONLY", "1")])),
+            ReadOnlyMode::Soft
+        );
+        assert_eq!(
+            resolve_read_only_mode(env(&[("IRIS_STRICT_READ_ONLY", "1")])),
+            ReadOnlyMode::Strict
+        );
+    }
+
+    #[test]
+    fn strict_beats_soft_when_both_are_asked_for() {
+        let both = [("IRIS_SOFT_READ_ONLY", "1"), ("IRIS_STRICT_READ_ONLY", "1")];
+        assert_eq!(
+            resolve_read_only_mode(env(&both)),
+            ReadOnlyMode::Strict,
+            "asking for both is asking for the stronger one — resolving to soft would quietly \
+             grant the scratch-class writes that strict was set to refuse"
+        );
+    }
+
+    #[test]
+    fn an_explicit_request_beats_allow_prod() {
+        // THE precedence that decides whether asking for read-only means anything. IRIS_ALLOW_PROD
+        // forces writes on, and an operator with it exported is exactly who most needs the request
+        // honoured.
+        for requested in [ReadOnlyMode::Soft, ReadOnlyMode::Strict] {
+            assert!(
+                !write_allowed_with(requested, &SystemMode::Development, "USER", true),
+                "{requested:?} must refuse writes even with IRIS_ALLOW_PROD set"
+            );
+        }
+    }
+
+    #[test]
+    fn allow_prod_still_wins_when_no_read_only_was_requested() {
+        // CONTROL for the test above. Without this, "an explicit request beats allow_prod" is also
+        // satisfied by a gate that simply never allows writes, which would be a different bug.
+        assert!(
+            write_allowed_with(ReadOnlyMode::Off, &SystemMode::Live, "PROD", true),
+            "IRIS_ALLOW_PROD must still override the heuristic when nothing was requested"
+        );
+    }
+
+    #[test]
+    fn the_inferred_gate_is_untouched() {
+        // The pre-#303 truth table, re-asserted so a change to the new precedence cannot quietly
+        // alter the old behaviour underneath it.
+        let off = ReadOnlyMode::Off;
+        assert!(!write_allowed_with(off, &SystemMode::Live, "USER", false));
+        assert!(write_allowed_with(
+            off,
+            &SystemMode::Development,
+            "USER",
+            false
+        ));
+        assert!(write_allowed_with(off, &SystemMode::Test, "USER", false));
+        assert!(write_allowed_with(off, &SystemMode::Unknown, "USER", false));
+        assert!(!write_allowed_with(
+            off,
+            &SystemMode::Unknown,
+            "PROD",
+            false
+        ));
+        assert!(!write_allowed_with(
+            off,
+            &SystemMode::Unknown,
+            "production",
+            false
+        ));
+    }
+
+    #[test]
+    fn only_affirmative_values_turn_a_level_on() {
+        for on in ["1", "true", "TRUE", "yes", " 1 "] {
+            assert_eq!(
+                resolve_read_only_mode(env(&[("IRIS_STRICT_READ_ONLY", on)])),
+                ReadOnlyMode::Strict,
+                "{on:?} should request strict"
+            );
+        }
+        // An unset variable and an explicitly negative one must give the same answer: a deployment
+        // that writes IRIS_STRICT_READ_ONLY=0 into a config has NOT asked for read-only, and
+        // treating any non-empty value as truthy is how that becomes a silent surprise.
+        for off in ["0", "false", "no", "", "off"] {
+            assert_eq!(
+                resolve_read_only_mode(env(&[("IRIS_STRICT_READ_ONLY", off)])),
+                ReadOnlyMode::Off,
+                "{off:?} must not request strict"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod atelier_http_error_tests {
     use super::*;

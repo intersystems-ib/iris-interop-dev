@@ -891,9 +891,71 @@ pub struct LogsParams {
     pub since_id: Option<i64>,
     #[serde(default = "default_limit")]
     pub limit: u32,
+    /// Comma-separated, as IRIS names them. #112: the accepted set belongs in the SCHEMA, not only
+    /// in the refusal — a guessed value costs a round trip otherwise.
+    #[schemars(extend("examples" = ["error,warning", "error", "info", "assert,error,warning,info,trace,alert"]))]
     #[serde(default = "default_log_type")]
     pub log_type: String,
 }
+/// The `Ens_Util.Log.Type` numbers a `log_type=` word selects.
+///
+/// MEASURED, because the mapping this replaces was wrong on every value. IRIS's own definition, read
+/// from `%Dictionary.CompiledProperty` for `Ens.Util.Log::Type` (an `Ens.DataType.LogType`):
+///
+/// ```text
+/// DISPLAYLIST = ,Assert,Error,Warning,Info,Trace,Alert
+///   => Assert 1, Error 2, Warning 3, Info 4, Trace 5, Alert 6
+/// ```
+///
+/// Confirmed against a live production's own log — 6 rows of `ERROR <Ens>ErrProductionAlreadyRunning`
+/// at Type 2, and 29 `$$$LOGINFO` rows at Type 4.
+///
+/// What the old mapping did, driven through the tool against that data:
+///
+/// | asked for | returned | rows that existed |
+/// |---|---|---|
+/// | `error` | **0 rows** | 6 |
+/// | `warning` | the 6 ERROR rows | 0 |
+/// | `info` | **0 rows** | 29 |
+/// | `alert` | the 29 INFO rows | 0 |
+/// | `trace`, `assert` | all 35, silently unfiltered | — |
+///
+/// `log_type=error` finding nothing while six errors sit in the log is the negative-fact shape
+/// CLAUDE.md is about, in the tool a caller reaches for precisely when something is broken. The
+/// DEFAULT (`error,warning`) happened to work: it asked for Types 3 and 2, and 2 is really Error — so
+/// the tool was right until a caller named what they wanted.
+///
+/// An unrecognised word is now refused rather than dropped. Dropping it removed the WHERE clause
+/// entirely, so `log_type=trace` returned every row of every type and looked like a successful filter.
+pub fn log_type_conditions(spec: &str) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    let mut unknown = Vec::new();
+    for word in spec.split(',') {
+        let w = word.trim().to_lowercase();
+        if w.is_empty() {
+            continue;
+        }
+        match w.as_str() {
+            "assert" => out.push("Type = 1".to_string()),
+            "error" => out.push("Type = 2".to_string()),
+            "warning" => out.push("Type = 3".to_string()),
+            "info" => out.push("Type = 4".to_string()),
+            "trace" => out.push("Type = 5".to_string()),
+            "alert" => out.push("Type = 6".to_string()),
+            _ => unknown.push(w),
+        }
+    }
+    if !unknown.is_empty() {
+        return Err(format!(
+            "log_type does not accept {unknown:?}. Accepted, as IRIS names them: assert, error, \
+             warning, info, trace, alert (comma-separated). An unrecognised word used to be dropped, \
+             which removed the filter entirely and returned every log row as though it had been \
+             applied."
+        ));
+    }
+    Ok(out)
+}
+
 fn default_limit() -> u32 {
     10
 }
@@ -1414,16 +1476,10 @@ pub async fn interop_logs_impl(
         None => return err_json("IRIS_UNREACHABLE", "No IRIS connection"),
     };
     let client = IrisConnection::http_client().map_err(|_| iris_unreachable())?;
-    let mut conditions = vec![];
-    for lt in params.log_type.split(',') {
-        match lt.trim().to_lowercase().as_str() {
-            "error" => conditions.push("Type = 3"),
-            "warning" => conditions.push("Type = 2"),
-            "info" => conditions.push("Type = 1"),
-            "alert" => conditions.push("Type = 4"),
-            _ => {}
-        }
-    }
+    let conditions = match log_type_conditions(&params.log_type) {
+        Ok(c) => c,
+        Err(why) => return err_json("INVALID_PARAMS", &why),
+    };
     let type_filter = if conditions.is_empty() {
         String::new()
     } else {
@@ -1524,7 +1580,7 @@ fn is_sql_identifier(s: &str) -> bool {
 /// Body-class join (issue #4). The join also pins h.MessageBodyClassName to
 /// the body class: MessageBodyId is only unique per body table, so without it
 /// same-numbered rows of OTHER body classes would match.
-fn build_body_join_sql(
+pub fn build_body_join_sql(
     limit: u32,
     mut filters: Vec<String>,
     body_class: &str,
@@ -1557,13 +1613,23 @@ fn build_body_join_sql(
 /// Search-Table join (issue #4) — the canonical shape from the issue: DocId IS
 /// MessageBodyId, and PropId must be resolved through Ens_Config.SearchTableProp
 /// first (PropId is only unique within one extent).
-fn build_search_table_sql(
+///
+/// `doc_classes` (#409) pins h.MessageBodyClassName the way the sibling
+/// `build_body_join_sql` already did. DocId is only unique within the document
+/// class's extent, so without the pin a custom body class whose numeric ID
+/// happens to collide with an indexed document's ID matches too. An EMPTY slice
+/// means the document class could not be resolved — the join is then emitted
+/// unpinned, exactly as before, and the caller is told so; it must never be
+/// turned into an impossible predicate, because zero rows would read as "no
+/// message matched".
+pub fn build_search_table_sql(
     limit: u32,
     mut filters: Vec<String>,
     extent_table: &str,
     prop_ids: &[i64],
     value: Option<&str>,
     value_like: Option<&str>,
+    doc_classes: &[String],
 ) -> String {
     let ids = prop_ids
         .iter()
@@ -1571,6 +1637,14 @@ fn build_search_table_sql(
         .collect::<Vec<_>>()
         .join(",");
     filters.push(format!("st.PropId IN ({ids})"));
+    if !doc_classes.is_empty() {
+        let list = doc_classes
+            .iter()
+            .map(|c| format!("'{}'", c.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(",");
+        filters.push(format!("h.MessageBodyClassName IN ({list})"));
+    }
     if let Some(v) = value {
         filters.push(format!("st.PropValue = '{}'", v.replace('\'', "''")));
     } else if let Some(v) = value_like {
@@ -1585,6 +1659,67 @@ fn build_search_table_sql(
         "SELECT TOP {limit} {header_cols}, st.PropValue FROM Ens.MessageHeader h JOIN {extent_table} st ON st.DocId = h.MessageBodyId WHERE {} ORDER BY h.ID DESC",
         filters.join(" AND ")
     )
+}
+
+/// What a caller is told when the extent's document class could not be resolved
+/// (#409). The search still answers — an impossible predicate would return zero
+/// rows, and zero rows read as "no message matched" — so the message has to say
+/// the guarantee is missing AND hand over the way to get it.
+pub fn unpinned_search_warning(extent: &str, ns: &str) -> String {
+    format!(
+        "Extent '{extent}' declares no DOCCLASS parameter that resolves to a compiled class in namespace '{ns}', so this search could NOT be constrained to the extent's document class. Rows whose MessageBodyClassName is a different class may be included: a Search Table DocId is unique only within its document class's extent. Pass message_class=<the body class you want> to constrain it yourself."
+    )
+}
+
+/// The document classes a Search-Table extent indexes (#409).
+///
+/// Every search-table family declares its document class as the `DOCCLASS` class
+/// parameter, and `%Dictionary.CompiledClass.PrimarySuper` is a `~`-delimited
+/// list that INCLUDES the class itself — so one LIKE returns DOCCLASS *and*
+/// every subclass of it, in a single round trip and with no HL7 special case.
+///
+/// Measured on IRIS for Health 2026.1 (`_Default`, not `Default` — that column
+/// name is reserved):
+///
+/// | extent | classes returned |
+/// |---|---|
+/// | `EnsLib.HL7.SearchTable` | 1 — `EnsLib.HL7.Message` |
+/// | `EnsLib.EDI.X12.SearchTable` | 1 — `EnsLib.EDI.X12.Document` |
+/// | `EnsLib.XML.SearchTable` | **5** — `Ens.StreamContainer` + 4 subclasses |
+/// | `Ens.MessageHeader` (no DOCCLASS) | 0 rows, not an error |
+///
+/// The XML row is why a bare `= DOCCLASS` is wrong: it would drop four real body
+/// classes. The last row is why `Ok(vec![])` must mean "cannot pin" and not
+/// "nothing matches".
+pub fn doc_class_family_sql(extent: &str) -> String {
+    let e = extent.replace('\'', "''");
+    format!(
+        "SELECT c.Name FROM %Dictionary.CompiledClass c, %Dictionary.CompiledParameter p WHERE p.parent = '{e}' AND p.Name = 'DOCCLASS' AND c.PrimarySuper LIKE '%~' || p._Default || '~%'"
+    )
+}
+
+/// Resolves [`doc_class_family_sql`]. An empty Vec is "could not resolve", which
+/// the caller reports rather than silently converting into an empty result.
+async fn resolve_doc_classes(
+    iris: &IrisConnection,
+    ns: &str,
+    client: &reqwest::Client,
+    extent: &str,
+) -> Result<Vec<String>, String> {
+    let resp = iris
+        .query(&doc_class_family_sql(extent), vec![], ns, client)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(resp["result"]["content"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| r["Name"].as_str())
+                .filter(|n| !n.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default())
 }
 
 /// SQL projection of a class via the dictionary (handles SqlTableName
@@ -1854,6 +1989,14 @@ pub async fn interop_message_search_impl(
                 )
             }
         };
+        // #409: pin the join to the extent's document class. DocId is unique only
+        // within that class's extent, so an unpinned join also matches bodies of
+        // OTHER classes whose numeric ID collides — which is what the sibling
+        // `build_body_join_sql` has always guarded against.
+        let doc_classes = match resolve_doc_classes(iris, ns, &client, &extent).await {
+            Ok(v) => v,
+            Err(e) => return err_json(net_err(&e), &e),
+        };
         let sql = build_search_table_sql(
             params.limit,
             header_filters(&params, "h."),
@@ -1861,6 +2004,7 @@ pub async fn interop_message_search_impl(
             &prop_ids,
             st.value.as_deref(),
             st.value_like.as_deref(),
+            &doc_classes,
         );
         return match iris.query(&sql, vec![], ns, &client).await {
             Ok(resp) => {
@@ -1874,6 +2018,15 @@ pub async fn interop_message_search_impl(
                     "prop_ids": prop_ids,
                     "sql": sql,
                 });
+                // #409: an unresolvable document class is reported, never hidden.
+                // Emitting an impossible predicate instead would answer the caller
+                // with zero rows, which reads as "no message matched".
+                if doc_classes.is_empty() {
+                    out["warning"] =
+                        serde_json::Value::String(unpinned_search_warning(&extent, ns));
+                } else {
+                    out["doc_classes"] = serde_json::json!(doc_classes);
+                }
                 if count == 0 {
                     // Issue #4: valid prop + zero rows is usually a config-time effect.
                     out["hint"] = serde_json::Value::String(
@@ -2439,6 +2592,114 @@ If '$IsObject(tProd) {{ Write "ERROR:INTEROP_ERROR:Cannot open production "_tPro
     )
 }
 
+/// #408: the ObjectScript that writes the production CLASS back after the extent was
+/// saved — the step the Portal performs via `SaveToClass()`, and the one every mutating
+/// action here omitted.
+///
+/// `%Save()` writes the extent (`Ens_Config.Item`), which is the LIVE configuration.
+/// The class's `XData ProductionDefinition` keeps the old item list. Staleness is the
+/// mild half of that. The sharp half, measured on IRIS for Health 2026.1: the XData is
+/// what a **compile** of the production class replays into the extent, so recompiling
+/// the stale class DELETED a just-added item from the live configuration —
+///
+/// ```text
+/// after Items.Insert + %Save()   extent [Added, First, Ghost]   XData 2 items
+/// recompile the stale class      extent [Added, First]          XData 2 items
+/// ```
+///
+/// with no error and `success: true` already reported. And the skills plugin's drift
+/// guidance ("iris_doc get the production class and write it to src/") writes that
+/// stale class to disk first, making it the source of truth.
+///
+/// Emitted after `%Save()` succeeded and before `UpdateProduction` — the Portal's order.
+pub const PRODUCTION_CLASS_SAVE: &str = "Set tSCC=tProd.SaveToClass()\nSet tClsErr=\"\" If $$$ISERR(tSCC) { Set tClsErr=$System.Status.GetErrorText(tSCC) }\n";
+
+/// #408: reports the class save AFTER the OK line, never before it.
+///
+/// Two reasons for the order. A `%Status` chain's text is multi-line, so a marker written
+/// first would push the OK line past where the reader looks — the truncation #347 fixed
+/// elsewhere. And a class that could not be saved is NOT a failed action: by the time this
+/// runs the live change has landed, so reporting failure would tell the caller to retry a
+/// mutation that already happened.
+pub const PRODUCTION_CLASS_SAVE_REPORT: &str =
+    "\nIf tClsErr'=\"\" { Write !,\"CLASS_NOT_SAVED:\"_tClsErr }";
+
+/// #408: splits a mutating action's output into the line the existing parsers read and the
+/// class-save reason that may follow it.
+///
+/// The reason is everything after the marker, so a multi-line `%Status` chain survives
+/// whole. `None` means the class WAS saved: the marker is written only on failure, so its
+/// absence is a positive statement rather than a missing field. An empty reason still
+/// returns `Some`, because decaying to `None` would report a class that was not saved as
+/// saved.
+pub fn read_class_save_marker(out: &str) -> (&str, Option<&str>) {
+    const MARKER: &str = "CLASS_NOT_SAVED:";
+    match out.find(MARKER) {
+        None => (out.trim(), None),
+        Some(i) => {
+            let reason = out[i + MARKER.len()..].trim();
+            (
+                out[..i].trim(),
+                Some(if reason.is_empty() {
+                    "(no reason reported)"
+                } else {
+                    reason
+                }),
+            )
+        }
+    }
+}
+
+/// #408: the success envelope's account of whether the production CLASS now matches the
+/// live configuration. One place, so the five actions cannot drift apart.
+pub fn attach_class_save(env: &mut serde_json::Value, class_error: Option<&str>) {
+    env["class_saved"] = serde_json::Value::Bool(class_error.is_none());
+    if let Some(reason) = class_error {
+        env["class_error"] = serde_json::Value::String(reason.to_string());
+        env["warning"] = serde_json::Value::String(class_not_saved_warning(reason));
+    }
+}
+
+/// #408: what the caller is told when the live configuration changed but the class did not.
+///
+/// It names the consequence (a recompile reverts this) and the way out, because the obvious
+/// next step — `iris_doc(mode=get)` then writing the class to `src/` — is precisely the step
+/// that makes the stale class authoritative.
+pub fn class_not_saved_warning(reason: &str) -> String {
+    format!(
+        "The live configuration was changed and applied, but the production CLASS could not be re-saved, so its XData ProductionDefinition no longer matches: {reason}. Do NOT write this class to disk from iris_doc(mode=get) — the stale XData is what a later compile replays into the configuration, which would revert this change. Fix the cause (a deployed or read-only production class is the usual one), then re-run this action to bring the class back in step."
+    )
+}
+
+/// Build the ObjectScript that enables or disables a config item (pure → unit-testable).
+///
+/// #408: extracted from an inline `format!` in the handler. It was the one mutating action
+/// whose codegen was not a named function, so it was the one a parity test over the
+/// builders could not see — and #409, in this same file, was exactly a guard that one
+/// sibling had and the other did not.
+pub fn build_set_enabled_code(production: &str, item: &str, enabled: bool) -> String {
+    let item_e = os_str_expr(item);
+    format!(
+        r#"{prologue}
+Set tItem="" For zfi=1:1:tProd.Items.Count() {{ If tProd.Items.GetAt(zfi).Name={item} {{ Set tItem=tProd.Items.GetAt(zfi) Quit }} }}
+If '$IsObject(tItem) {{
+{not_found}
+}}
+Set tItem.Enabled={enabled_val}
+Set tSC4=tProd.%Save()
+If $$$ISERR(tSC4) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC4) Quit }}
+{class_save}Set tSC5=##class(Ens.Director).UpdateProduction(10,0)
+If $$$ISERR(tSC5) {{ Write "ERROR:UPDATE_FAILED:"_$System.Status.GetErrorText(tSC5) Quit }}
+Write "OK"{class_save_report}"#,
+        prologue = resolve_production_prologue(production),
+        item = item_e,
+        not_found = item_not_found_block(&item_e),
+        enabled_val = if enabled { "1" } else { "0" },
+        class_save = PRODUCTION_CLASS_SAVE,
+        class_save_report = PRODUCTION_CLASS_SAVE_REPORT,
+    )
+}
+
 /// Build the ObjectScript that adds a config item to a production (pure → unit-testable).
 /// `production` empty ⇒ resolve the running production. Settings keys prefixed `Adapter.` target
 /// the adapter; otherwise the Host. Applies live only if the target production is the one running.
@@ -2480,12 +2741,14 @@ Set tItem.Enabled={enabled}
 {extra}Do tProd.Items.Insert(tItem)
 Set tSC4=tProd.%Save()
 If $$$ISERR(tSC4) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC4) Quit }}
-Set tRun="" Do ##class(Ens.Director).GetProductionStatus(.tRun,.s2)
+{class_save}Set tRun="" Do ##class(Ens.Director).GetProductionStatus(.tRun,.s2)
 If tRun=tProdName {{ Set tSC5=##class(Ens.Director).UpdateProduction(10,0) If $$$ISERR(tSC5) {{ Write "ERROR:UPDATE_FAILED:"_$System.Status.GetErrorText(tSC5) Quit }} }}
-Write "OK:"_tProdName"#,
+Write "OK:"_tProdName{class_save_report}"#,
         prologue = resolve_production_prologue(production),
         item = item_e,
         class = class_e,
+        class_save = PRODUCTION_CLASS_SAVE,
+        class_save_report = PRODUCTION_CLASS_SAVE_REPORT,
         enabled = if enabled { 1 } else { 0 },
         extra = extra
     )
@@ -2503,12 +2766,14 @@ If tIdx=0 {{
 Do tProd.Items.RemoveAt(tIdx)
 Set tSC4=tProd.%Save()
 If $$$ISERR(tSC4) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC4) Quit }}
-Set tRun="" Do ##class(Ens.Director).GetProductionStatus(.tRun,.s2)
+{class_save}Set tRun="" Do ##class(Ens.Director).GetProductionStatus(.tRun,.s2)
 If tRun=tProdName {{ Set tSC5=##class(Ens.Director).UpdateProduction(10,0) If $$$ISERR(tSC5) {{ Write "ERROR:UPDATE_FAILED:"_$System.Status.GetErrorText(tSC5) Quit }} }}
-Write "OK:"_tProdName"#,
+Write "OK:"_tProdName{class_save_report}"#,
         prologue = resolve_production_prologue(production),
         item = item_e,
-        not_found = item_not_found_block(&item_e)
+        not_found = item_not_found_block(&item_e),
+        class_save = PRODUCTION_CLASS_SAVE,
+        class_save_report = PRODUCTION_CLASS_SAVE_REPORT,
     )
 }
 
@@ -2562,11 +2827,13 @@ If '$IsObject(tItem) {{
 }}
 {setting_lines}Set tSC4=tProd.%Save()
 If $$$ISERR(tSC4) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC4) Quit }}
-{update_line}Write "OK""#,
+{class_save}{update_line}Write "OK"{class_save_report}"#,
         prologue = resolve_production_prologue(production),
         item = item_e,
         setting_lines = setting_lines,
         update_line = update_line,
+        class_save = PRODUCTION_CLASS_SAVE,
+        class_save_report = PRODUCTION_CLASS_SAVE_REPORT,
         not_found = item_not_found_block(&item_e)
     )
 }
@@ -2652,40 +2919,29 @@ pub async fn interop_production_item_impl(
         Some(i) => i,
         None => return err_json("IRIS_UNREACHABLE", "No IRIS connection"),
     };
-    let item = os_str_expr(&params.item);
-    // #329: ONE candidate block, shared by the enable/disable and get_settings templates below, so
-    // the two cannot drift apart. `item` is already os_str_expr'd.
-    let not_found = item_not_found_block(&item);
-    // #119: every action resolves its target the same way — `production=` when given, the
-    // running production otherwise. `add`/`remove` get theirs inside build_*_item_code.
-    let prologue = resolve_production_prologue(params.production.as_deref().unwrap_or(""));
+    // #329/#119: the candidate block and the target prologue used to be built HERE and threaded
+    // into each template. They are now built inside each `build_*_code`, which is why neither is
+    // bound here any more: every arm passes the raw production name and the builder resolves it.
+    // Keeping outer copies would reintroduce exactly the drift #329 closed — two resolutions of
+    // the same thing, one of them unexercised.
     let ns = &params.namespace;
     let client = IrisConnection::http_client()
         .map_err(|_| McpError::invalid_request("IRIS_UNREACHABLE", None))?;
 
     match params.action.as_str() {
         "enable" | "disable" => {
-            let enabled_val = if params.action == "enable" { "1" } else { "0" };
-            let code = format!(
-                r#"{prologue}
-Set tItem="" For zfi=1:1:tProd.Items.Count() {{ If tProd.Items.GetAt(zfi).Name={item} {{ Set tItem=tProd.Items.GetAt(zfi) Quit }} }}
-If '$IsObject(tItem) {{
-{not_found}
-}}
-Set tItem.Enabled={enabled_val}
-Set tSC4=tProd.%Save()
-If $$$ISERR(tSC4) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC4) Quit }}
-Set tSC5=##class(Ens.Director).UpdateProduction(10,0)
-If $$$ISERR(tSC5) {{ Write "ERROR:UPDATE_FAILED:"_$System.Status.GetErrorText(tSC5) Quit }}
-Write "OK""#
+            let code = build_set_enabled_code(
+                params.production.as_deref().unwrap_or(""),
+                &params.item,
+                params.action == "enable",
             );
             match iris.execute_via_generator(&code, ns, &client).await {
                 Ok(out) => {
-                    let out = out.trim();
+                    let (out, class_error) = read_class_save_marker(&out);
                     if out == "OK" {
-                        ok_json(
-                            serde_json::json!({"success":true,"item":params.item,"enabled":params.action=="enable"}),
-                        )
+                        let mut env = serde_json::json!({"success":true,"item":params.item,"enabled":params.action=="enable"});
+                        attach_class_save(&mut env, class_error);
+                        ok_json(env)
                     } else if let Some(msg) = out.strip_prefix("ERROR:ITEM_NOT_FOUND:") {
                         item_not_found(msg)
                     } else if let Some(msg) = out.strip_prefix("ERROR:NO_PRODUCTION:") {
@@ -2782,7 +3038,7 @@ Write "OK""#
             let warnings = unknown_prefix_warnings(&params.settings);
             match iris.execute_via_generator(&code, ns, &client).await {
                 Ok(out) => {
-                    let out = out.trim();
+                    let (out, class_error) = read_class_save_marker(&out);
                     if out == "OK" {
                         let mut env = serde_json::json!({
                             "success": true,
@@ -2800,6 +3056,7 @@ Write "OK""#
                         if !warnings.is_empty() {
                             env["warnings"] = serde_json::json!(warnings);
                         }
+                        attach_class_save(&mut env, class_error);
                         ok_json(env)
                     } else if let Some(msg) = out.strip_prefix("ERROR:ITEM_NOT_FOUND:") {
                         item_not_found(msg)
@@ -2836,15 +3093,18 @@ Write "OK""#
             );
             match iris.execute_via_generator(&code, ns, &client).await {
                 Ok(out) => {
-                    let out = out.trim();
+                    // #408: the class-save verdict rides on its own line after the OK line.
+                    let (out, class_error) = read_class_save_marker(&out);
                     if let Some(prod) = out.strip_prefix("OK:") {
-                        ok_json(serde_json::json!({
+                        let mut env = serde_json::json!({
                             "success": true,
                             "item": params.item,
                             "class_name": class_name,
                             "enabled": enabled,
                             "production": prod,
-                        }))
+                        });
+                        attach_class_save(&mut env, class_error);
+                        ok_json(env)
                     } else if let Some(msg) = out.strip_prefix("ERROR:ITEM_EXISTS:") {
                         err_json("ITEM_EXISTS", msg)
                     } else if let Some(msg) = out.strip_prefix("ERROR:NO_PRODUCTION:") {
@@ -2866,14 +3126,16 @@ Write "OK""#
                 build_remove_item_code(params.production.as_deref().unwrap_or(""), &params.item);
             match iris.execute_via_generator(&code, ns, &client).await {
                 Ok(out) => {
-                    let out = out.trim();
+                    let (out, class_error) = read_class_save_marker(&out);
                     if let Some(prod) = out.strip_prefix("OK:") {
-                        ok_json(serde_json::json!({
+                        let mut env = serde_json::json!({
                             "success": true,
                             "item": params.item,
                             "removed": true,
                             "production": prod,
-                        }))
+                        });
+                        attach_class_save(&mut env, class_error);
+                        ok_json(env)
                     } else if let Some(msg) = out.strip_prefix("ERROR:ITEM_NOT_FOUND:") {
                         item_not_found(msg)
                     } else if let Some(msg) = out.strip_prefix("ERROR:NO_PRODUCTION:") {
@@ -2919,6 +3181,61 @@ pub struct CredentialManageParams {
     pub password: Option<String>,
     #[serde(default = "default_ns")]
     pub namespace: String,
+}
+
+/// Is this credential action's `id` usable, and if not, what should the caller be told?
+///
+/// `Described` deserialises infallibly over any JSON object — deliberately, so that "the
+/// handler validates it and answers with a message that names the valid values". A call
+/// with no `id` key at all therefore arrives here as an empty string, and checking it is
+/// the handler's declared job. Measured 2026-09-24 (#384): an empty id reached
+/// `SetCredential` and came back as `ERROR #5659: Property
+/// 'Ens.Config.Credentials::SystemName(77@Ens.Config.Credentials,ID=)' required` under
+/// CREDENTIAL_EXISTS — the opposite of the truth, since nothing existed. The sibling check
+/// for `password` ("create requires password") already answers this shape correctly; `id`
+/// was simply never wired into it.
+///
+/// The id is only inspected, never rewritten: a non-empty id is passed through exactly as
+/// the caller sent it, so this makes no normalisation claim.
+pub fn credential_id_refusal(action: &str, id: &str) -> Option<String> {
+    let undone = match action {
+        "create" => "Nothing was created.",
+        "update" => "Nothing was updated.",
+        "delete" => "Nothing was deleted.",
+        // Any other action is answered by INVALID_ACTION, which names the valid set —
+        // more use to the caller than a complaint about a missing id.
+        _ => return None,
+    };
+    if !id.trim().is_empty() {
+        return None;
+    }
+    Some(format!(
+        "action={action} needs 'id' — the NAME of the credential (the SystemName that \
+         Ens.Config.Credentials requires). {undone} Use iris_credential_list to see which \
+         ids are defined."
+    ))
+}
+
+/// The program `create` runs: a duplicate id is named as such, every other failure is not.
+///
+/// A taken id is only ONE of the reasons `SetCredential` returns an error, but the marker
+/// used to be hardcoded to CREDENTIAL_EXISTS, so every failure claimed a duplicate (#384).
+/// The `%ExistsId` precheck names the one condition it can actually prove — the same
+/// structural check `delete` already makes, rather than parsing the error text — and
+/// anything else falls through to the generic arm. `Quit` inside `If { }` returns from the
+/// generated method, which is what keeps the precheck from falling through to the write.
+///
+/// All three arguments are already ObjectScript expressions, not raw values.
+pub fn build_credential_create_code(
+    id_expr: &str,
+    username_expr: &str,
+    password_expr: &str,
+) -> String {
+    format!(
+        r#"If ##class(Ens.Config.Credentials).%ExistsId({id_expr}) {{ Write "ERROR:CREDENTIAL_EXISTS:A credential named "_{id_expr}_" is already defined. Use action=update to change it, or action=delete it first." Quit }}
+Set tSC=##class(Ens.Config.Credentials).SetCredential({id_expr},{username_expr},{password_expr},0)
+If $$$ISERR(tSC) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC) }} Else {{ Write "OK" }}"#
+    )
 }
 
 pub async fn interop_credential_list_impl(
@@ -2979,6 +3296,11 @@ pub async fn interop_credential_manage_impl(
     let id = os_str_expr(&params.id);
     let ns = &params.namespace;
 
+    // #384: every action below needs a real id; without this an empty one reached IRIS.
+    if let Some(msg) = credential_id_refusal(&params.action, &params.id) {
+        return err_json("INVALID_PARAMS", &msg);
+    }
+
     match params.action.as_str() {
         "create" => {
             let username = match &params.username {
@@ -2989,10 +3311,7 @@ pub async fn interop_credential_manage_impl(
                 Some(p) => os_str_expr(p),
                 None => return err_json("INVALID_PARAMS", "create requires password"),
             };
-            let code = format!(
-                r#"Set tSC=##class(Ens.Config.Credentials).SetCredential({id},{username},{password},0)
-If $$$ISERR(tSC) {{ Write "ERROR:CREDENTIAL_EXISTS:"_$System.Status.GetErrorText(tSC) }} Else {{ Write "OK" }}"#
-            );
+            let code = build_credential_create_code(&id, &username, &password);
             match iris.execute_via_generator(&code, ns, &client).await {
                 Ok(out) => {
                     let out = out.trim();
@@ -3075,6 +3394,91 @@ If $$$ISERR(tSC) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC
 // ═══════════════════════════════════════════════════════════════════
 // 024-interop-depth: Lookup tables (US3)
 // ═══════════════════════════════════════════════════════════════════
+
+/// The marker `get` writes its value behind, so an empty value is not an empty reply.
+///
+/// #386: `get` used to `Write tVal` bare. A key holding an empty string therefore produced an
+/// empty program output — and `execute_via_generator` returns `Ok("")` for a SqlProc that failed
+/// at runtime as well (#362), so "the value is blank" and "the call failed" were the same
+/// observation. With the marker they are different: output that does not carry it is a failure,
+/// never a blank value.
+pub const LOOKUP_VALUE_MARKER: &str = "LK_VALUE:";
+
+/// The two presence checks `get` and `delete` share, in one place so they cannot drift apart.
+///
+/// Measured 2026-09-24 against a live instance, with its own control:
+///
+/// ```text
+/// $DATA(^Ens.LookupTable(T))        = 11   the table
+/// $DATA(^Ens.LookupTable(T,"kE"))   = 1    key whose stored value is ""
+/// $DATA(^Ens.LookupTable(T,"kN"))   = 1    key whose stored value is "v"
+/// $DATA(^Ens.LookupTable(T,"kZ"))   = 0    key never set          <- the control
+/// $GET(^Ens.LookupTable(T,"kE"))    = ""   indistinguishable from kZ by value
+/// ```
+///
+/// So `$DATA` answers existence and `$GET` does not. `get` used `If tVal=""` as its existence
+/// test, which reported a legitimately empty value as absence — and `set value=""` is accepted
+/// and reported `success: true`, so "" is a value a caller can deliberately store. `delete`
+/// checked the table but not the key at all, and fell through to `%RemoveValue`, which answered
+/// with a raw `ERROR #5810 ... ID 'Table||key'` carrying an internal composite ID.
+fn lookup_presence_prechecks(t: &str, k: &str) -> String {
+    format!(
+        r#"If '$DATA(^Ens.LookupTable({t})) {{ Write "ERROR:TABLE_NOT_FOUND:Table not found: "_{t} Quit }}
+If '$DATA(^Ens.LookupTable({t},{k})) {{ Write "ERROR:KEY_NOT_FOUND:Key not found: "_{k}_" in table "_{t}_". Use action=list_keys to see which keys this table holds." Quit }}"#
+    )
+}
+
+/// What a `get` program's output means. Four outcomes, because there are four.
+///
+/// #386: the old code had three of these collapsed into two. A key holding `""` and a program
+/// that produced nothing both arrived as an empty string, and `If tVal=""` then reported the
+/// first as KEY_NOT_FOUND — a stored value answered as a fact about the store's contents.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LookupValue<'a> {
+    /// The key exists and this is what it holds — possibly the empty string.
+    Value(&'a str),
+    /// No such table.
+    TableNotFound(&'a str),
+    /// The table exists, the key does not.
+    KeyNotFound(&'a str),
+    /// The program did not report any of the above, so nothing can be concluded about the key.
+    /// `execute_via_generator` returns `Ok("")` for a SqlProc that failed at runtime (#362), so
+    /// this case is reachable and must not be read as a blank value.
+    ProgramFailed(&'a str),
+}
+
+/// Decode a `get` program's output. The marker is what separates a blank value from no reply.
+pub fn read_lookup_get_output(out: &str) -> LookupValue<'_> {
+    if let Some(m) = out.strip_prefix("ERROR:TABLE_NOT_FOUND:") {
+        return LookupValue::TableNotFound(m);
+    }
+    if let Some(m) = out.strip_prefix("ERROR:KEY_NOT_FOUND:") {
+        return LookupValue::KeyNotFound(m);
+    }
+    match out.strip_prefix(LOOKUP_VALUE_MARKER) {
+        Some(v) => LookupValue::Value(v),
+        None => LookupValue::ProgramFailed(out),
+    }
+}
+
+/// The program `get` runs. Both arguments are already ObjectScript expressions.
+pub fn build_lookup_get_code(t: &str, k: &str) -> String {
+    format!(
+        "{}\nWrite \"{}\"_$GET(^Ens.LookupTable({t},{k}))",
+        lookup_presence_prechecks(t, k),
+        LOOKUP_VALUE_MARKER
+    )
+}
+
+/// The program `delete` runs. Both arguments are already ObjectScript expressions.
+pub fn build_lookup_delete_code(t: &str, k: &str) -> String {
+    format!(
+        r#"{}
+Set tSC=##class(Ens.Util.LookupTable).%RemoveValue({t},{k})
+If $$$ISERR(tSC) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC) }} Else {{ Write "OK" }}"#,
+        lookup_presence_prechecks(t, k)
+    )
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct LookupManageParams {
@@ -3160,26 +3564,19 @@ pub async fn interop_lookup_manage_impl(
                     )
                 }
             };
-            let code = format!(
-                r#"If '$DATA(^Ens.LookupTable({t})) {{ Write "ERROR:TABLE_NOT_FOUND:Table not found: "_{t} Quit }}
-Set tVal=$GET(^Ens.LookupTable({t},{k}))
-If tVal="" {{ Write "ERROR:KEY_NOT_FOUND:Key not found: "_{k} Quit }}
-Write tVal"#,
-                t = table,
-                k = key
-            );
+            let code = build_lookup_get_code(&table, &key);
             match iris.execute_via_generator(&code, ns, &client).await {
                 Ok(out) => {
                     let out = out.trim();
-                    if let Some(msg) = out.strip_prefix("ERROR:TABLE_NOT_FOUND:") {
-                        return err_json("TABLE_NOT_FOUND", msg);
+                    // #386: a stored "" is a value; a marker-less reply is a failed program.
+                    match read_lookup_get_output(out) {
+                        LookupValue::TableNotFound(msg) => err_json("TABLE_NOT_FOUND", msg),
+                        LookupValue::KeyNotFound(msg) => err_json("KEY_NOT_FOUND", msg),
+                        LookupValue::Value(value) => ok_json(
+                            serde_json::json!({"success":true,"table":params.table,"key":params.key,"value":value}),
+                        ),
+                        LookupValue::ProgramFailed(raw) => interop_fail(raw, None),
                     }
-                    if let Some(msg) = out.strip_prefix("ERROR:KEY_NOT_FOUND:") {
-                        return err_json("KEY_NOT_FOUND", msg);
-                    }
-                    ok_json(
-                        serde_json::json!({"success":true,"table":params.table,"key":params.key,"value":out}),
-                    )
                 }
                 Err(e) => err_json(classify_iris_error(&e.to_string()), &e.to_string()),
             }
@@ -3224,13 +3621,7 @@ If $$$ISERR(tSC) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC
                 Some(k) => os_str_expr(k),
                 None => return err_json("INVALID_PARAMS", "delete requires key"),
             };
-            let code = format!(
-                r#"If '$DATA(^Ens.LookupTable({t})) {{ Write "ERROR:TABLE_NOT_FOUND:Table not found: "_{t} Quit }}
-Set tSC=##class(Ens.Util.LookupTable).%RemoveValue({t},{k})
-If $$$ISERR(tSC) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC) }} Else {{ Write "OK" }}"#,
-                t = table,
-                k = key
-            );
+            let code = build_lookup_delete_code(&table, &key);
             match iris.execute_via_generator(&code, ns, &client).await {
                 Ok(out) => {
                     let out = out.trim();
@@ -3240,6 +3631,9 @@ If $$$ISERR(tSC) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC
                         )
                     } else if let Some(msg) = out.strip_prefix("ERROR:TABLE_NOT_FOUND:") {
                         err_json("TABLE_NOT_FOUND", msg)
+                    } else if let Some(msg) = out.strip_prefix("ERROR:KEY_NOT_FOUND:") {
+                        // #386: without this the precheck's refusal would fall to the generic arm.
+                        err_json("KEY_NOT_FOUND", msg)
                     } else {
                         interop_fail(out, None)
                     }
@@ -3706,6 +4100,32 @@ fn extract_xml_attr(line: &str, attr: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
+/// What to tell a caller whose message exists but whose body class does not.
+///
+/// #392: `$ClassMethod(bodyClass,"%OpenId",bodyId)` raises `<CLASS DOES NOT EXIST>` when the
+/// header names a class this namespace has not compiled, and that escaped as a raw
+/// `IRIS_EXECUTE_ERROR` carrying an ObjectScript frame and the generated scratch class name.
+/// Measured 2026-09-25 in namespace USER: message 18 names `IOP.MSG.Req`, absent from
+/// `%Dictionary.CompiledClass`, while message 19 names `Ens.Response`, present, and reads fine.
+/// **9 of the 19 messages** on that instance named an absent body class — the normal end state
+/// once a production's classes are removed while its `Ens` data persists.
+///
+/// This must not collapse into `MESSAGE_NOT_FOUND`: the header IS there, and the two conditions
+/// have different remedies. A caller told "no such message" would go looking for a wrong id.
+pub fn message_body_class_missing_message(
+    message_id: i64,
+    body_class: &str,
+    namespace: &str,
+) -> String {
+    format!(
+        "message {message_id} exists and its header names body class '{body_class}', but that \
+         class is not compiled in namespace '{namespace}', so the body cannot be opened. This is \
+         NOT a missing message — the header is there. Either compile '{body_class}' into this \
+         namespace, or read the header fields with iris_interop_query(what=messages), which does \
+         not need the body class."
+    )
+}
+
 /// Read an Ensemble message body (`Ens.StringContainer`, `Ens.StreamContainer`,
 /// `%Stream.Object`). `data_policy` gates PHI: `block` refuses outright, `allow`
 /// requires an explicit acknowledgement, `redact` blanks known HL7 v2 PHI fields.
@@ -3735,6 +4155,7 @@ If '$IsObject(hdr) {{ Write "ERROR:MESSAGE_NOT_FOUND" Quit }}
 Set bodyClass=hdr.MessageBodyClassName
 Set bodyId=hdr.MessageBodyId
 If bodyClass="" {{ Write "ERROR:MESSAGE_NOT_FOUND" Quit }}
+If '##class(%Dictionary.CompiledClass).%ExistsId(bodyClass) {{ Write "ERROR:MESSAGE_BODY_CLASS_MISSING:"_bodyClass Quit }}
 Set body=$ClassMethod(bodyClass,"%OpenId",bodyId)
 If '$IsObject(body) {{ Write "ERROR:MESSAGE_NOT_FOUND" Quit }}
 If body.%Extends("Ens.StreamContainer") {{
@@ -3875,6 +4296,11 @@ pub async fn handle_iris_message_body(
                     &format!("No body found for message ID {message_id}"),
                 );
             }
+            if let Some(cls) = out.strip_prefix("ERROR:MESSAGE_BODY_CLASS_MISSING:") {
+                let msg =
+                    message_body_class_missing_message(message_id, cls.trim(), &params.namespace);
+                return err_json("MESSAGE_BODY_CLASS_MISSING", &msg);
+            }
             if let Some(rest) = out.strip_prefix("ERROR:STREAM_READ_ERROR:") {
                 return err_json("STREAM_READ_ERROR", rest.trim());
             }
@@ -3994,6 +4420,35 @@ pub fn extract_xdata(source: &str, name: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// The action a call to `iris_business_rule_info` MEANS when it did not name one.
+///
+/// The default was an unconditional `"list"`, and the list path never reads `rule_name` — so a caller
+/// who passed a rule name and omitted `action` had that name silently discarded and got a listing.
+/// Measured against a live instance:
+///
+/// ```text
+/// {rule_name: "No.Such.Rule"}               -> success: true, count: 0, rules: []
+/// {action: "get", rule_name: "No.Such.Rule"} -> RULE_NOT_FOUND, "call action=list to see what is there"
+/// ```
+///
+/// The first reads as "your rule does not exist" when the tool never looked for it — and on a
+/// namespace that DOES hold rules it returns all of them, where a caller may not notice their name
+/// was ignored at all. Same shape as `require_name` in `doc.rs` (#327: a supplied `names` array
+/// discarded while `success: true` came back) and `item_name_arg` (#218).
+///
+/// So a non-blank `rule_name` with no explicit action means `get`: it is the only reading under which
+/// the parameter the caller supplied does anything. With neither given, `list` remains right — it is
+/// the action that needs no arguments.
+pub fn rule_action_for(explicit: Option<&str>, rule_name: Option<&str>) -> String {
+    if let Some(a) = explicit.map(str::trim).filter(|a| !a.is_empty()) {
+        return a.to_string();
+    }
+    match rule_name.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(_) => "get".to_string(),
+        None => "list".to_string(),
+    }
 }
 
 pub async fn handle_iris_business_rule_info(
@@ -4337,22 +4792,37 @@ If $System.Status.IsError(sc)||('isInSC) {{ Write "NO_SCM" }} Else {{ Write "IN_
         )
         .await
     {
-        Ok(resp) => resp["result"]["content"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .iter()
-            .map(|r| {
-                (
-                    r["Name"].as_str().unwrap_or("").to_string(),
-                    r["ClassName"].as_str().unwrap_or("").to_string(),
-                    // Enabled comes back as a SQL boolean on some builds and 0/1 on others.
-                    r["Enabled"]
-                        .as_bool()
-                        .unwrap_or_else(|| r["Enabled"].as_i64().unwrap_or(0) != 0),
+        // #360: this used to end in `.unwrap_or_default()`. `query()` already turns a transport
+        // fault, a non-2xx and a non-JSON body into `Err`, so the ONE way in is a 200 whose JSON
+        // parsed but carries no `result.content` array — a shape this server does not recognise.
+        // An empty item set there makes the diff report EVERY committed item as `removed` under
+        // success:true, the mirror image of what #153 fixed on the committed side.
+        Ok(resp) => match resp["result"]["content"].as_array() {
+            Some(rows) => rows
+                .iter()
+                .map(|r| {
+                    (
+                        r["Name"].as_str().unwrap_or("").to_string(),
+                        r["ClassName"].as_str().unwrap_or("").to_string(),
+                        // Enabled comes back as a SQL boolean on some builds and 0/1 on others.
+                        r["Enabled"]
+                            .as_bool()
+                            .unwrap_or_else(|| r["Enabled"].as_i64().unwrap_or(0) != 0),
+                    )
+                })
+                .collect(),
+            None => {
+                return err_json(
+                    "CURRENT_UNAVAILABLE",
+                    &format!(
+                        "Could not read the running item set for '{prod_name}' in namespace \
+                         '{ns}': IRIS answered, but the response carried no result rows. \
+                         Refusing rather than diffing against an empty current set, which \
+                         would report every committed item as `removed`."
+                    ),
                 )
-            })
-            .collect(),
+            }
+        },
         Err(e) => return err_json(classify_iris_error(&e.to_string()), &e.to_string()),
     };
 
@@ -4365,7 +4835,41 @@ If $System.Status.IsError(sc)||('isInSC) {{ Write "NO_SCM" }} Else {{ Write "IN_
         .await
     {
         Ok(resp) if resp.status().is_success() => {
-            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            // #360: `resp.json().await.unwrap_or_default()` yielded `Value::Null` on an
+            // unparseable body, `doc_content_to_string(&Null)` yielded "", and zero items
+            // followed — so a 200 reached the empty baseline that the arms below exist to
+            // refuse, by the one path that never consults them. Two `unwrap_or_default()` calls
+            // in series, each individually defensible.
+            let body: serde_json::Value = match resp.json().await {
+                Ok(b) => b,
+                Err(e) => {
+                    return err_json(
+                        "BASELINE_UNAVAILABLE",
+                        &format!(
+                            "Could not read the class definition for '{doc_name}' in namespace \
+                             '{ns}': IRIS answered 200 but the body could not be parsed ({e}). \
+                             Refusing rather than diffing against an empty baseline, which would \
+                             report every running item as `added`."
+                        ),
+                    )
+                }
+            };
+            // The document must arrive as an array of source lines. `%ExistsId` proved two calls
+            // ago that the class EXISTS, so a body with no lines is a read that failed, not a
+            // production whose source is empty — and a production with no <Item> entries still
+            // has a class definition, so this does not refuse a legitimately empty production.
+            let lines = body["result"]["content"].as_array();
+            if lines.is_none_or(|l| l.is_empty()) {
+                return err_json(
+                    "BASELINE_UNAVAILABLE",
+                    &format!(
+                        "Could not read the class definition for '{doc_name}' in namespace \
+                         '{ns}': IRIS answered 200 with no source lines, though the class was \
+                         just confirmed to exist. Refusing rather than diffing against an empty \
+                         baseline, which would report every running item as `added`."
+                    ),
+                );
+            }
             let source = crate::tools::doc::doc_content_to_string(&body);
             parse_production_items_from_source(&source)
         }
@@ -4424,6 +4928,11 @@ If $System.Status.IsError(sc)||('isInSC) {{ Write "NO_SCM" }} Else {{ Write "IN_
         "namespace": ns,
         "in_sync": changes.is_empty(),
         "changes": changes,
+        // #360: a verdict is not interpretable without the size of both sides. "every item
+        // added" and "every item removed" read exactly like real drift unless the caller can
+        // see the denominators they were computed from.
+        "committed_item_count": committed_items.len(),
+        "current_item_count": current_items.len(),
         // #153: name what the diff was taken against, so "in_sync" is interpretable.
         "baseline": baseline,
     }))
@@ -4537,6 +5046,7 @@ mod tests {
             &[4],
             Some("16284718"),
             None,
+            &["EnsLib.HL7.Message".to_string()],
         );
         assert!(sql.contains("JOIN EnsLib_HL7.SearchTable st ON st.DocId = h.MessageBodyId"));
         assert!(sql.contains("st.PropId IN (4)"));
@@ -4549,6 +5059,7 @@ mod tests {
             &[12, 14],
             None,
             Some("AMOX%"),
+            &[],
         );
         assert!(like.contains("st.PropId IN (12,14)"));
         assert!(like.contains("st.PropValue LIKE 'AMOX%'"));
