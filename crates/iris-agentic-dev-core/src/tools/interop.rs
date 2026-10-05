@@ -3448,6 +3448,7 @@ Set tSC=##class(Ens.Util.LookupTable).%RemoveValue({t},{k})
 If $$$ISERR(tSC) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC) }} Else {{ Write "OK" }}"#,
         lookup_presence_prechecks(t, k)
     )
+}
 
 /// The two lookup listings frame each entry as `<length>:<entry>`, with no separator.
 ///
