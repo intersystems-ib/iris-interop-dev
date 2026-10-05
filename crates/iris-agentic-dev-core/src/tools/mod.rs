@@ -7728,6 +7728,27 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
         // non-explicit source came from Docker/port-scan discovery, which can silently
         // target the wrong instance (issue #21, upstream #82).
         let is_explicit = conn.source.is_explicit();
+
+        // #410: the COMPLEMENT of the fallback_warning below. That one covers
+        // `config_file.is_none() && !is_explicit`; this covers the other half of the same
+        // partition — an explicit flag/env won, and a config file is sitting at the watched
+        // path being ignored. Only one branch of the partition had a warning, so the state
+        // the reporter hit was reported as three unconnected fields.
+        if let Some(p) = crate::iris::workspace_config::ignored_config_path(
+            conn.config_file.as_deref(),
+            is_explicit,
+            response["config_watch_path"].as_str(),
+        ) {
+            let src = response["connection_source"]
+                .as_str()
+                .unwrap_or("an explicit flag or environment variable")
+                .to_string();
+            response["config_file_warning"] = serde_json::Value::String(
+                crate::iris::workspace_config::ignored_config_warning(&p, &src),
+            );
+            response["config_file_ignored"] = serde_json::Value::String(p);
+        }
+
         if conn.config_file.is_none() && !is_explicit && conn.iris.is_some() {
             response["fallback_warning"] = serde_json::Value::String(
                 "No .iris-agentic-dev.toml config file found. Connection established via \
