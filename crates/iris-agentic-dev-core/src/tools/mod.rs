@@ -360,7 +360,8 @@ pub enum Toolset {
     /// executes the derivation against the live Nostub count instead.
     /// Not this fork's default.
     Merged,
-    /// 32 tools advertised (measured 2026-09-22) — exactly `INTEROP_TOOLS`. THIS FORK'S
+    /// Exactly `INTEROP_TOOLS` — the count is not restated here, because every prose copy
+    /// of it in this repo has rotted; `scripts/validate-tools.sh` prints the real one. THIS FORK'S
     /// DEFAULT: `--toolset` carries `default_value = "interop"` (see
     /// crates/iris-agentic-dev-bin/src/cmd/mcp.rs). Keeps only the tools the iris-interop
     /// skills actually exercise; everything else (skill_*/kb_*/agent_*/generate_*/
@@ -472,6 +473,13 @@ pub const INTEROP_TOOLS: &[&str] = &[
     // because there is no canonical answer to ask for, and because every failure mode looks alike
     // from outside.
     "iris_gateway_manage",
+    // #417: the fork's reason for existing is that the FILESYSTEM is the source of truth, and
+    // on a CCR instance the thing that moves a document between the filesystem and IRIS is the
+    // server-side %Studio.SourceControl hook — which no tool in this profile could reach, so a
+    // put that needed a checkout first simply failed with ERROR #5865 and nothing said why.
+    // Write-gated action-by-action via `ScmAction::is_write`; `status` and `menu` stay readable
+    // on a read-only connection.
+    "iris_source_control",
 ];
 
 pub const ERR_NO_TESTS_FOUND: &str = "NO_TESTS_FOUND";
@@ -4808,6 +4816,27 @@ pub(crate) fn mutating_call(tool: &str, args: &serde_json::Value) -> Option<&'st
             .unwrap_or(false)
             .then_some("run forced SQL"),
 
+        // #417/#418. Action-aware, because a tool-level verdict is wrong in both directions:
+        // blanket-mutating would refuse `status`/`menu`, which are the read path that makes
+        // this tool worth having on a read-only connection, and blanket-read would ship
+        // %CheckIn/%GetLatest/%Disconnect ungated in the DEFAULT profile.
+        //
+        // DERIVED from `ScmAction::is_write` for `execute`, so a new SCM action classified on
+        // the enum needs no edit here. The `_` arm is deliberately MUTATING: an unrecognised
+        // top-level action has not been understood by anything yet, and the gate must not be
+        // the component that assumes it is harmless. `execute` with no `action_id` parses to
+        // `Unknown("")`, which is also mutating.
+        "iris_source_control" => match action {
+            "status" | "menu" => None,
+            "checkout" => Some("check out a document"),
+            "execute" => crate::tools::scm::ScmAction::from_id(
+                args.get("action_id").and_then(|v| v.as_str()).unwrap_or(""),
+            )
+            .is_write()
+            .then_some("run a source-control action"),
+            _ => Some("run a source-control action"),
+        },
+
         // Everything else reads. Named exhaustively rather than defaulted, so a NEW tool
         // does not inherit "safe" by omission — `write_capable_tools_are_all_classified`
         // fails on any interop tool missing from this match.
@@ -4998,6 +5027,7 @@ pub(crate) const CLASSIFIED_TOOLS: &[&str] = &[
     "iris_production_diff",
     "iris_production_item",
     "iris_query",
+    "iris_source_control",
     "iris_symbols",
     "iris_symbols_local",
     "iris_table_info",
@@ -12572,10 +12602,20 @@ mod tool_annotation_tests {
             // is in GENERATOR_WRITE_TOOLS because it reads a stream through a scratch class, so it
             // is honestly not advertised readOnlyHint:true even though it writes nothing to the
             // stream. Recorded by running the gate row by row, not by arithmetic.
-            ("interop", Toolset::Interop, 35_usize, 11_usize),
-            ("nostub", Toolset::Nostub, 60, 36),
-            ("merged", Toolset::Merged, 56, 31),
-            ("baseline", Toolset::Baseline, 64, 40),
+            // #417 is +1 for `iris_source_control`, interop only — it was already implemented
+            // and so already in the wider toolsets. The read-only figure is UNCHANGED, and that is
+            // the measured point: with no `action` argument the gate's catch-all classifies the
+            // tool as mutating, so it is honestly not advertised readOnlyHint:true even though
+            // `status` and `menu` read.
+            ("interop", Toolset::Interop, 36_usize, 11_usize),
+            // The read-only figures for these three DROP by one, and the drop is the point.
+            // `iris_source_control` was already advertised in all three, and with no arm in
+            // `mutating_call` it fell through to the final `_ => None` — so it was announced
+            // readOnlyHint:TRUE while able to %CheckIn, %GetLatest and %Disconnect. Classifying it
+            // corrects that claim here too, not only in the interop profile.
+            ("nostub", Toolset::Nostub, 60, 35),
+            ("merged", Toolset::Merged, 56, 30),
+            ("baseline", Toolset::Baseline, 64, 39),
         ] {
             let t = IrisTools::new_with_toolset(None, ts).expect("build");
             let all = t.advertised_tools();

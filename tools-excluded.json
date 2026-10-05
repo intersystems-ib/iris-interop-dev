@@ -31,7 +31,6 @@
       "category": "unsafe-here",
       "why": "Closes the persistent terminal session. Excluded with the capability it belongs to."
     },
-
     "iris_admin": {
       "category": "not-interop",
       "why": "Instance administration dispatcher — users, roles, databases, webapps, locks, processes. Interop work needs none of it, and its write actions reach far outside a production."
@@ -196,11 +195,6 @@
       "category": "not-interop",
       "why": "A superclass-chain diagram for any class. The structural question an interop reviewer asks is the production's topology, which mermaid_production answers and #352 is evaluating."
     },
-
-    "iris_source_control": {
-      "category": "covered-here",
-      "why": "SCM status, menu, checkout. iris_doc does the checkout itself on every write — including the elicitation dialog when IRIS asks for confirmation — so the caller never has to sequence it."
-    },
     "debug_source_map": {
       "category": "covered-here",
       "why": "Builds a .INT source map for a class. iris_debug is the fork's dispatcher for this, and an abort from iris_execute is already enriched with the .CLS line before it reaches the caller."
@@ -217,7 +211,6 @@
       "category": "covered-here",
       "why": "Captures error state plus recent log entries as one bundle. Its two halves are what iris_debug and iris_get_log already return."
     },
-
     "iris_generate_test": {
       "category": "not-interop",
       "why": "Declined on #352's own precondition, which cannot be met: it asks the model to \"Extend %UnitTest.TestCase\", while this fork's tdd skill requires %UnitTest.TestProduction with Parameter PRODUCTION and TestControl neutralised. Its only output check is validate_cls_syntax — contains \"Class \", contains a brace, braces balanced — so the shape is a request to an LLM, not a guarantee, and \"verify the output shape before adopting\" has no answer for a non-deterministic generator."

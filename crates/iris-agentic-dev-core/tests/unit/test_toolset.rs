@@ -345,11 +345,17 @@ fn test_interop_excludes_meta_tools() {
         "iris_search",
         "iris_info",
         "iris_generate",
-        // `iris_macro` was excluded here by the original 20-tool interop profile as meta
-        // surface. #247 reverses that on evidence: `$$$` availability was guessed four times
-        // in one day of interop work, and the tool now derives the include list from the
-        // document being written, so it answers that question instead of relaying it.
-        "iris_source_control",
+        // Two tools have LEFT this list on evidence, and the reasons are recorded here because
+        // the list is otherwise a bare set of names:
+        //
+        // `iris_macro` — excluded by the original 20-tool interop profile as meta surface. #247
+        // reverses that: `$$$` availability was guessed four times in one day of interop work,
+        // and the tool now derives the include list from the document being written.
+        //
+        // `iris_source_control` — #417. `iris_doc` checks a document out on every write, which
+        // covers the WRITE path and nothing else: it does not check in, GetLatest, Diff, or report
+        // status, which is exactly what a CCR instance needs. Advertised and write-gated per
+        // action via `ScmAction::is_write`.
         "iris_containers",
         "iris_admin",
         "debug_capture_packet",
@@ -405,7 +411,7 @@ fn test_toolset_counts_match_doc_comments() {
         (Toolset::Baseline, 64usize),
         (Toolset::Nostub, 60),
         (Toolset::Merged, 56),
-        (Toolset::Interop, 35),
+        (Toolset::Interop, 36),
     ] {
         let n = IrisTools::new_with_toolset(None, ts)
             .expect("IrisTools::new")
@@ -421,7 +427,7 @@ fn test_toolset_counts_match_doc_comments() {
     // Two independent anchors for the interop number: the keep-list and the router.
     assert_eq!(
         iris_agentic_dev_core::tools::INTEROP_TOOLS.len(),
-        35,
+        36,
         "INTEROP_TOOLS is the interop profile — it must agree with the measured count"
     );
 }

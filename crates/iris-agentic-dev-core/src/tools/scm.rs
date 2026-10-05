@@ -73,14 +73,61 @@ impl ScmAction {
             other => Self::Unknown(other.to_string()),
         }
     }
+
+    /// Does invoking this action change state on the instance or in the source-control system?
+    ///
+    /// Exhaustive on purpose — there is no `_` arm. A variant added to `ScmAction` cannot
+    /// compile until it is classified here, and [`crate::tools::mutating_call`] then follows
+    /// it with no edit there. Same construction as `DocMode::is_write` and
+    /// `gateway_manage::Action::is_write`, and for the same stated reason: a second
+    /// `matches!` over action strings in the gate would be a duplicate, and an action
+    /// dispatched here but missing from that duplicate would be an UNGATED WRITE.
+    pub fn is_write(&self) -> bool {
+        match self {
+            // Each of these mutates: the first three move the document between checked-out
+            // states, GetLatest OVERWRITES the document in IRIS from the repository, and
+            // AddToSourceControl puts it under control. Disconnect/Reconnect change the
+            // server-side source-control connection for the session — #418 names %Disconnect
+            // specifically as reachable today with no gate in front of it.
+            Self::CheckOut
+            | Self::UndoCheckout
+            | Self::CheckIn
+            | Self::GetLatest
+            | Self::AddToSourceControl
+            | Self::Disconnect
+            | Self::Reconnect => true,
+            // Diff reads two versions and returns the comparison.
+            Self::Diff => false,
+            // An id this fork does not know is still dispatched: it names a method on the
+            // SERVER's own %Studio.SourceControl subclass, which is site-written and can do
+            // anything. Unknown is therefore mutating. The affordable error here is refusing
+            // a read that turns out to be harmless; the unaffordable one is performing an
+            // unnamed write on a connection the caller asked to be read-only.
+            Self::Unknown(_) => true,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ScmParams {
+    // #112, and `every_tool_advertises_the_parameters_it_reads` enforces it: the valid values
+    // belong in the SCHEMA, not only in the INVALID_ACTION message. A guessed action is otherwise
+    // a round trip the model could have avoided — and this tool was never advertised before #417,
+    // so the gate had nothing to check.
+    //
+    // `//`, not `///`: schemars ships a doc comment as the advertised `description`, so rationale
+    // written here would be sent to every client on every tools/list. That is what
+    // `mcp_server_tools_list_returns_interop_profile` caught on the first run of this change.
     /// Action: status, menu, checkout, execute
+    #[schemars(extend("enum" = ["status", "menu", "checkout", "execute"]))]
     pub action: String,
     pub document: Option<String>,
-    /// SCM action ID for action=execute
+    // Deliberately NOT an enum, unlike `action` above. The id names a method on the SERVER's own
+    // `%Studio.SourceControl` subclass, which is site-written: the eight this fork knows are the
+    // common ones, not the closed set, and an enum here would refuse a hook that exists. The write
+    // gate is what makes that safe — an id it does not recognise classifies as a WRITE
+    // (`ScmAction::is_write`), so an unknown site hook is gated rather than waved through.
+    /// SCM action ID for action=execute (e.g. CheckOut, CheckIn, GetLatest, Diff)
     pub action_id: Option<String>,
     /// Elicitation resume answer
     pub answer: Option<String>,

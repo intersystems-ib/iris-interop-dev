@@ -84,9 +84,9 @@
     {
       "tool": "iris_coverage",
       "status": "unit-ok",
-      "unit": "tools::coverage::tests (26) \u2014 validate/build_program/parse_output/report_json",
+      "unit": "tools::coverage::tests (26) — validate/build_program/parse_output/report_json",
       "e2e": null,
-      "note": "#24 item 064. No e2e: %Monitor.System.LineByLine is instance-wide and exclusive, so a live run needs an instance to itself \u2014 see #291 for the end-to-end verification done by hand."
+      "note": "#24 item 064. No e2e: %Monitor.System.LineByLine is instance-wide and exclusive, so a live run needs an instance to itself — see #291 for the end-to-end verification done by hand."
     },
     {
       "tool": "iris_credential_list",
@@ -115,7 +115,7 @@
     {
       "tool": "iris_doc_search",
       "status": "unit-ok",
-      "unit": "tools::doc_search::tests (24) \u2014 validate/class_sql/method_sql/strip_markup/snippet",
+      "unit": "tools::doc_search::tests (24) — validate/class_sql/method_sql/strip_markup/snippet",
       "e2e": null,
       "note": "#24 item 065. Advertised-surface coverage only, via mcp_handshake's tools/list assertions."
     },
@@ -202,6 +202,12 @@
       "unit": "sql_lint::tests::*",
       "e2e": "test_e2e::e2e_query_* (15)",
       "status": "OK"
+    },
+    {
+      "tool": "iris_source_control",
+      "unit": "source_control_is_exposed_and_gated",
+      "e2e": null,
+      "status": "profile-only"
     },
     {
       "tool": "iris_symbols",
