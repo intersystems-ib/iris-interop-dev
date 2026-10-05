@@ -4747,6 +4747,12 @@ pub(crate) fn mutating_call(tool: &str, args: &serde_json::Value) -> Option<&'st
         // is instance-wide, exclusive, and degrades performance for every process while it runs —
         // so this is mutating even for a test suite that only reads.
         "iris_coverage" => Some("run tests under the line-by-line monitor"),
+        // Reads, and is still gated — like `iris_debug`'s source_map, it reaches IRIS through
+        // `execute_via_generator`, which PUTs and COMPILES a scratch class on the instance. So
+        // the tool is read-only about the STREAM and not about the namespace. Whether that cost
+        // should gate a read at all is #303, open for the ten tools in this position; until it is
+        // decided this follows the existing precedent rather than inventing a second rule.
+        "stream_inspect" => Some("read a stream by id"),
         // Every action of this tool writes a credential.
         // DELIBERATELY ABSENT: stream_inspect (#352) and compare_namespace / compare_document
         // (#351). All three only read — two SELECTs and a GET between them — so none is write-gated.
