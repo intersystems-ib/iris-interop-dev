@@ -40,6 +40,12 @@ pub const SCM_MENU: &str = "%SourceMenu";
 /// snippet cannot do if it ran — so the outcome of the action is genuinely unknown.
 const SCM_NO_OUTPUT: &str = "SCM_NO_OUTPUT";
 
+/// The action can only be completed in the provider's own web UI (action 2 or 3).
+pub(crate) const SCM_NEEDS_UI: &str = "SCM_NEEDS_UI";
+
+/// The provider wants a typed value (action 7) on a path that cannot ask for one.
+pub(crate) const SCM_NEEDS_INPUT: &str = "SCM_NEEDS_INPUT";
+
 const EMPTY_OUTPUT_MSG: &str =
     "The source control action produced no output. The generated snippet \
      always writes an action code, so an empty response means it never ran and the outcome of the \
@@ -149,7 +155,7 @@ async fn xecute(
 
 /// Escape a string for safe interpolation into an ObjectScript double-quoted literal.
 /// Uses ObjectScript conventions: " → "", \n → $Char(10), \r → $Char(13).
-fn os_quote(s: &str) -> String {
+pub(crate) fn os_quote(s: &str) -> String {
     s.replace('"', "\"\"")
         .replace('\n', "$Char(10)")
         .replace('\r', "$Char(13)")
@@ -262,7 +268,7 @@ pub fn after_user_action_completed(out: &str) -> bool {
 /// * `Unparseable` — IRIS said something that is not a code: `<PROTECT>`, `ERROR #5865`, a provider
 ///   `NOTICE`. Classified by the existing IRIS-error classifier, with the raw text preserved because
 ///   it is the only thing that says what IRIS objected to (#302, first half).
-fn user_action_outcome(out: &str) -> Result<(u8, &str), (&'static str, &str)> {
+pub(crate) fn user_action_outcome(out: &str) -> Result<(u8, &str), (&'static str, &str)> {
     if out == "SCM_UNAVAILABLE" {
         return Err((
             "SCM_UNAVAILABLE",
@@ -273,6 +279,100 @@ fn user_action_outcome(out: &str) -> Result<(u8, &str), (&'static str, &str)> {
         ActionMsg::Code(c, m) => Ok((c, m)),
         ActionMsg::Empty => Err((SCM_NO_OUTPUT, EMPTY_OUTPUT_MSG)),
         ActionMsg::Unparseable(raw) => Err((scm_error_code(raw), raw)),
+    }
+}
+
+/// What a `UserAction` action code means to a caller that has no window to open.
+///
+/// **Why this exists.** Three sites read the same code and answered differently. Measured on the
+/// tree this replaces, the set of codes each one recognised was:
+///
+/// | site | recognised | everything else |
+/// |---|---|---|
+/// | `checkout` arm | `0` | presented as a **yes/no question** |
+/// | `execute` arm | `0`, `1`, `7` | `SCM_ERROR "Unexpected action code N"` |
+/// | `iris_doc`'s pre-write probe | `0`, `1`, `6` | **proceed** — the write went ahead ungated |
+///
+/// The intersection is `{0}`. So for every code but one, the three sites disagreed, and the
+/// disagreement was not visible at any of them: each looked locally reasonable. #418 names two of
+/// the consequences (§2, §4) and the third — a CCR login page, action 2, read as "proceed" — is the
+/// one that writes a document that is not checked out.
+///
+/// A `u8` has no exhaustiveness, so the `_` arm below is unavoidable. The tripwire is moved to the
+/// CONSUMERS instead: every site matches on this enum with no catch-all, so a variant added here
+/// does not compile until all three have decided what it means. `scm_action_codes_mean_one_thing`
+/// asserts that no site goes back to matching the integers.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum CodeMeaning {
+    /// 0 — no dialog is needed. NOT "it happened": `AfterUserAction` still has to run, which is
+    /// the false positive #302 fixed in the `checkout` arm.
+    NoDialog,
+    /// 1 — a yes/no confirmation, and the only code that is one.
+    Confirm,
+    /// 6 — source control declined by policy. A real answer, not a malfunction.
+    Declined,
+    /// 7 — a text prompt. Not a confirmation: answering a prompt with "yes" sends the string
+    /// "yes" as the value, which is why routing 7 to a yes/no dialog is wrong rather than merely
+    /// imprecise.
+    Prompt,
+    /// 2 (open a CSP page) or 3 (open a URL). CCR returns these for `%CheckIn`, `CommitChanges`,
+    /// `CCRControls`, `Diff`, `TakeOwnership` and `CCRFileHistory`, and it rewrites its own
+    /// password prompt from 7 into 2 — so this is the code a missing Perforce credential arrives
+    /// under. The address is in `target`, which is why the snippets must send it (§3).
+    NeedsUi,
+    /// Any other code. Unknown to this fork, so not driveable from here.
+    Undriveable,
+}
+
+impl CodeMeaning {
+    pub(crate) fn of(code: u8) -> Self {
+        match code {
+            0 => Self::NoDialog,
+            1 => Self::Confirm,
+            2 | 3 => Self::NeedsUi,
+            6 => Self::Declined,
+            7 => Self::Prompt,
+            _ => Self::Undriveable,
+        }
+    }
+}
+
+/// The refusal for a code this path cannot drive. Shared so the three sites word it once.
+///
+/// Returns `(error_code, detail)`. `msg` is whatever the provider put in `msg` or `target` — for
+/// `NeedsUi` that is the page or URL to open, which is the only actionable part of the answer.
+pub(crate) fn undriveable_refusal(
+    meaning: CodeMeaning,
+    code: u8,
+    msg: &str,
+    doc: &str,
+) -> (&'static str, String) {
+    let where_ = if msg.is_empty() {
+        String::new()
+    } else {
+        format!(" The provider said: {msg}")
+    };
+    match meaning {
+        CodeMeaning::NeedsUi => (
+            SCM_NEEDS_UI,
+            format!(
+                "Source control answered with action {code}, which means the action has to be                  completed in the provider's own web UI — this tool cannot open it, and nothing                  was changed.{where_}"
+            ),
+        ),
+        CodeMeaning::Prompt => (
+            SCM_NEEDS_INPUT,
+            format!(
+                "Source control is asking for a typed value before it will act on {doc}, and this                  path has no way to supply one — nothing was changed.{where_}"
+            ),
+        ),
+        // Reached only from a site that has already handled the driveable codes.
+        CodeMeaning::Undriveable
+        | CodeMeaning::NoDialog
+        | CodeMeaning::Confirm
+        | CodeMeaning::Declined => (
+            "SCM_ERROR",
+            format!("Unexpected action code {code} from UserAction.{where_}"),
+        ),
     }
 }
 
@@ -462,53 +562,92 @@ pub async fn handle_iris_source_control(
                 Err((code, detail)) => return err_json(code, detail),
             };
 
-            if action_code == 0 {
-                // action=0 means UserAction wants no confirmation dialog — but the checkout
-                // is NOT actually committed until AfterUserAction runs. Reporting success
-                // here on UserAction alone was a false positive: the item looked checked out
-                // but a later write failed with ERROR #5865. Finalize with AfterUserAction so
-                // the checkout genuinely persists server-side before we claim success.
-                let after_code =
-                    after_user_action_code("%CheckOut", doc, "yes", &iris.username, &iris.password);
-                match xecute(iris, client, &after_code, ns).await {
-                    Ok(o) => {
-                        // #342: the FULL output, not `lines().next()`. This generator ends with
-                        // `write $system.Status.GetErrorText(sc)`, which returns the whole %Status
-                        // chain CRLF-joined — measured on 2026.1, a 2-error chain came back as
-                        // "ERROR #5001: first cause\r\nERROR #5001: second cause". Reporting line 1
-                        // discarded the rest, and the specific cause of a checkout failure is
-                        // frequently the later element.
-                        //
-                        // Empty still means success: GetErrorText is "" for an OK status, which is
-                        // the asymmetry `the_two_generators_disagree_about_empty` pins.
-                        let aout = o.trim();
-                        if !aout.is_empty() && aout != "SCM_UNAVAILABLE" {
-                            return err_json("SCM_CHECKOUT_FAILED", aout);
+            // #418 §4: dispatch on what the code MEANS, not on whether it is zero. This arm
+            // used to read `if action_code == 0 { … }` and then fall through to a yes/no
+            // dialog, so EVERY non-zero code became a yes/no question — including action 2,
+            // which is how CCR reports "your Perforce credentials are missing, here is the
+            // login page". The user was asked to answer yes or no about a URL.
+            let meaning = CodeMeaning::of(action_code);
+            match meaning {
+                CodeMeaning::NoDialog => {
+                    // action=0 means UserAction wants no confirmation dialog — but the checkout
+                    // is NOT actually committed until AfterUserAction runs. Reporting success
+                    // here on UserAction alone was a false positive: the item looked checked out
+                    // but a later write failed with ERROR #5865. Finalize with AfterUserAction so
+                    // the checkout genuinely persists server-side before we claim success.
+                    let after_code = after_user_action_code(
+                        "%CheckOut",
+                        doc,
+                        "yes",
+                        &iris.username,
+                        &iris.password,
+                    );
+                    match xecute(iris, client, &after_code, ns).await {
+                        Ok(o) => {
+                            // #342: the FULL output, not `lines().next()`. This generator ends with
+                            // `write $system.Status.GetErrorText(sc)`, which returns the whole %Status
+                            // chain CRLF-joined — measured on 2026.1, a 2-error chain came back as
+                            // "ERROR #5001: first cause\r\nERROR #5001: second cause". Reporting line 1
+                            // discarded the rest, and the specific cause of a checkout failure is
+                            // frequently the later element.
+                            //
+                            // Empty still means success: GetErrorText is "" for an OK status, which is
+                            // the asymmetry `the_two_generators_disagree_about_empty` pins.
+                            let aout = o.trim();
+                            if !after_user_action_completed(aout) && aout != "SCM_UNAVAILABLE" {
+                                return err_json("SCM_CHECKOUT_FAILED", aout);
+                            }
                         }
+                        Err(e) => return err_json(scm_error_code(&e.to_string()), &e.to_string()),
                     }
-                    Err(e) => return err_json(scm_error_code(&e.to_string()), &e.to_string()),
+                    // Checkout committed — cache it so a following iris_doc write skips the probe.
+                    checkout_cache.mark(ns, doc);
+                    ok_json(serde_json::json!({"success": true, "document": doc, "editable": true}))
                 }
-                // Checkout committed — cache it so a following iris_doc write skips the probe.
-                checkout_cache.mark(ns, doc);
-                return ok_json(
-                    serde_json::json!({"success": true, "document": doc, "editable": true}),
-                );
+                CodeMeaning::Confirm => {
+                    let eid = elicitation_store.insert(
+                        doc,
+                        ElicitationAction::ScmExecute,
+                        None,
+                        Some("%CheckOut".to_string()),
+                        ns.clone(),
+                    );
+                    ok_json(serde_json::json!({
+                        "success": false,
+                        "elicitation_required": true,
+                        "elicitation_id": eid,
+                        "message": if msg.is_empty() { format!("Check out {} ?", doc) } else { msg.to_string() },
+                        "options": ["yes", "no"],
+                    }))
+                }
+                // A typed value, not a yes/no. The `execute` arm already answered this shape
+                // correctly; `checkout` is `execute %CheckOut` by another name, so it answers
+                // it the same way rather than turning a prompt into a confirmation.
+                CodeMeaning::Prompt => {
+                    let eid = elicitation_store.insert(
+                        doc,
+                        ElicitationAction::ScmExecute,
+                        None,
+                        Some("%CheckOut".to_string()),
+                        ns.clone(),
+                    );
+                    ok_json(serde_json::json!({
+                        "success": false,
+                        "elicitation_required": true,
+                        "elicitation_id": eid,
+                        "message": if msg.is_empty() { format!("Enter value for %CheckOut on {}:", doc) } else { msg.to_string() },
+                        "input_type": "text",
+                    }))
+                }
+                CodeMeaning::Declined => err_json(
+                    "SCM_REJECTED",
+                    &format!("Source control declined to check out {doc}: {msg}"),
+                ),
+                CodeMeaning::NeedsUi | CodeMeaning::Undriveable => {
+                    let (code, detail) = undriveable_refusal(meaning, action_code, msg, doc);
+                    err_json(code, &detail)
+                }
             }
-            // action=1: need user confirmation
-            let eid = elicitation_store.insert(
-                doc,
-                ElicitationAction::ScmExecute,
-                None,
-                Some("%CheckOut".to_string()),
-                ns.clone(),
-            );
-            ok_json(serde_json::json!({
-                "success": false,
-                "elicitation_required": true,
-                "elicitation_id": eid,
-                "message": if msg.is_empty() { format!("Check out {} ?", doc) } else { msg.to_string() },
-                "options": ["yes", "no"],
-            }))
         }
 
         "execute" => {
@@ -537,8 +676,13 @@ pub async fn handle_iris_source_control(
                 Err((code, detail)) => return err_json(code, detail),
             };
 
-            match action_code {
-                0 => {
+            // #418 §4: the same CodeMeaning table the `checkout` arm and `iris_doc`'s
+            // pre-write probe read. This arm answered `SCM_ERROR "Unexpected action code 2"`
+            // for every code it did not list — including 6, which is not unexpected at all
+            // (source control declined), and 2/3, which name a page the caller can open.
+            let meaning = CodeMeaning::of(action_code);
+            match meaning {
+                CodeMeaning::NoDialog => {
                     // A completed execute (undo checkout / checkin / disconnect / …) changes
                     // checkout state — drop any cached entry so the next write re-probes.
                     checkout_cache.invalidate(ns, doc);
@@ -546,7 +690,7 @@ pub async fn handle_iris_source_control(
                         serde_json::json!({"success": true, "document": doc, "action_id": action_id}),
                     )
                 }
-                1 => {
+                CodeMeaning::Confirm => {
                     // Yes/No confirmation
                     let eid = elicitation_store.insert(
                         doc,
@@ -561,7 +705,7 @@ pub async fn handle_iris_source_control(
                         "options": ["yes", "no"],
                     }))
                 }
-                7 => {
+                CodeMeaning::Prompt => {
                     // Text prompt
                     let eid = elicitation_store.insert(
                         doc,
@@ -576,10 +720,14 @@ pub async fn handle_iris_source_control(
                         "input_type": "text",
                     }))
                 }
-                _ => err_json(
-                    "SCM_ERROR",
-                    &format!("Unexpected action code {} from UserAction", action_code),
+                CodeMeaning::Declined => err_json(
+                    "SCM_REJECTED",
+                    &format!("Source control declined {action_id} on {doc}: {msg}"),
                 ),
+                CodeMeaning::NeedsUi | CodeMeaning::Undriveable => {
+                    let (code, detail) = undriveable_refusal(meaning, action_code, msg, doc);
+                    err_json(code, &detail)
+                }
             }
         }
 
@@ -799,7 +947,12 @@ fn scm_init_prefix(username: &str, password: &str) -> String {
 
 /// Build the ObjectScript snippet that invokes `UserAction` on the SCM instance,
 /// writing "action|msg" to the output stream.
-fn user_action_code(action_id: &str, doc: &str, username: &str, password: &str) -> String {
+pub(crate) fn user_action_code(
+    action_id: &str,
+    doc: &str,
+    username: &str,
+    password: &str,
+) -> String {
     let prefix = scm_init_prefix(username, password);
     format!(
         "{prefix}set action=0 set target=\"\" set msg=\"\" set reload=0 \
@@ -820,14 +973,28 @@ pub(crate) fn after_user_action_code(
     password: &str,
 ) -> String {
     let prefix = scm_init_prefix(username, password);
-    let answer_int = if answer == "yes" { "1" } else { "0" };
+    // #418 §4: `AfterUserAction`'s fourth argument is the ANSWER, and for a code-7 prompt that
+    // is the typed string — not a flag. This read `if answer == "yes" { "1" } else { "0" }`, so a
+    // typed value arrived as 0 and the prompt could never be answered. yes/no keep their exact
+    // previous spelling, so every existing path is byte-identical; anything else is passed as an
+    // ObjectScript string literal. A non-numeric string is not `1`, so a hook testing `If Answer=1`
+    // still reads an unrecognised answer as "no" — the refusal direction, unchanged.
+    let answer_owned;
+    let answer_os: &str = match answer {
+        "yes" => "1",
+        "no" => "0",
+        typed => {
+            answer_owned = format!("\"{}\"", os_quote(typed));
+            &answer_owned
+        }
+    };
     let action_id_q = os_quote(action_id);
     let doc_q = os_quote(doc);
     format!(
         "{prefix}\
          set action=0 set target=\"\" set msg=\"\" set reload=0 \
          set sc=obj.UserAction(0,\"%SourceMenu,{action_id_q}\",\"{doc_q}\",\"\",.action,.target,.msg,.reload) \
-         set sc=obj.AfterUserAction(0,\"%SourceMenu,{action_id_q}\",\"{doc_q}\",{answer_int},\"\") \
+         set sc=obj.AfterUserAction(0,\"%SourceMenu,{action_id_q}\",\"{doc_q}\",{answer_os},\"\") \
          write $system.Status.GetErrorText(sc)"
     )
 }
@@ -848,6 +1015,157 @@ fn menu_all_items_code(doc: &str, username: &str, password: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `AfterUserAction`'s fourth argument is the ANSWER. For a yes/no dialog that is 1 or 0; for a
+    /// code-7 prompt it is the typed string, which used to arrive as 0.
+    #[test]
+    fn a_typed_answer_reaches_the_hook_as_a_string() {
+        let c = after_user_action_code("%CheckOut", "D.cls", "P@ssw0rd", "u", "p");
+        assert!(
+            c.contains(r#","P@ssw0rd","#),
+            "the typed value is not passed to AfterUserAction:\n{c}"
+        );
+        // CONTROL: yes/no are UNCHANGED, so no existing path moves. If this ever fails, every
+        // confirmation dialog in the module changed meaning.
+        let yes = after_user_action_code("%CheckOut", "D.cls", "yes", "u", "p");
+        assert!(yes.contains(r#""D.cls",1,"#), "yes is no longer 1:\n{yes}");
+        let no = after_user_action_code("%CheckOut", "D.cls", "no", "u", "p");
+        assert!(no.contains(r#""D.cls",0,"#), "no is no longer 0:\n{no}");
+    }
+
+    /// A typed answer containing a quote must not break out of the literal.
+    #[test]
+    fn a_typed_answer_is_escaped() {
+        let c = after_user_action_code("%CheckOut", "D.cls", r#"a"b"#, "u", "p");
+        assert!(c.contains(r#""a""b""#), "the answer is not escaped:\n{c}");
+    }
+    // ── CodeMeaning (#418 §4) ─────────────────────────────────────────────────
+
+    /// The table itself. These are the codes `%Studio.SourceControl` defines and CCR returns, so a
+    /// change to any row here is a change to what the server believes IRIS told it.
+    #[test]
+    fn each_action_code_means_what_the_hook_api_says_it_means() {
+        for (code, want) in [
+            (0u8, CodeMeaning::NoDialog),
+            (1, CodeMeaning::Confirm),
+            (2, CodeMeaning::NeedsUi),
+            (3, CodeMeaning::NeedsUi),
+            (6, CodeMeaning::Declined),
+            (7, CodeMeaning::Prompt),
+        ] {
+            assert_eq!(
+                CodeMeaning::of(code),
+                want,
+                "action {code} classified as {:?}, expected {want:?}",
+                CodeMeaning::of(code)
+            );
+        }
+        // CONTROL: the function is not returning one value for everything. Without this, a body of
+        // `_ => CodeMeaning::NoDialog` would satisfy the row for 0 and nothing above would notice
+        // that the others were wrong — which is the shape the `checkout` arm actually had.
+        let distinct: std::collections::BTreeSet<_> = (0u8..=7)
+            .map(|c| format!("{:?}", CodeMeaning::of(c)))
+            .collect();
+        assert!(
+            distinct.len() >= 5,
+            "codes 0-7 produced only {} distinct meanings ({distinct:?}) — the table is collapsed",
+            distinct.len()
+        );
+    }
+
+    /// Codes outside the table are not driveable. The affordable error is refusing an action that
+    /// turns out to have been harmless; the unaffordable one is reporting an unknown answer as done.
+    #[test]
+    fn an_unlisted_code_is_undriveable_not_a_success() {
+        for code in [4u8, 5, 8, 9, 42, 255] {
+            assert_eq!(
+                CodeMeaning::of(code),
+                CodeMeaning::Undriveable,
+                "action {code} is not classified as Undriveable"
+            );
+        }
+    }
+
+    /// The `checkout` arm's defect, as a property: it read `if action_code == 0` and let everything
+    /// else fall into a yes/no dialog, so a prompt for a typed value became a yes/no question —
+    /// where answering "yes" sends the literal string "yes" as the value.
+    #[test]
+    fn a_prompt_is_not_a_confirmation() {
+        assert_ne!(
+            CodeMeaning::of(7),
+            CodeMeaning::Confirm,
+            "action 7 asks for a typed value; answering it yes/no sends \"yes\" as the value"
+        );
+        assert_eq!(CodeMeaning::of(7), CodeMeaning::Prompt);
+    }
+
+    /// The costliest row. CCR rewrites its own password prompt from action 7 into action 2, so this
+    /// is the code that arrives when Perforce credentials are missing. The `checkout` arm asked the
+    /// user yes/no about a URL; `iris_doc`'s probe read it as "proceed" and wrote the document with
+    /// no check-out at all.
+    #[test]
+    fn the_login_page_code_is_neither_a_question_nor_a_go_ahead() {
+        let m = CodeMeaning::of(2);
+        assert_ne!(
+            m,
+            CodeMeaning::Confirm,
+            "action 2 is a page, not a yes/no question"
+        );
+        assert_ne!(
+            m,
+            CodeMeaning::NoDialog,
+            "action 2 is not permission to proceed"
+        );
+        assert_eq!(m, CodeMeaning::NeedsUi);
+    }
+
+    /// A refusal must carry the address, because for `NeedsUi` the address IS the remedy. This is
+    /// also the pay-off of §3: the page only reaches us at all because the snippet now sends
+    /// `target` as well as `msg`.
+    #[test]
+    fn a_needs_ui_refusal_carries_the_page_to_open() {
+        let url = "https://ccr.example/csp/ccr/login.csp?ns=APP";
+        let (code, detail) = undriveable_refusal(CodeMeaning::NeedsUi, 2, url, "My.Cls.cls");
+        assert_eq!(code, SCM_NEEDS_UI);
+        assert!(
+            detail.contains(url),
+            "the refusal drops the only actionable part of the answer: {detail}"
+        );
+        // CONTROL: the detail is not simply the message echoed back — it says what happened.
+        assert!(
+            detail.len() > url.len() + 20,
+            "the refusal is barely more than the url: {detail}"
+        );
+    }
+
+    /// A prompt refusal names the document, since the caller may have several writes in flight.
+    #[test]
+    fn a_prompt_refusal_names_the_document_and_its_own_code() {
+        let (code, detail) = undriveable_refusal(CodeMeaning::Prompt, 7, "", "My.Cls.cls");
+        assert_eq!(code, SCM_NEEDS_INPUT);
+        assert!(detail.contains("My.Cls.cls"), "{detail}");
+        // No provider text, so none is invented.
+        assert!(
+            !detail.contains("provider said"),
+            "an empty message produced a dangling 'provider said': {detail}"
+        );
+    }
+
+    /// An unknown code keeps the old wording and the old code, so nothing that parsed the previous
+    /// message loses its footing — but it reports the number, which is the diagnosable part.
+    #[test]
+    fn an_undriveable_code_is_reported_with_its_number() {
+        let (code, detail) = undriveable_refusal(CodeMeaning::Undriveable, 9, "odd", "D.cls");
+        assert_eq!(code, "SCM_ERROR");
+        assert!(
+            detail.contains('9'),
+            "the code number is not in the message: {detail}"
+        );
+        assert!(
+            detail.contains("odd"),
+            "the provider text is dropped: {detail}"
+        );
+    }
 
     // ── os_quote ──────────────────────────────────────────────────────────────
     #[test]
