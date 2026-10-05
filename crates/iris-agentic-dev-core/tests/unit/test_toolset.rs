@@ -405,7 +405,7 @@ fn test_toolset_counts_match_doc_comments() {
         (Toolset::Baseline, 64usize),
         (Toolset::Nostub, 60),
         (Toolset::Merged, 56),
-        (Toolset::Interop, 35),
+        (Toolset::Interop, 36),
     ] {
         let n = IrisTools::new_with_toolset(None, ts)
             .expect("IrisTools::new")
@@ -421,7 +421,7 @@ fn test_toolset_counts_match_doc_comments() {
     // Two independent anchors for the interop number: the keep-list and the router.
     assert_eq!(
         iris_agentic_dev_core::tools::INTEROP_TOOLS.len(),
-        35,
+        36,
         "INTEROP_TOOLS is the interop profile — it must agree with the measured count"
     );
 }

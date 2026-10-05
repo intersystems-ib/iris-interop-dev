@@ -360,7 +360,8 @@ pub enum Toolset {
     /// executes the derivation against the live Nostub count instead.
     /// Not this fork's default.
     Merged,
-    /// 32 tools advertised (measured 2026-09-22) — exactly `INTEROP_TOOLS`. THIS FORK'S
+    /// Exactly `INTEROP_TOOLS` — the count is not restated here, because every prose copy
+    /// of it in this repo has rotted; `scripts/validate-tools.sh` prints the real one. THIS FORK'S
     /// DEFAULT: `--toolset` carries `default_value = "interop"` (see
     /// crates/iris-agentic-dev-bin/src/cmd/mcp.rs). Keeps only the tools the iris-interop
     /// skills actually exercise; everything else (skill_*/kb_*/agent_*/generate_*/
@@ -472,6 +473,13 @@ pub const INTEROP_TOOLS: &[&str] = &[
     // because there is no canonical answer to ask for, and because every failure mode looks alike
     // from outside.
     "iris_gateway_manage",
+    // #417: the fork's reason for existing is that the FILESYSTEM is the source of truth, and
+    // on a CCR instance the thing that moves a document between the filesystem and IRIS is the
+    // server-side %Studio.SourceControl hook — which no tool in this profile could reach, so a
+    // put that needed a checkout first simply failed with ERROR #5865 and nothing said why.
+    // Write-gated action-by-action via `ScmAction::is_write`; `status` and `menu` stay readable
+    // on a read-only connection.
+    "iris_source_control",
 ];
 
 pub const ERR_NO_TESTS_FOUND: &str = "NO_TESTS_FOUND";
@@ -4808,6 +4816,27 @@ pub(crate) fn mutating_call(tool: &str, args: &serde_json::Value) -> Option<&'st
             .unwrap_or(false)
             .then_some("run forced SQL"),
 
+        // #417/#418. Action-aware, because a tool-level verdict is wrong in both directions:
+        // blanket-mutating would refuse `status`/`menu`, which are the read path that makes
+        // this tool worth having on a read-only connection, and blanket-read would ship
+        // %CheckIn/%GetLatest/%Disconnect ungated in the DEFAULT profile.
+        //
+        // DERIVED from `ScmAction::is_write` for `execute`, so a new SCM action classified on
+        // the enum needs no edit here. The `_` arm is deliberately MUTATING: an unrecognised
+        // top-level action has not been understood by anything yet, and the gate must not be
+        // the component that assumes it is harmless. `execute` with no `action_id` parses to
+        // `Unknown("")`, which is also mutating.
+        "iris_source_control" => match action {
+            "status" | "menu" => None,
+            "checkout" => Some("check out a document"),
+            "execute" => crate::tools::scm::ScmAction::from_id(
+                args.get("action_id").and_then(|v| v.as_str()).unwrap_or(""),
+            )
+            .is_write()
+            .then_some("run a source-control action"),
+            _ => Some("run a source-control action"),
+        },
+
         // Everything else reads. Named exhaustively rather than defaulted, so a NEW tool
         // does not inherit "safe" by omission — `write_capable_tools_are_all_classified`
         // fails on any interop tool missing from this match.
@@ -4998,6 +5027,7 @@ pub(crate) const CLASSIFIED_TOOLS: &[&str] = &[
     "iris_production_diff",
     "iris_production_item",
     "iris_query",
+    "iris_source_control",
     "iris_symbols",
     "iris_symbols_local",
     "iris_table_info",

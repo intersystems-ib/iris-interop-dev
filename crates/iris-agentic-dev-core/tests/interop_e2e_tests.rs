@@ -193,8 +193,9 @@ fn tools_list_returns_interop_profile() {
     // them. A skip that reports `ok` is indistinguishable from a pass, which is why the CI
     // dispatch (where IRIS_HOST IS set) is the only thing that actually exercises this.
     assert!(
-        names.len() == 35,
-        "expected the interop profile (35 tools), got {}: {:?}",
+        names.len() == iris_agentic_dev_core::tools::INTEROP_TOOLS.len(),
+        "expected the interop profile ({} tools per INTEROP_TOOLS), got {}: {:?}",
+        iris_agentic_dev_core::tools::INTEROP_TOOLS.len(),
         names.len(),
         names
     );
