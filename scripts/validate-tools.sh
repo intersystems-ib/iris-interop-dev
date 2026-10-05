@@ -152,7 +152,12 @@ if len(up) < 40 or len(ours) < 40:
           "which cannot be right. Refusing to report buckets from a broken read.")
     sys.exit(0)
 
-src = open(f"{ROOT}/crates/iris-agentic-dev-core/src/tools/mod.rs").read()
+# BOTH sides at HEAD. `ours` comes from `git show HEAD:...` above, so reading INTEROP_TOOLS from the
+# WORKTREE made the two halves disagree while a change was uncommitted: a tool implemented and
+# advertised in the working tree showed up as advertised AND never-ported, and the #353 join below
+# then reported it UNCLASSIFIED — a false alarm about a tool that is in the profile. One source, and
+# the caveat printed, rather than two sources that agree only after a commit.
+src = git("show", "HEAD:crates/iris-agentic-dev-core/src/tools/mod.rs")
 km = re.search(r"INTEROP_TOOLS[^=]*=\s*&?\[(.*?)\];", src, re.S)
 profile = set(re.findall(r'"([a-z_][a-z_0-9]*)"', km.group(1))) if km else set()
 
@@ -162,7 +167,7 @@ pruned              = sorted((ours & up) - profile)
 absent              = sorted(up - ours)
 
 print()
-print("UPSTREAM SURFACE (#353)")
+print("UPSTREAM SURFACE (#353)   — compared at HEAD; uncommitted changes are not included")
 print(f"  upstream implemented          {len(up)}")
 print(f"  ours implemented              {len(ours)}")
 print(f"  ours advertised               {len(profile)}  = {len(advertised_upstream)} upstream "

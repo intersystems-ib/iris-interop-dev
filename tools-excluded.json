@@ -228,20 +228,13 @@
       "why": "Diffs one document across two servers. The per-class half of the same drift question, and the direct check for 'the file on disk and the class in IRIS have diverged'.",
       "tracking": "intersystems-ib/iris-interop-dev#351"
     },
-    "stream_inspect": {
-      "category": "wanted",
-      "why": "Reads a stream body by OID. Interop message bodies are streams, so this is a first-class interop read; measured here that a fresh %OpenId reads from the start, so it does not consume what it inspects.",
-      "tracking": "intersystems-ib/iris-interop-dev#352"
-    },
     "iris_generate_test": {
-      "category": "wanted",
-      "why": "Generates a %UnitTest.TestCase for an existing class, introspecting it first. The fork's own workflow is test-first, so the shape is right even though it needs an external model key.",
-      "tracking": "intersystems-ib/iris-interop-dev#352"
+        "category": "not-interop",
+        "why": "Declined on #352's own precondition, which cannot be met: it asks the model to \"Extend %UnitTest.TestCase\", while this fork's tdd skill requires %UnitTest.TestProduction with Parameter PRODUCTION and TestControl neutralised. Its only output check is validate_cls_syntax — contains \"Class \", contains a brace, braces balanced — so the shape is a request to an LLM, not a guarantee, and \"verify the output shape before adopting\" has no answer for a non-deterministic generator."
     },
     "mermaid_production": {
-      "category": "wanted",
-      "why": "A flowchart of a production's configured items. The topology is what a reviewer reads first, and nothing advertised here renders it.",
-      "tracking": "intersystems-ib/iris-interop-dev#352"
+        "category": "covered-here",
+        "why": "Declined on measurement: its implementation reads only Ens_Config.Item and draws every item as a child of the production node, so it renders a one-level fan-out with no edge between items. On a real 10-item production, 2 item-to-item edges are knowable from TargetConfigName(s) and 2 more items route through a business rule; the imported diagram would show 0 of those 4. This fork already reads both sources — items via iris_production_item(list) and targets via get_settings, batched since #372 — so it can answer a question the port cannot."
     },
     "resolve_storage": {
       "category": "wanted",
