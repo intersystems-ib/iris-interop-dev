@@ -41,6 +41,27 @@ pub const SCM_MENU: &str = "%SourceMenu";
 const SCM_NO_OUTPUT: &str = "SCM_NO_OUTPUT";
 
 /// The action can only be completed in the provider's own web UI (action 2 or 3).
+/// An administrative source-control action, refused unless the operator opted in (#418 §5).
+pub(crate) const SCM_ADMIN_BLOCKED: &str = "SCM_ADMIN_BLOCKED";
+
+/// Check-in is refused unless the operator opted in.
+///
+/// These next three are `const` for a reason worth recording, because it is a trap this refactor
+/// walked into. They used to be argument-position literals — `err_json("CHECKIN_BLOCKED", …)` —
+/// which is one of the shapes `every_refusal_names_a_remedy` can see. Moving the decision into a
+/// shared function (`opt_in_refusal`, `after_user_action_outcome`, `undriveable_refusal`) turned
+/// each of them into a struct field or a tuple element, visible to nothing, and the gate reported
+/// all three as **stale remedy rows for codes the server can no longer emit** — the opposite of the
+/// truth. Naming them makes them visible again through the `const` producer that same gate grew for
+/// #418. A de-duplication can narrow a guard without touching it.
+pub(crate) const CHECKIN_BLOCKED: &str = "CHECKIN_BLOCKED";
+
+/// A checkout was attempted and refused, or could not be confirmed.
+pub(crate) const SCM_CHECKOUT_FAILED: &str = "SCM_CHECKOUT_FAILED";
+
+/// The source-control hook raised an error, or answered something this tool cannot drive.
+pub(crate) const SCM_ERROR: &str = "SCM_ERROR";
+
 pub(crate) const SCM_NEEDS_UI: &str = "SCM_NEEDS_UI";
 
 /// The provider wants a typed value (action 7) on a path that cannot ask for one.
@@ -114,6 +135,95 @@ impl ScmAction {
     }
 }
 
+/// `1`/`true`/`yes`, case-insensitively. Three copies of this `matches!` existed, two of them in
+/// the two places that gated `CheckIn` — so "is CheckIn allowed" was answered twice, which is the
+/// shape #418 §2/§4 was about one layer down.
+pub(crate) fn env_truthy(var: &str) -> bool {
+    std::env::var(var)
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+/// An action refused unless the operator explicitly enabled it.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) struct OptIn {
+    /// The environment variable that enables it. Read by `env_truthy`, reported to STDERR, and
+    /// deliberately NOT put in the caller-facing refusal — see `opt_in_refusal`.
+    pub var: &'static str,
+    /// The error code the refusal carries.
+    pub code: &'static str,
+}
+
+impl ScmAction {
+    /// Is this action refused by default even on a connection that PERMITS writes?
+    ///
+    /// Distinct from `is_write`, and the distinction is the whole point. `is_write` answers "does
+    /// this change something", which the read-only write gate consumes — so before #418 §5,
+    /// `%Disconnect` was correctly refused on a read-only connection and ran with no confirmation
+    /// on every other one, which is the common case. This answers a different question: is the
+    /// blast radius the namespace's source-control CONFIGURATION rather than one document.
+    ///
+    /// `%Disconnect` / `%Reconnect` switch the namespace's provider integration off or on for the
+    /// session. In the CCR hook they run immediately — `UserAction` calls `AfterUserAction` itself
+    /// and returns action 0 — so there is not even a dialog to decline.
+    ///
+    /// Exhaustive with no `_` arm, so a variant added to `ScmAction` cannot compile until someone
+    /// has decided whether it needs an opt-in.
+    pub(crate) fn opt_in(&self) -> Option<OptIn> {
+        match self {
+            Self::CheckIn => Some(OptIn {
+                var: "IRIS_SCM_ALLOW_CHECKIN",
+                code: CHECKIN_BLOCKED,
+            }),
+            // #418 §5. One variable for the pair, as the issue proposed: they are the same
+            // capability in two directions, and an operator who wants one wants the other.
+            Self::Disconnect | Self::Reconnect => Some(OptIn {
+                var: "IRIS_SCM_ALLOW_DISCONNECT",
+                code: SCM_ADMIN_BLOCKED,
+            }),
+            // These act on ONE document and are already covered by the write gate.
+            Self::CheckOut
+            | Self::UndoCheckout
+            | Self::GetLatest
+            | Self::AddToSourceControl
+            | Self::Diff => None,
+            // An id this fork does not know names a method on the server's own site-written
+            // %Studio.SourceControl subclass. It is `is_write`, so a read-only connection refuses
+            // it — but NOT opt-in-gated, because calling site hooks is what this tool is for and
+            // a blanket default-refuse would break every one of them.
+            Self::Unknown(_) => None,
+        }
+    }
+}
+
+/// The refusal for an action whose opt-in is not set, or `None` when it may proceed.
+///
+/// **The variable name is not in the returned message.** #170 moved exactly this remediation to
+/// stderr after measuring that a denial naming its own escape hatch is read by an agent as the next
+/// step to take — 4/4 recoveries in that corpus wrote the config first. The operator reads stderr;
+/// the caller gets told what was refused and that it is an operator setting. The variable is also
+/// on record in the remedy table, which is reviewed prose for humans rather than a runtime hint.
+pub(crate) fn opt_in_refusal(action_id: &str) -> Option<(&'static str, String)> {
+    let OptIn { var, code } = ScmAction::from_id(action_id).opt_in()?;
+    if env_truthy(var) {
+        return None;
+    }
+    tracing::warn!(
+        action = %action_id,
+        env_var = %var,
+        "iris_source_control: refused an action that is disabled by default; set this variable in \
+         the server's environment and restart it to allow the action"
+    );
+    Some((
+        code,
+        format!(
+            "{action_id} is disabled by default on this server. It is an operator setting, not \
+             something this session can change; the server's administrator can enable it and \
+             restart the server. Until then, perform this step in your own source-control client."
+        ),
+    ))
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ScmParams {
     // #112, and `every_tool_advertises_the_parameters_it_reads` enforces it: the valid values
@@ -161,124 +271,291 @@ pub(crate) fn os_quote(s: &str) -> String {
         .replace('\r', "$Char(13)")
 }
 
-/// Parse "code|msg" output from SCM xecute helpers. Returns (action_code, msg).
-/// What the first line of a `UserAction` / `AfterUserAction` response actually said.
+/// The sentinel that marks this server's own record in a `UserAction` / `AfterUserAction` response.
 ///
-/// #302: this returned `(u8, &str)` with `…parse::<u8>().ok().unwrap_or(0)`, and **0 is the success
-/// code** — the branch that reports `{"success": true}` and invalidates the cached checkout. So any
-/// output IRIS produced that is not a number was read as "the action completed":
+/// **Why a one-line JSON record behind a printable sentinel, and not #418 §1's suggested
+/// `$c(1)_"IAD|"…_$c(1)`.** Measured 2026-10-06 through `execute_via_generator` against
+/// intersystemsdc/iris-community:2026.1:
 ///
-/// | input | old verdict |
-/// |---|---|
-/// | `"<PROTECT>"` | success |
-/// | `"ERROR #5865: Cannot save item, it is locked by another user"` | success |
-/// | `"NOTICE: … is currently checked out by user 'alice'"` | success |
-/// | `"SCM_UNAVAILABLE_TYPO"` | success — the guard above is an EXACT match on one sentinel |
+/// ```text
+/// write "A"_$char(1)_"B"   ->   bytes [65, 10, 66, 10]      i.e. "A\nB\n"
+/// ```
 ///
-/// The message was lost too: `splitn('|')` finds no pipe in any of those, so `msg` came back empty and
-/// IRIS's explanation was discarded rather than merely ignored.
+/// The transport turns a written control character into a NEWLINE — the same measurement
+/// `hl7_schema.rs` already records, where a delimiter-separated protocol silently shredded every
+/// row. So a `$c(1)`-delimited record would be split by the very mechanism it was meant to survive.
+/// `%ToJSON()` instead, because it escapes an embedded newline (`\n`, two characters) and therefore
+/// keeps a MULTI-LINE provider message inside ONE findable line — measured:
 ///
-/// `Empty` is kept separate from `Code(0, _)`, and since #302's second half it is a FAILURE at both
-/// call sites rather than a synonym for code 0.
+/// ```text
+/// set r={} set r.msg="line one"_$char(10)_"line two"  write "IADSCM|"_r.%ToJSON()
+///   ->   "IADSCM|{\"msg\":\"line one\\nline two\"}\n"        lines = 1
+/// ```
 ///
-/// The question "does a provider legitimately return nothing on success?" looked unanswerable from
-/// this tree. It is answerable — from the snippet we ourselves generate. `user_action_code` sets
-/// `action=0` and ends with an unconditional `write action_"|"_...`, so it always emits at least
-/// `0|`. No first line means the write never executed.
-///
-/// **The opposite is true one layer down, which is why this looked ambiguous.**
-/// `after_user_action_code` ends with `write $system.Status.GetErrorText(sc)`, and GetErrorText
-/// returns the EMPTY STRING for a success status — so on the AfterUserAction path empty IS success,
-/// and the `if !aout.is_empty()` check at the CheckOut call site is correct as written. The two
-/// generators have opposite conventions and both flow through `.lines().next()`.
-/// `the_two_generators_disagree_about_empty` pins that, so this fix is not "propagated" onto a call
-/// site where it would be wrong.
-#[derive(Debug, PartialEq)]
-enum ActionMsg<'a> {
-    /// A numeric action code and its message. 0 means "no confirmation dialog needed".
-    Code(u8, &'a str),
-    /// No output at all.
-    Empty,
-    /// Output that is not an action code — IRIS error text, a provider NOTICE, a `<PROTECT>`.
-    Unparseable(&'a str),
+/// This is also the house pattern: `status_check_code` already emits one `SCMSTATUS|…` line and
+/// `derive_scm_status` finds it among noise, which is why `status` was the one arm #418 §1 did not
+/// list as broken.
+pub(crate) const SCM_RECORD: &str = "IADSCM|";
+
+/// The record itself. `kind` is what the snippet was answering, so a caller never has to infer it
+/// from which fields happen to be populated.
+#[derive(Debug, Deserialize, PartialEq, Default)]
+pub(crate) struct ScmRecord {
+    pub kind: String,
+    /// The action code, as IRIS gave it. A `Value` rather than a `u8` ON PURPOSE: coercing it in
+    /// ObjectScript with `+action` would turn anything non-numeric into 0, and **0 is the success
+    /// code** — which is exactly the `unwrap_or(0)` defect #302 and #418 §2 are about, moved into
+    /// the snippet where no Rust test could see it. A value that is not a small integer is an
+    /// unparseable answer, not a go-ahead.
+    #[serde(default)]
+    pub code: serde_json::Value,
+    #[serde(default)]
+    pub msg: String,
+    #[serde(default)]
+    pub target: String,
+    /// `AfterUserAction` only: did the action complete?
+    #[serde(default)]
+    pub ok: u8,
+    /// `AfterUserAction` only: the whole `%Status` chain, CRLF-joined by IRIS.
+    #[serde(default)]
+    pub err: String,
 }
 
-fn parse_action_msg(out: &str) -> ActionMsg<'_> {
-    if out.trim().is_empty() {
+impl ScmRecord {
+    /// The action code if it really is one.
+    pub(crate) fn action_code(&self) -> Option<u8> {
+        self.code.as_u64().filter(|n| *n <= 255).map(|n| n as u8)
+    }
+
+    /// What to show a human: the provider's message, or its dialog target when the message is empty.
+    ///
+    /// #418 §3 was that the snippet sent `msg` and dropped `target`, where CCR puts the check-out
+    /// prompt and the TEST/UAT/LIVE "revert this afterwards" warning. The old repair was a
+    /// `$select(msg'="":msg,target'="":target,1:"")` in ObjectScript, which loses WHICH one it
+    /// returned. Both fields now cross the wire and the choice is made here, so `NeedsUi` can hand
+    /// back the address specifically.
+    pub(crate) fn display(&self) -> &str {
+        if self.msg.is_empty() {
+            &self.target
+        } else {
+            &self.msg
+        }
+    }
+}
+
+/// `json!(…).pipe_hook(&h)` — the same thing as `with_hook_output`, spelled so the big `json!`
+/// blocks in the two arms keep reading top-to-bottom instead of being wrapped in a call.
+trait PipeHook {
+    fn pipe_hook(self, hook_output: &str) -> serde_json::Value;
+}
+impl PipeHook for serde_json::Value {
+    fn pipe_hook(self, hook_output: &str) -> serde_json::Value {
+        with_hook_output(self, hook_output)
+    }
+}
+
+/// Attach the hook's own output to a response, when there was any.
+///
+/// #418 §1 asks for this to be RETURNED rather than discarded or misread. It is omitted entirely
+/// when empty, so a quiet provider does not add a null field to every answer.
+fn with_hook_output(mut v: serde_json::Value, hook_output: &str) -> serde_json::Value {
+    if !hook_output.is_empty() {
+        v["hook_output"] = serde_json::Value::String(hook_output.to_string());
+    }
+    v
+}
+
+/// Everything in `out` that is not this server's record: the hook's own chatter.
+///
+/// #418 §1 asks for this to be RETURNED rather than discarded or misread. CCR writes a `NOTICE:`
+/// line when no Perforce user is defined and a `CMD: p4 …` echo whenever it shells out, and both
+/// used to be fed to a parser that treated them as the answer.
+fn hook_chatter(out: &str, record_line: Option<&str>) -> String {
+    out.lines()
+        .filter(|l| Some(*l) != record_line && !l.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// What a `UserAction` / `AfterUserAction` response actually said.
+///
+/// ## The history this shape carries
+///
+/// #302: the code was read with `…parse::<u8>().ok().unwrap_or(0)`, and **0 is the success code**.
+/// So `<PROTECT>`, `ERROR #5865`, a provider `NOTICE` and a mistyped sentinel were all read as "the
+/// action completed", and the message was lost with them.
+///
+/// #418 §1: the code was then read from `out.lines().next()`, so a hook that wrote anything before
+/// its own record — which CCR does — made the first line the NOTICE rather than the answer, and a
+/// multi-line message was truncated at its first newline, dropping the part that says why.
+///
+/// Both are now structural rather than defended against: the snippet writes one labelled record and
+/// this finds it wherever it landed. There is no longer a first line to be wrong about.
+#[derive(Debug, PartialEq)]
+enum ActionMsg {
+    /// A record, parsed.
+    Record(ScmRecord, String),
+    /// The SCM session could not be created — `scm_init_prefix` writes this bare sentinel and
+    /// quits, so there is no record to find.
+    Unavailable,
+    /// No output at all.
+    Empty,
+    /// Output with no record in it: IRIS error text, a `<PROTECT>`, a provider refusal that killed
+    /// the snippet before it could write. The full text is kept, because it is the only thing that
+    /// says what IRIS objected to and `scm_error_code` classifies on content.
+    Unparseable(String),
+}
+
+fn parse_action_msg(out: &str) -> ActionMsg {
+    let trimmed = out.trim();
+    if trimmed.is_empty() {
         return ActionMsg::Empty;
     }
-    // #418: the ACTION CODE is on the first line; the MESSAGE is not. Callers used to hand this
-    // function `out.lines().next()`, which truncated every message at its first newline — and an
-    // IRIS error text carries its chain on the following lines, so the part that says WHY was the
-    // part dropped. `Unparseable` was worse: it fed a truncated string to `scm_error_code`, which
-    // classifies on content, so a code whose distinguishing text sat on line 2 could not be reached.
-    //
-    // The message is sliced to the end of the WHOLE output rather than the end of the first line,
-    // which keeps it a borrow — no allocation, and the record stays contiguous.
-    let first_end = out.find('\n').unwrap_or(out.len());
-    let first = &out[..first_end];
-    let (head, msg) = match first.find('|') {
-        Some(i) => (first[..i].trim(), out[i + 1..].trim()),
-        // No pipe on the first line. `user_action_code` always writes one, so this is a provider
-        // that answered in its own shape; keep whatever followed as the message rather than
-        // discarding it.
-        None => (first.trim(), out[first_end..].trim()),
-    };
-    match head.parse::<u8>() {
-        Ok(code) => ActionMsg::Code(code, msg),
-        // The FULL text, so the classifier sees every line it might key on.
-        Err(_) => ActionMsg::Unparseable(out.trim()),
+    // The record, wherever it is. Not the first line — that is the defect.
+    if let Some(line) = out.lines().find(|l| l.trim_start().starts_with(SCM_RECORD)) {
+        let json = &line.trim_start()[SCM_RECORD.len()..];
+        if let Ok(rec) = serde_json::from_str::<ScmRecord>(json) {
+            return ActionMsg::Record(rec, hook_chatter(out, Some(line)));
+        }
+        // A record we cannot read is NOT a success. Fall through to Unparseable with everything,
+        // so the classifier sees the malformed record too.
     }
+    if trimmed.lines().any(|l| l.trim() == "SCM_UNAVAILABLE") {
+        return ActionMsg::Unavailable;
+    }
+    ActionMsg::Unparseable(trimmed.to_string())
 }
 
 /// Did an `AfterUserAction` response mean "completed"?
 ///
-/// Empty IS success on this path, and only this path: `after_user_action_code` ends with
-/// `write $system.Status.GetErrorText(sc)`, and GetErrorText returns the EMPTY STRING for a success
-/// status. The `UserAction` generator has the opposite convention — it always writes at least `0|`
-/// — which is why this is a separate named decision rather than a shared `is_empty()`.
+/// `Ok(hook_output)` when it did. `Err((error_code, detail))` otherwise.
 ///
-/// #418: a named function because the call site read `out.lines().next().unwrap_or("").trim()` and
-/// then tested THAT for emptiness. An output whose first line is blank but which carries an error
-/// on the second therefore reported `{"success": true}` and discarded the error, on the one path in
-/// this module that claims success. Emptiness is a property of the whole output, and a test can only
-/// say so about something it can call.
-pub fn after_user_action_completed(out: &str) -> bool {
-    out.trim().is_empty()
+/// #418 §1's third bullet: this used to be "any output means failure, empty means success", because
+/// `after_user_action_code` ended with `write $system.Status.GetErrorText(sc)` and GetErrorText
+/// returns `""` for an OK status. That convention was the exact OPPOSITE of the `UserAction`
+/// generator's — which always wrote at least `0|` — and the two were pinned against each other by
+/// `the_two_generators_disagree_about_empty` precisely because neither could be reasoned about
+/// alone. A hook that wrote one line of chatter therefore turned a successful checkout into
+/// `SCM_CHECKOUT_FAILED`.
+///
+/// There is now an explicit `ok` field and the asymmetry is gone: both generators answer the same
+/// way, and silence from either means the snippet never ran.
+pub(crate) fn after_user_action_outcome(out: &str) -> Result<String, (&'static str, String)> {
+    match parse_action_msg(out) {
+        ActionMsg::Record(rec, chatter) if rec.kind == "after" => {
+            if rec.ok == 1 {
+                Ok(chatter)
+            } else {
+                let detail = if rec.err.is_empty() {
+                    "Source control reported the action as not completed, with no reason.".to_string()
+                } else {
+                    rec.err
+                };
+                Err((SCM_CHECKOUT_FAILED, detail))
+            }
+        }
+        // A record of the wrong kind means the snippet ran a different path than we asked for.
+        ActionMsg::Record(rec, _) => Err((
+            SCM_ERROR,
+            format!(
+                "Expected an AfterUserAction record and got kind '{}' — the finalizer did not run.",
+                rec.kind
+            ),
+        )),
+        // Unavailable is NOT success. The previous reading (`aout != "SCM_UNAVAILABLE"`) let it fall
+        // through to a committed checkout, which is the same "failure answered as a fact" shape.
+        ActionMsg::Unavailable => Err((
+            "SCM_UNAVAILABLE",
+            "The source-control session could not be created to finalize the action, so whether it \
+             completed is unknown and nothing may be assumed about it."
+                .to_string(),
+        )),
+        ActionMsg::Empty => Err((SCM_NO_OUTPUT, EMPTY_OUTPUT_MSG.to_string())),
+        ActionMsg::Unparseable(raw) => Err((scm_error_code(&raw), raw)),
+    }
 }
 
-/// Decide what the first line of a `UserAction` response means, for both call sites.
+/// The answer to a `UserAction`, for all three call sites.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ActionAnswer {
+    pub code: u8,
+    pub record: ScmRecord,
+    /// The hook's own output, so a caller can see what the provider said instead of it being
+    /// discarded (#418 §1) — carried into the response rather than dropped here.
+    pub hook_output: String,
+}
+
+/// Decide what a `UserAction` response means, for every call site.
 ///
-/// `Ok((action_code, msg))` means the action reported a real code. `Err((error_code, detail))` is the
-/// envelope the caller must return instead — the caller does nothing but hand it to `err_json`.
+/// `Err((error_code, detail))` is the envelope the caller must return instead — the caller does
+/// nothing but hand it to `err_json`.
 ///
-/// **Why this is a function.** Both the `checkout` and the `execute` arm used to carry an identical
-/// 15-line copy of this decision. That duplication is the shape #302's first half already got wrong
-/// once: a repair applied to one copy leaves the other looking more trustworthy than it is. It also
-/// made the decision untestable — the mapping sat inside an async handler behind an HTTP round trip,
-/// so a mutation that reverted `Empty` to success passed the whole suite. That surviving mutant is
-/// what produced this extraction.
-///
-/// The three outcomes, and why none of them is success:
-///
-/// * `SCM_UNAVAILABLE` — the sentinel the snippet writes when the SCM session could not start.
-/// * `Empty` — no output at all. `user_action_code` sets `action=0` and ends with an unconditional
-///   `write action_"|"_...`, so a snippet that RAN always emits at least `0|`. Empty therefore means
-///   the write never executed and the outcome is unknown (#302, second half).
-/// * `Unparseable` — IRIS said something that is not a code: `<PROTECT>`, `ERROR #5865`, a provider
-///   `NOTICE`. Classified by the existing IRIS-error classifier, with the raw text preserved because
-///   it is the only thing that says what IRIS objected to (#302, first half).
-pub(crate) fn user_action_outcome(out: &str) -> Result<(u8, &str), (&'static str, &str)> {
-    if out == "SCM_UNAVAILABLE" {
-        return Err((
-            "SCM_UNAVAILABLE",
-            "Source control session could not be initialized",
-        ));
-    }
+/// **Why this is a function.** The `checkout` and `execute` arms used to carry an identical 15-line
+/// copy of this decision, which is the shape #302's first half already got wrong once: a repair
+/// applied to one copy leaves the other looking more trustworthy than it is. It also made the
+/// decision untestable — the mapping sat inside an async handler behind an HTTP round trip, so a
+/// mutation that reverted `Empty` to success passed the whole suite.
+pub(crate) fn user_action_outcome(out: &str) -> Result<ActionAnswer, (&'static str, String)> {
     match parse_action_msg(out) {
-        ActionMsg::Code(c, m) => Ok((c, m)),
-        ActionMsg::Empty => Err((SCM_NO_OUTPUT, EMPTY_OUTPUT_MSG)),
-        ActionMsg::Unparseable(raw) => Err((scm_error_code(raw), raw)),
+        // The probe writes this kind when SourceControlCreate produced no session. It must reach
+        // the caller as SCM_UNAVAILABLE and not as "expected an action code", which is what the
+        // generic arm below would have said about a record with no `code` field.
+        ActionMsg::Record(rec, _) if rec.kind == "unavailable" => Err((
+            "SCM_UNAVAILABLE",
+            "Source control session could not be initialized".to_string(),
+        )),
+        ActionMsg::Record(rec, hook_output) => match rec.action_code() {
+            Some(code) => Ok(ActionAnswer {
+                code,
+                record: rec,
+                hook_output,
+            }),
+            // A record whose code is not a small integer. Not a go-ahead — see `ScmRecord::code`.
+            None => Err((
+                SCM_ERROR,
+                format!(
+                    "Source control returned '{}' where an action code was expected, so what it \
+                     did is unknown.",
+                    rec.code
+                ),
+            )),
+        },
+        ActionMsg::Unavailable => Err((
+            "SCM_UNAVAILABLE",
+            "Source control session could not be initialized".to_string(),
+        )),
+        ActionMsg::Empty => Err((SCM_NO_OUTPUT, EMPTY_OUTPUT_MSG.to_string())),
+        ActionMsg::Unparseable(raw) => Err((scm_error_code(&raw), raw)),
+    }
+}
+
+/// What the pre-write probe was answering, when its record says so.
+///
+/// `iris_doc`'s probe asks a question the two tool arms never do — "is there a provider here at
+/// all, and do we already hold this document?" — so it has `kind`s of its own on the shared record.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ProbeKind {
+    /// `SourceControlClassGet()` returned "": nothing to check out, and nothing to remember.
+    NoSourceControl,
+    /// The MenuItems pre-step saw `%UndoCheckout` offered, so this session already holds it.
+    WeHoldIt,
+    /// A `UserAction` answer, to be classified by `user_action_outcome` like any other.
+    Action,
+}
+
+/// The probe's record kind, or `None` when there is no readable record.
+pub(crate) fn parse_probe_record(out: &str) -> Option<ProbeKind> {
+    let line = out
+        .lines()
+        .find(|l| l.trim_start().starts_with(SCM_RECORD))?;
+    let rec: ScmRecord = serde_json::from_str(&line.trim_start()[SCM_RECORD.len()..]).ok()?;
+    match rec.kind.as_str() {
+        "none" => Some(ProbeKind::NoSourceControl),
+        "hold" => Some(ProbeKind::WeHoldIt),
+        "action" => Some(ProbeKind::Action),
+        // `unavailable` deliberately falls through to the shared classifier, which refuses it —
+        // this must never read as "there is no source control".
+        _ => None,
     }
 }
 
@@ -370,7 +647,7 @@ pub(crate) fn undriveable_refusal(
         | CodeMeaning::NoDialog
         | CodeMeaning::Confirm
         | CodeMeaning::Declined => (
-            "SCM_ERROR",
+            SCM_ERROR,
             format!("Unexpected action code {code} from UserAction.{where_}"),
         ),
     }
@@ -444,16 +721,26 @@ pub async fn handle_iris_source_control(
                 return err_json(ec, &emsg);
             }
         };
+        // #418 §1: the one path in this module that claims success. It used to test the output
+        // for EMPTINESS, so a hook that wrote a single line of chatter — CCR writes `CMD: p4 …`
+        // whenever it shells out — reported failure for a completed action, and a blank first
+        // line with an error on the second reported SUCCESS. There is an explicit `ok` field now.
         let out = out.trim().to_string();
-        if after_user_action_completed(&out) {
-            // Any resumed SCM action (checkout/undo/checkin/disconnect) changes checkout state,
-            // so drop the cached entry — the next write re-probes and re-caches if still ours.
-            checkout_cache.invalidate(&pending.namespace, &pending.document);
-            return ok_json(
-                serde_json::json!({"success": true, "document": pending.document, "action_id": action_id}),
-            );
-        }
-        return err_json("SCM_ERROR", &out);
+        return match after_user_action_outcome(&out) {
+            Ok(hook_output) => {
+                // Any resumed SCM action (checkout/undo/checkin/disconnect) changes checkout state,
+                // so drop the cached entry — the next write re-probes and re-caches if still ours.
+                checkout_cache.invalidate(&pending.namespace, &pending.document);
+                let mut resp = serde_json::json!({
+                    "success": true, "document": pending.document, "action_id": action_id
+                });
+                if !hook_output.is_empty() {
+                    resp["hook_output"] = serde_json::Value::String(hook_output);
+                }
+                ok_json(resp)
+            }
+            Err((code, detail)) => err_json(code, &detail),
+        };
     }
 
     match p.action.as_str() {
@@ -535,13 +822,12 @@ pub async fn handle_iris_source_control(
                     .next()
                     .and_then(|s| s.trim().parse().ok())
                     .unwrap_or(0);
-                let checkin_allowed = std::env::var("IRIS_SCM_ALLOW_CHECKIN")
-                    .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-                    .unwrap_or(false);
-                if enabled == 1
-                    && !name.is_empty()
-                    && (ScmAction::from_id(name) != ScmAction::CheckIn || checkin_allowed)
-                {
+                // #418 §5: offer exactly what `execute` would accept. This read
+                // IRIS_SCM_ALLOW_CHECKIN itself and compared against ScmAction::CheckIn by name,
+                // so the menu and the execute arm each decided "is this allowed" separately —
+                // and adding the two administrative actions to both would have made four copies
+                // of one policy. Both now ask `opt_in_refusal`.
+                if enabled == 1 && !name.is_empty() && opt_in_refusal(name).is_none() {
                     actions.push(serde_json::json!({"id": name, "label": name, "enabled": true}));
                 }
             }
@@ -554,13 +840,16 @@ pub async fn handle_iris_source_control(
                 Ok(o) => o,
                 Err(e) => return err_json(scm_error_code(&e.to_string()), &e.to_string()),
             };
-            // #418: the WHOLE output. `lines().next()` truncated the message at its first
-            // newline, and `parse_action_msg` reads the code from the first line itself.
+            // #418 §1: the record is found wherever the hook's own output put it, so there is no
+            // longer a first line to be wrong about.
             let out = raw.trim();
-            let (action_code, msg) = match user_action_outcome(out) {
+            let answer = match user_action_outcome(out) {
                 Ok(v) => v,
-                Err((code, detail)) => return err_json(code, detail),
+                Err((code, detail)) => return err_json(code, &detail),
             };
+            let action_code = answer.code;
+            let msg = answer.record.display();
+            let hook_output = answer.hook_output.clone();
 
             // #418 §4: dispatch on what the code MEANS, not on whether it is zero. This arm
             // used to read `if action_code == 0 { … }` and then fall through to a yes/no
@@ -591,18 +880,24 @@ pub async fn handle_iris_source_control(
                             // discarded the rest, and the specific cause of a checkout failure is
                             // frequently the later element.
                             //
-                            // Empty still means success: GetErrorText is "" for an OK status, which is
-                            // the asymmetry `the_two_generators_disagree_about_empty` pins.
+                            // #418 §1: an explicit `ok` field, so this no longer depends on the
+                            // generators having opposite conventions about empty — and
+                            // `SCM_UNAVAILABLE` is no longer waved through as success, which it
+                            // was: `aout != "SCM_UNAVAILABLE"` let a session that could not be
+                            // created fall through to a committed checkout.
                             let aout = o.trim();
-                            if !after_user_action_completed(aout) && aout != "SCM_UNAVAILABLE" {
-                                return err_json("SCM_CHECKOUT_FAILED", aout);
+                            if let Err((code, detail)) = after_user_action_outcome(aout) {
+                                return err_json(code, &detail);
                             }
                         }
                         Err(e) => return err_json(scm_error_code(&e.to_string()), &e.to_string()),
                     }
                     // Checkout committed — cache it so a following iris_doc write skips the probe.
                     checkout_cache.mark(ns, doc);
-                    ok_json(serde_json::json!({"success": true, "document": doc, "editable": true}))
+                    ok_json(with_hook_output(
+                        serde_json::json!({"success": true, "document": doc, "editable": true}),
+                        &hook_output,
+                    ))
                 }
                 CodeMeaning::Confirm => {
                     let eid = elicitation_store.insert(
@@ -618,7 +913,8 @@ pub async fn handle_iris_source_control(
                         "elicitation_id": eid,
                         "message": if msg.is_empty() { format!("Check out {} ?", doc) } else { msg.to_string() },
                         "options": ["yes", "no"],
-                    }))
+                    })
+                    .pipe_hook(&hook_output))
                 }
                 // A typed value, not a yes/no. The `execute` arm already answered this shape
                 // correctly; `checkout` is `execute %CheckOut` by another name, so it answers
@@ -637,7 +933,8 @@ pub async fn handle_iris_source_control(
                         "elicitation_id": eid,
                         "message": if msg.is_empty() { format!("Enter value for %CheckOut on {}:", doc) } else { msg.to_string() },
                         "input_type": "text",
-                    }))
+                    })
+                    .pipe_hook(&hook_output))
                 }
                 CodeMeaning::Declined => err_json(
                     "SCM_REJECTED",
@@ -652,29 +949,24 @@ pub async fn handle_iris_source_control(
 
         "execute" => {
             let action_id = p.action_id.as_deref().unwrap_or("");
-            if ScmAction::from_id(action_id) == ScmAction::CheckIn {
-                let allowed = std::env::var("IRIS_SCM_ALLOW_CHECKIN")
-                    .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-                    .unwrap_or(false);
-                if !allowed {
-                    return err_json(
-                        "CHECKIN_BLOCKED",
-                        "CheckIn is disabled by default. Set IRIS_SCM_ALLOW_CHECKIN=1 to enable.",
-                    );
-                }
+            if let Some((code, detail)) = opt_in_refusal(action_id) {
+                return err_json(code, &detail);
             }
             let code = user_action_code(action_id, doc, &iris.username, &iris.password);
             let raw = match xecute(iris, client, &code, ns).await {
                 Ok(o) => o,
                 Err(e) => return err_json(scm_error_code(&e.to_string()), &e.to_string()),
             };
-            // #418: the WHOLE output. `lines().next()` truncated the message at its first
-            // newline, and `parse_action_msg` reads the code from the first line itself.
+            // #418 §1: the record is found wherever the hook's own output put it, so there is no
+            // longer a first line to be wrong about.
             let out = raw.trim();
-            let (action_code, msg) = match user_action_outcome(out) {
+            let answer = match user_action_outcome(out) {
                 Ok(v) => v,
-                Err((code, detail)) => return err_json(code, detail),
+                Err((code, detail)) => return err_json(code, &detail),
             };
+            let action_code = answer.code;
+            let msg = answer.record.display();
+            let hook_output = answer.hook_output.clone();
 
             // #418 §4: the same CodeMeaning table the `checkout` arm and `iris_doc`'s
             // pre-write probe read. This arm answered `SCM_ERROR "Unexpected action code 2"`
@@ -686,9 +978,10 @@ pub async fn handle_iris_source_control(
                     // A completed execute (undo checkout / checkin / disconnect / …) changes
                     // checkout state — drop any cached entry so the next write re-probes.
                     checkout_cache.invalidate(ns, doc);
-                    ok_json(
+                    ok_json(with_hook_output(
                         serde_json::json!({"success": true, "document": doc, "action_id": action_id}),
-                    )
+                        &hook_output,
+                    ))
                 }
                 CodeMeaning::Confirm => {
                     // Yes/No confirmation
@@ -703,7 +996,8 @@ pub async fn handle_iris_source_control(
                         "success": false, "elicitation_required": true, "elicitation_id": eid,
                         "message": if msg.is_empty() { format!("Execute {} on {}?", action_id, doc) } else { msg.to_string() },
                         "options": ["yes", "no"],
-                    }))
+                    })
+                    .pipe_hook(&hook_output))
                 }
                 CodeMeaning::Prompt => {
                     // Text prompt
@@ -718,7 +1012,8 @@ pub async fn handle_iris_source_control(
                         "success": false, "elicitation_required": true, "elicitation_id": eid,
                         "message": if msg.is_empty() { format!("Enter value for {}:", action_id) } else { msg.to_string() },
                         "input_type": "text",
-                    }))
+                    })
+                    .pipe_hook(&hook_output))
                 }
                 CodeMeaning::Declined => err_json(
                     "SCM_REJECTED",
@@ -945,8 +1240,13 @@ fn scm_init_prefix(username: &str, password: &str) -> String {
     )
 }
 
-/// Build the ObjectScript snippet that invokes `UserAction` on the SCM instance,
-/// writing "action|msg" to the output stream.
+/// Build the ObjectScript snippet that invokes `UserAction` on the SCM instance, writing ONE
+/// labelled record (see `SCM_RECORD`) that the parser finds wherever the hook's own output put it.
+///
+/// `msg` and `target` are both sent. #418 §3 was that only `msg` crossed the wire, and CCR puts the
+/// check-out prompt — and in TEST/UAT/LIVE the warning that changes there must be reverted — in
+/// `target`. Choosing between them is now `ScmRecord::display`, in Rust, so which one arrived is
+/// still known: `NeedsUi` needs the address specifically.
 pub(crate) fn user_action_code(
     action_id: &str,
     doc: &str,
@@ -957,7 +1257,8 @@ pub(crate) fn user_action_code(
     format!(
         "{prefix}set action=0 set target=\"\" set msg=\"\" set reload=0 \
          set sc=obj.UserAction(0,\"%SourceMenu,{}\",\"{}\",\"\",.action,.target,.msg,.reload) \
-         write action_\"|\"_$select(msg'=\"\":msg,target'=\"\":target,1:\"\")",
+         set r={{}} set r.kind=\"action\" set r.code=action set r.msg=msg set r.target=target \
+         write \"{SCM_RECORD}\"_r.%ToJSON()",
         os_quote(action_id),
         os_quote(doc),
     )
@@ -965,6 +1266,12 @@ pub(crate) fn user_action_code(
 
 /// Build the ObjectScript snippet that re-runs `UserAction` then immediately calls
 /// `AfterUserAction` in the same job, so %SourceControl state is preserved.
+///
+/// #418 §1: this used to end `write $system.Status.GetErrorText(sc)`, so "no output" meant success
+/// and ANY output meant failure — the exact opposite of the `UserAction` generator's convention, and
+/// a hook that wrote one line of chatter turned a successful checkout into `SCM_CHECKOUT_FAILED`.
+/// There is an explicit `ok` field now, so the two generators answer the same way and silence from
+/// either means the snippet never ran.
 pub(crate) fn after_user_action_code(
     action_id: &str,
     doc: &str,
@@ -995,7 +1302,9 @@ pub(crate) fn after_user_action_code(
          set action=0 set target=\"\" set msg=\"\" set reload=0 \
          set sc=obj.UserAction(0,\"%SourceMenu,{action_id_q}\",\"{doc_q}\",\"\",.action,.target,.msg,.reload) \
          set sc=obj.AfterUserAction(0,\"%SourceMenu,{action_id_q}\",\"{doc_q}\",{answer_os},\"\") \
-         write $system.Status.GetErrorText(sc)"
+         set r={{}} set r.kind=\"after\" set r.ok=$select(sc=1:1,1:0) \
+         set r.err=$system.Status.GetErrorText(sc) \
+         write \"{SCM_RECORD}\"_r.%ToJSON()"
     )
 }
 
@@ -1039,6 +1348,264 @@ mod tests {
         let c = after_user_action_code("%CheckOut", "D.cls", r#"a"b"#, "u", "p");
         assert!(c.contains(r#""a""b""#), "the answer is not escaped:\n{c}");
     }
+    // ── #418 §1: the snippets COMPILE and their record survives the real transport ──
+
+    /// Run every SCM generator against a live instance.
+    ///
+    /// ## What this proves, measured rather than assumed
+    ///
+    /// The #418 §1 change rewrote three generated ObjectScript snippets, and every other assertion
+    /// about them is a `contains` on a Rust string. So this runs them.
+    ///
+    /// **It does NOT prove they compile, and the first version of this comment claimed it did.**
+    /// Measured against intersystemsdc/iris-community:2026.1 through `execute_via_generator`:
+    ///
+    /// ```text
+    /// write "OK"_$zconvert("x"            -> Ok("ERROR: <SYNTAX> 3 RunUser+1^IrisDevTmp.Run….1")
+    /// write "OK" quit / $zconvert("x"     -> Ok("OK")
+    /// write "OK" quit / @@@ not code @@@  -> Ok("OK")
+    /// ```
+    ///
+    /// A syntax error does not fail the COMPILE — it surfaces at RUNTIME, on the line that executes.
+    /// So a line after a `quit` is never validated: literal garbage there is invisible. On an
+    /// instance with no source-control class, `scm_init_prefix` writes `SCM_UNAVAILABLE` and quits,
+    /// which is before the record write in the two tool snippets. A deliberately broken `%ToJSON(`
+    /// in `user_action_code` therefore PASSES this test — verified, and it is
+    /// `the_two_generators_now_agree_about_empty` that catches it, textually.
+    ///
+    /// What it does establish, and what nothing offline can:
+    ///
+    /// * the lines that DO execute are valid — a reached `<SYNTAX>` lands in the output and is
+    ///   asserted against below;
+    /// * the probe's `scmClass=""` branch writes a REAL record on this instance, so the record
+    ///   format is exercised generator -> transport -> parser with bytes IRIS produced;
+    /// * that record arrives on ONE line, which is the property that made `%ToJSON()` the right
+    ///   format and the issue's suggested `$c(1)` delimiter the wrong one — a written control
+    ///   character arrives as a newline;
+    /// * `parse_probe_record` reads what IRIS actually wrote, not what we assumed it would.
+    ///
+    /// Covering the unreached lines needs an instance with a source-control class configured, which
+    /// is what #418's CCR sandbox spike is for.
+    ///
+    /// `#[ignore]` rather than an `if env.is_none() { return }` guard: an env-guarded early return
+    /// prints `... ok` and reads as coverage, whereas an ignored test reports `ignored`. The e2e job
+    /// runs the whole list with `--include-ignored` and IRIS_HOST set.
+    #[test]
+    #[ignore = "requires a live IRIS (IRIS_HOST); the e2e job runs it with --include-ignored"]
+    fn the_generated_snippets_run_and_the_record_round_trips() {
+        let host = std::env::var("IRIS_HOST")
+            .ok()
+            .filter(|h| !h.is_empty())
+            .expect(
+                "IRIS_HOST is unset. This test was asked to run (--include-ignored) and cannot: \
+                 skipping would report success for a snippet nobody compiled.",
+            );
+        let port = std::env::var("IRIS_WEB_PORT").unwrap_or_else(|_| "52773".into());
+        let user = std::env::var("IRIS_USERNAME").unwrap_or_else(|_| "_SYSTEM".into());
+        let pass = std::env::var("IRIS_PASSWORD").unwrap_or_else(|_| "SYS".into());
+        let ns = std::env::var("IRIS_NAMESPACE").unwrap_or_else(|_| "USER".into());
+        let c = crate::iris::connection::IrisConnection::new(
+            format!("http://{host}:{port}"),
+            &ns,
+            &user,
+            &pass,
+            crate::iris::connection::DiscoverySource::EnvVar,
+        );
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let client = crate::iris::connection::IrisConnection::http_client().expect("client");
+
+            // Anything IRIS says when it cannot PARSE or RUN the snippet. A compile failure comes
+            // back as an error from the generator, so the `expect` below is the first guard; these
+            // catch the case where it answers 200 with a diagnosis in the body.
+            let compile_noise = ["<SYNTAX>", "MPP", "#5373", "#1026", "<UNDEFINED>", "<COMMAND>"];
+
+            for (name, code) in [
+                ("user_action_code", user_action_code("%CheckOut", "D.cls", &user, &pass)),
+                (
+                    "after_user_action_code",
+                    after_user_action_code("%CheckOut", "D.cls", "yes", &user, &pass),
+                ),
+                (
+                    "after_user_action_code (typed answer)",
+                    after_user_action_code("%CheckOut", "D.cls", "P@ss", &user, &pass),
+                ),
+                ("menu_all_items_code", menu_all_items_code("D.cls", &user, &pass)),
+            ] {
+                let out = c
+                    .execute_via_generator(&code, &ns, &client)
+                    .await
+                    .unwrap_or_else(|e| panic!("{name} did not run: {e}\n{code}"));
+                for bad in compile_noise {
+                    assert!(
+                        !out.contains(bad),
+                        "{name} produced {bad} on a line that RAN — the snippet is not valid ObjectScript. Note \
+                         this only covers executed lines; see this test's doc comment.\n{out}\n{code}"
+                    );
+                }
+                // No source control here, so `scm_init_prefix` answers and quits.
+                assert!(
+                    out.contains("SCM_UNAVAILABLE"),
+                    "{name} did not reach the no-provider branch, so what it did is unknown:\n{out}"
+                );
+            }
+
+            // The probe writes a REAL record on this instance. Generator -> transport -> parser.
+            let probe = crate::tools::doc::scm_precheck_code_for_test("D.cls", &user, &pass);
+            let out = c
+                .execute_via_generator(&probe, &ns, &client)
+                .await
+                .unwrap_or_else(|e| panic!("the probe did not run: {e}\n{probe}"));
+            for bad in compile_noise {
+                assert!(!out.contains(bad), "the probe produced {bad} on a line that RAN:\n{out}\n{probe}");
+            }
+            assert!(
+                out.contains(SCM_RECORD),
+                "the probe wrote no record, so the sentinel does not survive the transport:\n{out:?}"
+            );
+            // It is ONE line — the property that made JSON the right format. A written control
+            // character arrives as a newline (measured), which is why `$c(1)` was rejected.
+            let rec_line = out
+                .lines()
+                .find(|l| l.trim_start().starts_with(SCM_RECORD))
+                .expect("the record line");
+            assert!(
+                !rec_line.trim_end().contains('\n'),
+                "the record spans lines: {rec_line:?}"
+            );
+            // And the Rust side reads what IRIS actually wrote.
+            assert_eq!(
+                parse_probe_record(&out),
+                Some(ProbeKind::NoSourceControl),
+                "the parser does not read the bytes the generator produced: {out:?}"
+            );
+        });
+    }
+
+    // ── the opt-in table (#418 §5) ────────────────────────────────────────────
+
+    /// §5. `%Disconnect`/`%Reconnect` switch the namespace's provider integration off or on, and
+    /// in the CCR hook they run immediately with no dialog to decline. Before this they were
+    /// `is_write`, which refuses them on a READ-ONLY connection and allows them everywhere else —
+    /// and everywhere else is the common case, which is what §5 is about.
+    #[test]
+    fn the_administrative_actions_need_an_opt_in() {
+        for id in ["Disconnect", "Reconnect", "%Disconnect", "%Reconnect"] {
+            let o = ScmAction::from_id(id)
+                .opt_in()
+                .unwrap_or_else(|| panic!("{id} is not opt-in gated, so it runs by default"));
+            assert_eq!(o.var, "IRIS_SCM_ALLOW_DISCONNECT", "{id}");
+            assert_eq!(o.code, SCM_ADMIN_BLOCKED, "{id}");
+        }
+    }
+
+    /// CheckIn keeps its own variable and its own code. This is the control for the table: a
+    /// refactor that collapsed every opt-in onto one variable would satisfy the test above and
+    /// silently widen what `IRIS_SCM_ALLOW_CHECKIN` grants.
+    #[test]
+    fn checkin_keeps_the_variable_and_code_it_already_had() {
+        let o = ScmAction::from_id("%CheckIn")
+            .opt_in()
+            .expect("CheckIn is gated");
+        assert_eq!(o.var, "IRIS_SCM_ALLOW_CHECKIN");
+        assert_eq!(o.code, "CHECKIN_BLOCKED");
+        assert_ne!(
+            o.var,
+            ScmAction::from_id("%Disconnect").opt_in().unwrap().var,
+            "the two opt-ins share a variable, so enabling one enables the other"
+        );
+    }
+
+    /// An action on ONE document is not opt-in gated — the write gate already covers it, and
+    /// default-refusing `%CheckOut` would make the tool useless.
+    #[test]
+    fn a_single_document_action_is_not_opt_in_gated() {
+        for id in [
+            "CheckOut",
+            "UndoCheckout",
+            "GetLatest",
+            "AddToSourceControl",
+            "Diff",
+        ] {
+            assert!(
+                ScmAction::from_id(id).opt_in().is_none(),
+                "{id} is opt-in gated, which refuses ordinary document work by default"
+            );
+        }
+        // CONTROL: opt_in() does not simply return None for everything.
+        assert!(ScmAction::from_id("%CheckIn").opt_in().is_some());
+    }
+
+    /// The two questions are different, and this is the pair that shows it. An unrecognised id
+    /// names a method on the server's own site-written subclass: it IS a write (so a read-only
+    /// connection refuses it) and it is NOT opt-in gated (so calling site hooks still works).
+    #[test]
+    fn an_unknown_action_is_a_write_but_not_opt_in_gated() {
+        let a = ScmAction::from_id("SomeSiteHook");
+        assert!(matches!(a, ScmAction::Unknown(_)));
+        assert!(
+            a.is_write(),
+            "an unknown hook must not run on a read-only connection"
+        );
+        assert!(
+            a.opt_in().is_none(),
+            "a blanket opt-in on unknown ids would default-refuse every site hook, which is what \
+             this tool exists to call"
+        );
+    }
+
+    /// #170's rule, as a test. A denial that names its own escape hatch is read by an agent as the
+    /// next step to take — measured on this fork, where 4/4 recoveries wrote the config first. The
+    /// variable goes to stderr and to the reviewed remedy table; not to the caller.
+    #[test]
+    fn the_refusal_does_not_hand_over_the_variable_that_lifts_it() {
+        let prev = std::env::var("IRIS_SCM_ALLOW_DISCONNECT").ok();
+        std::env::remove_var("IRIS_SCM_ALLOW_DISCONNECT");
+        let (code, detail) = opt_in_refusal("%Disconnect").expect("must refuse when unset");
+        assert_eq!(code, SCM_ADMIN_BLOCKED);
+        assert!(
+            !detail.contains("IRIS_SCM_ALLOW"),
+            "the refusal names the variable that lifts it: {detail}"
+        );
+        assert!(
+            !detail.contains('='),
+            "the refusal looks like an assignment the reader can copy: {detail}"
+        );
+        // CONTROL: it still says what was refused and that it is an operator setting, so the
+        // assertions above are not satisfied by an empty or useless message.
+        assert!(detail.contains("%Disconnect"), "{detail}");
+        assert!(detail.contains("operator"), "{detail}");
+        if let Some(v) = prev {
+            std::env::set_var("IRIS_SCM_ALLOW_DISCONNECT", v);
+        }
+    }
+
+    /// And the opt-in actually lifts it. Without this the table could refuse unconditionally.
+    #[test]
+    fn setting_the_opt_in_lifts_the_refusal() {
+        let prev = std::env::var("IRIS_SCM_ALLOW_DISCONNECT").ok();
+        for v in ["1", "true", "YES"] {
+            std::env::set_var("IRIS_SCM_ALLOW_DISCONNECT", v);
+            assert!(
+                opt_in_refusal("%Disconnect").is_none(),
+                "IRIS_SCM_ALLOW_DISCONNECT={v} did not enable the action"
+            );
+        }
+        for v in ["0", "no", "", "maybe"] {
+            std::env::set_var("IRIS_SCM_ALLOW_DISCONNECT", v);
+            assert!(
+                opt_in_refusal("%Disconnect").is_some(),
+                "IRIS_SCM_ALLOW_DISCONNECT={v} should NOT enable the action"
+            );
+        }
+        match prev {
+            Some(v) => std::env::set_var("IRIS_SCM_ALLOW_DISCONNECT", v),
+            None => std::env::remove_var("IRIS_SCM_ALLOW_DISCONNECT"),
+        }
+        // An action with no opt-in is never refused by this path, whatever the environment.
+        assert!(opt_in_refusal("%CheckOut").is_none());
+    }
+
     // ── CodeMeaning (#418 §4) ─────────────────────────────────────────────────
 
     /// The table itself. These are the codes `%Studio.SourceControl` defines and CCR returns, so a
@@ -1199,296 +1766,306 @@ mod tests {
         assert_eq!(os_quote("line\r\nend"), "line$Char(13)$Char(10)end");
     }
 
-    // ── parse_action_msg ─────────────────────────────────────────────────────
-    #[test]
-    fn test_parse_action_msg_code_and_msg() {
-        assert_eq!(
-            parse_action_msg("1|Please enter comment"),
-            ActionMsg::Code(1, "Please enter comment")
-        );
-    }
-    #[test]
-    fn test_parse_action_msg_zero_ok() {
-        assert_eq!(parse_action_msg("0|"), ActionMsg::Code(0, ""));
-    }
-    #[test]
-    fn test_parse_action_msg_no_pipe() {
-        assert_eq!(parse_action_msg("0"), ActionMsg::Code(0, ""));
-    }
-    #[test]
-    fn test_parse_action_msg_message_with_pipes() {
-        // Only splits on first pipe
-        assert_eq!(
-            parse_action_msg("1|msg with | pipe"),
-            ActionMsg::Code(1, "msg with | pipe")
-        );
-    }
-    #[test]
-    fn test_parse_action_msg_type_7() {
-        assert_eq!(
-            parse_action_msg("7|Enter value:"),
-            ActionMsg::Code(7, "Enter value:")
-        );
+    // ── #418 §1: the answer is a labelled RECORD, found wherever the hook put it ──
+
+    /// What the generators actually write, so every test below speaks the real wire format rather
+    /// than a convenient approximation of it. Measured against a live instance; see
+    /// `SCM_RECORD`'s doc comment for the bytes.
+    fn record(json: &str) -> String {
+        format!("{SCM_RECORD}{json}")
     }
 
-    // ── #418: the output is a RECORD, not a line ──────────────────────────────
+    #[test]
+    fn a_record_is_read_field_by_field() {
+        let out = record(r#"{"kind":"action","code":1,"msg":"Check out?","target":""}"#);
+        match parse_action_msg(&out) {
+            ActionMsg::Record(r, chatter) => {
+                assert_eq!(r.action_code(), Some(1));
+                assert_eq!(r.msg, "Check out?");
+                assert_eq!(r.display(), "Check out?");
+                assert_eq!(
+                    chatter, "",
+                    "a quiet provider produced chatter: {chatter:?}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
 
-    /// The code is on the first line. The message is not, and an IRIS error text puts the part that
-    /// says WHY on the lines after the first — exactly the part `lines().next()` dropped.
+    /// **THE §1 DEFECT.** CCR writes a `NOTICE:` line when no Perforce user is defined and a
+    /// `CMD: p4 …` echo whenever it shells out. The code used to be read from `lines().next()`, so
+    /// the NOTICE became the answer. There is no first line to be wrong about any more.
+    #[test]
+    fn the_record_is_found_after_the_hooks_own_chatter() {
+        let out = format!(
+            "NOTICE: no Perforce user is defined for this namespace\n\n{}\nCMD: p4 edit MyApp.cls\n",
+            record(r#"{"kind":"action","code":2,"target":"https://ccr/login.csp"}"#)
+        );
+        match parse_action_msg(&out) {
+            ActionMsg::Record(r, chatter) => {
+                assert_eq!(
+                    r.action_code(),
+                    Some(2),
+                    "the hook's NOTICE was read as the answer"
+                );
+                assert_eq!(r.display(), "https://ccr/login.csp");
+                // §1's second half: the chatter is RETURNED, not discarded.
+                assert!(chatter.contains("NOTICE: no Perforce user"), "{chatter:?}");
+                assert!(chatter.contains("CMD: p4 edit"), "{chatter:?}");
+                assert!(
+                    !chatter.contains(SCM_RECORD),
+                    "our own record is being reported back as hook output: {chatter:?}"
+                );
+            }
+            other => panic!("the record was not found among chatter: {other:?}"),
+        }
+    }
+
+    /// A multi-line provider message survives, because `%ToJSON()` escapes the newline and the
+    /// record stays one line. This is the property that made JSON the right format and the issue's
+    /// suggested `$c(1)` delimiter the wrong one — a written control character arrives as a newline.
     #[test]
     fn a_multi_line_message_survives_the_parse() {
-        let out = "1|Cannot check out\nERROR #5803: Lock on MyApp.Patient.cls\n  held by 'alice'";
-        match parse_action_msg(out) {
-            ActionMsg::Code(1, msg) => {
-                assert!(
-                    msg.contains("ERROR #5803") && msg.contains("'alice'"),
-                    "the message was truncated at the first newline: {msg:?}"
-                );
-                assert!(
-                    msg.starts_with("Cannot check out"),
-                    "the first line's own text was dropped: {msg:?}"
-                );
-            }
-            other => panic!("expected Code(1, _), got {other:?}"),
-        }
-    }
-
-    /// `Unparseable` feeds `scm_error_code`, which classifies on CONTENT. Handing it one line means
-    /// a code whose distinguishing text is on a later line cannot be reached at all.
-    #[test]
-    fn unparseable_output_keeps_every_line_for_the_classifier() {
-        let out = "<PROTECT>\nProtected item: ^Ens.Config\nuser: _SYSTEM";
-        match parse_action_msg(out) {
-            ActionMsg::Unparseable(got) => {
-                assert_eq!(got, out, "the classifier sees only part of what IRIS said")
-            }
-            other => panic!("expected Unparseable, got {other:?}"),
-        }
-    }
-
-    /// A provider that answers in its own shape — no pipe — still said something on the lines after
-    /// the first, and it is not this parser's place to discard it.
-    #[test]
-    fn a_code_with_its_message_on_the_next_line_keeps_the_message() {
-        match parse_action_msg("0\nchecked out to /tmp/ws/MyApp.Patient.cls") {
-            ActionMsg::Code(0, msg) => assert_eq!(msg, "checked out to /tmp/ws/MyApp.Patient.cls"),
-            other => panic!("expected Code(0, _), got {other:?}"),
-        }
-    }
-
-    /// The site that decided SUCCESS. A response whose FIRST LINE is blank but which carries an
-    /// error on the second is a failure, and used to be reported as `{"success": true}` with the
-    /// error discarded — the one path in this module that claims success.
-    #[test]
-    fn a_blank_first_line_is_not_a_completed_action() {
-        assert!(
-            after_user_action_completed(""),
-            "control: empty IS success on the AfterUserAction path (GetErrorText returns \"\" \
-             for a success status), so a test that rejected this would be wrong"
+        let out = record(
+            r#"{"kind":"action","code":1,"msg":"Cannot check out\nERROR #5803: Lock held by 'alice'"}"#,
         );
-        assert!(after_user_action_completed("   \n  \n"));
-        for out in [
-            "\nERROR #5865: Cannot save item, it is locked by another user",
-            "\n<PROTECT>",
-            "\n\nERROR #5803: Lock could not be acquired",
+        match parse_action_msg(&out) {
+            ActionMsg::Record(r, _) => {
+                assert!(r.msg.contains("ERROR #5803"), "truncated: {:?}", r.msg);
+                assert!(r.msg.contains("'alice'"), "truncated: {:?}", r.msg);
+                assert!(
+                    r.msg.contains('\n'),
+                    "the newline did not survive: {:?}",
+                    r.msg
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// §3: `target` crosses the wire on its own, so a dialog whose text IRIS put there is not lost.
+    /// Both fields are sent now, instead of an ObjectScript `$select` that hid which one arrived.
+    #[test]
+    fn target_is_used_when_msg_is_empty_and_both_are_kept() {
+        let out =
+            record(r#"{"kind":"action","code":1,"msg":"","target":"THIS IS LIVE. Revert after."}"#);
+        match parse_action_msg(&out) {
+            ActionMsg::Record(r, _) => {
+                assert_eq!(r.display(), "THIS IS LIVE. Revert after.");
+                assert_eq!(r.target, "THIS IS LIVE. Revert after.");
+                assert_eq!(r.msg, "");
+            }
+            other => panic!("{other:?}"),
+        }
+        // CONTROL: when msg IS set, it wins — target does not shadow it.
+        let out = record(r#"{"kind":"action","code":1,"msg":"m","target":"t"}"#);
+        match parse_action_msg(&out) {
+            ActionMsg::Record(r, _) => assert_eq!(r.display(), "m"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The snippet writes `set r.code=action` rather than `+action` ON PURPOSE. Coercing it in
+    /// ObjectScript would turn anything non-numeric into 0, and 0 is the success code — the
+    /// `unwrap_or(0)` defect of #302 and #418 §2, moved somewhere no Rust test could reach it.
+    #[test]
+    fn a_code_that_is_not_a_number_is_not_a_go_ahead() {
+        for json in [
+            r#"{"kind":"action","code":"","msg":"x"}"#,
+            r#"{"kind":"action","code":"oops","msg":"x"}"#,
+            r#"{"kind":"action","msg":"x"}"#,
+            r#"{"kind":"action","code":999,"msg":"x"}"#,
         ] {
+            let out = record(json);
+            match parse_action_msg(&out) {
+                ActionMsg::Record(r, _) => assert_eq!(
+                    r.action_code(),
+                    None,
+                    "{json} produced an action code, and a wrong one reads as success"
+                ),
+                other => panic!("{json}: {other:?}"),
+            }
             assert!(
-                !after_user_action_completed(out),
-                "{out:?} reports a completed action, so the error is discarded and the caller is \
-                 told the resume succeeded"
+                user_action_outcome(&out).is_err(),
+                "{json} was accepted as an answer"
             );
         }
+        // CONTROL: a real code still parses.
+        let ok = record(r#"{"kind":"action","code":0}"#);
+        assert_eq!(user_action_outcome(&ok).unwrap().code, 0);
     }
 
-    /// #418 asked for a guard that fires when a further site appears. The population is this file's
-    /// own CODE lines — the fix is per-site, so a new call site reintroduces the defect silently.
-    ///
-    /// The needle is BUILT from fragments rather than written out, because the first version of this
-    /// test flagged its own control line: a string literal holding the forbidden text is not a
-    /// comment, so the scan counted it as an offender. Assembled this way the literal never appears
-    /// in this file at all.
+    /// Output with no record is not an answer, and every line is kept because `scm_error_code`
+    /// classifies on content — a code whose distinguishing text sits on a later line must be
+    /// reachable.
     #[test]
-    fn no_code_in_this_file_parses_scm_output_by_its_first_line() {
-        let needle = concat!("lines()", ".next()");
-        let src = include_str!("scm.rs");
-        let offenders: Vec<(usize, &str)> = src
-            .lines()
-            .enumerate()
-            .filter(|(_, l)| {
-                let t = l.trim_start();
-                // Comments are stripped: this file DISCUSSES the construct in several places, and a
-                // guard that flags prose is one that gets loosened until it catches nothing.
-                !t.starts_with("//") && l.contains(needle)
-            })
-            .map(|(i, l)| (i + 1, l.trim()))
-            .collect();
-        assert!(
-            offenders.is_empty(),
-            "these parse SCM output by its first line, which truncates the message and can report \
-             a failure as success: {offenders:?}"
-        );
-        // CONTROLS: the file was really read, the construct is still discussed in prose, and the
-        // predicate still matches a real call.
-        assert!(
-            src.contains(needle),
-            "no occurrence at all — the comments explaining why this is avoided have gone too, so \
-             an empty result above means the scan read nothing"
-        );
-        let sample = format!("        let out = raw.{needle}.unwrap_or(\"\");");
-        assert!(
-            sample.contains(needle),
-            "the predicate no longer matches the construct it exists to forbid"
-        );
-        assert!(
-            !sample.trim_start().starts_with("//"),
-            "control: the sample is a CODE line, so the comment filter would not exempt it"
-        );
-    }
-
-    /// #302: the defect. Every one of these was read as code 0 — the success branch, which reports
-    /// `{"success": true}` AND invalidates the cached checkout — while the message was discarded,
-    /// because `splitn('|')` finds no pipe in any of them.
-    ///
-    /// Neither input is invented: `ERROR #5865` is quoted in this file's own comment on the CheckOut
-    /// path, and the `NOTICE: … checked out by user '…'` form is why `parse_checked_out_by` exists.
-    #[test]
-    fn iris_output_that_is_not_a_code_is_not_success() {
-        for raw in [
-            "<PROTECT>",
-            "ERROR #5865: Cannot save item, it is locked by another user",
-            "NOTICE: MyApp.Patient.cls is currently checked out by user 'alice'",
-            // The guard ahead of the parser is an EXACT match on one sentinel, so a near-miss of it
-            // used to reach the success branch too.
-            "SCM_UNAVAILABLE_TYPO",
-        ] {
-            match parse_action_msg(raw) {
-                ActionMsg::Unparseable(got) => assert_eq!(
-                    got, raw,
-                    "the raw text must survive — it is the only thing that says what IRIS objected to"
-                ),
-                other => panic!("{raw:?} was read as {other:?}, which the caller treats as success"),
+    fn output_with_no_record_keeps_every_line_for_the_classifier() {
+        let raw = "<PROTECT>zCheckOut+4^%Studio.SourceControl.ISC.1\nProtection: ^SYS(\"SCM\")";
+        match parse_action_msg(raw) {
+            ActionMsg::Unparseable(text) => {
+                assert!(text.contains("<PROTECT>"), "{text:?}");
+                assert!(text.contains("Protection:"), "line 2 was dropped: {text:?}");
             }
+            other => panic!("{other:?}"),
+        }
+        // A record we cannot PARSE is also not a go-ahead.
+        match parse_action_msg(&record("{not json")) {
+            ActionMsg::Unparseable(_) => {}
+            other => panic!("a malformed record was accepted: {other:?}"),
         }
     }
 
-    /// The control: a real code must still parse, or the test above would pass on a parser that calls
-    /// everything unparseable and breaks every dialog.
     #[test]
-    fn a_real_action_code_still_parses_after_the_302_change() {
-        assert_eq!(parse_action_msg("0"), ActionMsg::Code(0, ""));
-        assert_eq!(
-            parse_action_msg("1|Please enter comment"),
-            ActionMsg::Code(1, "Please enter comment")
-        );
-        assert_eq!(
-            parse_action_msg("7|Enter value:"),
-            ActionMsg::Code(7, "Enter value:")
-        );
-    }
-
-    /// Empty is its own answer, distinct from `Code(0, _)` — and since #302's second half the call
-    /// sites treat it as a failure rather than as code 0.
-    #[test]
-    fn empty_output_is_distinguishable_from_a_zero_code() {
+    fn empty_output_is_refused_and_is_distinguishable_from_code_zero() {
         assert_eq!(parse_action_msg(""), ActionMsg::Empty);
-        assert_eq!(parse_action_msg("   "), ActionMsg::Empty);
-        assert_ne!(parse_action_msg(""), ActionMsg::Code(0, ""));
+        assert_eq!(parse_action_msg("   \n\n "), ActionMsg::Empty);
+        let (code, _) = user_action_outcome("").unwrap_err();
+        assert_eq!(code, SCM_NO_OUTPUT);
+        // CONTROL: code 0 is NOT empty — it is a real answer and must stay one.
+        assert_eq!(
+            user_action_outcome(&record(r#"{"kind":"action","code":0}"#))
+                .unwrap()
+                .code,
+            0
+        );
     }
 
-    /// THE assertion #302's second half was missing.
-    ///
-    /// Written because a mutation reverting BOTH call sites to `ActionMsg::Empty => (0, "")` — the
-    /// original defect, verbatim — passed the entire suite. Everything that existed tested the
-    /// parser (`parse_action_msg`) or the generated ObjectScript; nothing tested the decision the
-    /// call sites actually make. The gap was in the wiring, which is the layer that survives most
-    /// mutations.
-    ///
-    /// Code 0 is the SUCCESS branch: in the checkout arm it runs AfterUserAction and then calls
-    /// `checkout_cache.mark`, caching a false "editable" state so a following `iris_doc` write skips
-    /// its probe. So "empty maps to 0" is not a cosmetic mislabel — it asserts a checkout happened.
     #[test]
-    fn empty_user_action_output_is_refused_not_reported_as_code_zero() {
-        for raw in ["", "   ", "\n", "\t \n"] {
-            match user_action_outcome(raw) {
-                Err((code, _)) => assert_eq!(
-                    code, SCM_NO_OUTPUT,
-                    "{raw:?} must be refused as SCM_NO_OUTPUT"
-                ),
-                Ok((c, m)) => panic!(
-                    "{raw:?} was accepted as code {c} (msg {m:?}). Code 0 is the success branch — \
-                     it marks the checkout cache as editable for an action that never ran."
-                ),
+    fn the_unavailable_sentinel_and_the_unavailable_record_both_keep_their_code() {
+        // `scm_init_prefix` writes the bare sentinel and quits, so there is no record to find.
+        let (code, _) = user_action_outcome("SCM_UNAVAILABLE").unwrap_err();
+        assert_eq!(code, "SCM_UNAVAILABLE");
+        // The probe writes it as a record kind instead.
+        let (code, _) = user_action_outcome(&record(r#"{"kind":"unavailable"}"#)).unwrap_err();
+        assert_eq!(
+            code, "SCM_UNAVAILABLE",
+            "an unavailable record did not reach the caller as SCM_UNAVAILABLE"
+        );
+        // CONTROL: a near-miss sentinel is NOT silently accepted as one.
+        let (code, _) = user_action_outcome("SCM_UNAVAILABLE_TYPO").unwrap_err();
+        assert_ne!(code, "SCM_NO_OUTPUT");
+    }
+
+    // ── #418 §1, third bullet: AfterUserAction answers explicitly ─────────────
+
+    #[test]
+    fn after_user_action_reads_an_explicit_ok_field() {
+        let out = record(r#"{"kind":"after","ok":1,"err":""}"#);
+        assert_eq!(after_user_action_outcome(&out), Ok(String::new()));
+        let out = record(
+            r#"{"kind":"after","ok":0,"err":"ERROR #5803: locked\r\nERROR #5001: by alice"}"#,
+        );
+        match after_user_action_outcome(&out) {
+            Err((code, detail)) => {
+                assert_eq!(code, "SCM_CHECKOUT_FAILED");
+                assert!(detail.contains("#5803"), "{detail}");
+                assert!(
+                    detail.contains("#5001"),
+                    "the chain was truncated: {detail}"
+                );
             }
+            other => panic!("{other:?}"),
         }
     }
 
-    /// The control for the test above: a real code must still come back as `Ok`, or the refusal
-    /// could be implemented by refusing everything, which would break every dialog.
+    /// **The defect this bullet names.** The finalizer used to treat ANY output as the error text,
+    /// so a hook that echoed one `CMD: p4 edit …` line turned a successful checkout into
+    /// `SCM_CHECKOUT_FAILED`. The explicit `ok` field is what removes that.
     #[test]
-    fn a_real_code_still_reaches_the_caller_as_ok() {
-        assert_eq!(user_action_outcome("0"), Ok((0, "")));
-        assert_eq!(
-            user_action_outcome("1|Please enter comment"),
-            Ok((1, "Please enter comment"))
+    fn hook_chatter_no_longer_turns_a_successful_finalize_into_a_failure() {
+        let out = format!(
+            "CMD: p4 edit //depot/MyApp.cls\n{}\n",
+            record(r#"{"kind":"after","ok":1,"err":""}"#)
         );
-        assert_eq!(
-            user_action_outcome("7|Enter value:"),
-            Ok((7, "Enter value:"))
-        );
+        match after_user_action_outcome(&out) {
+            Ok(chatter) => assert!(
+                chatter.contains("CMD: p4 edit"),
+                "the chatter was dropped instead of returned: {chatter:?}"
+            ),
+            other => panic!("chatter was read as a failure: {other:?}"),
+        }
     }
 
-    /// The other two `Err` arms still route where they did, so the extraction changed no behaviour
-    /// beyond the `Empty` decision.
+    /// `SCM_UNAVAILABLE` on the finalize path is no longer waved through as success. Both call
+    /// sites read `!out.is_empty() && out != "SCM_UNAVAILABLE"`, so a session that could not be
+    /// created fell through to a COMMITTED checkout — a failure answered as a fact.
     #[test]
-    fn the_unavailable_sentinel_and_unparseable_text_keep_their_codes() {
-        assert_eq!(
-            user_action_outcome("SCM_UNAVAILABLE").map_err(|(c, _)| c),
-            Err("SCM_UNAVAILABLE")
-        );
-        let (code, detail) = user_action_outcome("ERROR #5865: Cannot save item").unwrap_err();
-        assert_ne!(code, SCM_NO_OUTPUT, "IRIS text is not the no-output case");
-        assert_eq!(
-            detail, "ERROR #5865: Cannot save item",
-            "the raw text must survive — it is the only thing that says what IRIS objected to"
-        );
+    fn an_unavailable_session_does_not_finalize_a_checkout() {
+        match after_user_action_outcome("SCM_UNAVAILABLE") {
+            Err((code, _)) => assert_eq!(code, "SCM_UNAVAILABLE"),
+            other => panic!("an unavailable session reported a committed checkout: {other:?}"),
+        }
+        // Silence means the snippet never ran — on this path too, now.
+        assert!(after_user_action_outcome("").is_err());
     }
 
-    /// The evidence for #302's second half, and the guard against "fixing" the wrong layer.
+    /// Replaces `the_two_generators_disagree_about_empty`, which pinned an asymmetry that no longer
+    /// exists — and pinning it was right while it did, because neither convention could be reasoned
+    /// about from one side.
     ///
-    /// The two generated snippets end in writes with OPPOSITE conventions:
-    ///
-    ///   * `user_action_code`       -> `write action_"|"_...`  — unconditional, so it ALWAYS emits
-    ///     at least `0|`. Empty output means the write never ran.
-    ///   * `after_user_action_code` -> `write $system.Status.GetErrorText(sc)` — which is the EMPTY
-    ///     STRING on success. Empty output there is the normal, successful case.
-    ///
-    /// Both reach the caller through `.lines().next()`, so they look identical at the call site.
-    /// That is why "is empty legitimate?" read as unanswerable: it has two different answers. This
-    /// test fails if either generator's final write changes, which is exactly when the reasoning
-    /// behind `ActionMsg::Empty => err_json(...)` would stop holding.
+    /// `user_action_code` always wrote at least `0|`, so empty meant "never ran".
+    /// `after_user_action_code` ended with `GetErrorText`, which returns `""` for an OK status, so
+    /// empty meant SUCCESS. Opposite meanings for the same observation, three call sites between
+    /// them, and a fix applied to either one was wrong at the other. Both now write a labelled
+    /// record with an explicit field, so empty means "never ran" at both and there is nothing left
+    /// to keep straight.
     #[test]
-    fn the_two_generators_disagree_about_empty() {
-        let user = user_action_code("%CheckOut", "MyApp.Patient.cls", "u", "p");
+    fn the_two_generators_now_agree_about_empty() {
+        let ua = user_action_code("%CheckOut", "D.cls", "u", "p");
+        let aua = after_user_action_code("%CheckOut", "D.cls", "yes", "u", "p");
+        for (name, code) in [("user_action_code", &ua), ("after_user_action_code", &aua)] {
+            assert!(
+                code.contains(SCM_RECORD) && code.contains("%ToJSON()"),
+                "{name} does not write the labelled record:\n{code}"
+            );
+        }
         assert!(
-            user.contains("write action_"),
-            "UserAction must end in an unconditional write of the action code — the whole argument \
-             for treating empty as a failure rests on it. Got: {user}"
+            !aua.contains("write $system.Status.GetErrorText(sc)"),
+            "after_user_action_code still ends by writing the error text alone, so empty means \
+             success there and 'never ran' everywhere else:\n{aua}"
         );
-        assert!(
-            user.contains("set action=0"),
-            "action must be initialised, or an empty write would be possible on success"
-        );
+        assert!(aua.contains("r.ok="), "no explicit ok field:\n{aua}");
+        // And empty is now refused on BOTH paths — the assertion the old test could not make.
+        assert!(user_action_outcome("").is_err());
+        assert!(after_user_action_outcome("").is_err());
+    }
 
-        let after = after_user_action_code("%CheckOut", "MyApp.Patient.cls", "yes", "u", "p");
+    /// Population guard: no generator in this file writes the old bare `action|msg` form, so a
+    /// snippet added later cannot quietly reintroduce a format the parser no longer finds.
+    #[test]
+    fn no_generator_writes_the_old_pipe_form() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/tools/scm.rs"))
+            .expect("scm.rs");
+        let prod = match src.find("\n#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => &src[..],
+        };
+        // Comments are stripped: this file discusses `action_"|"_msg` in several places while
+        // explaining why it is gone, and a guard that flags its own prose gets loosened until it
+        // catches nothing.
+        let code: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//") && !l.trim_start().starts_with("///"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Assembled from fragments so the literal never appears in this file at all — the first
+        // version of this guard's sibling flagged its OWN control line.
+        let needle = concat!("action_", "\\\"|\\\"");
         assert!(
-            after.contains("GetErrorText"),
-            "AfterUserAction writes the error text, which is EMPTY on success — do not propagate \
-             the empty-is-failure rule onto this path. Got: {after}"
+            !code.contains(needle),
+            "a generator writes the old bare pipe form, which the parser no longer looks for"
+        );
+        // CONTROL: the window really is the production half and really was searched.
+        assert!(
+            code.contains("fn user_action_code"),
+            "the window does not contain the generators"
         );
         assert!(
-            !after.contains("write action_"),
-            "if AfterUserAction ever starts writing an action code, the asymmetry this test \
-             documents is gone and the CheckOut path's `!aout.is_empty()` needs revisiting"
+            prod.len() > src.len() / 4,
+            "the production window is {} of {} bytes — implausibly small, so the search above \
+             covered almost nothing",
+            prod.len(),
+            src.len()
         );
     }
 
@@ -2032,12 +2609,21 @@ mod tests {
         assert_eq!(parse_action_msg(""), ActionMsg::Empty);
     }
 
+    /// The record is found even when the hook's device left padding around it — IRIS writes with
+    /// `write`, and what surrounds a line is not under our control.
     #[test]
-    fn test_parse_action_msg_whitespace_trimmed() {
-        assert_eq!(
-            parse_action_msg("  1  |  some msg  "),
-            ActionMsg::Code(1, "some msg")
+    fn a_padded_record_line_is_still_found() {
+        let out = format!(
+            "   {}   ",
+            record(r#"{"kind":"action","code":1,"msg":"some msg"}"#)
         );
+        match parse_action_msg(&out) {
+            ActionMsg::Record(r, _) => {
+                assert_eq!(r.action_code(), Some(1));
+                assert_eq!(r.msg, "some msg");
+            }
+            other => panic!("leading whitespace hid the record: {other:?}"),
+        }
     }
 
     // ── ScmAction ─────────────────────────────────────────────────────────────

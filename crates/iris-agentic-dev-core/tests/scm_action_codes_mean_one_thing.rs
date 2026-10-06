@@ -125,7 +125,7 @@ fn sites() -> Vec<(&'static str, String)> {
             "doc.rs `precheck_verdict`",
             window(
                 &doc,
-                "fn precheck_verdict<'a>(",
+                "fn precheck_verdict(",
                 "\n/// Run the SCM pre-write check",
                 "precheck_verdict",
             ),

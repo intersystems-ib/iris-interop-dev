@@ -971,10 +971,8 @@ async fn handle_put(
                     // wrapper. Empty still means success here — see the asymmetry pinned by
                     // `the_two_generators_disagree_about_empty` in scm.rs.
                     let out = out.trim();
-                    if !crate::tools::scm::after_user_action_completed(out)
-                        && out != "SCM_UNAVAILABLE"
-                    {
-                        return err_json("SCM_CHECKOUT_FAILED", out);
+                    if let Err((code, detail)) = crate::tools::scm::after_user_action_outcome(out) {
+                        return err_json(code, &detail);
                     }
                 }
             }
@@ -1092,31 +1090,41 @@ fn scm_precheck_code(doc: &str, username: &str, password: &str) -> String {
     //
     // SourceControlCreate is used rather than %GetImplementationObject, which does not exist on any
     // IRIS version, and it gives a proper session that works over HTTP.
+    let rec = crate::tools::scm::SCM_RECORD;
     format!(
         "set scmClass=##class(%Studio.SourceControl.Interface).SourceControlClassGet() \
-         if scmClass=\"\" {{ write \"NO_SCM\" }} \
+         if scmClass=\"\" {{ set r={{}} set r.kind=\"none\" write \"{rec}\"_r.%ToJSON() }} \
          else {{ set sc=##class(%Studio.SourceControl.Interface).SourceControlCreate(\"{user_q}\",\"{pass_q}\",.c,.f,.o) \
          set obj=$get(%SourceControl) \
-         if '$IsObject(obj) {{ write \"SCM_UNAVAILABLE\" }} \
+         if '$IsObject(obj) {{ set r={{}} set r.kind=\"unavailable\" write \"{rec}\"_r.%ToJSON() }} \
          else {{ set hasUndoCheckout=0 \
          try {{ set rset=##class(%ResultSet).%New(\"%Studio.SourceControl.Interface:MenuItems\") \
          set sc=rset.Execute(\"%SourceMenu\",\"{doc_q}\",\"\") \
          while rset.Next() {{ if rset.GetData(2)&&(rset.GetData(1)=\"%UndoCheckout\") {{ set hasUndoCheckout=1 }} }} }} catch {{}} \
-         if hasUndoCheckout {{ write \"PROCEED|\" }} \
+         if hasUndoCheckout {{ set r={{}} set r.kind=\"hold\" write \"{rec}\"_r.%ToJSON() }} \
          else {{ set action=0 set msg=\"\" set target=\"\" set reload=0 \
          set sc=obj.UserAction(0,\"%SourceMenu,%CheckOut\",\"{doc_q}\",\"\",.action,.target,.msg,.reload) \
-         write action_\"|\"_$select(msg'=\"\":msg,target'=\"\":target,1:\"\") }} }} }}"
+         set r={{}} set r.kind=\"action\" set r.code=action set r.msg=msg set r.target=target \
+         write \"{rec}\"_r.%ToJSON() }} }} }}"
     )
+}
+
+/// The probe snippet, for the e2e test in `scm.rs` that compiles every generator against a live
+/// instance. `scm_precheck_code` stays private — this is the one caller outside this module, and it
+/// is a test.
+#[cfg(test)]
+pub(crate) fn scm_precheck_code_for_test(doc: &str, username: &str, password: &str) -> String {
+    scm_precheck_code(doc, username, password)
 }
 
 /// What the pre-write probe's output means for the write that is about to happen.
 #[derive(Debug, PartialEq)]
-enum Precheck<'a> {
+enum Precheck {
     /// Write. `we_hold_checkout` is true only where the probe CONFIRMED we hold the document —
     /// never for "there is no source control", because then there is no checkout to cache.
     Proceed { we_hold_checkout: bool },
     /// Action 1: ask before writing. The message is the provider's own dialog text.
-    Confirm(&'a str),
+    Confirm(String),
     /// Do not write. `(error_code, detail)` — the caller hands these straight to `err_json`.
     Refuse(&'static str, String),
 }
@@ -1136,42 +1144,55 @@ enum Precheck<'a> {
 /// Note which way the promotion runs: three outcomes that used to be "write it" are now refusals.
 /// That is the affordable direction here — a refused write is retried after reading the message,
 /// while a document written outside its source control diverges silently and is reverted by the
-/// next `GetLatest`. `Empty` is included on purpose: this snippet writes `NO_SCM`, `SCM_UNAVAILABLE`
-/// or `PROCEED|` on every other path and ends with an unconditional `write action_"|"_…`, so no
-/// output means the snippet never ran, not that it had nothing to say.
-fn precheck_verdict<'a>(out: &'a str, doc: &str) -> Precheck<'a> {
-    use crate::tools::scm::{undriveable_refusal, user_action_outcome, CodeMeaning};
-    let out = out.trim();
-    // We already hold it — the MenuItems pre-step saw %UndoCheckout offered.
-    if out.starts_with("PROCEED") {
-        return Precheck::Proceed {
-            we_hold_checkout: true,
-        };
-    }
-    // No source-control class in this namespace at all. Nothing to check out, nothing to cache.
-    if out == "NO_SCM" {
-        return Precheck::Proceed {
-            we_hold_checkout: false,
-        };
-    }
-    let (code, msg) = match user_action_outcome(out) {
-        Ok(v) => v,
-        Err((c, detail)) => return Precheck::Refuse(c, detail.to_string()),
+/// next `GetLatest`. `Empty` is included on purpose: the snippet writes a labelled record on every
+/// path, so no output means it never ran rather than that it had nothing to say.
+fn precheck_verdict(out: &str, doc: &str) -> Precheck {
+    use crate::tools::scm::{
+        parse_probe_record, undriveable_refusal, user_action_outcome, CodeMeaning, ProbeKind,
     };
-    let meaning = CodeMeaning::of(code);
-    match meaning {
-        CodeMeaning::NoDialog => Precheck::Proceed {
+    let out = out.trim();
+    // #418 §1: the probe's three bare sentinels — `NO_SCM`, `SCM_UNAVAILABLE`, `PROCEED|` — are now
+    // `kind` values on the same labelled record every other SCM snippet writes. Three consequences,
+    // and the third is why it was worth doing rather than merely tidier:
+    //
+    //  * they are found wherever the hook's chatter put them, instead of having to be the whole
+    //    output (`out == "NO_SCM"`) or its start (`out.starts_with("PROCEED")`);
+    //  * `starts_with("PROCEED")` matched any output BEGINNING with it, so a provider line like
+    //    "PROCEEDING WITH CHECKOUT" would have been read as "we already hold this document";
+    //  * "no source control" and "the session could not be created" are different `kind`s rather
+    //    than one sentinel answering two questions, which is the conflation that let a document be
+    //    written outside a provider that was there all along.
+    match parse_probe_record(out) {
+        Some(ProbeKind::NoSourceControl) => Precheck::Proceed {
             we_hold_checkout: false,
         },
-        CodeMeaning::Confirm => Precheck::Confirm(msg),
-        CodeMeaning::Declined => {
-            Precheck::Refuse("SCM_REJECTED", format!("Source control rejected: {msg}"))
-        }
-        // No window, no prompt, and no idea — all three mean the check-out did not happen, so the
-        // write must not either.
-        CodeMeaning::NeedsUi | CodeMeaning::Prompt | CodeMeaning::Undriveable => {
-            let (c, detail) = undriveable_refusal(meaning, code, msg, doc);
-            Precheck::Refuse(c, detail)
+        Some(ProbeKind::WeHoldIt) => Precheck::Proceed {
+            we_hold_checkout: true,
+        },
+        // Fall through to the shared classifier for an action record, a bare `SCM_UNAVAILABLE`
+        // from `scm_init_prefix`, empty output, or anything unparseable.
+        Some(ProbeKind::Action) | None => {
+            let answer = match user_action_outcome(out) {
+                Ok(v) => v,
+                Err((c, detail)) => return Precheck::Refuse(c, detail),
+            };
+            let meaning = CodeMeaning::of(answer.code);
+            let msg = answer.record.display().to_string();
+            match meaning {
+                CodeMeaning::NoDialog => Precheck::Proceed {
+                    we_hold_checkout: false,
+                },
+                CodeMeaning::Confirm => Precheck::Confirm(msg),
+                CodeMeaning::Declined => {
+                    Precheck::Refuse("SCM_REJECTED", format!("Source control rejected: {msg}"))
+                }
+                // No window, no prompt, and no idea — all three mean the check-out did not happen,
+                // so the write must not either.
+                CodeMeaning::NeedsUi | CodeMeaning::Prompt | CodeMeaning::Undriveable => {
+                    let (c, detail) = undriveable_refusal(meaning, answer.code, &msg, doc);
+                    Precheck::Refuse(c, detail)
+                }
+            }
         }
     }
 }
@@ -1216,25 +1237,37 @@ async fn write_with_scm(
     // Whether the probe told us the doc is already writable by us (PROCEED / already checked out).
     // Only such a "we hold it" outcome is safe to cache — NOT "no source control at all",
     // where there is no checkout to remember.
-    let mut we_hold_checkout = false;
     let scm_check = scm_precheck_code(name, &iris.username, &iris.password);
-    // #418: the `Err` arm is still missing here, deliberately and not by oversight.
+    // #418: the `Err` arm. This was `if let Ok(out) = …`, so a transport failure, a 401 or a
+    // timeout skipped the whole block and the write went ahead — the same defect #342 fixed at the
+    // SIBLING call site, left standing here because the two paths know different things.
     //
-    // #342 gave the SIBLING call site — the elicitation-resume path above — a real `Err` arm,
-    // because a transport failure there was being recorded as a committed checkout. The argument
-    // does not carry across to this one, and that is worth stating rather than leaving the two
-    // looking inconsistent. On the resume path the user has already answered a checkout dialog, so
-    // source control certainly exists and refusing costs nothing. Here nothing is known yet: a
-    // failed probe is equally consistent with "there is no source-control class in this namespace",
-    // where refusing every `put` on an instance whose generator cannot run is pure loss. Picking
-    // either answer trades one silent wrong for the other, and which one is affordable is a
-    // decision about deployments this fork cannot see from here. Left for #418 to settle with a
-    // configured instance in front of it.
-    if let Ok(out) = iris.execute_via_generator(&scm_check, ns, client).await {
-        match precheck_verdict(out.trim(), name) {
-            Precheck::Proceed {
-                we_hold_checkout: held,
-            } => we_hold_checkout = held,
+    // It is settled in the refusing direction, and the deciding argument is NOT symmetry with the
+    // sibling. It is that this repo already has the answer on record, as the reviewed remedy for
+    // `SCM_UNAVAILABLE`: *"this means UNKNOWN, not 'not under source control' — check the provider
+    // is configured before treating the document as free."* A probe that could not run produces
+    // exactly that state, and writing on it treats unknown as free.
+    //
+    // What this costs, stated plainly because it is a real behaviour change: on an instance where
+    // `execute_via_generator` cannot run — it PUTs and compiles a scratch class, so a caller
+    // without that privilege is the case — `iris_doc put` now refuses where it previously wrote.
+    // It refuses WITH the transport error, so the cause is in front of whoever hit it, which the
+    // silent write never was. The affordable error is the one you can read.
+    let we_hold_checkout = match iris.execute_via_generator(&scm_check, ns, client).await {
+        Err(e) => {
+            return err_json(
+                crate::tools::scm::scm_error_code(&e.to_string()),
+                &format!(
+                    "The pre-write source-control check could not run: {e}. Nothing was written. \
+                     A check that did not run is not a document that needs no checkout — if this \
+                     namespace has a source-control provider, writing now would put the document \
+                     outside it. Resolve the error above, or check the document out explicitly \
+                     with iris_source_control(action=checkout) and retry."
+                ),
+            );
+        }
+        Ok(out) => match precheck_verdict(out.trim(), name) {
+            Precheck::Proceed { we_hold_checkout } => we_hold_checkout,
             Precheck::Confirm(msg) => {
                 let eid = elicitation_store.insert(
                     name,
@@ -1252,8 +1285,8 @@ async fn write_with_scm(
                 }));
             }
             Precheck::Refuse(code, detail) => return err_json(code, &detail),
-        }
-    }
+        },
+    };
 
     let result = do_write(
         iris,
@@ -1299,64 +1332,110 @@ mod scm_precheck_tests {
         scm_precheck_code("My.Pkg.Cls.cls", "_SYSTEM", "SYS")
     }
 
+    /// What the probe actually writes, so these tests speak the real wire format.
+    fn rec(json: &str) -> String {
+        format!("{}{json}", crate::tools::scm::SCM_RECORD)
+    }
+
     /// §3. CCR puts the check-out prompt — and in TEST/UAT/LIVE the warning that changes there must
     /// be reverted — in `target`, not `msg`. The snippet sent `msg` alone, so the warning was
-    /// discarded and the caller saw a generic line instead.
+    /// discarded and the caller saw a generic line.
+    ///
+    /// Both fields now cross the wire as their own record fields. That is stronger than the
+    /// `$select(msg,target,"")` this first used: the select returned ONE string and lost which of
+    /// the two it came from, and `NeedsUi` needs the address specifically.
     #[test]
-    fn the_probe_asks_for_target_as_well_as_msg() {
+    fn the_probe_sends_msg_and_target_as_separate_fields() {
         let c = code();
         assert!(
-            c.contains(r#"$select(msg'="":msg,target'="":target,1:"")"#),
+            c.contains("set r.msg=msg"),
+            "the probe does not send msg:\n{c}"
+        );
+        assert!(
+            c.contains("set r.target=target"),
             "the probe does not send target, so a CCR dialog arrives empty:\n{c}"
         );
-        // And it must no longer send msg alone. The two can coexist textually, so assert the
-        // ABSENCE of the old form rather than only the presence of the new one.
+        // And neither of the forms that LOSE one of them.
         assert!(
-            !c.contains(r#"action_"|"_msg"#),
-            "the probe still writes `action_\"|\"_msg`, which drops target:\n{c}"
+            !c.contains(concat!("action_", "\\\"|\\\"")),
+            "the probe still writes the bare pipe form:\n{c}"
+        );
+        assert!(
+            !c.contains("$select(msg"),
+            "the probe still collapses msg and target in ObjectScript, so which one arrived is \
+             unknowable:\n{c}"
         );
     }
 
-    /// The snippet must agree with `user_action_code` character for character on this expression,
-    /// or the two paths see different dialog text from the same provider. #418 §3 exists because
-    /// they did not.
+    /// The probe and the tool must write the SAME record, or the two paths see different answers
+    /// from the same provider. #418 §3 exists because they did not.
     #[test]
-    fn the_probe_and_the_tool_ask_for_the_message_the_same_way() {
-        let select = r#"$select(msg'="":msg,target'="":target,1:"")"#;
+    fn the_probe_and_the_tool_write_the_same_record() {
         let tool = crate::tools::scm::user_action_code("%CheckOut", "D.cls", "u", "p");
-        assert!(
-            tool.contains(select),
-            "the tool's own snippet changed shape:\n{tool}"
-        );
-        assert!(
-            code().contains(select),
-            "the probe no longer matches the tool"
-        );
+        let probe = code();
+        for part in [
+            crate::tools::scm::SCM_RECORD,
+            "%ToJSON()",
+            "set r.kind=",
+            "set r.code=action",
+            "set r.msg=msg",
+            "set r.target=target",
+        ] {
+            assert!(
+                tool.contains(part),
+                "the tool's snippet lacks {part:?}:\n{tool}"
+            );
+            assert!(
+                probe.contains(part),
+                "the probe's snippet lacks {part:?}:\n{probe}"
+            );
+        }
     }
 
-    /// Two different questions used to get the same answer. `NO_SCM` meant both "there is no
-    /// source-control class here", where writing is correct, and "the class exists but no session
-    /// could be created", which is unknown — the #101 shape, reached by a wrong password.
+    /// Two different questions used to get the same answer. `NO_SCM` was written both when
+    /// `SourceControlClassGet()` returns `""` — genuinely no source control, where writing is
+    /// correct — and when the class exists but no session could be created, which is UNKNOWN (the
+    /// #101 shape, reached by a wrong password). They are different record `kind`s now.
     #[test]
     fn a_dead_scm_session_is_not_reported_as_no_source_control() {
         let c = code();
         assert_eq!(
-            c.matches(r#"write "NO_SCM""#).count(),
+            c.matches(r#"set r.kind="none""#).count(),
             1,
-            "NO_SCM is written from more than one place, so it answers more than one question:\n{c}"
+            "the `no source control` kind is written from more than one place:\n{c}"
         );
-        // It is the SourceControlClassGet branch that writes it, and the $IsObject branch that
-        // reports the session failure.
-        let at_no_scm = c.find(r#"write "NO_SCM""#).expect("NO_SCM");
+        assert_eq!(
+            c.matches(r#"set r.kind="unavailable""#).count(),
+            1,
+            "the `session could not be created` kind is missing or duplicated:\n{c}"
+        );
+        // And it is the right branch that writes each: the class test comes first.
         let at_class = c.find(r#"if scmClass="""#).expect("the class test");
+        let at_none = c.find(r#"set r.kind="none""#).expect("the none kind");
+        let at_obj = c.find("if '$IsObject(obj)").expect("the object test");
+        let at_unavail = c
+            .find(r#"set r.kind="unavailable""#)
+            .expect("the unavailable kind");
         assert!(
-            at_class < at_no_scm,
-            "NO_SCM is not written by the `no source-control class` branch:\n{c}"
+            at_class < at_none,
+            "`none` is not written by the class branch:\n{c}"
         );
         assert!(
-            c.contains(r#"if '$IsObject(obj) { write "SCM_UNAVAILABLE" }"#),
-            "a failed SourceControlCreate does not report SCM_UNAVAILABLE:\n{c}"
+            at_obj < at_unavail,
+            "`unavailable` is not written by the object branch:\n{c}"
         );
+        // CONTROL: these patterns match the BUILT string, not the escaping of the Rust source.
+        // The first version searched for the source spelling (`set r.kind=\"none\"`), found zero,
+        // and reported it as "written from more than one place" — a pattern that cannot match is
+        // not a measurement. So assert something that MUST be present.
+        assert!(
+            c.contains("set r.kind=") && c.contains("IADSCM|"),
+            "the patterns in this test cannot match this snippet at all:\n{c}"
+        );
+        // The old bare sentinels are gone, so nothing can match them by accident.
+        for old in ["\"NO_SCM\"", "\"PROCEED|\""] {
+            assert!(!c.contains(old), "the snippet still writes {old}:\n{c}");
+        }
     }
 
     /// The document name and the credentials go through the same quoting as every other snippet in
@@ -1380,31 +1459,50 @@ mod scm_precheck_tests {
     #[test]
     fn no_source_control_still_writes_and_is_not_cached() {
         assert_eq!(
-            precheck_verdict("NO_SCM", "D.cls"),
+            precheck_verdict(&rec(r#"{"kind":"none"}"#), "D.cls"),
             Precheck::Proceed {
                 we_hold_checkout: false
             },
             "a namespace with no source control no longer accepts writes"
         );
+        // And it is found after the hook's chatter, not only as the whole output. The old test
+        // asserted `out == "NO_SCM"`, which a single NOTICE line defeated.
+        let noisy = format!("NOTICE: something\n{}\n", rec(r#"{"kind":"none"}"#));
+        assert_eq!(
+            precheck_verdict(&noisy, "D.cls"),
+            Precheck::Proceed {
+                we_hold_checkout: false
+            },
+            "a hook NOTICE hid the `no source control` answer"
+        );
     }
 
-    /// Holding the checkout proceeds AND is cacheable — the two are different facts, and only this
-    /// one licenses the cache.
+    /// Holding the checkout proceeds AND is cacheable — different facts, and only this one licenses
+    /// the cache.
     #[test]
     fn holding_the_checkout_proceeds_and_is_cacheable() {
         assert_eq!(
-            precheck_verdict("PROCEED|", "D.cls"),
+            precheck_verdict(&rec(r#"{"kind":"hold"}"#), "D.cls"),
             Precheck::Proceed {
                 we_hold_checkout: true
             }
         );
-        // And action 0 proceeds WITHOUT licensing the cache: nothing said we hold the document.
+        // Action 0 proceeds WITHOUT licensing the cache: nothing said we hold the document.
         assert_eq!(
-            precheck_verdict("0|", "D.cls"),
+            precheck_verdict(&rec(r#"{"kind":"action","code":0}"#), "D.cls"),
             Precheck::Proceed {
                 we_hold_checkout: false
             },
             "action 0 was cached as a held checkout, which it is not"
+        );
+        // The old sentinel was matched with `starts_with("PROCEED")`, so any output BEGINNING with
+        // it counted — a provider line like this one would have claimed we hold the document.
+        assert!(
+            matches!(
+                precheck_verdict("PROCEEDING WITH CHECKOUT", "D.cls"),
+                Precheck::Refuse(..)
+            ),
+            "a prefix match still reads provider prose as `we hold this document`"
         );
     }
 
@@ -1430,11 +1528,11 @@ mod scm_precheck_tests {
         }
     }
 
-    /// The CCR login page. This is the one that writes a document outside source control today.
+    /// The CCR login page — the one that writes a document outside source control today.
     #[test]
     fn the_login_page_refuses_and_hands_over_the_address() {
         let url = "https://ccr.example/csp/ccr/login.csp";
-        let out = format!("2|{url}");
+        let out = rec(&format!(r#"{{"kind":"action","code":2,"target":"{url}"}}"#));
         match precheck_verdict(&out, "D.cls") {
             Precheck::Refuse(code, detail) => {
                 assert_eq!(code, crate::tools::scm::SCM_NEEDS_UI);
@@ -1447,12 +1545,14 @@ mod scm_precheck_tests {
         }
     }
 
-    /// Every code the probe cannot drive refuses. Stated over the whole `u8` rather than over a
-    /// handful, because the defect was precisely that the un-enumerated ones fell through.
+    /// Every code the probe cannot drive refuses. Stated over the whole `u8` rather than a handful,
+    /// because the defect was precisely that the un-enumerated ones fell through.
     #[test]
     fn no_action_code_outside_zero_and_one_permits_a_write() {
         for c in 0u8..=255 {
-            let out = format!("{c}|something");
+            let out = rec(&format!(
+                r#"{{"kind":"action","code":{c},"msg":"something"}}"#
+            ));
             let v = precheck_verdict(&out, "D.cls");
             let proceeds = matches!(v, Precheck::Proceed { .. });
             assert_eq!(
@@ -1469,8 +1569,8 @@ mod scm_precheck_tests {
         }
     }
 
-    /// Empty is not consent. This snippet writes one of `NO_SCM`, `SCM_UNAVAILABLE`, `PROCEED|` or
-    /// `action_"|"_…` on every path, so silence means it never ran.
+    /// Empty is not consent. The snippet writes a record on every path, so silence means it never
+    /// ran.
     #[test]
     fn silence_is_not_permission_to_write() {
         for raw in ["", "   ", "\n\n"] {
@@ -1481,23 +1581,32 @@ mod scm_precheck_tests {
         }
     }
 
-    /// A dead SCM session refuses, which is the other half of splitting the `NO_SCM` sentinel: the
-    /// snippet now says `SCM_UNAVAILABLE`, and this is what reads it.
+    /// A dead SCM session refuses, whether it arrives as the probe's record kind or as the bare
+    /// sentinel `scm_init_prefix` writes.
     #[test]
     fn a_dead_scm_session_refuses() {
-        match precheck_verdict("SCM_UNAVAILABLE", "D.cls") {
-            Precheck::Refuse(code, _) => assert_eq!(code, "SCM_UNAVAILABLE"),
-            other => panic!("a dead session was answered with {other:?}"),
+        for out in [
+            "SCM_UNAVAILABLE".to_string(),
+            rec(r#"{"kind":"unavailable"}"#),
+        ] {
+            match precheck_verdict(&out, "D.cls") {
+                Precheck::Refuse(code, _) => assert_eq!(
+                    code, "SCM_UNAVAILABLE",
+                    "a dead session did not reach the caller as SCM_UNAVAILABLE: {out}"
+                ),
+                other => panic!("a dead session was answered with {other:?}"),
+            }
         }
     }
 
     /// Action 1 asks, and it asks with the PROVIDER's words — including the lines after the first.
-    /// That is §1 arriving on this path: the environment warning CCR sends is multi-line, and the
-    /// part that says "revert this afterwards" is never the first line.
+    /// CCR's environment warning is multi-line, and "revert this afterwards" is never line one.
     #[test]
     fn the_question_carries_every_line_the_provider_sent() {
-        let raw = "1|Check out My.Cls.cls?\nTHIS IS THE LIVE ENVIRONMENT.\nRevert when done.";
-        match precheck_verdict(raw, "My.Cls.cls") {
+        let out = rec(
+            r#"{"kind":"action","code":1,"msg":"Check out My.Cls.cls?\nTHIS IS THE LIVE ENVIRONMENT.\nRevert when done."}"#,
+        );
+        match precheck_verdict(&out, "My.Cls.cls") {
             Precheck::Confirm(msg) => {
                 assert!(msg.contains("LIVE"), "line 2 was dropped: {msg:?}");
                 assert!(
@@ -1509,11 +1618,12 @@ mod scm_precheck_tests {
         }
     }
 
-    /// Source control declining is a real answer, not a malfunction, and it must not be reported as
-    /// one. The `execute` arm used to call code 6 "Unexpected action code 6".
+    /// Source control declining is a real answer, not a malfunction. The `execute` arm used to call
+    /// code 6 "Unexpected action code 6".
     #[test]
     fn a_policy_refusal_is_reported_as_a_policy_refusal() {
-        match precheck_verdict("6|Locked by release manager", "D.cls") {
+        let out = rec(r#"{"kind":"action","code":6,"msg":"Locked by release manager"}"#);
+        match precheck_verdict(&out, "D.cls") {
             Precheck::Refuse(code, detail) => {
                 assert_eq!(code, "SCM_REJECTED");
                 assert!(detail.contains("release manager"), "{detail}");
@@ -3097,6 +3207,28 @@ mod line_edit_mode_tests {
         .unwrap()
     }
 
+    /// Answer the pre-write source-control probe with "there is no source-control class here".
+    ///
+    /// #418 gave `write_with_scm` a real `Err` arm, so a probe that cannot RUN refuses the write
+    /// instead of writing anyway. These mocks never mounted the generator's `/action/query`
+    /// endpoint — wiremock answers an unmatched request with a 404 — so every one of them was
+    /// silently exercising the path where the probe FAILS, and passing because the old code wrote
+    /// regardless. Five tests in this module broke on the change, which is the blast radius
+    /// measured rather than argued: a server that cannot run the generator now refuses the write.
+    ///
+    /// The probe's own PUT of its scratch class is already excluded from `puts` below, so mounting
+    /// this does not change what the assertions see.
+    async fn mount_no_source_control(server: &MockServer) {
+        let body = format!("{}{{\"kind\":\"none\"}}", crate::tools::scm::SCM_RECORD);
+        Mock::given(method("POST"))
+            .and(path_regex(r".*/action/query.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": {"content": [{"result": body}]}
+            })))
+            .mount(server)
+            .await;
+    }
+
     /// GET returns `DOC`; PUT and the compile succeed. Returns the handler payload AND every PUT body
     /// the server received, so a test can assert on the BYTES that were written — the only way to know
     /// the document was not corrupted.
@@ -3125,6 +3257,7 @@ mod line_edit_mode_tests {
             })))
             .mount(&server)
             .await;
+        mount_no_source_control(&server).await;
         let iris = IrisConnection::new(
             server.uri(),
             "APP",
@@ -3306,6 +3439,7 @@ mod line_edit_mode_tests {
                 })))
                 .mount(&server)
                 .await;
+            mount_no_source_control(&server).await;
             let iris = IrisConnection::new(
                 server.uri(),
                 "APP",
