@@ -3408,6 +3408,101 @@ mod line_edit_mode_tests {
         });
     }
 
+    /// #418: a pre-write source-control probe that could not RUN must not become permission to
+    /// write — and this has to be a BEHAVIOURAL test, because the source guard could not carry it.
+    ///
+    /// `a_failed_pre_write_probe_does_not_become_permission_to_write` in
+    /// `tests/scm_policy_lives_in_one_table.rs` asserts the window has no `if let Ok(`, has an
+    /// `Err(e) =>` arm, and that the arm returns an error. A mutation that inserts
+    /// `Err(_e) => false,` BEFORE the real arm satisfies all three — the refusing arm is still
+    /// textually there, just unreachable — and **that mutant survived**. The oracle was wrong, not
+    /// the mutation. What cannot be faked is whether a PUT of the document happens, so that is what
+    /// this asserts.
+    ///
+    /// The fixture is the real failure: GET, PUT and compile are mounted, `/action/query` is not, so
+    /// the generator's probe 404s exactly as it does on an instance that cannot run it.
+    #[test]
+    fn a_probe_that_cannot_run_writes_nothing() {
+        rt().block_on(async {
+            async fn attempt(mount_probe: bool) -> (serde_json::Value, usize) {
+                let server = MockServer::start().await;
+                Mock::given(method("GET"))
+                    .and(path_regex(r".*/doc/.*"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "result": {"content": doc().split('\n').collect::<Vec<_>>()}
+                    })))
+                    .mount(&server)
+                    .await;
+                Mock::given(method("PUT"))
+                    .and(path_regex(r".*/doc/.*"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+                    .mount(&server)
+                    .await;
+                Mock::given(method("POST"))
+                    .and(path_regex(r".*/action/compile.*"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "status": {"errors": []}, "console": []
+                    })))
+                    .mount(&server)
+                    .await;
+                if mount_probe {
+                    mount_no_source_control(&server).await;
+                }
+                let iris = IrisConnection::new(
+                    server.uri(),
+                    "APP",
+                    "_SYSTEM",
+                    "SYS",
+                    DiscoverySource::EnvVar,
+                );
+                let client = reqwest::Client::new();
+                let store = crate::elicitation::ElicitationStore::default();
+                let cache = crate::elicitation::CheckoutCache::default();
+                let mut p = params("put");
+                p.content = Some("Class Demo.T { }\n".to_string());
+                let r = handle_iris_doc(&iris, &client, p, &store, &cache)
+                    .await
+                    .expect("the tool must answer");
+                let v = match &r.content[0].raw {
+                    rmcp::model::RawContent::Text(t) => {
+                        serde_json::from_str(&t.text).unwrap_or(serde_json::Value::Null)
+                    }
+                    _ => serde_json::Value::Null,
+                };
+                // The DOCUMENT put only — not the probe's own IrisDevTmp scratch class.
+                let puts = server
+                    .received_requests()
+                    .await
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|q| q.method.as_str() == "PUT" && q.url.path().ends_with("/Demo.T.cls"))
+                    .count();
+                (v, puts)
+            }
+
+            let (v, puts) = attempt(false).await;
+            assert_eq!(
+                puts, 0,
+                "the document was written although the pre-write check never ran — a check that \
+                 did not run is not a document that needs no checkout: {v}"
+            );
+            assert_eq!(v["success"], false, "{v}");
+            assert!(
+                v["error_code"].is_string(),
+                "the refusal carries no error code, so the caller cannot tell why: {v}"
+            );
+
+            // CONTROL, and it is the load-bearing half: with the probe answering, the SAME call
+            // writes. Without this, "refuse everything" would satisfy the assertions above.
+            let (v2, puts2) = attempt(true).await;
+            assert_eq!(
+                puts2, 1,
+                "the document is not written even when the probe answers, so the assertion above \
+                 says nothing about the probe: {v2}"
+            );
+        });
+    }
+
     /// A FAILED WRITE must return the write's envelope UNCHANGED — with its compile errors, and with no
     /// `line_edit` summary.
     ///
