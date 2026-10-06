@@ -142,6 +142,7 @@ const REMEDIES: &[(&str, &str)] = &[
     ("ROUTINE_NOT_FOUND", "the frame names a class that is not compiled here, so it cannot be mapped; compile the class, or read the frame as raw .INT text"),
     ("RULE_NOT_FOUND", "no business rule of that name is in the namespace; call action=list to see which rules are there and use one of those names"),
     ("RULE_NOT_PROJECTED", "the rule class is compiled but neither its Ens_Rule.RuleSet row nor its XData could be read; recompile the rule class so IRIS reprojects it, then retry"),
+    ("SCM_ADMIN_BLOCKED", "this action reconfigures the namespace's source-control integration rather than touching one document, so it is off unless the operator turned it on; the server's administrator can set IRIS_SCM_ALLOW_DISCONNECT=1 and restart it — otherwise connect or disconnect from your own source-control client"),
     ("SCM_CHECKOUT_FAILED", "the source-control checkout was attempted and refused; the message carries the provider's reason — the document was NOT checked out, so do not write on the assumption that it was"),
     ("SCM_ERROR", "the source-control hook raised an error; the message carries it — resolve it in the provider before retrying the write"),
     ("SCM_NEEDS_INPUT", "source control wants a typed value before it will act and this path cannot supply one; run iris_source_control(action=execute) for the same document, which can carry the answer, or complete the action in the provider's UI"),
