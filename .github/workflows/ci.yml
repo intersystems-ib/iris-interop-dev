@@ -139,6 +139,13 @@ jobs:
       # Runs in the ordinary `test` job so it cannot rot unnoticed until the next release.
       - name: "release-asset guard logic (#224)"
         run: bash scripts/test-verify-release-assets.sh
+      # Same reason, for the asset ARCHITECTURE guard. That one only runs on a tag push or a
+      # workflow_dispatch, on five different runners, so this is the only place its matcher is
+      # exercised at all — against recorded `file -b` output from Mach-O, ELF and PE. The cases
+      # that matter are the ones where `file` says nothing useful: a guard that passes on output
+      # it could not classify reports success for every asset it failed to inspect.
+      - name: "release-asset architecture guard logic"
+        run: bash scripts/test-verify-asset-arch.sh
       # #317: iris-up.sh exited 0 after a boot that never happened, then printed the export lines
       # anyway. With the 80x3s default the failure took four minutes to observe, which is why it
       # went unobserved; the bounds are overridable now so the failure path runs in milliseconds.

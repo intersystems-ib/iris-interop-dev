@@ -20,8 +20,9 @@ Works with IRIS installed natively on Windows or Linux, and with Docker. Require
 **1. Install the binary** from the [latest release](https://github.com/intersystems-ib/iris-interop-dev/releases/latest):
 
 ```bash
-# macOS (Apple Silicon)
-curl -fsSL https://github.com/intersystems-ib/iris-interop-dev/releases/latest/download/iris-interop-dev-macos-arm64 \
+# macOS — picks arm64 or Intel from `uname -m`, so the same line works on either
+arch=$([ "$(uname -m)" = "arm64" ] && echo arm64 || echo x64)
+curl -fsSL "https://github.com/intersystems-ib/iris-interop-dev/releases/latest/download/iris-interop-dev-macos-$arch" \
   -o /usr/local/bin/iris-interop-dev && chmod +x /usr/local/bin/iris-interop-dev
 xattr -d com.apple.quarantine /usr/local/bin/iris-interop-dev 2>/dev/null
 
@@ -29,6 +30,11 @@ xattr -d com.apple.quarantine /usr/local/bin/iris-interop-dev 2>/dev/null
 curl -fsSL https://github.com/intersystems-ib/iris-interop-dev/releases/latest/download/iris-interop-dev-linux-x64 \
   -o /usr/local/bin/iris-interop-dev && chmod +x /usr/local/bin/iris-interop-dev
 ```
+
+On a distribution with an older glibc — Amazon Linux 2023, RHEL 8-9, Debian 12 — use
+`iris-interop-dev-linux-x64-musl` instead. It is statically linked, so it has no glibc floor; the
+`-linux-x64` asset above is built on Ubuntu 24.04 and needs GLIBC 2.39, which those distributions do
+not have. The symptom is a download that hash-verifies and then fails at exec.
 
 **Windows**: download `iris-interop-dev-windows-x64.exe` from the
 [releases page](https://github.com/intersystems-ib/iris-interop-dev/releases/latest), rename it to
