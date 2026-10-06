@@ -47,6 +47,7 @@ use std::path::{Path, PathBuf};
 /// whole point: the gate is at authoring time, when the author still knows what the caller should do.
 const REMEDIES: &[(&str, &str)] = &[
     ("ADMIN_WRITE_DISABLED", "admin write tools are off unless asked for; set IRIS_ADMIN_TOOLS=1 in the server's environment and restart it, or make the change in the Management Portal instead"),
+    ("ATELIER_NOT_FOUND", "the Atelier REST API is not served at that path, so NOTHING was read and this is not a report that the document is absent; check the /api/atelier web application is enabled on the instance and that IRIS_WEB_PORT points at the right one"),
     ("BASELINE_UNAVAILABLE", "the committed side of the comparison could not be read, so no verdict exists; check the production class is readable with iris_doc(mode=get) and retry — an unread baseline is not an empty production"),
     ("BODY_CLASS_NOT_FOUND", "the message's body class is not compiled in this namespace, so the body cannot be projected; compile it with iris_compile, or read the header alone"),
     ("BODY_READ_ERROR", "the response began but could not be read to the end; retry, and if it repeats capture the partial body — this is a transport fault, not a rejection"),
@@ -77,6 +78,7 @@ const REMEDIES: &[(&str, &str)] = &[
     ("HL7_EMPTY_SCHEMA_READ", "the read returned no fields, which is not the same as a segment having none; check the version and segment names and re-read before concluding the segment is empty"),
     ("HL7_NOT_AVAILABLE", "the HL7 schema classes are not present in that namespace; work in a namespace where EnsLib HL7 is installed, or install schema support there first"),
     ("HL7_SCHEMA_ERROR", "IRIS refused the schema request and its message is carried through; check the version identifier exists on this instance, then retry"),
+    ("INDETERMINATE", "the probe ran but its answer does not decide the question either way; treat it as unknown rather than as a no, and re-read the specific object the message names"),
     ("INSUFFICIENT_HISTORY", "a skill is mined from recent tool calls and there are too few so far; keep working and retry later, or author the skill by hand"),
     ("INTERNAL_ERROR", "a bug in this server, not in the request; the message names the failing step — please report it with that text"),
     ("INTEROP_ERROR", "the interop call reached IRIS and failed; the message carries the Ens error — check the production is running and the item name is exact"),
@@ -125,6 +127,8 @@ const REMEDIES: &[(&str, &str)] = &[
     ("NOT_IMPLEMENTED", "this entry point is a stub in this build and does nothing; perform the step by hand and do not wait on it to appear"),
     ("NOT_SQL", "iris_query runs SQL statements only; send ObjectScript through iris_execute instead"),
     ("NO_PRODUCTION", "no production is running in that namespace; start one with iris_production, or pass the production name explicitly"),
+    ("NO_RUNNABLE_TESTS", "the class was found but exposes no Test* methods to run, so a green result here would mean nothing; add at least one Test* method, or pass the class that actually holds them"),
+    ("NO_TESTS_FOUND", "no test class matched, so nothing ran — this is NOT a pass; `pattern` does not expand a package, so pass the fully qualified case-correct class name, and compile it first (a class that failed to compile does not exist to the runner)"),
     ("PARAM_NOT_FOR_ACTION", "the action does not read that argument, so it was refused rather than silently ignored; the message names the action that DOES read it — reissue with that action, or drop the argument"),
     ("PARSE_ERROR", "the server's own output could not be parsed; this is a fault in this server or a version mismatch — report it with the message text"),
     ("PHI_ACK_REQUIRED", "an unredacted body needs acknowledgePhi=true alongside dataPolicy=allow; set both deliberately, or use dataPolicy=redact"),
@@ -140,6 +144,9 @@ const REMEDIES: &[(&str, &str)] = &[
     ("RULE_NOT_PROJECTED", "the rule class is compiled but neither its Ens_Rule.RuleSet row nor its XData could be read; recompile the rule class so IRIS reprojects it, then retry"),
     ("SCM_CHECKOUT_FAILED", "the source-control checkout was attempted and refused; the message carries the provider's reason — the document was NOT checked out, so do not write on the assumption that it was"),
     ("SCM_ERROR", "the source-control hook raised an error; the message carries it — resolve it in the provider before retrying the write"),
+    ("SCM_NEEDS_INPUT", "source control wants a typed value before it will act and this path cannot supply one; run iris_source_control(action=execute) for the same document, which can carry the answer, or complete the action in the provider's UI"),
+    ("SCM_NEEDS_UI", "the provider answered with a page to open rather than a result, so nothing was changed; the message carries the address — open it and complete the step there, then retry. For CCR this is also how a missing Perforce credential arrives, so check you are logged in"),
+    ("SCM_NO_OUTPUT", "the source-control snippet produced nothing, so whether the action ran is UNKNOWN — it is not a success and not a refusal; re-run it, and if it stays silent check the provider with iris_source_control(action=status) before writing anything"),
     ("SCM_REJECTED", "source control declined the operation by policy; the message carries the provider's reason — this needs a change in the provider, not a retry"),
     ("SCM_UNAVAILABLE", "no source-control provider answered; this means UNKNOWN, not 'not under source control' — check the provider is configured before treating the document as free"),
     ("SCOPE_REQUIRED", "the pattern would select on its tail alone, which is the whole namespace; qualify it with at least one package level and retry"),
@@ -155,6 +162,7 @@ const REMEDIES: &[(&str, &str)] = &[
     ("STREAM_READ_ERROR", "the stream could not be read; retry, and if it repeats the document may be corrupt on the server"),
     ("STREAM_UNREADABLE", "the inspect program returned nothing usable, so nothing can be concluded about the stream's contents — do not read it as an empty stream; retry, and confirm the namespace is the one holding the stream, and if it repeats treat it as a fault in this server rather than as an answer about the data"),
     ("TABLE_NOT_FOUND", "resolve the real table name with iris_table_info or docs_introspect — IRIS table names differ from class names and the separator is not a dot"),
+    ("TEST_EXECUTION_ERROR", "the test run itself failed rather than the tests failing, so there is no verdict; the message carries what IRIS said — most often ^UnitTestRoot pointing at a directory that does not exist on the server"),
     ("TIMEOUT", "the operation did not finish inside its budget and may STILL be running on the server; check the instance's state, then raise timeout or narrow the work before retrying"),
     ("TOOL_NOT_IN_TOOLSET", "the tool exists in this build but the running toolset does not include it; restart the server with --toolset baseline (or IRIS_TOOLSET=baseline) if you need it"),
     ("TOO_BROAD", "the wildcard matched more documents than one request may queue and nothing ran; add the next package level to narrow it and proceed in parts"),
@@ -447,6 +455,20 @@ fn vocabulary() -> Vec<(String, Vec<String>)> {
         for c in error_code_fields(&prod) {
             add(c, "error_code field");
         }
+        // #418: a FOURTH idiom this scan could not see — `const SCM_NEEDS_UI: &str =
+        // "SCM_NEEDS_UI";` handed to `err_json` through a binding. The producer list above reads
+        // literals in ARGUMENT POSITION and classifier fallbacks, and a const is neither, so every
+        // code declared this way was invisible: measured when this producer was added, EIGHT live
+        // codes had no remedy on record, `NO_TESTS_FOUND` and `TEST_EXECUTION_ERROR` among them.
+        //
+        // That is the fourth time this file has been found narrower than its own name (see the
+        // `fail_with`, `error_code field` and `classify_interop_failure` notes above), and the shape
+        // repeats: a new way of naming a code is invisible until something forces the question. The
+        // population is well defined and small — a `const` whose &str value is SCREAMING_SNAKE
+        // exists for one reason.
+        for c in code_consts(&prod) {
+            add(c, "const");
+        }
         let name = f
             .file_name()
             .unwrap_or_default()
@@ -487,6 +509,33 @@ fn vocabulary() -> Vec<(String, Vec<String>)> {
     map.into_iter()
         .map(|(k, v)| (k, v.into_iter().collect()))
         .collect()
+}
+
+/// Error codes declared as `const NAME: &str = "SCREAMING_SNAKE";`.
+///
+/// The VALUE is read, not the name: `ERR_NO_TESTS_FOUND` emits `NO_TESTS_FOUND`, and keying on the
+/// identifier would have put the wrong string in the table while looking right.
+fn code_consts(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let Some(eq) = line.find(": &str = \"") else {
+            continue;
+        };
+        if !line[..eq].contains("const ") {
+            continue;
+        }
+        let rest = &line[eq + ": &str = \"".len()..];
+        let Some(end) = rest.find('"') else { continue };
+        let val = &rest[..end];
+        if !val.is_empty()
+            && val
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        {
+            out.push(val.to_string());
+        }
+    }
+    out
 }
 
 /// Upper-case string literals in a snippet.

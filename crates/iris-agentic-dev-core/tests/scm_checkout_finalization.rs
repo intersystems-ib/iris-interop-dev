@@ -129,8 +129,18 @@ fn neither_checkout_finalizer_swallows_the_error_arm() {
 /// for an OK status, so an empty reply is the normal successful case — the asymmetry that
 /// `the_two_generators_disagree_about_empty` pins in scm.rs. Without this, "report everything as a
 /// failure" would satisfy the two guards above.
+///
+/// #418: the check may be spelled inline (`out.is_empty()`) or delegated to
+/// `after_user_action_completed`, which is now the one named definition of "empty means success on
+/// the AfterUserAction path". This test originally insisted on the inline spelling, and so FAILED on
+/// the extraction that gave that decision a name a unit test could reach — a guard forbidding the
+/// improvement it was written to protect. It follows the delegation by one hop instead, and checks
+/// that the helper is itself what consults emptiness: accepting the call without that hop would be
+/// satisfied by a call to a function that does anything at all.
 #[test]
 fn both_finalizers_still_treat_empty_output_as_success() {
+    const HELPER: &str = "after_user_action_completed(";
+    let mut delegated = 0usize;
     for file in ["doc.rs", "scm.rs"] {
         let blocks = finalization_blocks(&src(&format!("tools/{file}")));
         assert!(
@@ -138,12 +148,41 @@ fn both_finalizers_still_treat_empty_output_as_success() {
             "control: {file} must contain a finalizer"
         );
         for block in &blocks {
+            let inline = block.contains("is_empty()");
+            let via_helper = block.contains(HELPER);
+            if via_helper {
+                delegated += 1;
+            }
             assert!(
-            block.contains("is_empty()"),
+            inline || via_helper,
             "{file} no longer distinguishes empty output from an error string. GetErrorText is \"\" \
              for a success status, so dropping that check turns every successful checkout into \
              SCM_CHECKOUT_FAILED"
         );
         }
     }
+    if delegated > 0 {
+        let scm = src("tools/scm.rs");
+        let at = scm
+            .find("fn after_user_action_completed")
+            .unwrap_or_else(|| panic!("a finalizer calls {HELPER} but scm.rs does not define it"));
+        let body = &scm[at..];
+        let end = body.find("\n}").map(|i| i + 2).unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            body.contains("is_empty()"),
+            "after_user_action_completed does not test emptiness, so delegating to it does not \
+             preserve `empty means success`:\n{body}"
+        );
+    }
+    // CONTROL: the hop above only runs when something delegates. Print it so a zero is visible
+    // rather than silently skipping half of what this test claims to check.
+    eprintln!(
+        "finalizer blocks delegating to {HELPER}: {delegated} (inline spelling is also accepted)"
+    );
+    assert!(
+        delegated > 0,
+        "no finalizer delegates to {HELPER}; the extraction #418 made has been reverted, or this \
+         guard is reading the wrong text"
+    );
 }
