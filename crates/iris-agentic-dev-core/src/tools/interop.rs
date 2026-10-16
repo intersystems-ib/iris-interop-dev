@@ -2238,8 +2238,27 @@ pub const M_PI_ITEM: &str = "PI_ITEM:";
 pub const M_PI_MISSING: &str = "PI_MISSING:";
 /// How many settings this item holds, per IRIS's own `Settings.Count()`.
 pub const M_PI_NSET: &str = "PI_NSET:";
-/// One setting, `Name=Value`.
+/// One setting, `Target:Name=Value`.
+///
+/// The `Target` field is what makes the read feedable back into a write. It is FIRST and
+/// `:`-delimited because the first `=` is already the name/value boundary — the real
+/// `ReplyCodeActions` value is `:?R=F,:?E=F,…`, so `=` cannot delimit anything else, while a
+/// `Target` and a setting `Name` are both IRIS identifiers and carry neither `:` nor `=`.
+/// A line with no `:` before its first `=` therefore carries no target field at all, and is
+/// reported as such rather than guessed at.
 pub const M_PI_SET: &str = "PI_SET:";
+
+/// One setting as `Ens.Config.Setting` holds it.
+///
+/// `target` is the RAW text IRIS wrote, not a classification: whether `Ens.Config.Setting.Target`
+/// can hold anything besides `Host` and `Adapter` is not documented in the corpus available here,
+/// so the parse keeps what arrived and `classify_setting_target` decides what it means, once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Setting {
+    pub target: String,
+    pub name: String,
+    pub value: String,
+}
 
 /// What one item's section amounted to.
 ///
@@ -2251,7 +2270,7 @@ pub const M_PI_SET: &str = "PI_SET:";
 pub enum ItemSettings {
     /// Settings arrived, in order, with the count IRIS declared alongside them.
     Read {
-        settings: Vec<(String, String)>,
+        settings: Vec<Setting>,
         declared: usize,
     },
     /// The production holds no item by this name.
@@ -2310,6 +2329,13 @@ pub struct BatchSettings {
 /// be silently absent from the output. That is why `item_not_found_block` — which ends in `Quit` by
 /// design — is not reused per item here; its candidate block is emitted once, at the end.
 ///
+/// Each setting is written as `Target:Name=Value`, not `Name=Value`. `Ens.Config.Setting` is keyed
+/// on (Name, Target) and `FindSettingByName` — which `set_settings` and `add` both call — takes the
+/// target as its second argument, so a read that dropped `tS.Target` could not be fed back into a
+/// write for any adapter setting. The key the caller sees is assembled in Rust by
+/// `qualify_setting_key`, never pre-prefixed here: one place splits a settings key and one place
+/// re-joins it.
+///
 /// Every `For` stays on ONE line: `build_exec_class` splits generated code on `\n`.
 pub fn build_get_settings_batch_code(production: &str, items: &[String]) -> String {
     let mut code = resolve_production_prologue(production);
@@ -2318,7 +2344,7 @@ pub fn build_get_settings_batch_code(production: &str, items: &[String]) -> Stri
         code.push_str(&format!(
             "\nWrite \"{mi}\"_{e}_$C(10)\n\
              Set tItem=\"\" For zfi=1:1:tProd.Items.Count() {{ If tProd.Items.GetAt(zfi).Name={e} {{ Set tItem=tProd.Items.GetAt(zfi) Quit }} }}\n\
-             If '$IsObject(tItem) {{ Write \"{mm}1\"_$C(10) }} Else {{ Write \"{mn}\"_tItem.Settings.Count()_$C(10) Set zk=\"\" For {{ Set tS=tItem.Settings.GetNext(.zk) Quit:zk=\"\"  Write \"{ms}\"_tS.Name_\"=\"_tS.Value_$C(10) }} }}",
+             If '$IsObject(tItem) {{ Write \"{mm}1\"_$C(10) }} Else {{ Write \"{mn}\"_tItem.Settings.Count()_$C(10) Set zk=\"\" For {{ Set tS=tItem.Settings.GetNext(.zk) Quit:zk=\"\"  Write \"{ms}\"_tS.Target_\":\"_tS.Name_\"=\"_tS.Value_$C(10) }} }}",
             mi = M_PI_ITEM,
             mm = M_PI_MISSING,
             mn = M_PI_NSET,
@@ -2346,14 +2372,14 @@ pub fn parse_get_settings_batch(out: &str) -> BatchSettings {
     // The section being filled: name, declared count, settings so far, and whether it said MISSING.
     let mut name: Option<String> = None;
     let mut declared: Option<usize> = None;
-    let mut settings: Vec<(String, String)> = Vec::new();
+    let mut settings: Vec<Setting> = Vec::new();
     let mut missing = false;
 
     fn finish(
         items: &mut Vec<(String, ItemSettings)>,
         name: Option<String>,
         declared: Option<usize>,
-        settings: Vec<(String, String)>,
+        settings: Vec<Setting>,
         missing: bool,
     ) {
         let Some(n) = name else { return };
@@ -2390,19 +2416,44 @@ pub fn parse_get_settings_batch(out: &str) -> BatchSettings {
         } else if let Some(v) = l.strip_prefix(M_PI_NSET) {
             declared = v.trim().parse::<usize>().ok();
         } else if let Some(v) = l.strip_prefix(M_PI_SET) {
+            // The FIRST `=` separates the key from the value, and it has to be split first: a real
+            // `ReplyCodeActions` value is `:?R=F,:?E=F,…`, so splitting on `:` before `=` would
+            // take `ReplyCodeActions=` for a target. A Target and a setting Name are both IRIS
+            // identifiers and contain neither character, so the key part splits cleanly after.
             let mut parts = v.splitn(2, '=');
-            let k = parts.next().unwrap_or("").trim().to_string();
+            let key_part = parts.next().unwrap_or("");
             let val = parts.next().unwrap_or("").to_string();
-            if !k.is_empty() {
-                settings.push((k, val));
+            // No `:` in the key means the line carries NO target field. That is not Host: it is a
+            // reply this build cannot attribute, and `classify_setting_target` reports it by name.
+            //
+            // What reaches this `None` arm, measured rather than assumed (#373 review). It is NOT
+            // an older server build: `execute_via_generator_once` mints a fresh
+            // `IrisDevTmp.Run<uuid>` from `build_get_settings_batch_code` and PUTs it on every
+            // call, so generator and parser are always the same binary and version skew is
+            // structurally impossible. Nor is it an empty `tS.Target`: the generator writes
+            // `tS.Target_":"_tS.Name`, so an empty target emits `PI_SET::Name=Value` — measured,
+            // that still carries the delimiter and lands in the `Some` arm with target `""`.
+            // This arm is the defensive read of a key part that arrived without the delimiter at
+            // all — a malformed or truncated line. It converges on the same empty target as the
+            // empty-`Target` case, which is the point: neither is read as Host.
+            let (target, name) = match key_part.split_once(':') {
+                Some((t, n)) => (t.trim(), n.trim()),
+                None => ("", key_part.trim()),
+            };
+            if !name.is_empty() {
+                settings.push(Setting {
+                    target: target.to_string(),
+                    name: name.to_string(),
+                    value: val,
+                });
             }
         } else if l.starts_with("ITEM_CANDIDATES_N:") || l.starts_with("ITEM_CANDIDATE:") {
             candidate_block.push_str(l);
             candidate_block.push('\n');
         } else if let Some(last) = settings.last_mut() {
             // A continuation of the previous value: keep it rather than drop it.
-            last.1.push('\n');
-            last.1.push_str(l);
+            last.value.push('\n');
+            last.value.push_str(l);
         }
     }
     finish(&mut items, name, declared, settings, missing);
@@ -2429,11 +2480,24 @@ pub fn synthesise_not_found_payload(missing: &[String], candidate_block: &str) -
 
 /// One item's section as a JSON object, with the losses named.
 ///
-/// Two different losses, reported separately because they need different fixes:
-/// `settings_incomplete` means fewer (or more) settings arrived than IRIS declared — the output was
-/// cut. `duplicate_setting_names` means the settings that DID arrive collapsed in the map, which
-/// happens because this program writes `Name=Value` and drops `Setting.Target`: an item carrying
-/// both a Host and an Adapter setting of the same name has two rows and one key.
+/// Keys are rendered by `qualify_setting_key`, so what a read returns is the vocabulary
+/// `set_settings` accepts and a read feeds straight back into a write. An adapter setting comes back
+/// as `Adapter.FilePath`; a host setting comes back bare unless its own name begins `Adapter.` or
+/// `Host.`, in which case it is qualified so it cannot be re-read as a prefix.
+///
+/// Four losses, reported separately because they need different fixes. `settings_incomplete` means
+/// fewer (or more) settings arrived than IRIS declared — the output was cut.
+/// `settings_unknown_target` names EVERY setting whose `Ens.Config.Setting.Target` this build does
+/// not recognise, carrying its raw target, its value, and the key it was given — or `null` where no
+/// key can address it. `settings_unaddressable` counts those null-key rows, so a map shorter than
+/// the settings that arrived is explained by a number rather than left to be noticed.
+/// `duplicate_setting_names` means the settings that DID arrive collapsed in the map. Since both
+/// recognised targets are qualified and an unrecognised one can no longer borrow a recognised
+/// target's key, that field is an integrity check that must read absent rather than a report of a
+/// known loss.
+///
+/// Every row that arrived is therefore in exactly one place: `map.len() + settings_unaddressable +
+/// duplicate_setting_names == settings.len()`, which is asserted rather than restated.
 pub fn item_settings_payload(name: &str, state: &ItemSettings) -> serde_json::Value {
     match state {
         ItemSettings::Missing => serde_json::json!({
@@ -2443,10 +2507,19 @@ pub fn item_settings_payload(name: &str, state: &ItemSettings) -> serde_json::Va
             "item": name, "found": false, "error_code": "ITEM_UNREADABLE", "error": why
         }),
         ItemSettings::Read { settings, declared } => {
-            let map: std::collections::HashMap<&str, &str> = settings
-                .iter()
-                .map(|(k, v)| (k.as_str(), v.as_str()))
-                .collect();
+            // A row with no key is withheld from the map rather than given a key that addresses a
+            // different row. `unaddressable` has to be counted here, not derived from the map
+            // afterwards, or it would be indistinguishable from a name collision below.
+            let mut map: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
+            let mut unaddressable = 0usize;
+            for s in settings {
+                match qualify_setting_key(&s.target, &s.name) {
+                    SettingKey::Writable(k) | SettingKey::Unattributed(k) => {
+                        map.insert(k, s.value.as_str());
+                    }
+                    SettingKey::NoKey => unaddressable += 1,
+                }
+            }
             let mut v = serde_json::json!({
                 "item": name, "found": true,
                 "settings": map,
@@ -2456,8 +2529,43 @@ pub fn item_settings_payload(name: &str, state: &ItemSettings) -> serde_json::Va
                 v["settings_incomplete"] = serde_json::Value::Bool(true);
                 v["settings_received"] = serde_json::json!(settings.len());
             }
-            if map.len() != settings.len() {
-                v["duplicate_setting_names"] = serde_json::json!(settings.len() - map.len());
+            // An unrecognised Target is NAMED, never folded into Host. A key emitted as though it
+            // were a host setting reads back through `resolve_setting_target` as a host setting,
+            // and writing it would move the setting — a failure answered as a fact. Where the name
+            // itself begins `Adapter.`/`Host.` there is no honest key at all, so `key` is null and
+            // the VALUE rides along here: this entry is then the only record of the row.
+            let unknown: Vec<serde_json::Value> = settings
+                .iter()
+                .filter_map(|s| match classify_setting_target(&s.target) {
+                    SettingTarget::Host | SettingTarget::Adapter => None,
+                    SettingTarget::Unknown(raw) => {
+                        let key = match qualify_setting_key(&s.target, &s.name) {
+                            SettingKey::Unattributed(k) => serde_json::json!(k),
+                            // Unreachable for an Unknown target, but spelled out rather than
+                            // collapsed into the null arm: a `Writable` key here would mean
+                            // `qualify_setting_key` had started attributing a target this build
+                            // does not recognise, and that must not read as "no key".
+                            SettingKey::Writable(k) => serde_json::json!(k),
+                            SettingKey::NoKey => serde_json::Value::Null,
+                        };
+                        Some(serde_json::json!({
+                            "name": s.name,
+                            "target": raw,
+                            "key": key,
+                            "value": s.value,
+                        }))
+                    }
+                })
+                .collect();
+            if !unknown.is_empty() {
+                v["settings_unknown_target"] = serde_json::json!(unknown);
+            }
+            if unaddressable > 0 {
+                v["settings_unaddressable"] = serde_json::json!(unaddressable);
+            }
+            if map.len() + unaddressable != settings.len() {
+                v["duplicate_setting_names"] =
+                    serde_json::json!(settings.len() - unaddressable - map.len());
             }
             v
         }
@@ -2844,6 +2952,106 @@ pub fn resolve_setting_target(key: &str) -> (&'static str, &str) {
     match key.strip_prefix("Adapter.") {
         Some(rest) => ("Adapter", rest),
         None => ("Host", key.strip_prefix("Host.").unwrap_or(key)),
+    }
+}
+
+/// What an `Ens.Config.Setting.Target` amounts to.
+///
+/// `Unknown` carries the raw text rather than falling back to `Host`. Whether `Target` can hold
+/// anything besides `Host` and `Adapter` is not documented in the InterSystems corpus available
+/// here — a grep for `Ens.Config.Setting` over it returns nothing while a control grep for
+/// `Ens.Director` hits three books — so a default would be a guess dressed as a value, and the
+/// guess would be the one that silently moves a setting from the adapter to the host.
+///
+/// Matched exhaustively, with no catch-all arm, so a fourth target found later fails the compile at
+/// every site that has to decide what it means.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettingTarget {
+    /// The business host itself.
+    Host,
+    /// The item's adapter.
+    Adapter,
+    /// Anything else, including an absent target field. Carries what arrived.
+    Unknown(String),
+}
+
+/// The one place raw `Target` text is interpreted.
+pub fn classify_setting_target(raw: &str) -> SettingTarget {
+    match raw.trim() {
+        "Host" => SettingTarget::Host,
+        "Adapter" => SettingTarget::Adapter,
+        other => SettingTarget::Unknown(other.to_string()),
+    }
+}
+
+/// Whether a bare `name` would be re-read by `resolve_setting_target` as carrying a target prefix.
+///
+/// The one predicate behind both the `Host` qualification and the `Unknown` refusal, so the two
+/// arms cannot drift apart again: the first pass guarded only `Host` and left `Unknown` emitting
+/// exactly the key the guard existed to prevent.
+fn name_reads_as_prefixed(name: &str) -> bool {
+    name.starts_with("Adapter.") || name.starts_with("Host.")
+}
+
+/// What key, if any, a read can offer for one `Ens.Config.Setting` row.
+///
+/// Three cases, because a `String` return can only express two of them and the third was therefore
+/// answered with a key for a DIFFERENT row — the shape `CLAUDE.md` records as "a failure answered
+/// as a negative fact". Matched exhaustively at both call sites, with no catch-all, so a later
+/// variant fails the compile where it has to be decided rather than defaulting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettingKey {
+    /// `resolve_setting_target` reads this key back as exactly the (Target, Name) it was built
+    /// from. Only `Host` and `Adapter` reach here: they are the write side's whole vocabulary.
+    Writable(String),
+    /// The target is outside that vocabulary, so NO key reaches this row — but the bare name
+    /// carries no prefix `resolve_setting_target` would read, so it still identifies the row, and
+    /// it is what this tool has always returned. Offered under that name, and the row is also
+    /// listed in `settings_unknown_target` because writing the key back would reach the HOST.
+    Unattributed(String),
+    /// The target is outside the vocabulary AND the name itself begins `Adapter.`/`Host.`. Every
+    /// candidate string is either that bare name — which `resolve_setting_target` reads as a key
+    /// for another target entirely — or a prefix this build invented. There is no key, and none is
+    /// invented: the row is reported by name instead.
+    NoKey,
+}
+
+/// The exact inverse of `resolve_setting_target`: render (Target, Name) as the settings key a
+/// caller can hand straight back to `set_settings`. `resolve_setting_target(k) == (t, n)` for every
+/// Host and Adapter setting's `Writable(k)`, which is the property that makes a read feedable into
+/// a write.
+///
+/// A host setting keeps its bare name — that is what keeps most keys byte-identical to what this
+/// tool returned before — EXCEPT when the name itself begins `Adapter.` or `Host.`. That exception
+/// is not hypothetical: the pre-#212 bug hard-coded Target="Host" for every key, so it created, in
+/// the field, a HOST setting literally named `Adapter.DSN`. Emitted bare, that key reads back
+/// through `resolve_setting_target` as target Adapter / name DSN — a silent MOVE of the setting.
+/// Qualifying only the names that would be misread makes the mapping total and lossless without
+/// churning every key.
+///
+/// An unrecognised target is never guessed at, and — #373 review — it is never handed that same
+/// misreadable bare key either. `Host` has a prefix to escape with; an unrecognised target has
+/// none, so a name that would be misread yields `NoKey`. Measured on the first pass, where this
+/// arm returned the bare name unconditionally: `qualify_setting_key("Gateway", "Adapter.DSN")` and
+/// `qualify_setting_key("", "Adapter.DSN")` both gave `"Adapter.DSN"`, which
+/// `resolve_setting_target` reads as ("Adapter", "DSN") — a different target AND a different name.
+/// Worse, that key COLLIDES with a genuine `Adapter`/`DSN` row, and the two collapsed in the
+/// settings map with whichever value `HashMap` iteration happened to insert last winning.
+pub fn qualify_setting_key(target: &str, name: &str) -> SettingKey {
+    match classify_setting_target(target) {
+        SettingTarget::Adapter => SettingKey::Writable(format!("Adapter.{name}")),
+        SettingTarget::Host => SettingKey::Writable(if name_reads_as_prefixed(name) {
+            format!("Host.{name}")
+        } else {
+            name.to_string()
+        }),
+        SettingTarget::Unknown(_) => {
+            if name_reads_as_prefixed(name) {
+                SettingKey::NoKey
+            } else {
+                SettingKey::Unattributed(name.to_string())
+            }
+        }
     }
 }
 
