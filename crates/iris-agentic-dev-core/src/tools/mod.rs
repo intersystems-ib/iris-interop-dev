@@ -16,6 +16,22 @@ use serde::Deserialize;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
+/// #391: `iris_execute`'s DOCKER_REQUIRED text, with the HTTP leg's error as a PARAMETER.
+///
+/// That error was the thing being dropped. `iris_execute` bound `http_leg_error` and then
+/// interpolated it in the auth branch ALONE, so for every other HTTP failure IRIS's own words died
+/// at the envelope and the caller was handed the env-var advice by itself — which made any fix
+/// inside the generator (#391) unobservable through the tool. Taking it as an argument makes "the
+/// message names the HTTP leg" a property of the message rather than a habit of the call site, and
+/// unit-testable without reaching the branch, which needs IRIS_CONTAINER unset in a process other
+/// tests set it in.
+fn docker_required_message(http_leg_error: &str) -> String {
+    format!(
+        "iris_execute: HTTP execution failed ({http_leg_error}) and IRIS_CONTAINER is not set \
+         for docker exec fallback.{DOCKER_REQUIRED_HINT}"
+    )
+}
+
 /// Wrapper for tools that accept free-form JSON parameters.
 /// Uses a manual JsonSchema impl to emit `{"type":"object"}` instead of
 /// schemars' default `{"title":"AnyValue"}`, which Claude Code rejects.
@@ -3558,6 +3574,17 @@ async fn enrich_abort(
         }
     }
 
+    // #390: the one signal whose remedy is not "look at that line again" but "stop building one
+    // string". `abort_hint` returns `None` for a `RunUser+` `<MAXSTRING>` precisely so this can
+    // APPEND to the per-line explanation instead of replacing it: the caller needs the line AND
+    // what to do with it, and this is the only writer that has the line.
+    if maxstring_origin(abort) == Some(MaxstringOrigin::SubmittedLine) {
+        if !hint.is_empty() {
+            hint.push(' ');
+        }
+        hint.push_str(maxstring_hint(MaxstringOrigin::SubmittedLine));
+    }
+
     if !hint.is_empty() && resp.get("hint").is_none() {
         resp["hint"] = serde_json::Value::String(hint);
     }
@@ -4328,6 +4355,33 @@ pub fn runtime_abort_line(output: &str) -> Option<&str> {
         .find(|l| *l == "ERROR: output capture unavailable")
 }
 
+/// #390: the `<SIGNAL>` inside a status chain IRIS REPORTED, which is not the shape
+/// [`runtime_abort_line`] reads.
+///
+/// `runtime_abort_line` anchors on the wrapper's own trap, written to the captured device as
+/// `ERROR: <…>` / `ERROR($ZERROR): <…>`. This text never reached that device: the SqlProc died
+/// before it could return anything, so the signal arrives instead inside the `%Status` chain
+/// Atelier put in `status.errors` — `ERROR #5002: ObjectScript error: <MAXSTRING>zExecute+14^…`,
+/// with `error:` in LOWER case. A separate extractor rather than a widened `runtime_abort_line`,
+/// because that function is what decides `success` on both `Ok(Ok(output))` arms and several tests
+/// pin exactly what it matches; this one has no blast radius on the hot path.
+///
+/// The LAST match wins: a chain wraps the inner cause in outer codes (#5540 wraps #5002), so the
+/// deepest `ObjectScript error:` is the one that says what actually trapped.
+fn reported_abort_tail(text: &str) -> Option<&str> {
+    const MARKER: &str = "ObjectScript error: ";
+    let mut best: Option<usize> = None;
+    let mut from = 0usize;
+    while let Some(i) = text[from..].find(MARKER) {
+        let at = from + i + MARKER.len();
+        if text[at..].starts_with('<') {
+            best = Some(at);
+        }
+        from = from + i + 1;
+    }
+    best.map(|i| text[i..].trim_end())
+}
+
 /// `<ENDOFFILE>` is a `READ` loop reaching the end of a file — an abort, but usually the
 /// intended terminator rather than a defect. It is still reported as a failure, because the
 /// script did stop early and the ask in #123 was consistency; the hint says so, so a caller
@@ -4405,11 +4459,166 @@ pub(crate) fn attach_status_chain(resp: &mut serde_json::Value, output: &str) ->
     }
 }
 
+/// #390: whose string overflowed? `<MAXSTRING>` has two causes on this path and their remedies are
+/// OPPOSITE, so the one thing that must not happen is a single sentence for both. The FRAME says
+/// which.
+///
+/// * `[z]RunUser+N^IrisDevTmp.Run<id>.1` is the method this server writes the CALLER's code into,
+///   so the string that exceeded the limit is one the submitted code built. The remedy is that line
+///   (a `%Stream` instead of `Set x = x _ …` in a loop) and a second transport cannot help: the same
+///   code does the same thing over `docker exec`.
+/// * `[z]Execute+N^IrisDevTmp.*` is this server's own capture scaffolding. `build_exec_class`'s
+///   `Execute()` reads the redirected device file back with
+///   `While 'stream.AtEnd { Set out = out _ stream.ReadLine() _ $Char(10) }` and `Quit`s that ONE
+///   local, so what overflowed is OUR accumulation. The submitted code can be entirely correct —
+///   #390's own repro, `For i=1:1:500000 { Write "0123456789" }`, already writes in chunks — and
+///   here the other transport IS a second opinion: `IrisConnection::execute` pipes
+///   `docker exec … iris session` stdout into a Rust `String`, with no IRIS single-string limit
+///   anywhere on that path.
+///
+/// `ServerCapture` is identified POSITIVELY — the wrapper's own member, in the scratch package —
+/// rather than inferred from the absence of a `RunUser+` frame: an abort deeper in library code has
+/// no `RunUser+` frame either, and handing IT the capture verdict would re-enable a docker fallback
+/// that genuinely cannot help. The DEEPEST frame decides, which is the one
+/// [`abort_frame_routine`] returns; `Execute()` calls `RunUser()`, so exactly one of the two can be
+/// innermost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MaxstringOrigin {
+    /// The generated wrapper's capture accumulation. The code the caller sent may be correct.
+    ServerCapture,
+    /// A line of the submitted code — the frame carries its number.
+    SubmittedLine,
+    /// Neither: a frame in code the caller called into, or no frame at all.
+    Elsewhere,
+}
+
+/// `None` for any abort that is not `<MAXSTRING>`, so this doubles as the signal test.
+pub(crate) fn maxstring_origin(abort: &str) -> Option<MaxstringOrigin> {
+    if !abort.contains("<MAXSTRING>") {
+        return None;
+    }
+    if let Some((label, routine)) = abort_frame_routine(abort).and_then(|f| f.split_once('^')) {
+        // `Execute+2` (#390's measured frame) and `zExecute+14` (the fixture's) are both real
+        // spellings — the class compiler prefixes a method's label with `z`.
+        let member = label.split('+').next().unwrap_or(label);
+        if routine.starts_with("IrisDevTmp.") && matches!(member, "Execute" | "zExecute") {
+            return Some(MaxstringOrigin::ServerCapture);
+        }
+    }
+    // Deliberately `contains("RunUser+")` rather than the member of the frame above: that is the
+    // same predicate `parse_abort_frame` uses to decide `line`, so "the caller's own line is named"
+    // and "this origin is SubmittedLine" cannot disagree — which is exactly what the hint-slot gate
+    // in `abort_hint` depends on.
+    if abort.contains("RunUser+") {
+        return Some(MaxstringOrigin::SubmittedLine);
+    }
+    Some(MaxstringOrigin::Elsewhere)
+}
+
+/// The remedy for each origin. Separate from [`abort_hint`] because the call sites have different
+/// slot rules: `abort_hint` must YIELD the contended `hint` slot to `enrich_abort`'s per-line
+/// explanation, while `iris_execute`'s reported-error arm has no other writer and must say
+/// something.
+pub(crate) fn maxstring_hint(origin: MaxstringOrigin) -> &'static str {
+    match origin {
+        MaxstringOrigin::ServerCapture => {
+            "<MAXSTRING> fired in this server's output capture, not on a line you sent: \
+             iris_execute collects everything your code Writes into ONE IRIS string before \
+             returning it, and that string hit IRIS's maximum length (measured: 3,600,000 \
+             characters comes back, 3,700,000 does not). The frame `Execute+N^IrisDevTmp.*` IS \
+             that accumulation, so writing in chunks cannot help — it is this server that \
+             concatenates them. Your code may be correct as it stands: ask it for less output per \
+             call, or have it write the large value to a %Stream or a file and read that back in \
+             pieces with stream_inspect(max_chars=…)."
+        }
+        MaxstringOrigin::SubmittedLine => {
+            "<MAXSTRING> means a single string the code you sent built exceeded IRIS's maximum \
+             string length (about 3.6 million characters). `Set x = x _ …` in a loop is the usual \
+             shape: accumulate into a %Stream (`Set s = ##class(%Stream.GlobalCharacter).%New()`, \
+             then `Do s.Write(chunk)`) and read it back with stream_inspect, or Write each chunk \
+             to the device as you go. Another transport will fail the same way — the limit is on \
+             the string, not on the way the answer travels."
+        }
+        MaxstringOrigin::Elsewhere => {
+            "<MAXSTRING> means a single string exceeded IRIS's maximum string length (about 3.6 \
+             million characters). It did not trap on a line of the code you sent — the frame names \
+             where it fired — so look at the value being handed to that routine rather than \
+             editing your own loop: a %Stream, or a chunked read with stream_inspect, is what it \
+             can accept."
+        }
+    }
+}
+
+/// The envelope for an error IRIS itself REPORTED, as `iris_execute` answers it (#390).
+///
+/// ONE writer with two call sites: the short-circuit that answers without touching the docker leg,
+/// and the docker leg's own failure arms, which answer with this when the fall-through for a
+/// server-capture `<MAXSTRING>` did not produce the output either. Two copies would be the #105
+/// shape, one of them quietly keeping the old DOCKER_REQUIRED answer.
+///
+/// `method` is always `"http"`: the HTTP leg is what reached IRIS and carried this verdict back,
+/// whether or not a docker attempt happened afterwards.
+///
+/// `docker_fallback_tried` is written because the decision is otherwise INVISIBLE. Both routes end
+/// in this same envelope, so "answered without trying docker" and "tried docker, which added
+/// nothing" were indistinguishable to a caller AND to a test — and the frame gate that chooses
+/// between them is the whole of finding 3. It is also the question #390 left ambiguous: the old
+/// DOCKER_REQUIRED answer implied an attempt that had not happened. Only this envelope carries the
+/// key, because this is the only answer where the attempt is a judgement call rather than a
+/// consequence of the configuration.
+fn iris_reported_envelope(
+    text: &str,
+    namespace: &str,
+    redirect_hint: Option<&'static str>,
+    docker_fallback_tried: bool,
+) -> Result<CallToolResult, McpError> {
+    let mut resp = serde_json::json!({
+        "success": false,
+        "namespace": namespace,
+        "method": "http",
+        "docker_fallback_tried": docker_fallback_tried,
+    });
+    // #323's decode, on the one arm that never had it: the text is a %Status chain (`ERROR #5540`
+    // wrapping `ERROR #5002`), so the per-error codes are there to be split and the caller must not
+    // have to re-parse the prefix.
+    attach_status_chain(&mut resp, text);
+    let tail = reported_abort_tail(text);
+    // The frame-specific remedy first. Unlike `abort_hint` this arm has no `enrich_abort` to yield
+    // to, so it must answer for a `RunUser+` frame as well — `abort_hint` returns `None` there.
+    if let Some(h) = tail
+        .and_then(maxstring_origin)
+        .map(maxstring_hint)
+        .or_else(|| tail.and_then(abort_hint))
+    {
+        resp["hint"] = serde_json::Value::String(h.into());
+    }
+    apply_redirect_hint(&mut resp, redirect_hint);
+    // No `output` key. Nothing was returned — the SqlProc died before it could hand back what the
+    // device captured — and `""` here would be read as "the script produced no output", which is
+    // the #362 shape this chain started as.
+    envelope::fail_with("IRIS_RUNTIME_ERROR", text, resp)
+}
+
 fn abort_hint(abort: &str) -> Option<&'static str> {
     // #209: known library frames first — they only match when there is no RunUser+ frame,
     // so this cannot take the slot from a per-line explanation.
     if let Some(h) = library_frame_hint(abort) {
         return Some(h);
+    }
+    // #390: `<MAXSTRING>` is the signal behind the measurement that filed #362 — a captured output
+    // of 3,600,000 characters returns and 3,700,000 does not — and it is the one abort whose remedy
+    // is not necessarily "fix the line". Split by frame (see `maxstring_origin`), and gated like
+    // `library_frame_hint` above it for the same reason: this is a first-writer-wins slot and
+    // `abort_hint` runs BEFORE `enrich_abort`, so an ungated entry outranks the per-line
+    // explanation. The first version of this arm was ungated and said "the call returned NOTHING"
+    // for every `<MAXSTRING>` — FALSE on both `Ok(Ok(output))` arms, where `resp["output"]` holds
+    // everything the script wrote before the trap, and it took the slot from the one sentence that
+    // names the line. For that frame the remedy is appended by `enrich_abort` instead, which is the
+    // only writer that HAS the line.
+    match maxstring_origin(abort) {
+        Some(MaxstringOrigin::SubmittedLine) => return None,
+        Some(origin) => return Some(maxstring_hint(origin)),
+        None => {}
     }
     abort.contains("<ENDOFFILE>").then_some(
         "<ENDOFFILE> is usually a READ loop reaching the end of the file, not a defect — the \
@@ -5883,6 +6092,18 @@ impl IrisTools {
                 );
             }
         }
+        // #391: `result.log` is the third source, and `iris_compile` does NOT route through
+        // `compile_error_list` — it keeps this richer per-entry assembly. The triage plan assumed
+        // extending the shared helper covered this site; it does not, and leaving it would make
+        // the half that was fixed look like the whole layer. Before the summary fallback on
+        // purpose: a specific log entry outranks a generic summary string.
+        for text in log_error_entries(&body) {
+            if !console_diag_already_reported(&errors, &text) {
+                errors.push(
+                    serde_json::json!({"severity":"error","code":"","line":0,"column":0,"location":"","text":text}),
+                );
+            }
+        }
         // Also check status.summary as a fallback — some IRIS versions put the error only there.
         if errors.is_empty() {
             let summary = body["status"]["summary"].as_str().unwrap_or("");
@@ -6227,6 +6448,20 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                                 return missing;
                             }
                             let msg = e.to_string();
+                            // #390, same missing distinction as `iris_execute`: IRIS answered and
+                            // reported this itself, so Docker is not the remedy and
+                            // DOCKER_REQUIRED_HINT's "verify /api/atelier" is the wrong advice for
+                            // a leg that answered 200. Wired here in the same change deliberately
+                            // — a second copy of this path that quietly kept the old behaviour
+                            // would look MORE trustworthy for having a working sibling.
+                            // No frame gate here, unlike `iris_execute`: on THIS path the docker
+                            // leg was tried FIRST and already failed, so there is no second
+                            // opinion left to fall through to — a server-capture `<MAXSTRING>`
+                            // included. All that is left to decide is the label, and IRIS's own
+                            // verdict is the honest one.
+                            if crate::iris::connection::iris_reported(&e).is_some() {
+                                return envelope::fail("IRIS_RUNTIME_ERROR", &msg);
+                            }
                             let code = interop::classify_iris_error_or(&msg, "DOCKER_REQUIRED");
                             let text = if code == "DOCKER_REQUIRED" {
                                 format!("iris_test: IRIS_CONTAINER set but docker exec failed and HTTP fallback also failed: {msg}.{DOCKER_REQUIRED_HINT}")
@@ -6274,6 +6509,15 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                         return missing;
                     }
                     let msg = e.to_string();
+                    // #390's sibling, which the first pass left behind: this tool has TWO
+                    // `execute_via_generator` `Err` arms and only the docker one was wired, so the
+                    // identical cause answered TEST_EXECUTION_ERROR or IRIS_RUNTIME_ERROR
+                    // depending on whether IRIS_CONTAINER happened to be set — a caller branching
+                    // on `error_code` was reading the configuration, not the cause. There is no
+                    // docker leg on this arm to fall through to, so no frame gate either.
+                    if crate::iris::connection::iris_reported(&e).is_some() {
+                        return envelope::fail("IRIS_RUNTIME_ERROR", &msg);
+                    }
                     return envelope::fail(
                         interop::classify_iris_error_or(&msg, ERR_TEST_EXECUTION_ERROR),
                         &msg,
@@ -6847,7 +7091,7 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
     }
 
     #[tool(
-        description = "Execute arbitrary ObjectScript code on IRIS and return stdout. Uses pure-HTTP execution: your code is written into the RunUser() method of a temp class, compiled, run at CALL time by an Execute() SqlProc that captures the device output, then the class is deleted. Falls back to docker exec if IRIS_CONTAINER env var is set and HTTP fails. &sql(...) embedded SQL macros are automatically translated to %SQL.Statement calls (set translate_sql: false to disable). When translation fires, response includes sql_translated: true and translated_code. Example: code='write $ZVERSION,!' returns the IRIS version string. Use this for side-effecting ObjectScript only — for SELECTs use iris_query, for class/table introspection use docs_introspect/iris_symbols/iris_table_info, for production state use iris_production/iris_interop_query, and to create+compile a class use iris_doc(put,compile) over Atelier (never $SYSTEM.OBJ.Load from a file path — that needs IRIS to share this host's disk). When the code matches one of those, the response includes a `hint` naming the typed tool. When your code writes a %Status (`write $SYSTEM.Status.GetErrorText(sc)`), the response also carries `status`: that chain split into per-error {code, text}, so you never split it or re-parse the `ERROR #NNNN:` prefix yourself — `status.complete: false` means part of it did not decode and `status.undecoded` holds it verbatim. No `status` key means no %Status text was found in the output, which is NOT a claim that a status was OK. This tool can only decode a status your code actually writes, so for a ClassMethod that returns one prefer iris_execute_method, which reads the status itself. namespace: optional — defaults to the connection namespace (IRIS_NAMESPACE), never a hardcoded USER; the response echoes the namespace it ran in."
+        description = "Execute arbitrary ObjectScript code on IRIS and return stdout. Uses pure-HTTP execution: your code is written into the RunUser() method of a temp class, compiled, run at CALL time by an Execute() SqlProc that captures the device output, then the class is deleted. Falls back to docker exec if IRIS_CONTAINER env var is set and the HTTP TRANSPORT fails \u{2014} but NOT when IRIS itself answered and reported an error about your code: that is returned as error_code IRIS_RUNTIME_ERROR carrying IRIS's own text, because docker exec cannot change a verdict IRIS has already given. The one exception is a <MAXSTRING> raised inside this server's own output capture (frame Execute+N^IrisDevTmp.*), where the docker transport has no single-string limit and is therefore still tried. On an IRIS_RUNTIME_ERROR from this tool, docker_fallback_tried says which of the two happened, so you never have to guess whether the other transport was attempted. &sql(...) embedded SQL macros are automatically translated to %SQL.Statement calls (set translate_sql: false to disable). When translation fires, response includes sql_translated: true and translated_code. Example: code='write $ZVERSION,!' returns the IRIS version string. Use this for side-effecting ObjectScript only — for SELECTs use iris_query, for class/table introspection use docs_introspect/iris_symbols/iris_table_info, for production state use iris_production/iris_interop_query, and to create+compile a class use iris_doc(put,compile) over Atelier (never $SYSTEM.OBJ.Load from a file path — that needs IRIS to share this host's disk). When the code matches one of those, the response includes a `hint` naming the typed tool. When your code writes a %Status (`write $SYSTEM.Status.GetErrorText(sc)`), the response also carries `status`: that chain split into per-error {code, text}, so you never split it or re-parse the `ERROR #NNNN:` prefix yourself — `status.complete: false` means part of it did not decode and `status.undecoded` holds it verbatim. No `status` key means no %Status text was found in the output, which is NOT a claim that a status was OK. This tool can only decode a status your code actually writes, so for a ClassMethod that returns one prefer iris_execute_method, which reads the status itself. namespace: optional — defaults to the connection namespace (IRIS_NAMESPACE), never a hardcoded USER; the response echoes the namespace it ran in."
     )]
     async fn iris_execute(
         &self,
@@ -6891,6 +7135,13 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
         // Bound as a match EXPRESSION: the other two arms diverge (both `return`), so only
         // the fall-through arm yields a value. A deferred `let` + assignment trips
         // clippy::needless_late_init on the CI toolchain (1.98) though not on 1.96.
+        // #390 follow-up: ONE reported error has a real second opinion, so it is RECORDED here
+        // rather than answered immediately. See `maxstring_origin`: a `[z]Execute+N^IrisDevTmp.*`
+        // frame is this server's capture accumulation overflowing, which the docker leg does not do
+        // — so that one falls through, and if the docker leg cannot answer either, IRIS's verdict
+        // is still the best account of the call and must not be relabelled DOCKER_REQUIRED.
+        let mut deferred_iris_verdict: Option<String> = None;
+
         let http_leg_error: String = match gen_result {
             Err(_) => {
                 self.record_call("iris_execute", false);
@@ -6995,10 +7246,45 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                     self.record_call("iris_execute", false);
                     return missing;
                 }
-                // #101: the fall-through STAYS. `IrisConnection::execute` shells out via
-                // `docker exec ... iris session` and does not use IRIS_USERNAME/IRIS_PASSWORD
-                // at all, so with a valid IRIS_CONTAINER a wrong Atelier password genuinely IS
-                // recoverable. Only what gets REPORTED when the docker leg also fails changes.
+                // #390: IRIS answered, RAN the code, and reported an error of its own. That is a
+                // verdict about the code, not a transport failure, so the docker-exec leg is
+                // neither a remedy nor a second opinion — and the answer it produced was actively
+                // wrong: with no IRIS_CONTAINER the envelope said DOCKER_REQUIRED and its hint said
+                // "verify http://<host>:<port>/api/atelier", for a call where /api/atelier had
+                // answered HTTP 200 with the whole diagnosis in it. Worse, the DOCKER_REQUIRED
+                // message interpolated nothing, so IRIS's text was dropped outright.
+                //
+                // Typed, not prose: `iris_reported` downcasts the boundary's own verdict. The code
+                // is the EXISTING IRIS_RUNTIME_ERROR, which is what this same tool already answers
+                // for a `<DIVIDE>` or `<UNDEFINED>` — the same IRIS condition arriving by a
+                // different route gets the same label, and its remedy is already on record.
+                if let Some(reported) = crate::iris::connection::iris_reported(&e) {
+                    // The exception is read off the FRAME, not off the signal.
+                    // `[z]Execute+N^IrisDevTmp.*` is `build_exec_class`'s own `Execute()`, which
+                    // accumulates the whole captured device file into one IRIS local — so the
+                    // string that overflowed is OURS, the submitted code may be entirely correct,
+                    // and `IrisConnection::execute` has no such limit (piped stdout straight into
+                    // a Rust `String`). Short-circuiting THAT would delete a path that works
+                    // today. Every other error IRIS reported is answered right here.
+                    if reported_abort_tail(&reported.text).and_then(maxstring_origin)
+                        == Some(MaxstringOrigin::ServerCapture)
+                    {
+                        deferred_iris_verdict = Some(reported.text.clone());
+                    } else {
+                        self.record_call("iris_execute", false);
+                        return iris_reported_envelope(
+                            &reported.text,
+                            &namespace,
+                            redirect_hint,
+                            false,
+                        );
+                    }
+                }
+                // #101: the fall-through STAYS for every OTHER failure. `IrisConnection::execute`
+                // shells out via `docker exec ... iris session` and does not use
+                // IRIS_USERNAME/IRIS_PASSWORD at all, so with a valid IRIS_CONTAINER a wrong
+                // Atelier password genuinely IS recoverable. Only what gets REPORTED when the
+                // docker leg also fails changes.
                 e.to_string()
             }
         };
@@ -7017,6 +7303,12 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
             Ok(Err(e)) => {
                 let msg = e.to_string();
                 self.record_call("iris_execute", false);
+                // #390: both legs are done now. The docker leg could not produce the output
+                // either, so the answer is the verdict IRIS gave — never "set IRIS_CONTAINER" or
+                // "verify /api/atelier" for a leg that answered HTTP 200 with the diagnosis in it.
+                if let Some(text) = deferred_iris_verdict.as_deref() {
+                    return iris_reported_envelope(text, &namespace, redirect_hint, true);
+                }
                 if msg == "DOCKER_REQUIRED" {
                     // #101: both legs have now failed. If the HTTP leg was an auth refusal,
                     // that is the cause and IRIS_CONTAINER is not the remedy — name both legs.
@@ -7031,16 +7323,29 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                             ),
                         );
                     }
-                    envelope::fail(
-                        "DOCKER_REQUIRED",
-                        &format!("iris_execute: HTTP execution failed and IRIS_CONTAINER is not set for docker exec fallback.{DOCKER_REQUIRED_HINT}"),
-                    )
+                    // #391: `http_leg_error` was bound and then used ONLY by the auth branch
+                    // above, so for every other HTTP failure IRIS's own words died here and the
+                    // caller got the env-var advice alone. Any fix further up the generator is
+                    // unobservable through this tool without this interpolation.
+                    envelope::fail("DOCKER_REQUIRED", &docker_required_message(&http_leg_error))
                 } else {
                     envelope::fail("EXECUTION_FAILED", &msg)
                 }
             }
             Ok(Ok(output)) => {
                 let trimmed = output.trim();
+                // #390/#362: this leg ran only because the HTTP leg FAILED. An EMPTY answer from it
+                // adds nothing, so when IRIS already said why the HTTP leg failed, that verdict is
+                // the answer — `success: true` + `no_output: true` here would turn a failure into
+                // the negative fact #362 was filed for. A non-empty answer is a genuine second
+                // opinion and wins, which is the whole point of falling through.
+                if let Some(text) = deferred_iris_verdict
+                    .as_deref()
+                    .filter(|_| trimmed.is_empty())
+                {
+                    self.record_call("iris_execute", false);
+                    return iris_reported_envelope(text, &namespace, redirect_hint, true);
+                }
                 // #123: same rule as the HTTP arm — the flag must not depend on prior output.
                 let abort = runtime_abort_line(trimmed);
                 let is_runtime_error = abort.is_some();
@@ -11297,6 +11602,35 @@ pub(crate) fn parse_console_diag(
     })
 }
 
+/// #391: the `type: "error"` entries of an Atelier compile response's `result.log`, as text.
+///
+/// `text`, then `message`, then the entry verbatim — a log entry whose wording this does not know
+/// must still reach the caller, because the alternative is dropping the one diagnosis IRIS gave.
+/// Returns an empty Vec when `result.log` is absent or is not an array, which is the shape of every
+/// compile response in the tree today (a multi-document compile makes `result` an array, where this
+/// index is simply Null).
+fn log_error_entries(body: &serde_json::Value) -> Vec<String> {
+    let Some(entries) = body["result"]["log"].as_array() else {
+        return vec![];
+    };
+    entries
+        .iter()
+        .filter(|e| {
+            e["type"]
+                .as_str()
+                .map(|t| t.eq_ignore_ascii_case("error"))
+                .unwrap_or(false)
+        })
+        .map(|e| {
+            e["text"]
+                .as_str()
+                .or_else(|| e["message"].as_str())
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| e.to_string())
+        })
+        .collect()
+}
+
 /// Assemble a compile's error list from an Atelier response: the `status.errors` entries
 /// first, then every console diagnostic the shared parser recognises that no single-line
 /// status entry already stands in for.
@@ -11308,6 +11642,14 @@ pub(crate) fn parse_console_diag(
 ///
 /// `iris_compile` keeps its own richer assembly (it emits code/line/location per entry and
 /// has a `status.summary` fallback); these two return plain strings.
+///
+/// #391: `result.log` is the THIRD place a compile diagnosis arrives, and it was read in exactly
+/// one place in the workspace — `execute_via_generator_once`, which read it and nothing else. The
+/// two readers were each blind to the other's source, so a parse failure (`ERROR #5559`, which
+/// lands in `status.errors` with an EMPTY log) looked like a clean compile to the generator while
+/// a log-only diagnosis would have been invisible here. One union, so neither can fall behind.
+/// Additive by construction: it can only RAISE `reported`, and
+/// [`note_error_undercount`]'s invariant is `reported >= detected`.
 pub fn compile_error_list(body: &serde_json::Value, console: &[String]) -> Vec<String> {
     let mut errors: Vec<String> = vec![];
     if let Some(se) = body["status"]["errors"].as_array() {
@@ -11315,6 +11657,11 @@ pub fn compile_error_list(body: &serde_json::Value, console: &[String]) -> Vec<S
             if let Some(msg) = e["error"].as_str() {
                 errors.push(msg.to_string());
             }
+        }
+    }
+    for e in log_error_entries(body) {
+        if !errors.iter().any(|x| diag_stands_in_for(x, &e)) {
+            errors.push(e);
         }
     }
     for line in console {
@@ -18546,6 +18893,74 @@ mod http_status_answer_tests {
         });
     }
 
+    /// #391's third source, at the site that does NOT route through `compile_error_list`.
+    ///
+    /// `iris_compile` keeps its own richer per-entry assembly, so extending the shared helper
+    /// did nothing for it and the `log_error_entries` loop added here was the untested half of a
+    /// change whose whole point was that one layer must not fall behind another. A compile whose
+    /// diagnosis arrives ONLY in `result.log` — `status.errors` empty, `console` empty — read as
+    /// a clean compile.
+    #[test]
+    fn iris_compile_reports_a_diagnosis_that_arrived_only_in_the_log() {
+        fn body(entry_type: &str) -> serde_json::Value {
+            serde_json::json!({
+                "status": {"errors": [], "summary": ""},
+                "console": [],
+                "result": {"log": [
+                    {"type": "info", "text": "Compiling class Zz.One"},
+                    {"type": entry_type,
+                     "text": "MPP5610 : Referenced macro not defined: 'ZzUndefined0'"}
+                ]}
+            })
+        }
+        async fn compile(b: serde_json::Value) -> serde_json::Value {
+            let server = server_with(
+                "POST",
+                r".*/action/compile$",
+                ResponseTemplate::new(200).set_body_json(b),
+            )
+            .await;
+            let r = tools_for(&server)
+                .iris_compile(Parameters(Described::new(serde_json::json!({
+                    "target": "Zz.One.cls",
+                    "namespace": "APP"
+                }))))
+                .await
+                .expect("the tool must answer");
+            payload(&r)
+        }
+
+        rt().block_on(async {
+            let v = compile(body("error")).await;
+            assert_eq!(
+                v["success"], false,
+                "a class IRIS reported an error for is not a clean compile: {v}"
+            );
+            assert_eq!(
+                v["errors"].as_array().map(Vec::len),
+                Some(1),
+                "exactly the one error entry — the `info` line is not a diagnosis: {v}"
+            );
+            assert!(
+                v["errors"][0]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("MPP5610"),
+                "the log entry's own words must reach the caller: {v}"
+            );
+
+            // CONTROL, and the removal test for the assertions above: the SAME entry with a
+            // non-error type must leave the compile clean, so this is reading `type` and not just
+            // any log line that happens to be present.
+            let v = compile(body("info")).await;
+            assert_eq!(v["success"], true, "{v}");
+            assert!(
+                v["errors"].as_array().is_some_and(Vec::is_empty),
+                "an info entry is not an error: {v}"
+            );
+        });
+    }
+
     /// A mock Atelier where EVERY route answers `tpl` — no root descriptor either. The state
     /// a wrong password, a wrong prefix or a dead app actually produces.
     async fn all_routes(tpl_status: u16) -> MockServer {
@@ -19581,5 +19996,631 @@ mod production_item_list_tests {
             !body.contains("async fn iris_production("),
             "the window ran past the handler's body"
         );
+    }
+}
+
+// ── #390 / #391: a reported error is not a transport failure ──────────────────────────────────
+//
+// This module is in `src/` rather than in `tests/` for one reason: `iris_execute` is a private
+// handler (`async fn iris_execute`, no `pub`), so no integration test can call it. The connection
+// half of the same chain IS reachable and lives in
+// `tests/a_reported_error_is_not_a_transport_failure.rs`; what only this module can see is what the
+// CALLER gets, which is where both issues were filed.
+//
+// Why driving the tool matters here: #362's test
+// (`tests/generator_sqlproc_failure.rs::a_sqlproc_that_fails_is_an_error_not_an_empty_output`)
+// already pinned that the connection returns an Err carrying SQLCODE and MAXSTRING, and it was
+// green throughout. #390 survived it because nothing drove the tool one layer up, where that Err
+// was relabelled DOCKER_REQUIRED and its text dropped.
+#[cfg(test)]
+mod reported_error_routing_tests {
+    use super::*;
+    use crate::iris::connection::{DiscoverySource, IrisConnection};
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    fn payload(r: &CallToolResult) -> serde_json::Value {
+        match &r.content[0].raw {
+            rmcp::model::RawContent::Text(t) => serde_json::from_str(&t.text).unwrap(),
+            _ => panic!("expected text content"),
+        }
+    }
+
+    fn tools_for(server: &MockServer) -> IrisTools {
+        let conn = IrisConnection::new(
+            server.uri(),
+            "APP",
+            "_SYSTEM",
+            "SYS",
+            DiscoverySource::EnvVar,
+        );
+        IrisTools::new_with_toolset(Some(conn), Toolset::Interop).unwrap()
+    }
+
+    /// The whole generator round trip against a mock Atelier: PUT and DELETE accepted, `compile`
+    /// and `query` answering whatever this test is about.
+    async fn atelier(compile: serde_json::Value, query: ResponseTemplate) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path_regex(r".*/doc/IrisDevTmp\..*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path_regex(r".*/doc/IrisDevTmp\..*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r".*/action/compile.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(compile))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r".*/action/query$"))
+            .respond_with(query)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/api/atelier/$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": {"content": {"version": "IRIS for UNIX 2026.1", "api": 8,
+                                       "namespaces": ["APP"]}}
+            })))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn clean_compile() -> serde_json::Value {
+        serde_json::json!({"status": {"errors": []}, "console": [], "result": {"log": []}})
+    }
+
+    /// Captured from a live instance while #362 was being filed: HTTP 200, the whole diagnosis in
+    /// `status.errors`, and `result` with NO `content` key. The chain is `#5540` wrapping `#5002`,
+    /// whose text ends in the signal.
+    fn maxstring_body() -> serde_json::Value {
+        serde_json::json!({
+            "status": {"errors": [{
+                "error": "ERROR #5540: SQLCODE: -149 Message: SQL Function IRISDEVTMP.RUN_EXECUTE \
+                          failed with error:  SQLCODE=-400,%msg=ERROR #5002: ObjectScript error: \
+                          <MAXSTRING>zExecute+14^IrisDevTmp.Run.1",
+                "code": 5540, "domain": "%ObjectErrors", "id": "SQLCode"
+            }], "summary": "ERROR #5540: SQLCODE: -149"},
+            "console": [],
+            "result": {}
+        })
+    }
+
+    async fn execute(server: &MockServer, code: &str) -> (Option<bool>, serde_json::Value) {
+        let r = tools_for(server)
+            .iris_execute(Parameters(
+                serde_json::from_value(serde_json::json!({"code": code, "namespace": "APP"}))
+                    .unwrap(),
+            ))
+            .await
+            .expect("the tool must answer, not error out of the transport");
+        (r.is_error, payload(&r))
+    }
+
+    /// #390, the headline. IRIS answered 200, ran the code, and reported `<MAXSTRING>`. Before the
+    /// fix this call answered `DOCKER_REQUIRED` with the message "HTTP execution failed and
+    /// IRIS_CONTAINER is not set…" and a hint telling the caller to verify `/api/atelier` — about a
+    /// request `/api/atelier` had answered 200 to, with the diagnosis inside it. The IRIS text was
+    /// not even interpolated, so it was gone.
+    ///
+    /// Asserted on the POSITIVE side on purpose: `IRIS_CONTAINER` is process-global, so a pre-fix
+    /// assertion phrased `== "DOCKER_REQUIRED"` would be hostage to whether another test set it,
+    /// whereas `== "IRIS_RUNTIME_ERROR"` is red before the fix under EITHER docker outcome.
+    ///
+    /// This frame — `zExecute+14^IrisDevTmp.Run.1` — is the server's own capture accumulation, so
+    /// since the repair the call FALLS THROUGH to the docker leg before answering (see
+    /// `maxstring_origin`). What is asserted here is therefore the answer once BOTH legs are done:
+    /// with `IRIS_CONTAINER` unset `docker exec` refuses immediately, with it set the container is
+    /// not there, and either way the docker leg adds nothing so IRIS's verdict is what comes back.
+    /// The remaining outcome — a container that really runs the code — is handled explicitly below
+    /// rather than left to chance, because a call that now SUCCEEDS is the path finding 3 said the
+    /// first pass had deleted.
+    #[test]
+    fn iris_execute_answers_what_iris_reported_not_docker_required() {
+        rt().block_on(async {
+            let server = atelier(
+                clean_compile(),
+                ResponseTemplate::new(200).set_body_json(maxstring_body()),
+            )
+            .await;
+            let (is_err, v) = execute(&server, "For i=1:1:500000 { Write \"0123456789\" }").await;
+
+            // A container that genuinely answered: the fall-through did its job and the output
+            // came back over a transport with no IRIS single-string limit. That is a pass, and an
+            // explicit one rather than a branch nothing checks.
+            if v["success"] == true {
+                assert_eq!(
+                    v["method"], "docker",
+                    "only the docker leg can have answered this: {v}"
+                );
+                assert!(
+                    !v["output"].as_str().unwrap_or_default().is_empty(),
+                    "a successful second opinion has to carry the output: {v}"
+                );
+                return;
+            }
+
+            assert_eq!(is_err, Some(true), "{v}");
+            assert_eq!(v["error_code"], "IRIS_RUNTIME_ERROR", "{v}");
+            assert_ne!(
+                v["error_code"], "DOCKER_REQUIRED",
+                "IRIS ran this and said why; Docker was never the problem: {v}"
+            );
+            // FINDING 3. This frame is the server's own capture accumulation, and
+            // `IrisConnection::execute` has no IRIS single-string limit — so the docker leg is a
+            // real second opinion here and the first pass's unconditional short-circuit deleted
+            // it. The decision is invisible in every other field (both routes end in the same
+            // envelope), which is why it is reported.
+            assert_eq!(
+                v["docker_fallback_tried"], true,
+                "a <MAXSTRING> from OUR capture must still reach the transport that can answer \
+                 it: {v}"
+            );
+
+            let err = v["error"].as_str().unwrap_or_default();
+            assert!(
+                err.contains("SQLCODE") && err.contains("<MAXSTRING>"),
+                "the caller needs IRIS's own words — they are the whole actionable part: {v}"
+            );
+
+            // #323's decode, on the arm that never had it: per-error codes, not one concatenation.
+            assert_eq!(v["status"]["errors"][0]["code"], 5540, "{v}");
+            assert_eq!(v["status"]["errors"][1]["code"], 5002, "{v}");
+
+            // The remedy for THIS FRAME. `zExecute+14^IrisDevTmp.Run.1` is `build_exec_class`'s
+            // own `Execute()`, which concatenates the whole captured device file into one IRIS
+            // local — so the string that overflowed is this server's, and the `For` loop in the
+            // code above already writes in chunks. Telling it to write in chunks would be advice
+            // it has followed already, which is what finding 2 measured.
+            let hint = v["hint"].as_str().unwrap_or_default();
+            assert!(
+                hint.contains("<MAXSTRING>") && hint.contains("this server's output capture"),
+                "the hint must name the signal AND whose string overflowed: {v}"
+            );
+            assert!(
+                !hint.contains("returned NOTHING"),
+                "nothing may claim the call came back empty — `abort_hint` is shared with both \
+                 Ok(Ok(output)) arms, where it is false: {v}"
+            );
+
+            // Never advise fixing Docker when HTTP answered 200.
+            let whole = v.to_string();
+            assert!(
+                !whole.contains("IRIS_CONTAINER") && !whole.contains("api/atelier"),
+                "the envelope still points the caller at Docker or at the Atelier endpoint, \
+                 both of which answered: {v}"
+            );
+        });
+    }
+
+    /// #391 through the tool: the brace, not the SqlProc. This is the input the issue was filed
+    /// with, and the assertion is that the one sentence naming braces reaches the caller.
+    #[test]
+    fn iris_execute_names_the_brace_for_a_class_that_did_not_parse() {
+        rt().block_on(async {
+            let parse_error = "ERROR #5559: The class definition for class 'IrisDevTmp.Run0' \
+                 could not be parsed correctly, possibly due to non-matching {} or () characters \
+                 or a missing ; character or non-matched /* */ blocks. Edit the class and correct \
+                 the problem.";
+            let server = atelier(
+                serde_json::json!({
+                    "status": {"errors": [{"error": parse_error, "code": 5559}]},
+                    "console": [], "result": {"log": []}
+                }),
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "status": {"errors": [{"error": "ERROR #5540: SQLCODE: -428 Message: Stored \
+                                                     procedure 'IrisDevTmp.Run0_Execute' not found",
+                                           "code": 5540}]},
+                    "result": {}
+                })),
+            )
+            .await;
+            let (is_err, v) = execute(&server, "Write \"a\" }").await;
+
+            assert_eq!(is_err, Some(true), "{v}");
+            assert_eq!(v["error_code"], "IRIS_RUNTIME_ERROR", "{v}");
+            let err = v["error"].as_str().unwrap_or_default();
+            assert!(
+                err.contains("5559") && err.contains("non-matching {} or ()"),
+                "the caller typed a stray brace and this is the only message that says so: {v}"
+            );
+            assert_eq!(
+                v["status"]["errors"][0]["code"], 5559,
+                "the compile error must be the FIRST element of the decoded chain — it is the \
+                 cause, and the SqlProc failure is its consequence: {v}"
+            );
+            // THE OTHER DIRECTION of finding 3's gate, and the control that stops the assertion
+            // in `iris_execute_answers_what_iris_reported_not_docker_required` from being
+            // satisfied by a tool that simply always falls through. A stray brace is a verdict
+            // about the caller's code: `docker exec` runs the SAME code and cannot change it.
+            assert_eq!(
+                v["docker_fallback_tried"], false,
+                "nothing may be spent on a second transport for an error IRIS has settled: {v}"
+            );
+        });
+    }
+
+    /// OVER-REACH CONTROL. A legitimately empty output must still be a SUCCESS with `no_output`,
+    /// not a refusal — this is the case that breaks if the new arm is reached too eagerly.
+    #[test]
+    fn a_script_that_writes_nothing_still_succeeds_through_the_tool() {
+        rt().block_on(async {
+            let server = atelier(
+                clean_compile(),
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "status": {"errors": [], "summary": ""},
+                    "result": {"content": [{"result": ""}]}
+                })),
+            )
+            .await;
+            let (is_err, v) = execute(&server, "Set x=1").await;
+
+            assert_ne!(is_err, Some(true), "{v}");
+            assert_eq!(v["success"], true, "{v}");
+            assert_eq!(v["no_output"], true, "{v}");
+            assert!(v["error_code"].is_null(), "{v}");
+        });
+    }
+
+    /// The fallback is NOT removed wholesale. A 200 whose body is not JSON is a proxy page — a
+    /// transport fault, for which the docker leg genuinely is a second opinion — so it must still
+    /// fall through rather than be reported as IRIS's verdict on the code.
+    ///
+    /// Only that half is asserted here, and it holds whatever the docker leg does. Asserting the
+    /// DOCKER_REQUIRED *envelope* in this binary would be a coin flip:
+    /// `workspace_config::tests::host_plus_container_reports_docker_source` calls
+    /// `workspace_config_to_connection` with a `container`, which `std::env::set_var`s
+    /// IRIS_CONTAINER for the whole process and never restores it — after which this call really
+    /// spawns `docker exec`, and a failed `docker exec` reaches this crate as `Ok("")`
+    /// (see skills_tools.rs's note on the same shape), so the envelope comes back `success: true`.
+    /// The DOCKER_REQUIRED text itself is pinned env-free by
+    /// `the_docker_required_message_carries_the_http_leg_error`.
+    #[test]
+    fn a_transport_fault_is_not_reported_as_an_iris_verdict() {
+        rt().block_on(async {
+            let server = atelier(
+                clean_compile(),
+                ResponseTemplate::new(200)
+                    .set_body_string("<html><body>gateway error</body></html>"),
+            )
+            .await;
+            let (_is_err, v) = execute(&server, "Write 1").await;
+
+            assert_ne!(
+                v["error_code"], "IRIS_RUNTIME_ERROR",
+                "a non-JSON body is a proxy page, not IRIS reporting an error about the code — \
+                 the #390 short-circuit must not reach it: {v}"
+            );
+            // And the generator must have treated it as retryable-or-not on its own terms rather
+            // than as an IRIS verdict: the one thing that must not appear is the decoded chain.
+            assert!(
+                v["status"].is_null(),
+                "a proxy page carries no %Status to decode: {v}"
+            );
+            // THE DISCRIMINATION THIS TEST LACKED. The two negatives above are green for "fell
+            // through correctly" AND for "fell through, the docker leg failed, and its failure
+            // arrived as `Ok(\"\")`" — which the tool then renders `success: true, no_output: true`.
+            // That second one is #362's negative fact re-emerging one layer up: a leg that never
+            // ran, reported as a script that ran and printed nothing. `docker_exec_failure` now
+            // reads the child's exit status so that empty cannot masquerade as the other.
+            assert!(
+                !(v["success"] == true && v["no_output"] == true),
+                "neither leg produced anything here, so this must not come back as a script that \
+                 ran and wrote nothing: {v}"
+            );
+            // Keyed off the OUTCOME, not off the environment, so it is never a skip: in the
+            // configuration the gate runs in (no container) this is the branch taken, and the
+            // answer must still carry what the HTTP leg actually hit.
+            if v["error_code"] == "DOCKER_REQUIRED" {
+                assert!(
+                    v["error"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("gateway error"),
+                    "the proxy page is the cause and #391's interpolation is what carries it: {v}"
+                );
+            }
+        });
+    }
+
+    /// #391 step 6, pinned where no environment can reach it. The HTTP leg's error was bound in
+    /// `iris_execute` and interpolated in the auth branch ALONE, so for every other HTTP failure
+    /// the caller got "HTTP execution failed and IRIS_CONTAINER is not set" with IRIS's words
+    /// nowhere in it — which is what made a correct #391 fix invisible through the tool.
+    #[test]
+    fn the_docker_required_message_carries_the_http_leg_error() {
+        // The argument deliberately shares NO substring with DOCKER_REQUIRED_HINT. A first version
+        // of this test passed a realistic `non-JSON response from http://h/api/atelier/v1/…`, and
+        // a mutation that deleted the appended hint SURVIVED — the `/api/atelier` control was being
+        // satisfied by the interpolated argument, not by the hint.
+        let m = docker_required_message("zz-leg-verbatim-marker (HTTP 200)");
+        assert!(
+            m.contains("zz-leg-verbatim-marker"),
+            "the HTTP leg's own words must be in the message: {m}"
+        );
+        assert!(
+            m.contains("IRIS_CONTAINER is not set"),
+            "control: the env-var advice must still be there — this is additive: {m}"
+        );
+        assert!(
+            m.contains("set host/web_port"),
+            "control: DOCKER_REQUIRED_HINT must still be appended: {m}"
+        );
+    }
+
+    /// The extractor behind the hint, with the controls that say what it must NOT match.
+    #[test]
+    fn reported_abort_tail_reads_the_lowercase_marker_and_takes_the_deepest_signal() {
+        assert_eq!(
+            reported_abort_tail(
+                "ERROR #5540: SQLCODE: -149 %msg=ERROR #5002: ObjectScript error: \
+                 <MAXSTRING>zExecute+14^IrisDevTmp.Run.1"
+            ),
+            Some("<MAXSTRING>zExecute+14^IrisDevTmp.Run.1"),
+            "the signal arrives inside the status chain, after a LOWERCASE `error:`"
+        );
+        assert_eq!(
+            reported_abort_tail(
+                "ObjectScript error: <UNDEFINED>outer\nObjectScript error: <MAXSTRING>inner"
+            ),
+            Some("<MAXSTRING>inner"),
+            "a chain wraps the cause in outer codes, so the deepest element is the one that says \
+             what trapped"
+        );
+        assert_eq!(
+            reported_abort_tail("ERROR #5540: SQLCODE: -428 Message: Stored procedure not found"),
+            None,
+            "a SQL failure with no ObjectScript signal must not be given one"
+        );
+        assert_eq!(
+            reported_abort_tail("ObjectScript error: see the docs for <MAXSTRING>"),
+            None,
+            "the signal must follow the marker immediately — prose that merely mentions it is \
+             not an abort"
+        );
+        // CONTROL: `runtime_abort_line` does NOT see this text, which is why a second extractor
+        // exists rather than a widened one.
+        assert_eq!(
+            runtime_abort_line(
+                "ERROR #5002: ObjectScript error: <MAXSTRING>zExecute+14^IrisDevTmp.Run.1"
+            ),
+            None,
+            "if runtime_abort_line started matching this, reported_abort_tail would be dead code \
+             — and the widening would be on the path that decides `success`"
+        );
+    }
+
+    /// Finding 1 and finding 2, at the layer where the choice is made: the remedy for
+    /// `<MAXSTRING>` depends on WHOSE string overflowed, and only the frame says.
+    #[test]
+    fn the_maxstring_remedy_is_chosen_by_frame_not_by_signal() {
+        use MaxstringOrigin::{Elsewhere, ServerCapture, SubmittedLine};
+
+        // The two frames MEASURED on this path: #390's own, and the fixture's.
+        assert_eq!(
+            maxstring_origin("<MAXSTRING>Execute+2^IrisDevTmp.ZzProbeBig.1"),
+            Some(ServerCapture),
+            "the frame #390 was filed with is the capture accumulation"
+        );
+        assert_eq!(
+            maxstring_origin("<MAXSTRING>zExecute+14^IrisDevTmp.Run.1"),
+            Some(ServerCapture),
+            "and so is the `z`-prefixed spelling the compiler emits"
+        );
+        // The caller's own line — the case that must NOT be handed the capture remedy, and the
+        // only one for which another transport is genuinely useless.
+        assert_eq!(
+            maxstring_origin("ERROR: <MAXSTRING>zRunUser+1^IrisDevTmp.Run0.1"),
+            Some(SubmittedLine)
+        );
+        // DISCRIMINATORS for "ServerCapture is identified positively". A library frame has no
+        // `RunUser+` either, so an absence test would call it the capture and re-enable a docker
+        // fallback that cannot help it...
+        assert_eq!(
+            maxstring_origin("<MAXSTRING>zWrite+7^EnsLib.HL7.Message.1"),
+            Some(Elsewhere)
+        );
+        // ... and an `Execute()` in somebody else's package is not our scaffolding.
+        assert_eq!(
+            maxstring_origin("<MAXSTRING>zExecute+3^MyApp.Report.1"),
+            Some(Elsewhere)
+        );
+        // CONTROL: this is the signal test as well, so every other abort must answer None —
+        // without these the assertions above could come from a function that classifies anything.
+        assert_eq!(
+            maxstring_origin("<UNDEFINED>zRunUser+1^IrisDevTmp.Run.1"),
+            None
+        );
+        assert_eq!(
+            maxstring_origin("ERROR: <ENDOFFILE>zRead+3^MyApp.Reader.1"),
+            None
+        );
+
+        // The three texts must actually DIFFER: one shared sentence satisfies any "contains
+        // %Stream" assertion for all three origins, which is how the first version passed.
+        let cap = maxstring_hint(ServerCapture);
+        let own = maxstring_hint(SubmittedLine);
+        let other = maxstring_hint(Elsewhere);
+        assert_ne!(cap, own);
+        assert_ne!(cap, other);
+        assert_ne!(own, other);
+        // The capture remedy says whose string it was and withdraws the advice that does not fit.
+        assert!(cap.contains("this server's output capture"), "{cap}");
+        assert!(cap.contains("cannot help"), "{cap}");
+        assert!(cap.contains("stream_inspect"), "{cap}");
+        // The caller-side remedy names the construct and its replacement instead.
+        assert!(own.contains("Set x = x _"), "{own}");
+        assert!(own.contains("%Stream"), "{own}");
+        // And NONE of them may claim the call came back empty: `abort_hint` is shared with both
+        // `Ok(Ok(output))` arms, where the prefix the script wrote IS returned.
+        for h in [cap, own, other] {
+            assert!(!h.contains("returned NOTHING"), "{h}");
+        }
+    }
+
+    /// The slot gate. `abort_hint` writes BEFORE `enrich_abort` into a first-writer-wins `hint`,
+    /// so for the one frame that HAS a per-line explanation it must yield — the same rule
+    /// `library_frame_hint` immediately above it already follows, and the rule the first version
+    /// of this arm broke while the comment one line up documented it.
+    #[test]
+    fn abort_hint_yields_the_slot_for_a_maxstring_on_the_callers_own_line() {
+        assert_eq!(
+            abort_hint("ERROR: <MAXSTRING>zRunUser+1^IrisDevTmp.Run0.1"),
+            None,
+            "a RunUser+ frame has a per-line explanation and that sentence is the better one; \
+             the remedy is appended there by enrich_abort instead"
+        );
+        // It must still answer for the frames where nothing else can: `parse_abort_frame` returns
+        // `line: None` for both of these, so `enrich_abort` has no explanation to be outranked.
+        assert_eq!(
+            abort_hint("<MAXSTRING>zExecute+14^IrisDevTmp.Run.1"),
+            Some(maxstring_hint(MaxstringOrigin::ServerCapture))
+        );
+        assert_eq!(
+            abort_hint("<MAXSTRING>zWrite+7^EnsLib.HL7.Message.1"),
+            Some(maxstring_hint(MaxstringOrigin::Elsewhere))
+        );
+        // CONTROL: the pre-existing arm still answers, so the new one did not take its place.
+        assert!(
+            abort_hint("ERROR: <ENDOFFILE>zRead+3^MyApp.Reader.1")
+                .expect("a hint")
+                .contains("<ENDOFFILE>"),
+            "the <ENDOFFILE> arm must still fire"
+        );
+        assert_eq!(
+            abort_hint("<DIVIDE>zRunUser+1^IrisDevTmp.Run.1"),
+            None,
+            "control: an abort with no arm still has no hint, so the ones above are not a \
+             function that answers everything"
+        );
+    }
+
+    /// The sibling tool, and the gap the first pass declared in `not_done`: `iris_test` has TWO
+    /// `execute_via_generator` `Err` arms and only the docker-first one was wired, so the identical
+    /// cause answered TEST_EXECUTION_ERROR or IRIS_RUNTIME_ERROR depending on whether
+    /// `IRIS_CONTAINER` happened to be set — a caller branching on `error_code` was reading the
+    /// configuration, not the cause.
+    ///
+    /// WHY THIS IS ENV-INDEPENDENT RATHER THAN ENV-GUARDED. `IRIS_CONTAINER` is process-global and
+    /// `workspace_config::tests` sets it mid-run, so a test that reads it races. It does not need
+    /// to: BOTH arms now answer the same code for the same cause, which IS the invariant under
+    /// test. Whichever arm this process takes, the assertion is the same one — and under the
+    /// previous behaviour it was red on the arm that runs when the var is unset, which is the
+    /// configuration the gate runs in.
+    #[test]
+    fn iris_test_gives_one_cause_one_code_whichever_leg_it_took() {
+        rt().block_on(async {
+            let server = atelier(
+                clean_compile(),
+                ResponseTemplate::new(200).set_body_json(maxstring_body()),
+            )
+            .await;
+            let r = tools_for(&server)
+                .iris_test(Parameters(Described::new(serde_json::json!({
+                    "pattern": "Zz.Tests.One",
+                    "namespace": "APP",
+                    "timeout": 5
+                }))))
+                .await
+                .expect("the tool must answer, not error out of the transport");
+            let v = payload(&r);
+
+            assert_eq!(
+                v["error_code"], "IRIS_RUNTIME_ERROR",
+                "an error IRIS reported must carry the same code here as it does from \
+                 iris_execute, on either of this tool's two Err arms: {v}"
+            );
+            assert_ne!(
+                v["error_code"], ERR_TEST_EXECUTION_ERROR,
+                "the test run is not what failed — IRIS answered and reported about the code: {v}"
+            );
+            // IRIS's own words have to survive the relabelling, which is the half of #390 that
+            // was about the message rather than the code.
+            let err = v["error"].as_str().unwrap_or_default();
+            assert!(
+                err.contains("<MAXSTRING>") && err.contains("SQLCODE"),
+                "the diagnosis is the whole actionable part: {v}"
+            );
+            // And never the env-var advice for a leg that answered HTTP 200.
+            assert!(
+                !v.to_string().contains("IRIS_CONTAINER"),
+                "IRIS_CONTAINER has no bearing on an error IRIS has already reported: {v}"
+            );
+        });
+    }
+
+    /// FINDING 1, DRIVEN — the one new reachable regression, which nothing exercised.
+    ///
+    /// `abort_hint` is shared with both `Ok(Ok(output))` arms, and on those the capture SUCCEEDED:
+    /// the wrapper's `Catch` wrote the trap into the device file, so `output` holds everything the
+    /// script printed before it. The ungated arm claimed the first-writer-wins slot and told the
+    /// caller the call "returned NOTHING" with that prefix sitting in `output` beside it, while
+    /// the sentence naming the failing line was dropped.
+    #[test]
+    fn a_maxstring_on_the_ok_path_keeps_the_output_and_names_the_line() {
+        rt().block_on(async {
+            // `$C(1)` is the transport's newline encoding — `execute_via_generator_once` decodes
+            // \x01 back to \n — so this is the wire form of two captured lines.
+            let captured = "start\u{1}ERROR: <MAXSTRING>zRunUser+1^IrisDevTmp.Run0.1";
+            let server = atelier(
+                clean_compile(),
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "status": {"errors": [], "summary": ""},
+                    "result": {"content": [{"result": captured}]}
+                })),
+            )
+            .await;
+            let code = "Set x=\"\" For i=1:1:400000 { Set x=x_\"0123456789\" }";
+            let (is_err, v) = execute(&server, code).await;
+
+            assert_eq!(is_err, Some(true), "{v}");
+            assert_eq!(v["error_code"], "IRIS_RUNTIME_ERROR", "{v}");
+            assert_eq!(
+                v["signal"], "MAXSTRING",
+                "control: enrich_abort ran, so the hint slot was genuinely contended here: {v}"
+            );
+            // The fact the old wording denied.
+            assert!(
+                v["output"].as_str().unwrap_or_default().contains("start"),
+                "everything the script wrote before the trap is still returned: {v}"
+            );
+            let hint = v["hint"].as_str().unwrap_or_default();
+            assert!(
+                !hint.contains("returned NOTHING"),
+                "`output` is right there in the same envelope: {v}"
+            );
+            // The per-line explanation owns the slot...
+            assert!(
+                hint.starts_with("Line 1 of the code you sent is what failed:"),
+                "the sentence that names the failing line is the one the caller acts on: {v}"
+            );
+            assert!(
+                hint.contains("Set x=x_"),
+                "and it must quote that line: {v}"
+            );
+            // ... and the remedy is APPENDED to it rather than replacing it or being lost.
+            assert!(
+                hint.contains("%Stream"),
+                "the <MAXSTRING> remedy still has to reach the caller: {v}"
+            );
+            // Never the capture remedy for a line the caller wrote.
+            assert!(
+                !hint.contains("this server's output capture"),
+                "this string was built by the submitted code, not by our accumulation: {v}"
+            );
+        });
     }
 }

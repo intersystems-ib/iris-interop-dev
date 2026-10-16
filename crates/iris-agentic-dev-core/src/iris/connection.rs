@@ -55,6 +55,83 @@ pub fn atelier_status(err: &anyhow::Error) -> Option<&AtelierHttpError> {
     err.downcast_ref::<AtelierHttpError>()
 }
 
+/// Issue #390: IRIS answered the request, RAN the code, and reported an error of its OWN — carried
+/// as a TYPED error so the tool layer can tell that apart from a transport failure.
+///
+/// The distinction already existed at the boundary ([`QueryOutcome::IrisError`] against
+/// [`QueryOutcome::HttpError`] and [`QueryOutcome::NonJson`]) and was then COLLAPSED into an
+/// untyped `anyhow` string whose only discriminant was a message prefix. Nothing read that prefix,
+/// so `iris_execute` could not ask "did IRIS run this?", routed the answer into the docker-exec
+/// fallback, and reported `DOCKER_REQUIRED` — advising the caller to "verify /api/atelier" for a
+/// call where /api/atelier had answered **HTTP 200** with the whole diagnosis in it. Re-reading
+/// prose to recover a kind is the shape #102 had to remove from this file once already.
+///
+/// `text` is the WHOLE human message and `Display` is exactly it, so what a reader gets from
+/// `e.to_string()` is unchanged in kind and, on the no-compile-diagnosis path, byte-for-byte the
+/// `bail!` this replaced ("the generated SqlProc failed: …").
+#[derive(Debug, Clone)]
+pub struct IrisReportedError {
+    pub text: String,
+}
+
+impl fmt::Display for IrisReportedError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+impl std::error::Error for IrisReportedError {}
+
+/// `Some` when IRIS itself reported this failure, `None` for a transport fault, a non-2xx status, a
+/// non-JSON body, or anything else. The tool layer's one entry point to that distinction, and the
+/// counterpart of [`atelier_status`].
+///
+/// A `Some` here means the request reached IRIS, IRIS executed it, and IRIS put its own diagnosis in
+/// the response — so for nearly all of them a second transport is not a second opinion and cannot be
+/// a remedy.
+///
+/// There is ONE exception, and the first version of this doc denied it: a `<MAXSTRING>` raised
+/// inside the generated wrapper's own capture accumulation (`tools::maxstring_origin`'s
+/// `ServerCapture` — the frame is `[z]Execute+N^IrisDevTmp.*`, which is `build_exec_class`'s
+/// `Execute()` concatenating the whole captured device file into one IRIS local). The string that
+/// overflowed there is THIS SERVER'S, not the caller's, and [`IrisConnection::execute`] pipes
+/// `docker exec … iris session` stdout into a Rust `String` with no IRIS single-string limit — so
+/// for that frame, and only that frame, the docker leg really can return the output. This function
+/// stays a pure kind test; the exception belongs to the caller that owns the fallback.
+pub fn iris_reported(err: &anyhow::Error) -> Option<&IrisReportedError> {
+    err.downcast_ref::<IrisReportedError>()
+}
+
+/// Did this `docker exec` fail WITHOUT saying anything? (#362's shape, one layer below the tools.)
+///
+/// [`IrisConnection::execute`] discarded the child's exit status, so a `docker exec` that failed —
+/// missing or stopped container, daemon down, permission denied — came back as `Ok("")` with
+/// `stderr` already sent to `/dev/null`. `skills_tools::classify_skills_payload` documents that and
+/// defends against it by knowing that every skills read ends in a `write`; the generic path cannot
+/// know that, so `iris_execute` reported "the script ran and produced no output" for a leg that
+/// never ran at all. The exit status is the ONLY thing that separates those two empties, and it was
+/// the one value being thrown away.
+///
+/// NARROW on purpose. A non-zero exit WITH output is left alone: `iris session` can exit non-zero
+/// for an abort whose text is on stdout, and that text is the answer — `runtime_abort_line` already
+/// reads it, and turning it into an `Err` would DROP it. Only "exited badly and said nothing" is a
+/// failure here, which is exactly the case that is indistinguishable from success today.
+pub(crate) fn docker_exec_failure(exit_code: Option<i32>, stdout: &str) -> Option<String> {
+    if exit_code == Some(0) || !stdout.trim().is_empty() {
+        return None;
+    }
+    Some(match exit_code {
+        Some(c) => format!(
+            "docker exec exited {c} and produced no output, so the code was NOT run: check that \
+             the IRIS_CONTAINER container exists and is running (`docker ps`). This is not an \
+             empty result from IRIS."
+        ),
+        None => "docker exec was killed by a signal and produced no output, so the code was NOT \
+                 run. This is not an empty result from IRIS."
+            .to_string(),
+    })
+}
+
 /// Whether a failed `execute_via_generator` attempt is worth repeating: a 5xx or a transport
 /// fault, never a 4xx and never a deterministic IRIS error.
 ///
@@ -625,21 +702,32 @@ impl IrisConnection {
             )));
         }
         let compile_body: serde_json::Value = compile_resp.json().await.unwrap_or_default();
-        let has_errors = compile_body["result"]["log"]
+        // #391: the compile verdict is RECORDED here and surfaced at step 3. It deliberately has no
+        // control flow of its own.
+        //
+        // Two separate defects met in the block this replaces. It decided "did the scratch class
+        // compile?" from `result.log` ALONE — the only reader of that key in the workspace, against
+        // nine sites that consult `status.errors` — so the whole class of failure IRIS reports only
+        // there was invisible: one stray brace gives `ERROR #5559: ... non-matching {} or ()
+        // characters ...` in `status.errors` with an EMPTY log, which read as a clean compile. And
+        // it bailed, which the issue's author implemented and then MEASURED regressing the commoner
+        // input: with `flags=cuk` a class can carry a reported compile error and still expose a
+        // callable `Execute()`, so `Set x=` went from a good answer (IRIS_RUNTIME_ERROR, <SYNTAX>,
+        // `source_line`) to a bare failure.
+        //
+        // A compile diagnosis is therefore a HYPOTHESIS. Whether `Execute()` runs is the
+        // authoritative test, and it is one round trip away. `compile_error_list` is the shared
+        // reader the other sites use - `status.errors`, `result.log` and the console in one union -
+        // so this site cannot fall a source behind again.
+        let compile_console: Vec<String> = compile_body["console"]
             .as_array()
-            .map(|entries| {
-                entries.iter().any(|e| {
-                    e["type"]
-                        .as_str()
-                        .map(|t| t.eq_ignore_ascii_case("error"))
-                        .unwrap_or(false)
-                })
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
             })
-            .unwrap_or(false);
-        if has_errors {
-            let _ = self.delete_doc(&doc_name, namespace, client).await;
-            anyhow::bail!("compile errors: {:?}", compile_body["result"]["log"]);
-        }
+            .unwrap_or_default();
+        let compile_diagnosis = crate::tools::compile_error_list(&compile_body, &compile_console);
 
         // 3. Query via SQL
         // "output" is a reserved word in IRIS SQL — use "result" as the column alias.
@@ -675,7 +763,23 @@ impl IrisConnection {
                 .replace('\x01', "\n"),
             QueryOutcome::IrisError(msg) => {
                 let _ = self.delete_doc(&doc_name, namespace, client).await;
-                anyhow::bail!("the generated SqlProc failed: {msg}");
+                // #391: `Execute()` did not run, so the recorded compile diagnosis is now the
+                // CAUSE and the SqlProc failure is its consequence. Tri-state rather than an
+                // unconditional prefix: with nothing recorded this is byte-for-byte the message
+                // it has always emitted.
+                //
+                // #390: typed. IRIS answered 200 and reported this itself, which is a verdict
+                // about the code - the docker-exec fallback is neither a remedy nor a second
+                // opinion for it.
+                let text = if compile_diagnosis.is_empty() {
+                    format!("the generated SqlProc failed: {msg}")
+                } else {
+                    format!(
+                        "the scratch class did not compile: {}; the SqlProc call then failed: {msg}",
+                        compile_diagnosis.join("; ")
+                    )
+                };
+                return Err(anyhow::Error::new(IrisReportedError { text }));
             }
             QueryOutcome::HttpError { status, snippet } => {
                 let _ = self.delete_doc(&doc_name, namespace, client).await;
@@ -688,7 +792,18 @@ impl IrisConnection {
             }
             QueryOutcome::NonJson { status, snippet } => {
                 let _ = self.delete_doc(&doc_name, namespace, client).await;
-                anyhow::bail!("non-JSON response from {query_url} (HTTP {status}): {snippet}");
+                // #391: the recorded diagnosis leads here too - it is still the best account of
+                // why nothing usable came back. #390: deliberately NOT typed, though. A 200 whose
+                // body is not JSON is a proxy page or a login redirect, i.e. a TRANSPORT fault,
+                // and for that the docker leg genuinely is a second opinion.
+                if compile_diagnosis.is_empty() {
+                    anyhow::bail!("non-JSON response from {query_url} (HTTP {status}): {snippet}");
+                }
+                anyhow::bail!(
+                    "the scratch class did not compile: {}; the query then returned a non-JSON \
+                     response from {query_url} (HTTP {status}): {snippet}",
+                    compile_diagnosis.join("; ")
+                );
             }
         };
 
@@ -832,7 +947,11 @@ impl IrisConnection {
                 .map_err(|_| anyhow::anyhow!("docker exec timed out after 30s"))??;
 
         let raw = String::from_utf8_lossy(&output.stdout).to_string();
-        Ok(strip_iris_banner(&raw))
+        let stripped = strip_iris_banner(&raw);
+        if let Some(why) = docker_exec_failure(output.status.code(), &stripped) {
+            anyhow::bail!("{why}");
+        }
+        Ok(stripped)
     }
 
     /// FR-004: Run a SQL query via the Atelier query endpoint.
@@ -1741,6 +1860,49 @@ mod read_only_mode_tests {
                 "{off:?} must not request strict"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod docker_exec_failure_tests {
+    use super::docker_exec_failure;
+
+    /// #362's shape one layer below the tools, and the reason `iris_execute` can now hand the
+    /// docker leg a `<MAXSTRING>` fall-through without lying about the outcome.
+    ///
+    /// `execute()` discarded the child's exit status, so a `docker exec` that failed — missing or
+    /// stopped container, daemon down — arrived as `Ok("")`, which is byte-identical to a script
+    /// that ran and wrote nothing. The exit status is the ONLY thing that separates them.
+    #[test]
+    fn a_docker_exec_that_said_nothing_is_a_failure_not_an_empty_answer() {
+        // The two empties that used to be one value.
+        assert!(
+            docker_exec_failure(Some(0), "").is_none(),
+            "exit 0 with no output is a side-effecting script that wrote nothing — unchanged"
+        );
+        let failed = docker_exec_failure(Some(1), "   \n")
+            .expect("a non-zero exit with nothing on stdout is a failed exec, not an empty result");
+        assert!(failed.contains("NOT run"), "{failed}");
+        assert!(failed.contains("not an empty result"), "{failed}");
+        // Killed by a signal: no exit code at all, same conclusion.
+        assert!(
+            docker_exec_failure(None, "").is_some(),
+            "a child with no exit code produced nothing either"
+        );
+
+        // THE NARROWNESS CONTROL, and the assertion that matters most here. `iris session` can
+        // exit non-zero for an abort whose text is on stdout — and that text is the ANSWER:
+        // `runtime_abort_line` reads it and the envelope reports IRIS_RUNTIME_ERROR with the
+        // output attached. Turning that into an `Err` would drop the very diagnosis this whole
+        // chain is about, so a non-zero exit WITH output must stay `Ok`.
+        assert!(
+            docker_exec_failure(Some(1), "ERROR: <SYNTAX>zRunUser+1^IrisDevTmp.Run0.1").is_none(),
+            "a non-zero exit that produced output must stay Ok — the output is the diagnosis"
+        );
+        assert!(
+            docker_exec_failure(Some(2), "42").is_none(),
+            "and so must any other non-zero exit that actually said something"
+        );
     }
 }
 
