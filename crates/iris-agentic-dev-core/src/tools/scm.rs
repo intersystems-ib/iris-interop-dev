@@ -1744,29 +1744,24 @@ mod tests {
     /// while every test in this mod stayed green: `contains` and `len` predicates cannot see
     /// internal whitespace, so the gap was in the oracle, not in the coverage.
     ///
-    /// The input domain is FINITE and this covers ALL of it: every `CodeMeaning` variant, each with
-    /// a representative code, times an empty and a non-empty provider message. The `match` below
-    /// has no catch-all, so a seventh variant will not compile until it is given a code here.
+    /// The input domain is FINITE and this covers ALL of it — by CONSTRUCTION, not by a list. Every
+    /// call site reaches this function as `undriveable_refusal(CodeMeaning::of(action_code), …)`
+    /// with `action_code: u8`, so the domain is all 256 codes, and iterating them covers every
+    /// variant `of` can return without anyone keeping a roster in step.
+    ///
+    /// The #378 review was right that the earlier form did not hold that claim: it walked a
+    /// hand-written `variants` array of six, and its `checked == 12` control was derived from the
+    /// same array, so a variant that existed but was not listed was invisible to both. The `match`
+    /// tripwire covered the `match`, not the population.
     #[test]
     fn no_undriveable_refusal_leaks_its_source_indentation() {
-        let variants = [
-            CodeMeaning::NoDialog,
-            CodeMeaning::Confirm,
-            CodeMeaning::Declined,
-            CodeMeaning::Prompt,
-            CodeMeaning::NeedsUi,
-            CodeMeaning::Undriveable,
-        ];
         let mut checked = 0usize;
-        for meaning in variants {
-            let code: u8 = match meaning {
-                CodeMeaning::NoDialog => 0,
-                CodeMeaning::Confirm => 1,
-                CodeMeaning::Declined => 6,
-                CodeMeaning::Prompt => 7,
-                CodeMeaning::NeedsUi => 2,
-                CodeMeaning::Undriveable => 9,
-            };
+        let mut meanings_seen: Vec<CodeMeaning> = Vec::new();
+        for code in 0u8..=u8::MAX {
+            let meaning = CodeMeaning::of(code);
+            if !meanings_seen.contains(&meaning) {
+                meanings_seen.push(meaning);
+            }
             for msg in ["", "https://ccr.example/csp/ccr/login.csp?ns=APP"] {
                 let (_, detail) = undriveable_refusal(meaning, code, msg, "My.Cls.cls");
                 assert!(
@@ -1781,11 +1776,21 @@ mod tests {
                 checked += 1;
             }
         }
-        // CONTROL: a green must not come from an empty iteration. Six variants x two messages, and
+        // CONTROL: a green must not come from an empty iteration. 256 codes x two messages, and
         // `checked` is only reached after the detail is known to be non-empty.
         assert_eq!(
-            checked, 12,
-            "the loop did not produce one non-empty detail per variant per message"
+            checked, 512,
+            "the loop did not produce one non-empty detail per code per message"
+        );
+        // CONTROL on the POPULATION, read out of `of()` rather than out of a list here: a seventh
+        // variant has already been exercised by the loop above by the time this fires, so this is a
+        // prompt to update the count, not a gap.
+        assert_eq!(
+            meanings_seen.len(),
+            6,
+            "`CodeMeaning::of` returns {} distinct variants, not 6 — every one of them has been \
+             checked above; update this count so the next change is still noticed: {meanings_seen:?}",
+            meanings_seen.len()
         );
     }
 

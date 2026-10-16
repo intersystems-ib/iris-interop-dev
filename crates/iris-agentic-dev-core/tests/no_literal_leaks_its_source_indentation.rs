@@ -58,6 +58,12 @@
 //! is the control for it, and `a_mask_is_the_same_length_as_its_source` is the control that the mask
 //! is a mask rather than a rewrite.
 //!
+//! The scanner itself lives in `support/rust_source_scan.rs`, shared with
+//! `every_refusal_names_a_remedy.rs` — the gate this one's matcher was copied from, and which the
+//! review of #378 caught still counting braces over the raw text. One copy, so the next fix to it
+//! reaches both gates. The controls in this file exercise that module through its own API, which is
+//! why they stayed here rather than moving with it.
+//!
 //! ## What this gate can and cannot claim
 //!
 //! It is a SHAPE claim: no product literal's reconstructed value carries an internal space run. It
@@ -66,8 +72,31 @@
 //! `no_undriveable_refusal_leaks_its_source_indentation` (`undriveable_refusal` and `CodeMeaning`
 //! are `pub(crate)`, so only that module's `#[cfg(test)]` mod can call them), plus the two existing
 //! assertions in `message_body_class_missing.rs` and `credential_create_names_the_real_failure.rs`.
+//!
+//! And one FALSE NEGATIVE it does not catch, named here because the paragraph above would otherwise
+//! read as though it did (#378 review, nit 4). `internal_run` trims each line of the reconstructed
+//! value, and "a leading run is either layout the compiler put there or indentation the author
+//! meant" stops being true once an embedded `\n` escape precedes it: a collapsed continuation that
+//! resumes right after a `\n` puts its leaked run at the START of a value line, where the trim
+//! removes it. `"Nothing was changed.\n                  Try {alt} instead."` ships 18 spaces to
+//! the caller and this gate stays green. The trim is still the right scoping decision — removing it
+//! takes the flagged count from 4 to 39, and #378 asked for exactly this variant — and the four
+//! product literals that carry a line-leading run after a `\n` today were measured and are all
+//! deliberate (`plugin.rs` CLI help indentation, `execute_method.rs` generated ObjectScript). The
+//! population that could hide in that blind spot is small, and it is written down rather than
+//! implied away.
 
 use std::path::{Path, PathBuf};
+
+// The scanner, shared with `every_refusal_names_a_remedy.rs`. `#[path]` rather than a `mod.rs`
+// because Cargo auto-discovers `tests/*.rs` as test targets and would compile a `tests/support.rs`
+// as a test binary of its own; a file nested in `tests/support/` is not auto-discovered.
+#[path = "support/rust_source_scan.rs"]
+mod rust_source_scan;
+
+use rust_source_scan::{
+    brace_depth, find_chars, in_any, line_of, mask_of, match_paren, scan, test_mod_ranges,
+};
 
 /// Below this many files, assume the walk broke rather than that the crates emptied out.
 const MIN_FILES_SCANNED: usize = 45;
@@ -115,25 +144,6 @@ const ALLOWED: &[(&str, &str, &str)] = &[
 
 // ───────────────────────────── the detector ──────────────────────────────────
 
-/// One non-raw string literal pulled out of a source file.
-struct Literal {
-    /// Index into the file's `char` sequence of the opening quote.
-    offset: usize,
-    /// 1-based line of the opening quote.
-    line: usize,
-    /// The literal's value, as the compiler would build it.
-    value: String,
-}
-
-/// The result of one pass over a source file.
-struct Scan {
-    /// The same `char` sequence as the input, with every comment, char literal, raw string and
-    /// string literal blanked to spaces and every newline kept where it was. Braces are code only
-    /// here.
-    mask: Vec<char>,
-    literals: Vec<Literal>,
-}
-
 /// The longest run of 2+ spaces that survives trimming each line of `value`.
 ///
 /// Trimming per line is the whole scoping decision: a leading run is either layout the compiler put
@@ -159,312 +169,6 @@ fn internal_run(value: &str) -> Option<usize> {
     } else {
         None
     }
-}
-
-/// Decode a non-raw literal body (the text between the quotes) the way the compiler does.
-///
-/// The case this file exists for is the first arm: `\` + newline + leading whitespace collapses to
-/// nothing, which is why a correct continuation yields single spaces and a collapsed one does not.
-fn decode(body: &str) -> String {
-    let mut out = String::with_capacity(body.len());
-    let mut it = body.chars().peekable();
-    while let Some(ch) = it.next() {
-        if ch != '\\' {
-            out.push(ch);
-            continue;
-        }
-        match it.next() {
-            // `\` + newline: eat the newline and ALL following whitespace. The compiler's rule, and
-            // the reason a correctly continued literal has no run to find.
-            Some('\n') | Some('\r') => {
-                while let Some(&c) = it.peek() {
-                    if c.is_whitespace() {
-                        it.next();
-                    } else {
-                        break;
-                    }
-                }
-            }
-            Some('n') => out.push('\n'),
-            Some('t') => out.push('\t'),
-            Some('r') => out.push('\r'),
-            Some('0') => out.push('\0'),
-            Some('"') => out.push('"'),
-            Some('\'') => out.push('\''),
-            Some('\\') => out.push('\\'),
-            // `\xNN` is decoded rather than placeheld, because `\x20` IS a space.
-            Some('x') => {
-                let mut hex = String::new();
-                for _ in 0..2 {
-                    match it.peek() {
-                        Some(&c) if c.is_ascii_hexdigit() => {
-                            hex.push(c);
-                            it.next();
-                        }
-                        _ => break,
-                    }
-                }
-                match u8::from_str_radix(&hex, 16) {
-                    Ok(b) => out.push(b as char),
-                    Err(_) => out.push('\u{fffd}'),
-                }
-            }
-            Some('u') => {
-                let mut hex = String::new();
-                if it.peek() == Some(&'{') {
-                    it.next();
-                    while let Some(&c) = it.peek() {
-                        it.next();
-                        if c == '}' {
-                            break;
-                        }
-                        hex.push(c);
-                    }
-                }
-                match u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
-                    Some(c) => out.push(c),
-                    None => out.push('\u{fffd}'),
-                }
-            }
-            Some(other) => out.push(other),
-            None => out.push('\\'),
-        }
-    }
-    out
-}
-
-fn blank(mask: &mut [char], src: &[char], from: usize, to: usize) {
-    for k in from..to.min(src.len()) {
-        if src[k] != '\n' {
-            mask[k] = ' ';
-        }
-    }
-}
-
-/// One pass over a source file, producing every non-raw string literal AND the code mask.
-///
-/// Comments and literals are recognised together because they are the same job: a `//` inside
-/// `"https://host/x"` is not a comment, and a `"` inside `// see "x` does not open a literal. A
-/// chain that stripped comments first would truncate every URL literal in the tree at its scheme,
-/// which is a silent corruption of the value this gate measures.
-fn scan(src: &str) -> Scan {
-    let b: Vec<char> = src.chars().collect();
-    let mut mask = b.clone();
-    let mut literals = Vec::new();
-    let mut i = 0usize;
-    let mut line = 1usize;
-    while i < b.len() {
-        let c = b[i];
-        if c == '\n' {
-            line += 1;
-            i += 1;
-            continue;
-        }
-        // `//` line comment
-        if c == '/' && b.get(i + 1) == Some(&'/') {
-            let start = i;
-            while i < b.len() && b[i] != '\n' {
-                i += 1;
-            }
-            blank(&mut mask, &b, start, i);
-            continue;
-        }
-        // `/* */` block comment, nested as Rust allows
-        if c == '/' && b.get(i + 1) == Some(&'*') {
-            let start = i;
-            let mut depth = 1usize;
-            i += 2;
-            while i < b.len() && depth > 0 {
-                if b[i] == '\n' {
-                    line += 1;
-                } else if b[i] == '/' && b.get(i + 1) == Some(&'*') {
-                    depth += 1;
-                    i += 1;
-                } else if b[i] == '*' && b.get(i + 1) == Some(&'/') {
-                    depth -= 1;
-                    i += 1;
-                }
-                i += 1;
-            }
-            blank(&mut mask, &b, start, i);
-            continue;
-        }
-        // Raw string `r"…"`, `r#"…"#`, `br#"…"#`. Excluded by kind — a raw string cannot carry a
-        // `\`-continuation — but it must still be SKIPPED so its contents are not read as code.
-        // The preceding char must not be an identifier char, or `for`/`char` would open one.
-        let prev_is_ident = i > 0 && (b[i - 1].is_alphanumeric() || b[i - 1] == '_');
-        if (c == 'r' || c == 'b') && !prev_is_ident {
-            let mut j = i;
-            if b[j] == 'b' {
-                j += 1;
-            }
-            if b.get(j) == Some(&'r') {
-                j += 1;
-                let mut hashes = 0usize;
-                while b.get(j) == Some(&'#') {
-                    hashes += 1;
-                    j += 1;
-                }
-                if b.get(j) == Some(&'"') {
-                    let start = i;
-                    j += 1;
-                    while j < b.len() {
-                        if b[j] == '\n' {
-                            line += 1;
-                        }
-                        if b[j] == '"' {
-                            let mut k = j + 1;
-                            let mut seen = 0usize;
-                            while seen < hashes && b.get(k) == Some(&'#') {
-                                seen += 1;
-                                k += 1;
-                            }
-                            if seen == hashes {
-                                j = k;
-                                break;
-                            }
-                        }
-                        j += 1;
-                    }
-                    blank(&mut mask, &b, start, j);
-                    i = j;
-                    continue;
-                }
-            }
-        }
-        // A char literal, or a lifetime. `'\n'` and `'x'` are literals; `'a` and `'static` are not.
-        if c == '\'' {
-            let close = if b.get(i + 1) == Some(&'\\') {
-                b.iter()
-                    .skip(i + 2)
-                    .position(|&x| x == '\'')
-                    .map(|p| i + 2 + p)
-            } else if b.get(i + 2) == Some(&'\'') {
-                Some(i + 2)
-            } else {
-                None
-            };
-            match close {
-                Some(end) => {
-                    blank(&mut mask, &b, i, end + 1);
-                    i = end + 1;
-                }
-                // a lifetime: the tick is code, nothing is blanked
-                None => i += 1,
-            }
-            continue;
-        }
-        // A non-raw string literal.
-        if c == '"' {
-            let start = i;
-            let start_line = line;
-            let mut body = String::new();
-            i += 1;
-            while i < b.len() {
-                if b[i] == '\\' && i + 1 < b.len() {
-                    if b[i + 1] == '\n' {
-                        line += 1;
-                    }
-                    body.push(b[i]);
-                    body.push(b[i + 1]);
-                    i += 2;
-                    continue;
-                }
-                if b[i] == '"' {
-                    i += 1;
-                    break;
-                }
-                if b[i] == '\n' {
-                    line += 1;
-                }
-                body.push(b[i]);
-                i += 1;
-            }
-            blank(&mut mask, &b, start, i);
-            literals.push(Literal {
-                offset: start,
-                line: start_line,
-                value: decode(&body),
-            });
-            continue;
-        }
-        i += 1;
-    }
-    Scan { mask, literals }
-}
-
-// ─────────────────── `#[cfg(test)]` stripping, brace-matched ──────────────────
-
-fn find_chars(hay: &[char], needle: &str, from: usize) -> Option<usize> {
-    let n: Vec<char> = needle.chars().collect();
-    if n.is_empty() || hay.len() < n.len() {
-        return None;
-    }
-    (from..=hay.len() - n.len()).find(|&s| hay[s..s + n.len()] == n[..])
-}
-
-/// Index just past the `}` matching the `{` at `open`, counted over the MASK.
-fn match_brace(mask: &[char], open: usize) -> usize {
-    let mut depth = 0i32;
-    for (off, ch) in mask[open..].iter().enumerate() {
-        match ch {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return open + off + 1;
-                }
-            }
-            _ => {}
-        }
-    }
-    mask.len()
-}
-
-/// `(start, end)` for every `#[cfg(test)] mod NAME { … }`, brace-matched from the module's OWN brace.
-///
-/// Requiring the `mod NAME {` shape is not decoration. `every_refusal_names_a_remedy.rs` records
-/// what "the next `{` after the attribute" did: two `#[cfg(test)]` attributes in `mod.rs` decorate a
-/// `pub(crate) const … = &[`, so the search jumped past the `[` to an unrelated brace far below and
-/// swallowed about a thousand lines — reporting `mod.rs` as having zero production refusals, which
-/// is impossible in a file that both defines and calls `err_json`.
-fn test_mod_ranges(mask: &[char]) -> Vec<(usize, usize)> {
-    const ATTR: &str = "#[cfg(test)]";
-    let attr_len = ATTR.chars().count();
-    let mut out = Vec::new();
-    let mut at = 0usize;
-    while let Some(start) = find_chars(mask, ATTR, at) {
-        let after = start + attr_len;
-        let rest: String = mask[after..].iter().collect();
-        let mut head = rest.trim_start();
-        if let Some(h) = head.strip_prefix("pub") {
-            head = h.trim_start();
-            if head.starts_with('(') {
-                if let Some(close) = head.find(')') {
-                    head = head[close + 1..].trim_start();
-                }
-            }
-        }
-        if let Some(h) = head.strip_prefix("mod ") {
-            if let Some(brace_rel) = h.find('{') {
-                // No other statement may intervene, or this is `#[cfg(test)] mod x;`.
-                if !h[..brace_rel].contains(';') {
-                    let before = rest.chars().count() - h.chars().count();
-                    let brace = after + before + h[..brace_rel].chars().count();
-                    let end = match_brace(mask, brace);
-                    out.push((start, end));
-                    at = end;
-                    continue;
-                }
-            }
-        }
-        at = after;
-    }
-    out
-}
-
-fn in_any(ranges: &[(usize, usize)], offset: usize) -> bool {
-    ranges.iter().any(|&(s, e)| offset >= s && offset < e)
 }
 
 // ───────────────────────────── the walk ──────────────────────────────────────
@@ -548,6 +252,20 @@ fn survey() -> Survey {
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
         let scanned = scan(&text);
+        // STRUCTURAL CONTROL, before anything is read out of this file (#378 review, nit 5). The
+        // mask keeps exactly the braces that are code, so a well-formed Rust file must balance
+        // over it: net zero and never negative. Anything else means the single-pass scanner
+        // mis-lexed a literal form it does not know, and every window matched over this mask —
+        // including the `#[cfg(test)]` ranges below — is then wrong in a direction that reads as a
+        // clean pass. Measured at the time of writing: all 50 files under `crates/*/src` are
+        // (0, 0).
+        assert_eq!(
+            brace_depth(&scanned.mask),
+            (0, 0),
+            "the mask of {} does not balance, so the scanner mis-lexed something in it and no \
+             window taken from this file can be trusted",
+            path.display()
+        );
         let ranges = test_mod_ranges(&scanned.mask);
         s.files += 1;
         for lit in &scanned.literals {
@@ -984,4 +702,93 @@ fn every_allowlist_entry_still_matches_something() {
             .collect::<Vec<_>>()
             .join("\n  ")
     );
+}
+
+/// Below this many cfg-test attributes, assume the walk or the matcher broke rather than that the
+/// tree stopped having test modules.
+const MIN_CFG_TEST_ATTRS: usize = 50;
+
+/// Every cfg-test attribute in the scanned tree is a SHAPE `test_mod_ranges` recognises.
+///
+/// #378 review, nit 3: the stripper pins a spelling. It finds the literal string `#[cfg(test)]`
+/// followed by an optional visibility and `mod NAME {`, so `#[cfg(all(test, feature = "live"))]`,
+/// or any attribute sitting between the cfg and the `mod`, leaves that module inside the product
+/// population — and a verbatim IRIS fixture in it then reddens this gate on correct code. Neither
+/// shape exists under `crates/*/src` today, which is exactly why it is worth a test: the failure
+/// would arrive the day someone writes one, in a file they were not thinking about, as a false RED
+/// in a gate whose own prose says "a gate that reddens on correct code gets deleted rather than
+/// obeyed".
+///
+/// So rather than widening the matcher to guess at shapes nobody has written — `not(test)` means
+/// PRODUCT code, and stripping it would be a false green, the dangerous direction — this asserts
+/// that the shapes PRESENT are the ones handled, and fails by name the moment a new one appears.
+/// That is the whole claim: not that the stripper handles every conceivable cfg, but that nothing
+/// in the tree needs a shape it does not handle.
+#[test]
+fn every_cfg_test_attribute_in_the_tree_is_a_shape_the_stripper_recognises() {
+    let mut found = 0usize;
+    let mut unhandled: Vec<String> = Vec::new();
+    for path in product_files() {
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        let mask = mask_of(&text);
+        let mut at = 0usize;
+        // Searched in the MASK, so a `#[cfg(test)]` named inside a string or a comment — `scm.rs`
+        // has one, in `src.find("\n#[cfg(test)]")` — is not mistaken for a real attribute.
+        while let Some(start) = find_chars(&mask, "#[cfg(", at) {
+            let open = start + "#[cfg(".chars().count();
+            let close = match_paren(&mask, open).unwrap_or_else(|| {
+                panic!(
+                    "{}:{} — `#[cfg(` with no closing paren",
+                    path.display(),
+                    line_of(&mask, start)
+                )
+            });
+            let arg: String = mask[open..close].iter().collect();
+            at = open;
+            if !arg.contains("test") {
+                continue;
+            }
+            found += 1;
+            let here = format!(
+                "{}:{}",
+                path.file_name().unwrap_or_default().to_string_lossy(),
+                line_of(&mask, start)
+            );
+            if arg.trim() != "test" {
+                unhandled.push(format!(
+                    "{here}: `#[cfg({arg})]` — `test_mod_ranges` matches only the exact spelling \
+                     `#[cfg(test)]`, so this module stays in the product population"
+                ));
+                continue;
+            }
+            // Nothing but whitespace, a visibility and `mod NAME` may sit between the attribute and
+            // the item. An ATTRIBUTE here is the second shape the review named.
+            let after: String = mask[close..].iter().skip(2).take(80).collect();
+            let next = after.trim_start();
+            if next.starts_with("#[") || next.starts_with("#!") {
+                unhandled.push(format!(
+                    "{here}: an attribute sits between `#[cfg(test)]` and its item, which \
+                     `test_mod_ranges` does not look past, so this module stays in the product \
+                     population"
+                ));
+            }
+        }
+    }
+    // CONTROL, first: there were attributes to inspect. A broken walk and a clean tree print the
+    // same empty `unhandled`.
+    assert!(
+        found >= MIN_CFG_TEST_ATTRS,
+        "found only {found} cfg-test attributes (floor {MIN_CFG_TEST_ATTRS}) — the walk or the \
+         mask search broke, so a clean result below would mean nothing"
+    );
+    assert!(
+        unhandled.is_empty(),
+        "{} cfg-test attribute(s) use a shape `test_mod_ranges` does not recognise. Teach the \
+         stripper the shape — and note that `not(test)` and `any(test, …)` can be PRODUCT code, so \
+         stripping them would be a false green rather than a false red:\n  {}",
+        unhandled.len(),
+        unhandled.join("\n  ")
+    );
+    eprintln!("cfg-test attributes inspected: {found}, all of a recognised shape");
 }

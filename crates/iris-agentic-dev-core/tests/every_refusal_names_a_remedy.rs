@@ -37,6 +37,22 @@
 
 use std::path::{Path, PathBuf};
 
+// #378 review: this file's brace matcher counted `{` and `}` over the RAW text, so a brace inside a
+// string or char literal moved the closing brace. The repaired, mask-based matcher now lives in one
+// place, shared with `no_literal_leaks_its_source_indentation.rs` — the gate it was copied into,
+// where the defect was found and fixed while this copy was left behind. `#[path]` rather than a
+// `mod.rs` because Cargo auto-discovers `tests/*.rs` as test targets and would compile a
+// `tests/support.rs` as a test binary of its own.
+#[path = "support/rust_source_scan.rs"]
+mod rust_source_scan;
+
+use rust_source_scan::{find_chars, fn_body, mask_of, match_paren, strip_test_mods};
+
+// The stripper recognises the exact spelling `#[cfg(test)]` and no other. That this tree contains
+// no other is asserted by `every_cfg_test_attribute_in_the_tree_is_a_shape_the_stripper_recognises`
+// in `no_literal_leaks_its_source_indentation.rs`, over `crates/*/src` — a strict superset of the
+// `src/tools` population scanned here, so it covers this gate too.
+
 /// Remedy on record for every code the server can emit.
 ///
 /// A remedy names an ACTION available to the caller, not a restatement of the failure. "The
@@ -189,6 +205,10 @@ const REMEDIES: &[(&str, &str)] = &[
 const MIN_LITERAL_CODES: usize = 25;
 /// The classifier tables that must each be located. Zero found = the windows moved.
 const MIN_PRODUCERS_FOUND: usize = 4;
+/// Below this many `#[test]` attributes in the scanned tree, assume the walk or the counter broke
+/// rather than that the tree stopped having tests. Without it, "none survived the stripping" is
+/// equally satisfied by a strip that found nothing to strip.
+const MIN_TEST_ATTRS_FOUND: usize = 200;
 
 fn tools_dir() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -216,83 +236,16 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Remove `#[cfg(test)] mod NAME { … }` blocks, brace-matched from the module's OWN brace.
-///
-/// The naive version of this — "find the next `{` after the attribute" — silently swallowed about a
-/// thousand lines of `mod.rs`, because two `#[cfg(test)]` attributes there decorate
-/// `pub(crate) const … = &[` rather than a module, so the search jumped past the `[` to an unrelated
-/// brace far below. It reported mod.rs as having ZERO production refusals, which is impossible: the
-/// file both defines `err_json` and calls it. Requiring the `mod NAME {` shape is what makes the
-/// window match the claim.
-fn strip_test_mods(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut i = 0usize;
-    while i < text.len() {
-        match find_test_mod_brace(text, i) {
-            Some((start, brace)) => {
-                out.push_str(&text[i..start]);
-                i = match_brace(text, brace);
-            }
-            None => {
-                out.push_str(&text[i..]);
-                break;
-            }
-        }
-    }
-    out
-}
-
-/// `(attribute_start, index_of_the_mod_body_open_brace)` for the next `#[cfg(test)] mod X {`.
-fn find_test_mod_brace(text: &str, from: usize) -> Option<(usize, usize)> {
-    const ATTR: &str = "#[cfg(test)]";
-    let mut at = from;
-    while let Some(rel) = text[at..].find(ATTR) {
-        let start = at + rel;
-        let rest = &text[start + ATTR.len()..];
-        // Only whitespace, a visibility, and `mod NAME` may sit between the attribute and the brace.
-        let mut head = rest.trim_start();
-        if let Some(h) = head.strip_prefix("pub") {
-            head = h.trim_start();
-            if head.starts_with('(') {
-                if let Some(close) = head.find(')') {
-                    head = head[close + 1..].trim_start();
-                }
-            }
-        }
-        if let Some(h) = head.strip_prefix("mod ") {
-            if let Some(b) = h.find('{') {
-                // no other statement may intervene
-                if !h[..b].contains(';') {
-                    let brace = text.len() - h.len() + b;
-                    return Some((start, brace));
-                }
-            }
-        }
-        at = start + ATTR.len();
-    }
-    None
-}
-
-/// Index just past the `}` matching the `{` at `open`.
-fn match_brace(text: &str, open: usize) -> usize {
-    let mut depth = 0i32;
-    for (off, ch) in text[open..].char_indices() {
-        match ch {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return open + off + 1;
-                }
-            }
-            _ => {}
-        }
-    }
-    text.len()
-}
-
 /// Drop `//` line comments. A code named in a comment is not a code the server emits, and a comment
 /// explaining a refusal is exactly where the code name appears in prose.
+///
+/// KNOWN WEAKNESS, deliberately left as it is. This is line-based and literal-unaware, so it also
+/// truncates a line at a `//` INSIDE a string — `"https://host/x"` becomes `"https:`. The mask the
+/// window-finders now use would fix that too, but it would change which codes this file admits, and
+/// that is a different claim from the #378 review's finding. It is why every window-finder below is
+/// fed the test-mod-stripped source with its comments INTACT and strips comments from the window it
+/// extracted: a truncated literal leaves an unmatched quote behind, and a mask built over that is
+/// desynced from the first stray quote onward.
 fn strip_line_comments(text: &str) -> String {
     text.lines()
         .map(|l| match l.find("//") {
@@ -360,14 +313,29 @@ fn error_code_fields(code: &str) -> Vec<String> {
 }
 
 /// The `&'static str` fallback passed as the 2nd argument of `classify_iris_error_or(msg, "CODE")`.
-fn fallback_codes(code: &str) -> Vec<String> {
+///
+/// `text` is the test-mod-stripped SOURCE, comments intact — the argument list is delimited over
+/// the mask, for the same reason the braces are: `')'` is not a closing paren. Comments are then
+/// stripped from the extracted window, so what is read out of it is what the old raw version read.
+fn fallback_codes(text: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let pat = "classify_iris_error_or(";
+    let mask = mask_of(text);
+    let chars: Vec<char> = text.chars().collect();
+    const PAT: &str = "classify_iris_error_or(";
+    let pat_len = PAT.chars().count();
     let mut from = 0usize;
-    while let Some(rel) = code[from..].find(pat) {
-        let open = from + rel + pat.len();
-        let end = match_paren(code, open);
-        let args = &code[open..end];
+    while let Some(rel) = find_chars(&mask, PAT, from) {
+        let open = rel + pat_len;
+        let end = match_paren(&mask, open)
+            .unwrap_or_else(|| {
+                panic!(
+                    "`{PAT}` at line {} has no closing `)`: the scanner desynced, so the argument \
+                     window — and therefore the fallback code read out of it — would be wrong",
+                    rust_source_scan::line_of(&mask, open)
+                )
+            })
+            .min(chars.len());
+        let args = strip_line_comments(&chars[open..end].iter().collect::<String>());
         if let Some(comma) = args.rfind(',') {
             let second = args[comma + 1..].trim();
             if let Some(lit) = second.strip_prefix('"').and_then(|s| s.split('"').next()) {
@@ -379,31 +347,6 @@ fn fallback_codes(code: &str) -> Vec<String> {
         from = open;
     }
     out
-}
-
-fn match_paren(text: &str, after_open: usize) -> usize {
-    let mut depth = 1i32;
-    for (off, ch) in text[after_open..].char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return after_open + off;
-                }
-            }
-            _ => {}
-        }
-    }
-    text.len()
-}
-
-/// The body of `fn NAME(` up to its matching brace.
-fn fn_body(text: &str, name: &str) -> Option<String> {
-    let pat = format!("fn {name}(");
-    let at = text.find(&pat)?;
-    let brace = text[at..].find('{')? + at;
-    Some(text[brace..match_brace(text, brace)].to_string())
 }
 
 /// Every code the server can emit, with the producer that can emit it.
@@ -426,7 +369,10 @@ fn vocabulary() -> Vec<(String, Vec<String>)> {
     for f in &files {
         let raw = std::fs::read_to_string(f)
             .unwrap_or_else(|e| panic!("cannot read {}: {e}", f.display()));
-        let prod = strip_line_comments(&strip_test_mods(&raw));
+        // `stripped` keeps its comments, so the mask the window-finders build over it is sound;
+        // `prod` is what the pattern scans read, unchanged. See `strip_line_comments`.
+        let stripped = strip_test_mods(&raw);
+        let prod = strip_line_comments(&stripped);
         for c in codes_after(&prod, "err_json(") {
             add(c, "literal");
         }
@@ -445,7 +391,7 @@ fn vocabulary() -> Vec<(String, Vec<String>)> {
         for c in codes_after(&prod, "fail(") {
             add(c, "fail");
         }
-        for c in fallback_codes(&prod) {
+        for c in fallback_codes(&stripped) {
             add(c, "fallback");
         }
         // A THIRD emission route, found when SCRATCH_WRITE_BLOCKED was added for #303 and this file
@@ -489,10 +435,10 @@ fn vocabulary() -> Vec<(String, Vec<String>)> {
             _ => &[],
         };
         for t in tables {
-            match fn_body(&prod, t) {
+            match fn_body(&stripped, t) {
                 Some(body) => {
                     producers_found += 1;
-                    for c in string_literals_upper(&body) {
+                    for c in string_literals_upper(&strip_line_comments(&body)) {
                         add(c, t);
                     }
                 }
@@ -799,4 +745,118 @@ fn every_emitter_names_where_its_codes_come_from() {
          reading the tree this test claims to cover"
     );
     eprintln!("emitter callees in the tree: {seen:?}");
+}
+
+/// `#[test]` attributes per file, over the comment-stripped text so a commented-out one is not read
+/// as real. Counted on TRIMMED lines: an attribute is its own line in this tree.
+fn count_test_attrs(text: &str) -> usize {
+    text.lines()
+        .filter(|l| {
+            let l = l.trim();
+            l == "#[test]" || l == "#[tokio::test]" || l.starts_with("#[tokio::test(")
+        })
+        .count()
+}
+
+/// A brace inside a string or char LITERAL must not close a `#[cfg(test)] mod` early.
+///
+/// #378's review found this file's own matcher counting `{` and `}` over the raw text, after the
+/// repaired version had already shipped in the gate this one was copied into. Reproduced against
+/// the real tree before the fix: `gateway_manage.rs`'s single `#[cfg(test)] mod tests {` (line
+/// 1430) closed at line 1618 instead of 2899, because line 1616 holds `rest.find([',', '}'])` — a
+/// `'}'` char literal. 1281 lines of test code therefore sat inside what this gate calls the
+/// PRODUCTION population, and injecting one `err_json("ZZ_FIXTURE", …)` into that window made
+/// `vocabulary()` admit ZZ_FIXTURE, which is a demand for a REMEDIES row that no product site
+/// needs: a false red in the gate that guards every refusal in the product.
+///
+/// This runs the real pipeline rather than asserting over the matcher's source text, because the
+/// claim is about which codes come OUT, not about how the braces are counted.
+#[test]
+fn a_brace_in_a_literal_does_not_close_the_test_mod_early() {
+    // The measured shape, reduced to its smallest form: a `'}'` char literal in a test fixture,
+    // with a further emission site AFTER it inside the same module.
+    let src = "\
+fn product() {\n\
+    let _ = err_json(\"REAL_PRODUCT_CODE\", \"m\");\n\
+}\n\
+#[cfg(test)]\n\
+mod tests {\n\
+    fn split(rest: &str) -> usize {\n\
+        rest.find([',', '}']).expect(\"field value must terminate\")\n\
+    }\n\
+    #[test]\n\
+    fn t() {\n\
+        let _ = err_json(\"ZZ_FIXTURE_ONLY\", \"m\");\n\
+    }\n\
+}\n";
+    let found = codes_after(&strip_line_comments(&strip_test_mods(src)), "err_json(");
+    // POSITIVE CONTROL, first: the pipeline does see product code on this very input. Without it,
+    // the assertion below is equally satisfied by a strip that deleted the whole file.
+    assert!(
+        found.iter().any(|c| c == "REAL_PRODUCT_CODE"),
+        "the product emission site was not seen at all, so the next assertion proves nothing: \
+         {found:?}"
+    );
+    assert!(
+        !found.iter().any(|c| c == "ZZ_FIXTURE_ONLY"),
+        "a `'}}'` char literal closed the `#[cfg(test)] mod` early, so a test fixture's code entered \
+         the production vocabulary: {found:?}"
+    );
+
+    // And the control for the input shape itself: with the braces taken out of the char literal
+    // the answer is the same, so the assertion above is about the literal and not about the walk.
+    let plain = src.replace("[',', '}']", "[',', ';']");
+    let plain_found = codes_after(&strip_line_comments(&strip_test_mods(&plain)), "err_json(");
+    assert_eq!(
+        plain_found,
+        vec!["REAL_PRODUCT_CODE".to_string()],
+        "the brace-free variant did not give exactly the product code: {plain_found:?}"
+    );
+}
+
+/// REAL-TREE control for the same defect: every `#[cfg(test)] mod` in the scanned tree is removed
+/// WHOLE, so no `#[test]` function survives into the population this gate calls production.
+///
+/// The fixture above is the mechanism; this is the population. A mod closed early leaves its
+/// remaining `#[test]` functions behind, and that is measurable without knowing which codes they
+/// carry — which is the point, because today's survivors carry none and tomorrow's might. Before
+/// the fix this reported survivors in `gateway_manage.rs` and `mod.rs`.
+#[test]
+fn no_test_function_survives_the_test_mod_stripping() {
+    let mut files = Vec::new();
+    rust_files(&tools_dir(), &mut files);
+    assert!(
+        !files.is_empty(),
+        "no .rs files under {} — scanning nothing",
+        tools_dir().display()
+    );
+    let mut total = 0usize;
+    let mut survivors: Vec<String> = Vec::new();
+    for f in &files {
+        let raw = std::fs::read_to_string(f)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", f.display()));
+        total += count_test_attrs(&strip_line_comments(&raw));
+        let left = count_test_attrs(&strip_line_comments(&strip_test_mods(&raw)));
+        if left > 0 {
+            survivors.push(format!(
+                "{}: {left} `#[test]` fn(s) left in the production population",
+                f.file_name().unwrap_or_default().to_string_lossy()
+            ));
+        }
+    }
+    // CONTROL, first: there were test attributes to strip. A tree with none, and a counter that
+    // matches nothing, both print a clean "none survived".
+    assert!(
+        total >= MIN_TEST_ATTRS_FOUND,
+        "counted only {total} `#[test]` attributes under {} (floor {MIN_TEST_ATTRS_FOUND}) — the \
+         walk or the counter broke, so a clean result below would mean nothing",
+        tools_dir().display()
+    );
+    assert!(
+        survivors.is_empty(),
+        "a `#[cfg(test)] mod` was not removed whole, so test code is being scanned as production \
+         — which makes a fixture's error code a demand for a REMEDIES row:\n  {}",
+        survivors.join("\n  ")
+    );
+    eprintln!("`#[test]` attributes stripped from the production population: {total}");
 }
