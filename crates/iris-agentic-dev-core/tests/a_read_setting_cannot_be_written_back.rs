@@ -195,18 +195,41 @@ fn a_line_with_no_target_field_is_not_read_as_a_host_setting() {
 }
 
 /// The value is allowed to contain the delimiter. A real production carries
-/// `ReplyCodeActions=:?R=F,:?E=F,…`, so a parser that looked for the target by splitting the whole
-/// line on its first `:` would read `ReplyCodeActions=` as the target and lose both name and value.
+/// `ReplyCodeActions=:?R=F,:?E=F,…`, which is why the `=` is split BEFORE the `:`.
+///
+/// The two halves of this test are not redundant, and the first alone does not pin the claim the
+/// test is named for. On a WELL-FORMED line the split order is unobservable: `Host:Name=:a:b`
+/// yields the same three fields either way. The order is only observable on a line carrying NO
+/// target field, where splitting on `:` first takes `ReplyCodeActions=` for the target and leaves
+/// `?R=F,…` as the name — and that is exactly the line an older server build emits, so it is the
+/// case the backward-compatible read has to get right.
 #[test]
 fn a_value_full_of_colons_does_not_become_the_target() {
-    let b = parse_get_settings_batch(
-        "PI_ITEM:A\nPI_NSET:1\nPI_SET:Host:ReplyCodeActions=:?R=F,:?E=F,:~=S\n",
-    );
+    const VALUE: &str = ":?R=F,:?E=F,:~=S";
+
+    let b = parse_get_settings_batch(&format!(
+        "PI_ITEM:A\nPI_NSET:1\nPI_SET:Host:ReplyCodeActions={VALUE}\n"
+    ));
     let v = item_settings_payload("A", &b.items[0].1);
-    assert_eq!(v["settings"]["ReplyCodeActions"], ":?R=F,:?E=F,:~=S", "{v}");
+    assert_eq!(v["settings"]["ReplyCodeActions"], VALUE, "{v}");
     assert!(
         v.get("settings_unknown_target").is_none(),
         "the target is `Host`, which is recognised — reading it as `ReplyCodeActions=` would \
          report an unknown target here: {v}"
+    );
+
+    // The discriminating case: the SAME value with no target field in front of it.
+    let bare = parse_get_settings_batch(&format!(
+        "PI_ITEM:A\nPI_NSET:1\nPI_SET:ReplyCodeActions={VALUE}\n"
+    ));
+    let bv = item_settings_payload("A", &bare.items[0].1);
+    assert_eq!(
+        bv["settings"]["ReplyCodeActions"], VALUE,
+        "a targetless line's value is full of `:` — looking for the target before splitting the \
+         `=` reads `ReplyCodeActions=` as the target and `?R=F,` as the name: {bv}"
+    );
+    assert_eq!(
+        bv["settings_unknown_target"][0]["name"], "ReplyCodeActions",
+        "the name must survive even though no target arrived: {bv}"
     );
 }
