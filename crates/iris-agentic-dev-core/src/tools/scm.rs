@@ -633,13 +633,16 @@ pub(crate) fn undriveable_refusal(
         CodeMeaning::NeedsUi => (
             SCM_NEEDS_UI,
             format!(
-                "Source control answered with action {code}, which means the action has to be                  completed in the provider's own web UI — this tool cannot open it, and nothing                  was changed.{where_}"
+                "Source control answered with action {code}, which means the action has to be \
+                 completed in the provider's own web UI — this tool cannot open it, and nothing \
+                 was changed.{where_}"
             ),
         ),
         CodeMeaning::Prompt => (
             SCM_NEEDS_INPUT,
             format!(
-                "Source control is asking for a typed value before it will act on {doc}, and this                  path has no way to supply one — nothing was changed.{where_}"
+                "Source control is asking for a typed value before it will act on {doc}, and this \
+                 path has no way to supply one — nothing was changed.{where_}"
             ),
         ),
         // Reached only from a site that has already handled the driveable codes.
@@ -1731,6 +1734,63 @@ mod tests {
         assert!(
             detail.contains("odd"),
             "the provider text is dropped: {detail}"
+        );
+    }
+
+    /// #378: a `format!` whose backslash-continuations have been collapsed onto ONE source line
+    /// keeps its source indentation INSIDE the runtime string. `undriveable_refusal`'s detail goes
+    /// straight to the caller — through `err_json` at the two sites above and through
+    /// `Precheck::Refuse` in `iris_doc` — and three 18-space runs shipped that way on 2026-10-06
+    /// while every test in this mod stayed green: `contains` and `len` predicates cannot see
+    /// internal whitespace, so the gap was in the oracle, not in the coverage.
+    ///
+    /// The input domain is FINITE and this covers ALL of it — by CONSTRUCTION, not by a list. Every
+    /// call site reaches this function as `undriveable_refusal(CodeMeaning::of(action_code), …)`
+    /// with `action_code: u8`, so the domain is all 256 codes, and iterating them covers every
+    /// variant `of` can return without anyone keeping a roster in step.
+    ///
+    /// The #378 review was right that the earlier form did not hold that claim: it walked a
+    /// hand-written `variants` array of six, and its `checked == 12` control was derived from the
+    /// same array, so a variant that existed but was not listed was invisible to both. The `match`
+    /// tripwire covered the `match`, not the population.
+    #[test]
+    fn no_undriveable_refusal_leaks_its_source_indentation() {
+        let mut checked = 0usize;
+        let mut meanings_seen: Vec<CodeMeaning> = Vec::new();
+        for code in 0u8..=u8::MAX {
+            let meaning = CodeMeaning::of(code);
+            if !meanings_seen.contains(&meaning) {
+                meanings_seen.push(meaning);
+            }
+            for msg in ["", "https://ccr.example/csp/ccr/login.csp?ns=APP"] {
+                let (_, detail) = undriveable_refusal(meaning, code, msg, "My.Cls.cls");
+                assert!(
+                    !detail.is_empty(),
+                    "{meaning:?} (code {code}, msg {msg:?}) produced no detail at all"
+                );
+                assert!(
+                    !detail.contains("  "),
+                    "a run of leaked source indentation reached the caller for \
+                     {meaning:?} (code {code}, msg {msg:?}): {detail:?}"
+                );
+                checked += 1;
+            }
+        }
+        // CONTROL: a green must not come from an empty iteration. 256 codes x two messages, and
+        // `checked` is only reached after the detail is known to be non-empty.
+        assert_eq!(
+            checked, 512,
+            "the loop did not produce one non-empty detail per code per message"
+        );
+        // CONTROL on the POPULATION, read out of `of()` rather than out of a list here: a seventh
+        // variant has already been exercised by the loop above by the time this fires, so this is a
+        // prompt to update the count, not a gap.
+        assert_eq!(
+            meanings_seen.len(),
+            6,
+            "`CodeMeaning::of` returns {} distinct variants, not 6 — every one of them has been \
+             checked above; update this count so the next change is still noticed: {meanings_seen:?}",
+            meanings_seen.len()
         );
     }
 
