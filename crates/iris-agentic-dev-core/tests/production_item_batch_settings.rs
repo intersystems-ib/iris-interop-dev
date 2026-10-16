@@ -11,13 +11,16 @@
 //!
 //! * `ReplyCodeActions` has the value `:?R=F,:?E=F,:~=S,:?A=C,:*=S,:I?=W,:T?=C` — so a parser that
 //!   splits on every `=` mangles a real setting.
-//! * One item carries both `Adapter` and `Host` settings, and `Setting.Target` is NOT in the output.
-//!   A Host and an Adapter setting of the same name therefore collapse to one map key. That is
-//!   pre-existing, and now counted rather than silent.
+//! * One item carries both `Adapter` and `Host` settings. `Setting.Target` is on the wire as the
+//!   first field of each `PI_SET:` line, and the map key is rendered from it by
+//!   `qualify_setting_key`, so the two targets no longer collapse to one key and what a read
+//!   returns is what `set_settings` accepts. `duplicate_setting_names` therefore stops reporting a
+//!   known loss and becomes an integrity check that must read absent — the round-trip itself is
+//!   pinned in `a_read_setting_cannot_be_written_back.rs`.
 
 use iris_agentic_dev_core::tools::interop::{
     build_get_settings_batch_code, item_names_arg, item_settings_payload, parse_get_settings_batch,
-    synthesise_not_found_payload, ItemSettings,
+    synthesise_not_found_payload, ItemSettings, Setting,
 };
 use serde_json::json;
 
@@ -31,29 +34,31 @@ const ITEMS: [&str; 4] = [
 
 /// A framed reply for the first three, built from the real settings of each.
 fn real_output() -> String {
+    // Targets as the real production holds them: the TCP settings live on the ADAPTER, the
+    // framework settings on the Host. That split is why a read without Target was unfeedable.
     "PI_ITEM:Censo.BS.HL7\n\
      PI_NSET:5\n\
-     PI_SET:Port=43210\n\
-     PI_SET:StayConnected=30\n\
-     PI_SET:MessageSchemaCategory=2.8\n\
-     PI_SET:TargetConfigNames=Censo.Router\n\
-     PI_SET:AlertOnError=1\n\
+     PI_SET:Adapter:Port=43210\n\
+     PI_SET:Adapter:StayConnected=30\n\
+     PI_SET:Host:MessageSchemaCategory=2.8\n\
+     PI_SET:Host:TargetConfigNames=Censo.Router\n\
+     PI_SET:Host:AlertOnError=1\n\
      PI_ITEM:Censo.Router\n\
      PI_NSET:2\n\
-     PI_SET:BusinessRuleName=Censo.RUL.Censo\n\
-     PI_SET:AlertOnError=1\n\
+     PI_SET:Host:BusinessRuleName=Censo.RUL.Censo\n\
+     PI_SET:Host:AlertOnError=1\n\
      PI_ITEM:Censo.BO.DietoolsHL7\n\
      PI_NSET:3\n\
-     PI_SET:IPAddress=demo-genai-dietools-mllp\n\
-     PI_SET:Port=2575\n\
-     PI_SET:ReplyCodeActions=:?R=F,:?E=F,:~=S,:?A=C,:*=S,:I?=W,:T?=C\n\
+     PI_SET:Adapter:IPAddress=demo-genai-dietools-mllp\n\
+     PI_SET:Adapter:Port=2575\n\
+     PI_SET:Host:ReplyCodeActions=:?R=F,:?E=F,:~=S,:?A=C,:*=S,:I?=W,:T?=C\n\
      ITEM_CANDIDATES_N:2\n\
      ITEM_CANDIDATE:Censo.BS.HL7\n\
      ITEM_CANDIDATE:Censo.Router\n"
         .to_string()
 }
 
-fn read(state: &ItemSettings) -> &Vec<(String, String)> {
+fn read(state: &ItemSettings) -> &Vec<Setting> {
     match state {
         ItemSettings::Read { settings, .. } => settings,
         other => panic!("expected Read, got {other:?}"),
@@ -79,14 +84,20 @@ fn every_item_section_is_attributed_to_its_own_item() {
 fn a_setting_value_containing_equals_signs_survives_whole() {
     let b = parse_get_settings_batch(&real_output());
     let s = read(&b.items[2].1);
-    let (name, value) = s
+    let found = s
         .iter()
-        .find(|(k, _)| k == "ReplyCodeActions")
+        .find(|st| st.name == "ReplyCodeActions")
         .expect("ReplyCodeActions");
-    assert_eq!(name, "ReplyCodeActions");
+    assert_eq!(found.name, "ReplyCodeActions");
     assert_eq!(
-        value, ":?R=F,:?E=F,:~=S,:?A=C,:*=S,:I?=W,:T?=C",
+        found.value, ":?R=F,:?E=F,:~=S,:?A=C,:*=S,:I?=W,:T?=C",
         "this is the value a real production carries; splitting on every `=` truncates it at `:?R`"
+    );
+    // The value is FULL of `:`, which is now also the target delimiter. Splitting on `:` before
+    // `=` would read `ReplyCodeActions=` as this setting's target and `?R=F,…` as its name.
+    assert_eq!(
+        found.target, "Host",
+        "the target must come from the key part, not from the first `:` in the whole line: {found:?}"
     );
 }
 
@@ -94,11 +105,15 @@ fn a_setting_value_containing_equals_signs_survives_whole() {
 /// settings list. Same rule #347 established for the `%Status` chain.
 #[test]
 fn a_section_cut_short_is_incomplete_not_a_smaller_settings_list() {
-    let b = parse_get_settings_batch("PI_ITEM:A\nPI_NSET:4\nPI_SET:Port=1\n");
+    let b = parse_get_settings_batch("PI_ITEM:A\nPI_NSET:4\nPI_SET:Adapter:Port=1\n");
     assert_eq!(
         b.items[0].1,
         ItemSettings::Read {
-            settings: vec![("Port".into(), "1".into())],
+            settings: vec![Setting {
+                target: "Adapter".into(),
+                name: "Port".into(),
+                value: "1".into()
+            }],
             declared: 4
         }
     );
@@ -109,7 +124,7 @@ fn a_section_cut_short_is_incomplete_not_a_smaller_settings_list() {
     assert_eq!(v["settings_declared"], 4);
     // CONTROL: a section that IS whole must not carry the flag, or the assertion above is
     // satisfied by a payload that always claims incompleteness.
-    let whole = parse_get_settings_batch("PI_ITEM:A\nPI_NSET:1\nPI_SET:Port=1\n");
+    let whole = parse_get_settings_batch("PI_ITEM:A\nPI_NSET:1\nPI_SET:Adapter:Port=1\n");
     let wv = item_settings_payload("A", &whole.items[0].1);
     assert!(wv.get("settings_incomplete").is_none(), "{wv}");
 }
@@ -149,12 +164,17 @@ fn a_section_with_no_count_and_no_marker_is_unreadable_not_empty() {
     );
 }
 
-/// The pre-existing loss, now counted: the program writes `Name=Value` and drops `Setting.Target`,
-/// so a Host and an Adapter setting of the same name become one map key. Real shape — the production
-/// read for these fixtures has items carrying both targets.
+/// A collapse is still COUNTED, but it no longer has a legitimate cause. While `Setting.Target` was
+/// dropped, a Host and an Adapter setting of the same name became one map key, and this field
+/// reported that known loss. Now that the key carries the target, the only way two rows can share a
+/// key is two rows with the SAME target and name — which `Ens.Config.Setting` should never hold — so
+/// the field is an integrity check. The Host/Adapter pair that USED to land here is now asserted to
+/// keep both keys, in `a_read_setting_cannot_be_written_back.rs`.
 #[test]
 fn settings_that_collapse_in_the_map_are_counted_not_hidden() {
-    let b = parse_get_settings_batch("PI_ITEM:A\nPI_NSET:2\nPI_SET:Port=8080\nPI_SET:Port=443\n");
+    let b = parse_get_settings_batch(
+        "PI_ITEM:A\nPI_NSET:2\nPI_SET:Adapter:Port=8080\nPI_SET:Adapter:Port=443\n",
+    );
     assert!(
         b.items[0].1.complete(),
         "both rows arrived — the transport lost nothing"
@@ -166,7 +186,9 @@ fn settings_that_collapse_in_the_map_are_counted_not_hidden() {
     );
     assert_eq!(v["settings_declared"], 2);
     // CONTROL: distinct names must NOT report a collapse.
-    let ok = parse_get_settings_batch("PI_ITEM:A\nPI_NSET:2\nPI_SET:Port=8080\nPI_SET:Host=x\n");
+    let ok = parse_get_settings_batch(
+        "PI_ITEM:A\nPI_NSET:2\nPI_SET:Adapter:Port=8080\nPI_SET:Host:Timeout=x\n",
+    );
     let okv = item_settings_payload("A", &ok.items[0].1);
     assert!(okv.get("duplicate_setting_names").is_none(), "{okv}");
 }
@@ -175,10 +197,10 @@ fn settings_that_collapse_in_the_map_are_counted_not_hidden() {
 /// value behind — the worst of the two failures.
 #[test]
 fn a_value_spanning_lines_keeps_its_continuation() {
-    let b = parse_get_settings_batch("PI_ITEM:A\nPI_NSET:1\nPI_SET:Note=first\nsecond line\n");
+    let b = parse_get_settings_batch("PI_ITEM:A\nPI_NSET:1\nPI_SET:Host:Note=first\nsecond line\n");
     let s = read(&b.items[0].1);
     assert_eq!(s.len(), 1, "the continuation is not a second setting");
-    assert_eq!(s[0].1, "first\nsecond line");
+    assert_eq!(s[0].value, "first\nsecond line");
     assert!(b.items[0].1.complete(), "one declared, one received");
 }
 
@@ -370,11 +392,15 @@ fn payload(out: &str, legacy_single: bool) -> serde_json::Value {
 #[test]
 fn a_single_item_call_reports_the_shape_it_always_did() {
     let v = payload(
-        "PI_ITEM:Censo.Router\nPI_NSET:1\nPI_SET:BusinessRuleName=Censo.RUL.Censo\n",
+        "PI_ITEM:Censo.Router\nPI_NSET:1\nPI_SET:Host:BusinessRuleName=Censo.RUL.Censo\n",
         true,
     );
     assert_eq!(v["success"], true);
     assert_eq!(v["item"], "Censo.Router");
+    // The key is BARE even though the wire now carries `Host:` in front of it. This was the one
+    // site in the repo that keyed a bare output setting name, and it is byte-identical after the
+    // change — which is the whole point of qualifying a host key only when its own name would
+    // otherwise be misread as a prefix.
     assert_eq!(v["settings"]["BusinessRuleName"], "Censo.RUL.Censo");
     assert!(
         v.get("results").is_none(),
@@ -390,7 +416,7 @@ fn a_single_item_call_reports_the_shape_it_always_did() {
 /// batch and should not have to handle two response shapes depending on how many names they sent.
 #[test]
 fn asking_with_a_list_reports_the_list_shape() {
-    let v = payload("PI_ITEM:A\nPI_NSET:1\nPI_SET:Port=1\n", false);
+    let v = payload("PI_ITEM:A\nPI_NSET:1\nPI_SET:Adapter:Port=1\n", false);
     assert_eq!(v["count"], 1);
     assert_eq!(v["results"][0]["item"], "A");
     assert_eq!(v["results"][0]["found"], true);
@@ -402,7 +428,7 @@ fn asking_with_a_list_reports_the_list_shape() {
 #[test]
 fn a_partial_read_names_what_was_missing_and_does_not_claim_all_found() {
     let v = payload(
-        "PI_ITEM:Censo.BS.HL7\nPI_NSET:1\nPI_SET:Port=43210\nPI_ITEM:Nope\nPI_MISSING:1\n",
+        "PI_ITEM:Censo.BS.HL7\nPI_NSET:1\nPI_SET:Adapter:Port=43210\nPI_ITEM:Nope\nPI_MISSING:1\n",
         false,
     );
     assert_eq!(v["success"], true, "the read happened");
@@ -420,7 +446,7 @@ fn a_partial_read_names_what_was_missing_and_does_not_claim_all_found() {
 #[test]
 fn a_complete_read_claims_all_found() {
     let v = payload(
-        "PI_ITEM:A\nPI_NSET:1\nPI_SET:Port=1\nPI_ITEM:B\nPI_NSET:0\n",
+        "PI_ITEM:A\nPI_NSET:1\nPI_SET:Adapter:Port=1\nPI_ITEM:B\nPI_NSET:0\n",
         false,
     );
     assert_eq!(v["all_found"], true);
@@ -431,7 +457,7 @@ fn a_complete_read_claims_all_found() {
 /// presented as the item's settings is the failure the declared count exists to catch.
 #[test]
 fn a_short_section_stops_the_batch_claiming_all_found() {
-    let v = payload("PI_ITEM:A\nPI_NSET:9\nPI_SET:Port=1\n", false);
+    let v = payload("PI_ITEM:A\nPI_NSET:9\nPI_SET:Adapter:Port=1\n", false);
     assert_eq!(v["all_found"], false, "9 declared, 1 arrived: {v}");
     assert_eq!(
         v["missing"],

@@ -332,7 +332,8 @@ It keeps the secret out of the ObjectScript you send, and it is write-gated on L
 Ens.Config.Production here, iris_production_item does it in one typed call: action=add \
 (item=..., class_name=..., optional settings=...), action=remove, action=enable, action=disable, \
 action=get_settings, action=set_settings. Prefix a settings key with 'Adapter.' to target the \
-adapter rather than the Host, and add/set_settings apply the change live via \
+adapter rather than the Host — and get_settings returns its keys in that same form, so a read \
+feeds straight back into a write. add/set_settings apply the change live via \
 Ens.Director.UpdateProduction when that production is running (set_settings takes apply=false to \
 batch), so there is no separate update step to remember.",
         );
