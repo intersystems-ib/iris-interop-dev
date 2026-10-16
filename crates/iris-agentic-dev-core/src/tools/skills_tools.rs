@@ -173,9 +173,12 @@ pub(crate) async fn read_skills_json(
 /// Classify what came back off the wire. Split out from `read_skills_json` so the
 /// empty-payload rule below is testable without a live connection.
 ///
-/// #119 follow-up: `IrisConnection::execute` discards the child's exit status, so a
+/// #119 follow-up: `IrisConnection::execute` USED to discard the child's exit status, so a
 /// `docker exec` that FAILED — missing or stopped container, daemon down, permission
-/// denied — comes back as `Ok("")` rather than an error. Every builder above ends in a
+/// denied — came back as `Ok("")` rather than an error. `connection::docker_exec_failure`
+/// reads it now (#390), so that case arrives here as `Unreachable` before this runs; the
+/// rule below stays as the second line of defence and still covers the one case an exit
+/// status cannot name — a child that exits 0 having written nothing. Every builder above ends in a
 /// `write`, so a reachable IRIS always answers something: an empty registry writes `[]`,
 /// not nothing at all. Empty therefore means the transport produced no output, and
 /// calling that `Unparseable` would make the tool assert "IRIS WAS reachable" about an

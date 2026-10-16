@@ -87,9 +87,49 @@ impl std::error::Error for IrisReportedError {}
 /// counterpart of [`atelier_status`].
 ///
 /// A `Some` here means the request reached IRIS, IRIS executed it, and IRIS put its own diagnosis in
-/// the response — so a second transport is not a second opinion and cannot be a remedy.
+/// the response — so for nearly all of them a second transport is not a second opinion and cannot be
+/// a remedy.
+///
+/// There is ONE exception, and the first version of this doc denied it: a `<MAXSTRING>` raised
+/// inside the generated wrapper's own capture accumulation (`tools::maxstring_origin`'s
+/// `ServerCapture` — the frame is `[z]Execute+N^IrisDevTmp.*`, which is `build_exec_class`'s
+/// `Execute()` concatenating the whole captured device file into one IRIS local). The string that
+/// overflowed there is THIS SERVER'S, not the caller's, and [`IrisConnection::execute`] pipes
+/// `docker exec … iris session` stdout into a Rust `String` with no IRIS single-string limit — so
+/// for that frame, and only that frame, the docker leg really can return the output. This function
+/// stays a pure kind test; the exception belongs to the caller that owns the fallback.
 pub fn iris_reported(err: &anyhow::Error) -> Option<&IrisReportedError> {
     err.downcast_ref::<IrisReportedError>()
+}
+
+/// Did this `docker exec` fail WITHOUT saying anything? (#362's shape, one layer below the tools.)
+///
+/// [`IrisConnection::execute`] discarded the child's exit status, so a `docker exec` that failed —
+/// missing or stopped container, daemon down, permission denied — came back as `Ok("")` with
+/// `stderr` already sent to `/dev/null`. `skills_tools::classify_skills_payload` documents that and
+/// defends against it by knowing that every skills read ends in a `write`; the generic path cannot
+/// know that, so `iris_execute` reported "the script ran and produced no output" for a leg that
+/// never ran at all. The exit status is the ONLY thing that separates those two empties, and it was
+/// the one value being thrown away.
+///
+/// NARROW on purpose. A non-zero exit WITH output is left alone: `iris session` can exit non-zero
+/// for an abort whose text is on stdout, and that text is the answer — `runtime_abort_line` already
+/// reads it, and turning it into an `Err` would DROP it. Only "exited badly and said nothing" is a
+/// failure here, which is exactly the case that is indistinguishable from success today.
+pub(crate) fn docker_exec_failure(exit_code: Option<i32>, stdout: &str) -> Option<String> {
+    if exit_code == Some(0) || !stdout.trim().is_empty() {
+        return None;
+    }
+    Some(match exit_code {
+        Some(c) => format!(
+            "docker exec exited {c} and produced no output, so the code was NOT run: check that \
+             the IRIS_CONTAINER container exists and is running (`docker ps`). This is not an \
+             empty result from IRIS."
+        ),
+        None => "docker exec was killed by a signal and produced no output, so the code was NOT \
+                 run. This is not an empty result from IRIS."
+            .to_string(),
+    })
 }
 
 /// Whether a failed `execute_via_generator` attempt is worth repeating: a 5xx or a transport
@@ -907,7 +947,11 @@ impl IrisConnection {
                 .map_err(|_| anyhow::anyhow!("docker exec timed out after 30s"))??;
 
         let raw = String::from_utf8_lossy(&output.stdout).to_string();
-        Ok(strip_iris_banner(&raw))
+        let stripped = strip_iris_banner(&raw);
+        if let Some(why) = docker_exec_failure(output.status.code(), &stripped) {
+            anyhow::bail!("{why}");
+        }
+        Ok(stripped)
     }
 
     /// FR-004: Run a SQL query via the Atelier query endpoint.
@@ -1816,6 +1860,49 @@ mod read_only_mode_tests {
                 "{off:?} must not request strict"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod docker_exec_failure_tests {
+    use super::docker_exec_failure;
+
+    /// #362's shape one layer below the tools, and the reason `iris_execute` can now hand the
+    /// docker leg a `<MAXSTRING>` fall-through without lying about the outcome.
+    ///
+    /// `execute()` discarded the child's exit status, so a `docker exec` that failed — missing or
+    /// stopped container, daemon down — arrived as `Ok("")`, which is byte-identical to a script
+    /// that ran and wrote nothing. The exit status is the ONLY thing that separates them.
+    #[test]
+    fn a_docker_exec_that_said_nothing_is_a_failure_not_an_empty_answer() {
+        // The two empties that used to be one value.
+        assert!(
+            docker_exec_failure(Some(0), "").is_none(),
+            "exit 0 with no output is a side-effecting script that wrote nothing — unchanged"
+        );
+        let failed = docker_exec_failure(Some(1), "   \n")
+            .expect("a non-zero exit with nothing on stdout is a failed exec, not an empty result");
+        assert!(failed.contains("NOT run"), "{failed}");
+        assert!(failed.contains("not an empty result"), "{failed}");
+        // Killed by a signal: no exit code at all, same conclusion.
+        assert!(
+            docker_exec_failure(None, "").is_some(),
+            "a child with no exit code produced nothing either"
+        );
+
+        // THE NARROWNESS CONTROL, and the assertion that matters most here. `iris session` can
+        // exit non-zero for an abort whose text is on stdout — and that text is the ANSWER:
+        // `runtime_abort_line` reads it and the envelope reports IRIS_RUNTIME_ERROR with the
+        // output attached. Turning that into an `Err` would drop the very diagnosis this whole
+        // chain is about, so a non-zero exit WITH output must stay `Ok`.
+        assert!(
+            docker_exec_failure(Some(1), "ERROR: <SYNTAX>zRunUser+1^IrisDevTmp.Run0.1").is_none(),
+            "a non-zero exit that produced output must stay Ok — the output is the diagnosis"
+        );
+        assert!(
+            docker_exec_failure(Some(2), "42").is_none(),
+            "and so must any other non-zero exit that actually said something"
+        );
     }
 }
 
