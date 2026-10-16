@@ -22,7 +22,7 @@
 
 use iris_agentic_dev_core::tools::interop::{
     build_get_settings_batch_code, item_settings_payload, parse_get_settings_batch,
-    qualify_setting_key, resolve_setting_target,
+    qualify_setting_key, resolve_setting_target, SettingKey,
 };
 
 /// The headline defect. Two rows, two targets, one name: before the fix both arrived as names
@@ -80,7 +80,15 @@ fn every_read_key_resolves_back_to_the_target_it_came_from() {
     let mut checked = 0;
     for target in ["Host", "Adapter"] {
         for name in names {
-            let key = qualify_setting_key(target, name);
+            // Both recognised targets must yield a WRITABLE key. The variant is half the claim:
+            // the round trip below is vacuous if the key never reaches a caller.
+            let key = match qualify_setting_key(target, name) {
+                SettingKey::Writable(k) => k,
+                other => panic!(
+                    "target {target:?} name {name:?} must yield a writable key — both targets are \
+                     in the write side's vocabulary, got {other:?}"
+                ),
+            };
             assert_eq!(
                 resolve_setting_target(&key),
                 (target, name),
@@ -101,7 +109,7 @@ fn every_read_key_resolves_back_to_the_target_it_came_from() {
     assert_eq!(resolve_setting_target("Adapter.DSN"), ("Adapter", "DSN"));
     assert_eq!(
         qualify_setting_key("Host", "Adapter.DSN"),
-        "Host.Adapter.DSN"
+        SettingKey::Writable("Host.Adapter.DSN".into())
     );
 
     // CONTROL for the other direction: an ordinary host setting is NOT qualified, or the mapping
@@ -114,33 +122,217 @@ fn every_read_key_resolves_back_to_the_target_it_came_from() {
     ] {
         assert_eq!(
             qualify_setting_key("Host", name),
-            name,
+            SettingKey::Writable(name.into()),
             "an ordinary host setting's key must be byte-identical to the pre-fix output"
         );
     }
 }
 
+/// #373 review, the should_fix: the sibling of the conditional `Host.` guard.
+///
+/// The guard exists because a bare key whose own name begins `Adapter.`/`Host.` is re-read by
+/// `resolve_setting_target` as a PREFIX. The first pass applied it on the `Host` arm only, and the
+/// `Unknown` arm — which also covers an absent target field — returned the bare name
+/// unconditionally, so it emitted exactly the key the guard was written to prevent. `Host` has a
+/// prefix to escape with; an unrecognised target has none, so the honest answer is no key at all.
+#[test]
+fn an_unknown_target_is_never_handed_a_recognised_target_s_key() {
+    // Measured on the first pass: both of these returned the bare `"Adapter.DSN"`.
+    for target in ["", "Gateway", "  ", "Adapter.Nested", "Host2"] {
+        for name in ["Adapter.DSN", "Host.Port", "Adapter.", "Host."] {
+            assert_eq!(
+                qualify_setting_key(target, name),
+                SettingKey::NoKey,
+                "target {target:?} is outside the write side's vocabulary and name {name:?} reads \
+                 back as a prefix, so no key can address this row — emitting one addresses a \
+                 DIFFERENT row"
+            );
+        }
+    }
+
+    // CONTROL, and the reason this is `NoKey` rather than a new prefix: the bare name really is
+    // read as another target's key. Without this, `NoKey` could be refusing a harmless name.
+    assert_eq!(resolve_setting_target("Adapter.DSN"), ("Adapter", "DSN"));
+    assert_eq!(resolve_setting_target("Host.Port"), ("Host", "Port"));
+
+    // CONTROL in the other direction: an unknown target whose name carries NO such prefix keeps
+    // its bare name, exactly as before. Without this the refusal above is satisfied by refusing
+    // every unknown-target row, which would drop settings this tool has always returned.
+    for name in ["DSN", "Port", "ReplyCodeActions"] {
+        assert_eq!(
+            qualify_setting_key("Gateway", name),
+            SettingKey::Unattributed(name.into()),
+            "an unknown target with an ordinary name still yields its bare name"
+        );
+    }
+
+    // CONTROL that the recognised targets are untouched by this arm.
+    assert_eq!(
+        qualify_setting_key("Adapter", "DSN"),
+        SettingKey::Writable("Adapter.DSN".into())
+    );
+}
+
+/// The payload half of the same defect, and the failure the review understated: the bare key an
+/// unknown-target row was given does not merely misaddress on write-back — it COLLIDES with a
+/// genuine row of the target it names, and the two collapsed in the settings map with whichever
+/// value `HashMap` iteration inserted last winning. A nondeterministic wrong value, reported as a
+/// successful read.
+#[test]
+fn an_unknown_target_row_cannot_overwrite_a_genuine_adapter_setting() {
+    let b = parse_get_settings_batch(
+        "PI_ITEM:A\nPI_NSET:2\nPI_SET:Gateway:Adapter.DSN=from_gateway\nPI_SET:Adapter:DSN=from_adapter\n",
+    );
+    let v = item_settings_payload("A", &b.items[0].1);
+
+    // The genuine adapter setting owns its key, every time. Before the fix this assertion was a
+    // coin flip: measured, the map held one `Adapter.DSN` built from two different rows.
+    assert_eq!(
+        v["settings"]["Adapter.DSN"], "from_adapter",
+        "the `Adapter`/`DSN` row owns `Adapter.DSN`; the unknown-target row must not take it: {v}"
+    );
+    assert_eq!(
+        v["settings"].as_object().map(|o| o.len()),
+        Some(1),
+        "only the row with a writable key is in the map: {v}"
+    );
+
+    // The withheld row is NAMED, not dropped: raw target, null key, and its value — which this
+    // entry is now the only record of.
+    assert_eq!(
+        v["settings_unknown_target"][0]["name"], "Adapter.DSN",
+        "{v}"
+    );
+    assert_eq!(v["settings_unknown_target"][0]["target"], "Gateway", "{v}");
+    assert_eq!(
+        v["settings_unknown_target"][0]["value"], "from_gateway",
+        "{v}"
+    );
+    assert!(
+        v["settings_unknown_target"][0]["key"].is_null(),
+        "no key can address this row, and a key must not be invented to fill the field: {v}"
+    );
+    assert_eq!(v["settings_unaddressable"], 1, "{v}");
+
+    // The arithmetic that says nothing was lost twice or counted twice: every row that arrived is
+    // in exactly one place. `duplicate_setting_names` must read ABSENT — withholding a row is not
+    // a name collision, and reporting it as one would send a maintainer after the wrong defect.
+    assert!(
+        v.get("duplicate_setting_names").is_none(),
+        "a withheld row is not a collapsed name: {v}"
+    );
+    assert_eq!(
+        v["settings"].as_object().map(|o| o.len()).unwrap_or(0)
+            + v["settings_unaddressable"].as_u64().unwrap_or(0) as usize,
+        2,
+        "map + unaddressable must account for both rows that arrived: {v}"
+    );
+}
+
+/// The block `{ … }` opened by the `{` at `open_at`, as a byte range of its body.
+///
+/// Brace counting is sound on these lines: the generated markers carry no braces and `$C(10)` uses
+/// parentheses, so there is no brace inside a string literal to confuse it. Asserted below by
+/// requiring the block to close.
+fn block_body(line: &str, open_at: usize) -> std::ops::Range<usize> {
+    let b = line.as_bytes();
+    assert_eq!(b[open_at], b'{', "expected a block to open at {open_at}");
+    let mut depth = 0usize;
+    for (i, c) in line.bytes().enumerate().skip(open_at) {
+        match c {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return (open_at + 1)..i;
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("the block opened at {open_at} never closes:\n{line}");
+}
+
 /// The wire. Every other test in this file and in `production_item_batch_settings.rs` is fed
 /// hand-written marker text, so none of them can tell whether the generated ObjectScript writes
 /// the target at all.
+///
+/// #373 review, nit: this test used to pin the generated loop variable's SPELLING (`tS`), so a
+/// behaviour-preserving rename reddened it — a guard forbidding its own refactor. The variable is
+/// now DERIVED from the `GetNext` call and the emission built from it, so the test pins the ORDER
+/// of the fields and not the name of the cursor.
+///
+/// It also used to assert only `contains` + a count, which cannot say the write is in the loop.
+/// `build_get_settings_batch_code` keeps every `For` on one line (`build_exec_class` splits
+/// generated code on `\n`), so lexical containment within that one line is checkable here and is a
+/// real structural claim: the write sits inside the `For` block, inside the `Else` branch. What
+/// this still cannot establish is RUNTIME reachability — no test in this repo executes the
+/// generated ObjectScript — so the claim is kept to position.
 #[test]
-fn the_generated_program_writes_the_target_on_the_wire() {
+fn the_generated_program_writes_the_target_inside_the_settings_loop() {
     let items = vec!["A".to_string(), "B".to_string()];
     let code = build_get_settings_batch_code("P", &items);
-    // The ORDER is the contract: target, `:`, name, `=`, value. That is what the parser splits,
-    // and it is why the value may contain both `:` and `=` while the key may contain neither.
-    let emission = "_tS.Target_\":\"_tS.Name_\"=\"_tS.Value_";
-    assert!(
-        code.contains(emission),
-        "the per-setting write must carry Target first, or get_settings output cannot be fed back \
-         into set_settings for any adapter setting:\n{code}"
-    );
-    // CONTROL: one such write per item asked for, not one for the whole program.
+
+    let loop_lines: Vec<&str> = code
+        .lines()
+        .filter(|l| l.contains(".Settings.GetNext("))
+        .collect();
+    // CONTROL: one walk per item asked for, not one for the whole program — so this test cannot
+    // pass *because* the patch created the single match it then finds.
     assert_eq!(
-        code.matches(emission).count(),
+        loop_lines.len(),
         items.len(),
-        "expected one setting write per item:\n{code}"
+        "expected one settings walk per item:\n{code}"
     );
+
+    for line in &loop_lines {
+        // Derive the cursor variable rather than pinning it: `Set <var>=tItem.Settings.GetNext(`.
+        let get_next = line
+            .find("=tItem.Settings.GetNext(.zk)")
+            .unwrap_or_else(|| panic!("no settings walk on this line:\n{line}"));
+        let set_kw = line[..get_next]
+            .rfind("Set ")
+            .unwrap_or_else(|| panic!("the walk is not a `Set`:\n{line}"));
+        let var = &line[set_kw + 4..get_next];
+        assert!(
+            !var.is_empty() && var.chars().all(|c| c.is_alphanumeric() || c == '%'),
+            "derived cursor variable {var:?} is not an identifier — the derivation, not the \
+             generator, is what broke:\n{line}"
+        );
+
+        // The ORDER is the contract: target, `:`, name, `=`, value. That is what the parser
+        // splits, and it is why the value may contain both `:` and `=` while the key may contain
+        // neither.
+        let emission = format!("_{var}.Target_\":\"_{var}.Name_\"=\"_{var}.Value_");
+
+        // Position, by lexical containment: inside the `Else` branch, inside the `For` block.
+        let else_at = line.find("Else {").expect("no Else branch") + 5;
+        let else_body = block_body(line, else_at);
+        let for_at = else_body.start
+            + line[else_body.clone()]
+                .find("For {")
+                .expect("the settings walk is not in a `For` inside the Else branch")
+            + 4;
+        let for_body = block_body(line, for_at);
+        let at = line.find(&emission).unwrap_or_else(|| {
+            panic!(
+                "the per-setting write must carry Target first, or get_settings output cannot be \
+                 fed back into set_settings for any adapter setting:\n{line}"
+            )
+        });
+        assert!(
+            for_body.contains(&at) && for_body.contains(&(at + emission.len() - 1)),
+            "the per-setting write must sit INSIDE the settings `For` block (body {for_body:?}), \
+             not merely somewhere in the program: found at {at}. Hoisted above the loop it runs \
+             once against an unset cursor:\n{line}"
+        );
+        // And the walk itself is in that same block, or the containment above is about some other
+        // loop that happens to be on this line.
+        assert!(
+            for_body.contains(&get_next),
+            "the `GetNext` cursor advance must be in the same block as the write:\n{line}"
+        );
+    }
 }
 
 /// An unrecognised `Setting.Target` is reported by name. Folding it into Host would emit a key that
@@ -156,6 +348,14 @@ fn an_unrecognised_target_is_named_not_folded_into_host() {
     // what a `Gateway` target means, and inventing a prefix would hand the caller a key to write
     // back that addresses something this build chose for them.
     assert_eq!(v["settings"]["DSN"], "pg", "{v}");
+    // `DSN` carries no prefix `resolve_setting_target` reads, so a key exists and is reported —
+    // the null-key case is the sibling test. This pins which of the two this row is.
+    assert_eq!(v["settings_unknown_target"][0]["key"], "DSN", "{v}");
+    assert_eq!(v["settings_unknown_target"][0]["value"], "pg", "{v}");
+    assert!(
+        v.get("settings_unaddressable").is_none(),
+        "this row has a key, so nothing was withheld from the map: {v}"
+    );
     assert!(
         v["settings"].get("Host.DSN").is_none() && v["settings"].get("Gateway.DSN").is_none(),
         "an unknown target must not be given an invented prefix: {v}"
@@ -172,9 +372,22 @@ fn an_unrecognised_target_is_named_not_folded_into_host() {
     assert_eq!(kv["settings"]["Adapter.DSN"], "pg", "{kv}");
 }
 
-/// The pre-fix wire shape, which an older server build still speaks. It must not silently
-/// half-work: the name and value are still recovered, but nothing claims to know which object the
-/// setting belongs to, because nothing on the line said.
+/// A line whose key part carries no `:` at all. It must not silently half-work: the name and value
+/// are still recovered, but nothing claims to know which object the setting belongs to, because
+/// nothing on the line said.
+///
+/// #373 review, nit: this used to say "the pre-fix wire shape, which an older server build still
+/// speaks". No server build speaks a different shape here — `execute_via_generator_once` PUTs a
+/// fresh `IrisDevTmp.Run<uuid>` built from `build_get_settings_batch_code` on every call, so the
+/// generator and this parser are always the same binary and version skew is structurally
+/// impossible. A maintainer who went looking for that mechanism would find none and could delete
+/// the branch as dead.
+///
+/// The measured reason, which is NOT an empty `Target` either: the generator writes
+/// `tS.Target_":"_tS.Name`, so an empty `Target` emits `PI_SET::Name=Value` — that still carries
+/// the delimiter and parses with target `""` through the ordinary arm. This arm is the defensive
+/// read of a key part that arrived WITHOUT the delimiter — a malformed or truncated line. Both
+/// converge on target `""`, which is the whole point: neither is read as Host.
 #[test]
 fn a_line_with_no_target_field_is_not_read_as_a_host_setting() {
     let b = parse_get_settings_batch("PI_ITEM:A\nPI_NSET:1\nPI_SET:Port=8080\n");
@@ -201,8 +414,10 @@ fn a_line_with_no_target_field_is_not_read_as_a_host_setting() {
 /// test is named for. On a WELL-FORMED line the split order is unobservable: `Host:Name=:a:b`
 /// yields the same three fields either way. The order is only observable on a line carrying NO
 /// target field, where splitting on `:` first takes `ReplyCodeActions=` for the target and leaves
-/// `?R=F,…` as the name — and that is exactly the line an older server build emits, so it is the
-/// case the backward-compatible read has to get right.
+/// `?R=F,…` as the name. That line is not something an older server build emits — see
+/// `a_line_with_no_target_field_is_not_read_as_a_host_setting` for why no build speaks a different
+/// shape — it is a malformed or truncated line, which is exactly the input a defensive parse has to
+/// get right rather than attribute to Host.
 #[test]
 fn a_value_full_of_colons_does_not_become_the_target() {
     const VALUE: &str = ":?R=F,:?E=F,:~=S";
