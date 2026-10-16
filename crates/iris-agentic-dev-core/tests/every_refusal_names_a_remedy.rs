@@ -806,6 +806,13 @@ mod tests {\n\
     // And the control for the input shape itself: with the braces taken out of the char literal
     // the answer is the same, so the assertion above is about the literal and not about the walk.
     let plain = src.replace("[',', '}']", "[',', ';']");
+    // Assert the SUBSTITUTION HAPPENED. A needle that matches nothing leaves `plain == src`, and
+    // the assertion below then passes for the wrong reason — it would be measuring the same input
+    // twice while reading as a second, independent case.
+    assert_ne!(
+        plain, src,
+        "the brace-free variant is identical to the input, so the control below is vacuous"
+    );
     let plain_found = codes_after(&strip_line_comments(&strip_test_mods(&plain)), "err_json(");
     assert_eq!(
         plain_found,
