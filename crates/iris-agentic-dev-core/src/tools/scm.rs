@@ -633,13 +633,16 @@ pub(crate) fn undriveable_refusal(
         CodeMeaning::NeedsUi => (
             SCM_NEEDS_UI,
             format!(
-                "Source control answered with action {code}, which means the action has to be                  completed in the provider's own web UI — this tool cannot open it, and nothing                  was changed.{where_}"
+                "Source control answered with action {code}, which means the action has to be \
+                 completed in the provider's own web UI — this tool cannot open it, and nothing \
+                 was changed.{where_}"
             ),
         ),
         CodeMeaning::Prompt => (
             SCM_NEEDS_INPUT,
             format!(
-                "Source control is asking for a typed value before it will act on {doc}, and this                  path has no way to supply one — nothing was changed.{where_}"
+                "Source control is asking for a typed value before it will act on {doc}, and this \
+                 path has no way to supply one — nothing was changed.{where_}"
             ),
         ),
         // Reached only from a site that has already handled the driveable codes.
@@ -1731,6 +1734,58 @@ mod tests {
         assert!(
             detail.contains("odd"),
             "the provider text is dropped: {detail}"
+        );
+    }
+
+    /// #378: a `format!` whose backslash-continuations have been collapsed onto ONE source line
+    /// keeps its source indentation INSIDE the runtime string. `undriveable_refusal`'s detail goes
+    /// straight to the caller — through `err_json` at the two sites above and through
+    /// `Precheck::Refuse` in `iris_doc` — and three 18-space runs shipped that way on 2026-10-06
+    /// while every test in this mod stayed green: `contains` and `len` predicates cannot see
+    /// internal whitespace, so the gap was in the oracle, not in the coverage.
+    ///
+    /// The input domain is FINITE and this covers ALL of it: every `CodeMeaning` variant, each with
+    /// a representative code, times an empty and a non-empty provider message. The `match` below
+    /// has no catch-all, so a seventh variant will not compile until it is given a code here.
+    #[test]
+    fn no_undriveable_refusal_leaks_its_source_indentation() {
+        let variants = [
+            CodeMeaning::NoDialog,
+            CodeMeaning::Confirm,
+            CodeMeaning::Declined,
+            CodeMeaning::Prompt,
+            CodeMeaning::NeedsUi,
+            CodeMeaning::Undriveable,
+        ];
+        let mut checked = 0usize;
+        for meaning in variants {
+            let code: u8 = match meaning {
+                CodeMeaning::NoDialog => 0,
+                CodeMeaning::Confirm => 1,
+                CodeMeaning::Declined => 6,
+                CodeMeaning::Prompt => 7,
+                CodeMeaning::NeedsUi => 2,
+                CodeMeaning::Undriveable => 9,
+            };
+            for msg in ["", "https://ccr.example/csp/ccr/login.csp?ns=APP"] {
+                let (_, detail) = undriveable_refusal(meaning, code, msg, "My.Cls.cls");
+                assert!(
+                    !detail.is_empty(),
+                    "{meaning:?} (code {code}, msg {msg:?}) produced no detail at all"
+                );
+                assert!(
+                    !detail.contains("  "),
+                    "a run of leaked source indentation reached the caller for \
+                     {meaning:?} (code {code}, msg {msg:?}): {detail:?}"
+                );
+                checked += 1;
+            }
+        }
+        // CONTROL: a green must not come from an empty iteration. Six variants x two messages, and
+        // `checked` is only reached after the detail is known to be non-empty.
+        assert_eq!(
+            checked, 12,
+            "the loop did not produce one non-empty detail per variant per message"
         );
     }
 
