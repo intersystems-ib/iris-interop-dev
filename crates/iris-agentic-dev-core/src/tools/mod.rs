@@ -4558,15 +4558,25 @@ pub(crate) fn maxstring_hint(origin: MaxstringOrigin) -> &'static str {
 ///
 /// `method` is always `"http"`: the HTTP leg is what reached IRIS and carried this verdict back,
 /// whether or not a docker attempt happened afterwards.
+///
+/// `docker_fallback_tried` is written because the decision is otherwise INVISIBLE. Both routes end
+/// in this same envelope, so "answered without trying docker" and "tried docker, which added
+/// nothing" were indistinguishable to a caller AND to a test — and the frame gate that chooses
+/// between them is the whole of finding 3. It is also the question #390 left ambiguous: the old
+/// DOCKER_REQUIRED answer implied an attempt that had not happened. Only this envelope carries the
+/// key, because this is the only answer where the attempt is a judgement call rather than a
+/// consequence of the configuration.
 fn iris_reported_envelope(
     text: &str,
     namespace: &str,
     redirect_hint: Option<&'static str>,
+    docker_fallback_tried: bool,
 ) -> Result<CallToolResult, McpError> {
     let mut resp = serde_json::json!({
         "success": false,
         "namespace": namespace,
         "method": "http",
+        "docker_fallback_tried": docker_fallback_tried,
     });
     // #323's decode, on the one arm that never had it: the text is a %Status chain (`ERROR #5540`
     // wrapping `ERROR #5002`), so the per-error codes are there to be split and the caller must not
@@ -7081,7 +7091,7 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
     }
 
     #[tool(
-        description = "Execute arbitrary ObjectScript code on IRIS and return stdout. Uses pure-HTTP execution: your code is written into the RunUser() method of a temp class, compiled, run at CALL time by an Execute() SqlProc that captures the device output, then the class is deleted. Falls back to docker exec if IRIS_CONTAINER env var is set and the HTTP TRANSPORT fails \u{2014} but NOT when IRIS itself answered and reported an error about your code: that is returned as error_code IRIS_RUNTIME_ERROR carrying IRIS's own text, because docker exec cannot change a verdict IRIS has already given. The one exception is a <MAXSTRING> raised inside this server's own output capture (frame Execute+N^IrisDevTmp.*), where the docker transport has no single-string limit and is therefore still tried. &sql(...) embedded SQL macros are automatically translated to %SQL.Statement calls (set translate_sql: false to disable). When translation fires, response includes sql_translated: true and translated_code. Example: code='write $ZVERSION,!' returns the IRIS version string. Use this for side-effecting ObjectScript only — for SELECTs use iris_query, for class/table introspection use docs_introspect/iris_symbols/iris_table_info, for production state use iris_production/iris_interop_query, and to create+compile a class use iris_doc(put,compile) over Atelier (never $SYSTEM.OBJ.Load from a file path — that needs IRIS to share this host's disk). When the code matches one of those, the response includes a `hint` naming the typed tool. When your code writes a %Status (`write $SYSTEM.Status.GetErrorText(sc)`), the response also carries `status`: that chain split into per-error {code, text}, so you never split it or re-parse the `ERROR #NNNN:` prefix yourself — `status.complete: false` means part of it did not decode and `status.undecoded` holds it verbatim. No `status` key means no %Status text was found in the output, which is NOT a claim that a status was OK. This tool can only decode a status your code actually writes, so for a ClassMethod that returns one prefer iris_execute_method, which reads the status itself. namespace: optional — defaults to the connection namespace (IRIS_NAMESPACE), never a hardcoded USER; the response echoes the namespace it ran in."
+        description = "Execute arbitrary ObjectScript code on IRIS and return stdout. Uses pure-HTTP execution: your code is written into the RunUser() method of a temp class, compiled, run at CALL time by an Execute() SqlProc that captures the device output, then the class is deleted. Falls back to docker exec if IRIS_CONTAINER env var is set and the HTTP TRANSPORT fails \u{2014} but NOT when IRIS itself answered and reported an error about your code: that is returned as error_code IRIS_RUNTIME_ERROR carrying IRIS's own text, because docker exec cannot change a verdict IRIS has already given. The one exception is a <MAXSTRING> raised inside this server's own output capture (frame Execute+N^IrisDevTmp.*), where the docker transport has no single-string limit and is therefore still tried. On an IRIS_RUNTIME_ERROR from this tool, docker_fallback_tried says which of the two happened, so you never have to guess whether the other transport was attempted. &sql(...) embedded SQL macros are automatically translated to %SQL.Statement calls (set translate_sql: false to disable). When translation fires, response includes sql_translated: true and translated_code. Example: code='write $ZVERSION,!' returns the IRIS version string. Use this for side-effecting ObjectScript only — for SELECTs use iris_query, for class/table introspection use docs_introspect/iris_symbols/iris_table_info, for production state use iris_production/iris_interop_query, and to create+compile a class use iris_doc(put,compile) over Atelier (never $SYSTEM.OBJ.Load from a file path — that needs IRIS to share this host's disk). When the code matches one of those, the response includes a `hint` naming the typed tool. When your code writes a %Status (`write $SYSTEM.Status.GetErrorText(sc)`), the response also carries `status`: that chain split into per-error {code, text}, so you never split it or re-parse the `ERROR #NNNN:` prefix yourself — `status.complete: false` means part of it did not decode and `status.undecoded` holds it verbatim. No `status` key means no %Status text was found in the output, which is NOT a claim that a status was OK. This tool can only decode a status your code actually writes, so for a ClassMethod that returns one prefer iris_execute_method, which reads the status itself. namespace: optional — defaults to the connection namespace (IRIS_NAMESPACE), never a hardcoded USER; the response echoes the namespace it ran in."
     )]
     async fn iris_execute(
         &self,
@@ -7262,7 +7272,12 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                         deferred_iris_verdict = Some(reported.text.clone());
                     } else {
                         self.record_call("iris_execute", false);
-                        return iris_reported_envelope(&reported.text, &namespace, redirect_hint);
+                        return iris_reported_envelope(
+                            &reported.text,
+                            &namespace,
+                            redirect_hint,
+                            false,
+                        );
                     }
                 }
                 // #101: the fall-through STAYS for every OTHER failure. `IrisConnection::execute`
@@ -7292,7 +7307,7 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                 // either, so the answer is the verdict IRIS gave — never "set IRIS_CONTAINER" or
                 // "verify /api/atelier" for a leg that answered HTTP 200 with the diagnosis in it.
                 if let Some(text) = deferred_iris_verdict.as_deref() {
-                    return iris_reported_envelope(text, &namespace, redirect_hint);
+                    return iris_reported_envelope(text, &namespace, redirect_hint, true);
                 }
                 if msg == "DOCKER_REQUIRED" {
                     // #101: both legs have now failed. If the HTTP leg was an auth refusal,
@@ -7329,7 +7344,7 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                     .filter(|_| trimmed.is_empty())
                 {
                     self.record_call("iris_execute", false);
-                    return iris_reported_envelope(text, &namespace, redirect_hint);
+                    return iris_reported_envelope(text, &namespace, redirect_hint, true);
                 }
                 // #123: same rule as the HTTP arm — the flag must not depend on prior output.
                 let abort = runtime_abort_line(trimmed);
@@ -20144,6 +20159,16 @@ mod reported_error_routing_tests {
                 v["error_code"], "DOCKER_REQUIRED",
                 "IRIS ran this and said why; Docker was never the problem: {v}"
             );
+            // FINDING 3. This frame is the server's own capture accumulation, and
+            // `IrisConnection::execute` has no IRIS single-string limit — so the docker leg is a
+            // real second opinion here and the first pass's unconditional short-circuit deleted
+            // it. The decision is invisible in every other field (both routes end in the same
+            // envelope), which is why it is reported.
+            assert_eq!(
+                v["docker_fallback_tried"], true,
+                "a <MAXSTRING> from OUR capture must still reach the transport that can answer \
+                 it: {v}"
+            );
 
             let err = v["error"].as_str().unwrap_or_default();
             assert!(
@@ -20216,6 +20241,14 @@ mod reported_error_routing_tests {
                 v["status"]["errors"][0]["code"], 5559,
                 "the compile error must be the FIRST element of the decoded chain — it is the \
                  cause, and the SqlProc failure is its consequence: {v}"
+            );
+            // THE OTHER DIRECTION of finding 3's gate, and the control that stops the assertion
+            // in `iris_execute_answers_what_iris_reported_not_docker_required` from being
+            // satisfied by a tool that simply always falls through. A stray brace is a verdict
+            // about the caller's code: `docker exec` runs the SAME code and cannot change it.
+            assert_eq!(
+                v["docker_fallback_tried"], false,
+                "nothing may be spent on a second transport for an error IRIS has settled: {v}"
             );
         });
     }
@@ -20473,6 +20506,60 @@ mod reported_error_routing_tests {
             "control: an abort with no arm still has no hint, so the ones above are not a \
              function that answers everything"
         );
+    }
+
+    /// The sibling tool, and the gap the first pass declared in `not_done`: `iris_test` has TWO
+    /// `execute_via_generator` `Err` arms and only the docker-first one was wired, so the identical
+    /// cause answered TEST_EXECUTION_ERROR or IRIS_RUNTIME_ERROR depending on whether
+    /// `IRIS_CONTAINER` happened to be set — a caller branching on `error_code` was reading the
+    /// configuration, not the cause.
+    ///
+    /// WHY THIS IS ENV-INDEPENDENT RATHER THAN ENV-GUARDED. `IRIS_CONTAINER` is process-global and
+    /// `workspace_config::tests` sets it mid-run, so a test that reads it races. It does not need
+    /// to: BOTH arms now answer the same code for the same cause, which IS the invariant under
+    /// test. Whichever arm this process takes, the assertion is the same one — and under the
+    /// previous behaviour it was red on the arm that runs when the var is unset, which is the
+    /// configuration the gate runs in.
+    #[test]
+    fn iris_test_gives_one_cause_one_code_whichever_leg_it_took() {
+        rt().block_on(async {
+            let server = atelier(
+                clean_compile(),
+                ResponseTemplate::new(200).set_body_json(maxstring_body()),
+            )
+            .await;
+            let r = tools_for(&server)
+                .iris_test(Parameters(Described::new(serde_json::json!({
+                    "pattern": "Zz.Tests.One",
+                    "namespace": "APP",
+                    "timeout": 5
+                }))))
+                .await
+                .expect("the tool must answer, not error out of the transport");
+            let v = payload(&r);
+
+            assert_eq!(
+                v["error_code"], "IRIS_RUNTIME_ERROR",
+                "an error IRIS reported must carry the same code here as it does from \
+                 iris_execute, on either of this tool's two Err arms: {v}"
+            );
+            assert_ne!(
+                v["error_code"], ERR_TEST_EXECUTION_ERROR,
+                "the test run is not what failed — IRIS answered and reported about the code: {v}"
+            );
+            // IRIS's own words have to survive the relabelling, which is the half of #390 that
+            // was about the message rather than the code.
+            let err = v["error"].as_str().unwrap_or_default();
+            assert!(
+                err.contains("<MAXSTRING>") && err.contains("SQLCODE"),
+                "the diagnosis is the whole actionable part: {v}"
+            );
+            // And never the env-var advice for a leg that answered HTTP 200.
+            assert!(
+                !v.to_string().contains("IRIS_CONTAINER"),
+                "IRIS_CONTAINER has no bearing on an error IRIS has already reported: {v}"
+            );
+        });
     }
 
     /// FINDING 1, DRIVEN — the one new reachable regression, which nothing exercised.
