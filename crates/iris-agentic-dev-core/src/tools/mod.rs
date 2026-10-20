@@ -792,14 +792,15 @@ pub const ERR_INDETERMINATE: &str = "INDETERMINATE";
 #[serde(rename_all = "snake_case")]
 pub enum ConnectionSource {
     ConfigFile,
-    /// Reached through the discovery cascade's env-var step. NOTE: the MCP server does not
-    /// normally produce this — clap resolves `--host` and `$IRIS_HOST` into one value, so an
-    /// env-configured server arrives as an explicit seed and is stamped `ExplicitFlag`. This
-    /// variant is for entry points that go through `discover_iris` without a seed.
+    /// Reached through the discovery cascade's env-var step — which, since #410, is how an
+    /// `IRIS_HOST`-configured MCP server normally arrives. It previously could not be: clap
+    /// merged `--host` and `$IRIS_HOST` into one value, so an env-configured server was stamped
+    /// `ExplicitFlag` and outranked the workspace config file.
     EnvVars,
     VsCodeSettings,
-    /// The operator named the target directly: a CLI flag, OR its environment-variable
-    /// equivalent, which clap merges into the same value before the connection is built.
+    /// The operator named the target on the command line. #410: this no longer covers the
+    /// environment-variable equivalent — `IRIS_HOST` reports `EnvVars` and ranks below the
+    /// workspace config file, so only a real flag is top-ranked.
     ExplicitFlag,
     IrisSelectContainer,
     AutoDiscovered,
@@ -813,8 +814,10 @@ impl ConnectionSource {
     /// — reported `auto_discovered`, and `EnvVars` was reachable ONLY on the disconnected
     /// path. The connection already knows: `discovery.rs` stamps `DiscoverySource` on it. The
     /// answer was being discarded here rather than missing.
-    pub fn for_connection(conn: &IrisConnection, has_config_file: bool) -> Self {
-        if has_config_file {
+    /// `from_config_file` means "the file CHOSE this target", not "a file was read" — #410 split
+    /// those apart after the second reading let a blind discovery be reported as the file's.
+    pub fn for_connection(conn: &IrisConnection, from_config_file: bool) -> Self {
+        if from_config_file {
             // A config file is the narrowest statement of intent, so it wins.
             return Self::ConfigFile;
         }
@@ -828,7 +831,37 @@ impl ConnectionSource {
             }
         }
     }
+}
 
+/// #410: what a hot-reload may claim as the new connection's provenance.
+///
+/// Separated from `check_reload` so the decision can be tested without a live server, because
+/// the defect was invisible in every offline test: `check_reload` stamped `ConfigFile` and the
+/// file's path unconditionally, which is right for a file that names `host` or `container` and
+/// a fabrication for one that names neither. Measured on the reported case — a bare `touch` of
+/// a file holding only `web_port = 45080` — it reported `connection_source: config_file` and
+/// port 48080, an instance named in neither the file nor the environment, reached by the blind
+/// localhost scan. Returning the path also silenced both `check_config` warnings, since
+/// `ignored_config_path` returns early when `config_file` is `Some`.
+///
+/// `file_named_the_target` comes from `names_a_target`, NOT from whether a connection was
+/// built: `workspace_config_to_connection` answers `None` both for `container = "x"` (a named
+/// target that discovery resolves) and for a file that chose nothing.
+pub(crate) fn reload_provenance(
+    file_named_the_target: bool,
+    conn: &IrisConnection,
+    config_path: std::path::PathBuf,
+) -> (ConnectionSource, Option<std::path::PathBuf>) {
+    if file_named_the_target {
+        (ConnectionSource::ConfigFile, Some(config_path))
+    } else {
+        // The cascade answered, so report the cascade's own source and leave `config_file`
+        // null — which also lets the ignored-file warning fire, as it should.
+        (ConnectionSource::for_connection(conn, false), None)
+    }
+}
+
+impl ConnectionSource {
     /// Did the operator NAME this target, or did we guess it?
     ///
     /// Only `AutoDiscovered` is a guess. #21's fallback warning exists to flag exactly that
@@ -5606,6 +5639,22 @@ impl IrisTools {
             return;
         }
 
+        // #410: a real `--host` flag outranks the file at startup, and must outrank it here too.
+        // Without this the precedence depended on WHEN you looked: the flag won until the file
+        // was touched, and the file won afterwards. `has_changed` has already consumed the mtime,
+        // so the edit is acknowledged and deliberately not adopted.
+        //
+        // Reading the live source is enough to make this stick: `ExplicitFlag` is stamped only by
+        // a command-line flag (a file-built connection carries `EnvVar`/`Docker`), and because
+        // this branch never swaps, the source stays `ExplicitFlag` for the life of the process.
+        if self.connection.lock().unwrap().source == ConnectionSource::ExplicitFlag {
+            tracing::debug!(
+                "iris-agentic-dev: .iris-agentic-dev.toml changed, but --host was passed and \
+                 outranks it (#410) — keeping the flag's connection"
+            );
+            return;
+        }
+
         // Config file changed — reload and re-probe
         let config_path = {
             let w = self.config_watcher.lock().unwrap();
@@ -5623,7 +5672,7 @@ impl IrisTools {
         // Parse the new config
         let cfg = crate::iris::workspace_config::load_workspace_config(config_file_str.as_deref());
 
-        let conn_result = match cfg {
+        let (conn_result, file_named_the_target) = match cfg {
             // #312: this arm used to cover BOTH "could not be parsed" and "the file is gone", and
             // reported the parse message for both. Three outcomes now, each with its own state.
             Err(e) => {
@@ -5642,16 +5691,24 @@ impl IrisTools {
                 );
                 return;
             }
-            Ok(Some(cfg)) => {
-                crate::iris::workspace_config::workspace_config_to_connection(&cfg, "USER")
-            }
+            Ok(Some(cfg)) => (
+                crate::iris::workspace_config::workspace_config_to_connection(&cfg, "USER"),
+                // #410: remember whether the FILE chose the target, for the provenance stamp
+                // below. `workspace_config_to_connection` returning `None` does not answer
+                // that question — it is `None` both for `container = "x"`, which names a
+                // target discovery then resolves, and for a file naming no target at all.
+                crate::iris::workspace_config::names_a_target(&cfg),
+            ),
         };
 
         // Probe the new connection
         let mut new_conn = match conn_result {
             Some(c) => c,
             None => {
-                // container= config — let discovery find it via IRIS_CONTAINER env
+                // Reached two ways, and they are not equivalent: `container = "x"` names a
+                // target for discovery to resolve via IRIS_CONTAINER, and a file that names no
+                // target at all leaves the whole cascade to answer — env vars, VS Code settings,
+                // then the blind scans. `file_named_the_target` keeps them apart for the stamp.
                 match crate::iris::discovery::discover_iris(None).await {
                     crate::iris::discovery::IrisDiscovery::Found(c) => c,
                     _ => {
@@ -5668,10 +5725,19 @@ impl IrisTools {
 
         new_conn.probe().await;
 
-        // Atomically swap connection
-        let new_state =
-            ConnectionState::from_iris(new_conn, ConnectionSource::ConfigFile, Some(config_path));
+        // Atomically swap connection.
+        //
+        // #410: provenance follows what CHOSE the target, not what was read. This used to stamp
+        // `ConfigFile` and the file's path unconditionally, so a `touch` of a file naming only
+        // `web_port` reported `connection_source: config_file` for an instance found by a blind
+        // scan — and because the path was `Some`, both `check_config` warnings stayed silent.
+        let (source, file) = reload_provenance(file_named_the_target, &new_conn, config_path);
+        let mut new_state = ConnectionState::from_iris(new_conn, source, file);
         let mut conn = self.connection.lock().unwrap();
+        // `from_iris` starts every field fresh, so a reload used to DROP the #110 re-probe seed —
+        // after one hot-reload a later `retry_discovery` had nothing to target. Carried across the
+        // swap with the connection it describes.
+        new_state.discovery_seed = conn.discovery_seed.clone();
         *conn = new_state;
         conn.config_parse_error = None;
         tracing::info!("iris-agentic-dev: hot-reloaded connection from .iris-agentic-dev.toml");
@@ -8107,7 +8173,7 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
     }
 
     #[tool(
-        description = "Return the active IRIS connection state + this MCP server's own version. It only reports the cached connection snapshot (no IRIS network call), so it ALWAYS succeeds — when IRIS is down it returns connected:false / connection_source:disconnected instead of erroring with IRIS_UNREACHABLE. That is the point: it's the one tool you can call to DIAGNOSE an unreachable IRIS (read the `connected` field) without the call itself failing — unlike iris_query/iris_execute/etc., which fail instead. If those tools instead return IRIS_AUTH_FAILED (HTTP 401) or IRIS_FORBIDDEN (HTTP 403), IRIS is REACHABLE and the credentials are the problem: read `auth_ok` and `probe_status` here — auth_ok:false means IRIS rejected IRIS_USERNAME/IRIS_PASSWORD (401) or refused this user the %Development privilege (403), and `connected` is false for that reason, not a network one. Also use to: verify hot-reload completed; confirm which container/host is active; validate the loaded MCP build (mcp_version). Hot-reload is operator-driven: an edit to the .iris-agentic-dev.toml at config_watch_path is picked up on the next tool call, and config_loaded_at moves when it happens. A reload can only NARROW the write gate — once write_tools_enabled has gone false it stays false until the server restarts (write_gate_latched reports that), so a reload cannot reopen writes. Fields: mcp_version, toolset, connected, auth_ok, probe_status, connection_source — where the connection came from: config_file, explicit_flag (a --host flag or the IRIS_HOST env var, which clap merges), vs_code_settings, env_vars, iris_select_container, or auto_discovered. Only auto_discovered is a GUESS (a blind localhost/Docker scan that can land on the wrong instance); every other value means the operator named this target, and the fallback_warning is emitted for auto_discovered alone, host, port, namespace, container, config_file, config_watch_path, config_loaded_at, iris_version, write_tools_enabled, write_gate_latched."
+        description = "Return the active IRIS connection state + this MCP server's own version. It only reports the cached connection snapshot (no IRIS network call), so it ALWAYS succeeds — when IRIS is down it returns connected:false / connection_source:disconnected instead of erroring with IRIS_UNREACHABLE. That is the point: it's the one tool you can call to DIAGNOSE an unreachable IRIS (read the `connected` field) without the call itself failing — unlike iris_query/iris_execute/etc., which fail instead. If those tools instead return IRIS_AUTH_FAILED (HTTP 401) or IRIS_FORBIDDEN (HTTP 403), IRIS is REACHABLE and the credentials are the problem: read `auth_ok` and `probe_status` here — auth_ok:false means IRIS rejected IRIS_USERNAME/IRIS_PASSWORD (401) or refused this user the %Development privilege (403), and `connected` is false for that reason, not a network one. Also use to: verify hot-reload completed; confirm which container/host is active; validate the loaded MCP build (mcp_version). Hot-reload is operator-driven: an edit to the .iris-agentic-dev.toml at config_watch_path is picked up on the next tool call, and config_loaded_at moves when it happens. A reload can only NARROW the write gate — once write_tools_enabled has gone false it stays false until the server restarts (write_gate_latched reports that), so a reload cannot reopen writes. Fields: mcp_version, toolset, connected, auth_ok, probe_status, connection_source — where the connection came from: config_file, explicit_flag (a --host flag ONLY), vs_code_settings, env_vars (IRIS_HOST/IRIS_WEB_PORT), iris_select_container, or auto_discovered. The precedence is --host flag > .iris-agentic-dev.toml > IRIS_* env vars > VS Code settings > blind scans, and it holds identically at startup and on hot-reload (#410: IRIS_HOST used to be merged into the --host slot by clap, so it outranked the config file and the file was ignored until something touched it). Only auto_discovered is a GUESS (a blind localhost/Docker scan that can land on the wrong instance); every other value means the operator named this target, and the fallback_warning is emitted for auto_discovered alone. config_file names the file ONLY when that file chose the target: a file setting just web_port or namespace decorates a target chosen lower down, and reports that lower source instead, with config_file_warning saying so, host, port, namespace, container, config_file, config_watch_path, config_loaded_at, iris_version, write_tools_enabled, write_gate_latched."
     )]
     async fn check_config(
         &self,
@@ -8268,9 +8334,12 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                 .as_str()
                 .unwrap_or("an explicit flag or environment variable")
                 .to_string();
-            response["config_file_warning"] = serde_json::Value::String(
-                crate::iris::workspace_config::ignored_config_warning(&p, &src),
-            );
+            response["config_file_warning"] =
+                serde_json::Value::String(crate::iris::workspace_config::ignored_config_warning(
+                    &p,
+                    &src,
+                    conn.source == ConnectionSource::ExplicitFlag,
+                ));
             response["config_file_ignored"] = serde_json::Value::String(p);
         }
 
@@ -12270,10 +12339,176 @@ mod schema_normalization_tests {
         );
     }
 
+    /// #410, the measured defect: a bare `touch` of a file holding only `web_port = 45080` ran
+    /// the WHOLE discovery cascade — env vars, VS Code settings, then the blind scans — and the
+    /// result was stamped as the file's. The reported session landed on port 48080, named in
+    /// neither the file nor the environment, and reported `connection_source: config_file`.
+    #[test]
+    fn a_reload_that_fell_through_to_discovery_does_not_claim_the_file() {
+        use crate::iris::connection::DiscoverySource;
+        let path = std::path::PathBuf::from("/proj/.iris-agentic-dev.toml");
+        let (source, file) = crate::tools::reload_provenance(
+            false,
+            &conn_from(DiscoverySource::LocalhostScan { port: 48080 }),
+            path,
+        );
+        assert_eq!(
+            source,
+            crate::tools::ConnectionSource::AutoDiscovered,
+            "a blind scan chose this instance; the file chose nothing"
+        );
+        assert_eq!(
+            file, None,
+            "and claiming the path is what silenced BOTH check_config warnings"
+        );
+        assert!(
+            !source.is_explicit(),
+            "a guess must keep the #21 fallback warning, which the ConfigFile stamp removed"
+        );
+    }
+
+    /// The positive control: same function, one boolean different. Without it the test above
+    /// would also pass against a `reload_provenance` that never attributes anything.
+    #[test]
+    fn a_reload_from_a_file_that_named_a_target_is_still_the_files() {
+        use crate::iris::connection::DiscoverySource;
+        let path = std::path::PathBuf::from("/proj/.iris-agentic-dev.toml");
+        let (source, file) = crate::tools::reload_provenance(
+            true,
+            // A file-built connection carries EnvVar from `workspace_config_to_connection`, which
+            // is why provenance cannot be read off the DiscoverySource alone.
+            &conn_from(DiscoverySource::EnvVar),
+            path.clone(),
+        );
+        assert_eq!(source, crate::tools::ConnectionSource::ConfigFile);
+        assert_eq!(file, Some(path));
+    }
+
+    /// #410's second checkbox as BEHAVIOUR, not as a claim in a message.
+    ///
+    /// Deciding "the flag outranks the file" at startup is half a precedence. `check_reload`
+    /// swapped the connection on any file change, so the flag won until something touched the
+    /// file and the file won afterwards — the same asymmetry the issue was filed about, just
+    /// moved off `IRIS_*` and onto `--host`. The warning text now promises an edit will NOT take
+    /// over, and only this makes that promise true.
+    ///
+    /// The second half is the instrument's own control: an identical scenario whose only
+    /// difference is the connection's source MUST be taken over. Without it, a watcher that
+    /// never fired — equal mtimes, a path that does not exist — would read as a passing test.
+    #[tokio::test]
+    async fn a_file_edit_does_not_displace_a_connection_named_by_a_flag() {
+        use crate::iris::connection::{DiscoverySource, IrisConnection};
+        use crate::tools::{ConfigWatcher, ConnectionSource, ConnectionState, IrisTools, Toolset};
+        const FILE: &str = "host = \"127.0.0.1\"\nweb_port = 45080\nnamespace = \"FILEWINS\"\n";
+
+        async fn reload_once(
+            src: DiscoverySource,
+            start_source: ConnectionSource,
+        ) -> ConnectionState {
+            let dir = tempfile::tempdir().unwrap();
+            let f = dir.path().join(".iris-agentic-dev.toml");
+            std::fs::write(&f, FILE).unwrap();
+            let conn =
+                IrisConnection::new("http://127.0.0.1:59999", "FLAGWINS", "_SYSTEM", "SYS", src);
+            let tools = IrisTools::with_registry_and_toolset(
+                Some(conn),
+                crate::skills::SkillRegistry::new(),
+                Toolset::Interop,
+                ConfigWatcher::new(f.clone()),
+                None,
+            )
+            .expect("build");
+            tools.connection.lock().unwrap().source = start_source;
+
+            // A strictly later mtime on the same path is what the watcher keys on.
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            std::fs::write(&f, format!("{FILE}# touched\n")).unwrap();
+            tools.check_reload().await;
+            let c = tools.connection.lock().unwrap();
+            ConnectionState {
+                iris: c.iris.clone(),
+                source: c.source.clone(),
+                config_file: c.config_file.clone(),
+                loaded_at: c.loaded_at,
+                write_tools_enabled: c.write_tools_enabled,
+                config_parse_error: c.config_parse_error.clone(),
+                discovery_seed: None,
+                discovery_pending: false,
+                last_retry: None,
+            }
+        }
+
+        // The control FIRST, so a broken instrument fails loudly rather than silently passing
+        // the assertion below: an env-var connection has nothing outranking the file, so the
+        // edit must be adopted.
+        let adopted = reload_once(DiscoverySource::EnvVar, ConnectionSource::EnvVars).await;
+        assert_eq!(
+            adopted.source,
+            ConnectionSource::ConfigFile,
+            "control: the watcher must fire and the file must be adopted, or the test below \
+             proves nothing"
+        );
+        assert_eq!(
+            adopted.iris.as_ref().unwrap().namespace,
+            "FILEWINS",
+            "control: adoption moves the namespace too — that is what makes this dangerous"
+        );
+
+        let kept = reload_once(
+            DiscoverySource::ExplicitFlag,
+            ConnectionSource::ExplicitFlag,
+        )
+        .await;
+        assert_eq!(
+            kept.source,
+            ConnectionSource::ExplicitFlag,
+            "a real --host flag outranks the file on reload, exactly as at startup"
+        );
+        assert_eq!(
+            kept.iris.as_ref().unwrap().namespace,
+            "FLAGWINS",
+            "the flag's namespace must survive an edit to the file"
+        );
+        assert!(
+            kept.config_file.is_none(),
+            "nothing was adopted, so no file may be reported as the provenance"
+        );
+    }
+
+    /// The two defects were one cause: the claimed path is also what suppressed the warning that
+    /// would have exposed it. `ignored_config_path` returns early on `config_file.is_some()`.
+    #[test]
+    fn releasing_the_claimed_path_re_enables_the_ignored_file_warning() {
+        use crate::iris::connection::DiscoverySource;
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join(".iris-agentic-dev.toml");
+        std::fs::write(&f, "web_port = 45080\n").unwrap();
+
+        let (source, file) =
+            crate::tools::reload_provenance(false, &conn_from(DiscoverySource::EnvVar), f.clone());
+        assert_eq!(source, crate::tools::ConnectionSource::EnvVars);
+        assert_eq!(
+            crate::iris::workspace_config::ignored_config_path(
+                file.as_deref(),
+                source.is_explicit(),
+                f.to_str()
+            ),
+            Some(f.to_str().unwrap().to_string()),
+            "with the path released, the ignored-file warning is eligible to fire"
+        );
+
+        // The pre-fix stamp, for contrast: a claimed path suppresses it.
+        assert_eq!(
+            crate::iris::workspace_config::ignored_config_path(Some(f.as_path()), true, f.to_str()),
+            None,
+            "this is the suppression the old unconditional ConfigFile stamp caused"
+        );
+    }
+
     /// `EnvVars` used to be assigned in exactly ONE place — the disconnected path — so no
-    /// live connection could ever report it. It is now derived. (The MCP server itself
-    /// stamps `ExplicitFlag` for env config, because clap merges flag and env into one
-    /// value before the connection is built; this covers the seedless cascade path.)
+    /// live connection could ever report it. It is now derived, and since #410 it is what an
+    /// `IRIS_HOST`-configured server actually reports: the clap merge that used to stamp those
+    /// sessions `ExplicitFlag` (and thereby outrank the workspace config file) is gone.
     #[test]
     fn env_var_discovery_maps_to_env_vars() {
         use crate::iris::connection::DiscoverySource;

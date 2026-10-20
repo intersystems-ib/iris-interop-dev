@@ -48,7 +48,11 @@ use std::time::Duration;
 /// The ports we scan on localhost for IRIS web servers.
 /// Includes 52773 (IRIS private web server), 80/8080/8443/443 (ISC Web Gateway container),
 /// and legacy ports 41773/51773.
-const IRIS_WEB_PORTS: &[u16] = &[52773, 80, 8080, 41773, 51773, 8443, 443];
+/// The blind localhost scan's population. `pub` so a test asserting "nothing was found" can
+/// measure the SAME ports rather than a copied list: the copy in `ci.yml`'s comment already says
+/// four ports, and `discover_iris_returns_none_when_nothing_found` passed for a year while a real
+/// IRIS answered on one of them.
+pub const IRIS_WEB_PORTS: &[u16] = &[52773, 80, 8080, 41773, 51773, 8443, 443];
 
 // ── Discovery result types ────────────────────────────────────────────────────
 
@@ -245,6 +249,29 @@ pub async fn discover_iris(explicit: Option<IrisConnection>) -> IrisDiscovery {
             conn.source = DiscoverySource::EnvVar;
             return IrisDiscovery::Found(conn);
         }
+
+        // #410: IRIS_HOST NAMES a target, so a failed probe is not a reason to go looking
+        // elsewhere — it is a reason to report that the named instance is down.
+        //
+        // Falling through used to be unreachable and therefore harmless: clap merged IRIS_HOST
+        // into `--host`, so an env-configured server was built as an explicit seed above and
+        // step 2 never ran. Now that the workspace file outranks IRIS_*, step 2 IS the live path
+        // for the normal installation, and falling through cost two measured behaviours — a
+        // configured-but-down instance produced NO connection, so a tool call came back as a
+        // JSON-RPC protocol error instead of the standard envelope (#57), and there was no
+        // connection left to re-probe later (#110).
+        //
+        // The scheme/prefix branch above already returns a connection whose probe failed. This
+        // makes the two halves of step 2 agree rather than differ by whether a prefix was set.
+        let mut conn = IrisConnection::new(
+            format!("{}://{}:{}", scheme, host, port),
+            namespace,
+            username,
+            password,
+            DiscoverySource::EnvVar,
+        );
+        conn.probe().await;
+        return IrisDiscovery::Found(conn);
     }
 
     // 3. IRIS_CONTAINER: resolve the named container's web port via Docker.

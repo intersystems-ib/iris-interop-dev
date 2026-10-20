@@ -345,9 +345,15 @@ fn test_e2e_check_config_returns_all_fields() {
 
     // #240: this list predated #193 ("check_config reports the source a connection actually
     // came from") and was never updated, because this target runs in no CI job. Run the way
-    // this file's own header documents — IRIS_HOST=... on the command line — clap merges that
-    // as `explicit_flag`, which the old list rejected: the test could NEVER pass as documented.
-    // The set below is the one check_config's own description enumerates.
+    // this file's own header documents — IRIS_HOST=... on the command line — the old build
+    // merged that into `--host` and reported `explicit_flag`, which the old list rejected: the
+    // test could NEVER pass as documented.
+    //
+    // #410 changed which value that run produces: IRIS_HOST now enters below the config file
+    // and reports `env_vars`. Both remain in the set below, which is deliberately the full
+    // enumeration from check_config's own description rather than one expected value — this
+    // assertion is about the field being a known source, not about the precedence. The
+    // precedence itself is pinned offline by `the_file_outranks_the_environment`.
     let valid_sources = [
         "config_file",
         "explicit_flag",
