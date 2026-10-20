@@ -1606,6 +1606,19 @@ pub struct IntrospectParams {
     /// has 451 methods of which 70 are its own.
     #[serde(default)]
     pub include_inherited: bool,
+    /// #430: return only members whose name matches — `Get*` (prefix), `*Stored` (suffix),
+    /// `*Settings*` or a bare substring. ONE pattern per call. `%` and `_` are matched
+    /// literally, which matters here because IRIS member names contain them (`%OnNew`).
+    #[serde(default)]
+    pub members: Option<String>,
+    /// #430: which kinds to read — `methods`, `properties`, or `both` (default). The kind you
+    /// leave out costs no query at all.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// #430: cap the members returned PER KIND. The response carries `truncated` and the
+    /// matched totals, so a cap is never silent.
+    #[serde(default)]
+    pub limit: Option<usize>,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DebugMapParams {
@@ -2888,11 +2901,96 @@ pub fn validate_read_only_sql(sql: &str) -> Result<(), String> {
 }
 
 /// Rows in an Atelier query body, or 0 when there are none.
-fn row_count(body: &serde_json::Value) -> usize {
-    body["result"]["content"]
+/// #430: which member kinds `docs_introspect` was asked for.
+///
+/// An enum rather than two booleans so "neither" cannot be expressed: a call that reads nothing
+/// would answer `{methods: [], properties: []}`, which is this tree's dominant bug shape — an
+/// empty answer that reads as a fact about the class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberKindFilter {
+    Methods,
+    Properties,
+    Both,
+}
+
+impl MemberKindFilter {
+    /// `None` (the field was omitted) means `Both`. An unrecognised value is REFUSED rather than
+    /// silently treated as `Both`: a caller who sent `kind: "method"` asked for a narrowing, and
+    /// answering with everything looks like the narrowing did not match.
+    pub fn parse(raw: Option<&str>) -> Result<Self, String> {
+        match raw.map(str::trim) {
+            None | Some("") | Some("both") | Some("Both") | Some("BOTH") => Ok(Self::Both),
+            Some(v) if v.eq_ignore_ascii_case("methods") => Ok(Self::Methods),
+            Some(v) if v.eq_ignore_ascii_case("properties") => Ok(Self::Properties),
+            Some(other) => Err(other.to_string()),
+        }
+    }
+
+    pub fn wants_methods(self) -> bool {
+        matches!(self, Self::Methods | Self::Both)
+    }
+
+    pub fn wants_properties(self) -> bool {
+        matches!(self, Self::Properties | Self::Both)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Methods => "methods",
+            Self::Properties => "properties",
+            Self::Both => "both",
+        }
+    }
+}
+
+/// #430: a member pattern as a SQL `LIKE` operand, for `LIKE ? ESCAPE '\'`.
+///
+/// `*` is the wildcard; a pattern with no `*` is a substring search. `%`, `_` and `\` are
+/// ESCAPED, which is load-bearing rather than defensive: IRIS member names begin with `%` all the
+/// time, and measured on `Ens.Config.Production`, `members: "%Get"` returns **3** methods escaped
+/// (`%GetLock`, `%GetParameter`, `%GetSwizzleObject`) against **62** unescaped — the unescaped form
+/// silently answers a different question and looks like a working filter.
+pub fn member_like(pattern: &str) -> String {
+    let has_glob = pattern.contains('*');
+    let mut out = String::with_capacity(pattern.len() + 2);
+    if !has_glob {
+        out.push('%');
+    }
+    for ch in pattern.chars() {
+        match ch {
+            '*' => out.push('%'),
+            '%' | '_' | '\\' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            c => out.push(c),
+        }
+    }
+    if !has_glob {
+        out.push('%');
+    }
+    out
+}
+
+/// #430: apply a per-kind cap, reporting whether it bit. `None` means uncapped.
+fn bound_member_rows(
+    body: &serde_json::Value,
+    limit: Option<usize>,
+) -> (Vec<serde_json::Value>, bool) {
+    let rows = body["result"]["content"]
         .as_array()
-        .map(|a| a.len())
-        .unwrap_or(0)
+        .cloned()
+        .unwrap_or_default();
+    match limit {
+        Some(n) => take_with_truncation(rows, n),
+        None => (rows, false),
+    }
+}
+
+/// The empty body a kind that was not asked for stands in with, so every downstream reader —
+/// `row_count` included — sees the same shape whether a query ran or not.
+fn no_rows() -> serde_json::Value {
+    serde_json::json!({"result": {"content": []}})
 }
 
 /// #107: what the class dictionary says about a class that introspected to nothing.
@@ -8549,7 +8647,7 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
     }
 
     #[tool(
-        description = "Introspect an ObjectScript class — returns methods, properties, and type information. Returns only what the class DECLARES by default; pass include_inherited=true to also get everything it inherits (that is usually an order of magnitude more — Ens.Config.Production declares 70 methods and inherits 381)."
+        description = "Introspect an ObjectScript class — returns methods, properties, and type information. Returns only what the class DECLARES by default; pass include_inherited=true to also get everything it inherits (that is usually an order of magnitude more — Ens.Config.Production declares 70 methods and inherits 381). ASK FOR THE PART YOU NEED (#430) — all three narrowings constrain the SQL, so the members you did not ask for are never read: `members` matches names (`Get*` prefix, `*Stored` suffix, `*Settings*` or a bare word for substring — ONE pattern per call, and `%`/`_` are matched LITERALLY because IRIS member names contain them, so members='%OnNew' finds that method rather than every name containing 'OnNew'); `kind` is 'methods', 'properties' or 'both' (default), and an unrecognised value is REFUSED rather than widened to both; `limit` caps the members returned per kind, with `truncated` + `truncated_hint` when it bit. An empty result under a narrowing is NOT reported as a missing class: `filter_matched_nothing: true` with `members_available: N` says the class is there and the pattern missed, which is a different fact from CLASS_NOT_FOUND and needs a different fix. `args[]` is still returned alongside the raw FormalSpec by default — the structured form exists because a naive comma-split of a FormalSpec silently drops output arguments, so narrow with these parameters instead of asking for less per member."
     )]
     async fn docs_introspect(
         &self,
@@ -8600,31 +8698,87 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
         } else {
             " AND Origin = parent"
         };
-        let methods = match iris.query(
-            &format!("SELECT Name,FormalSpec,ReturnType FROM %Dictionary.CompiledMethod WHERE parent=?{origin_filter} ORDER BY Name"),
-            vec![serde_json::Value::String(class_name.clone())],
-            &namespace,
-            client,
-        ).await {
-            Ok(v) => v,
-            Err(e) => {
-                return introspect_failure(&iris, client, &namespace, &class_name, &e).await
+        // #430: the three narrowings, all applied in SQL so the rows never cross the wire.
+        let kind = match MemberKindFilter::parse(p.kind.as_deref()) {
+            Ok(k) => k,
+            Err(bad) => {
+                return envelope::fail_with(
+                    "INVALID_PARAM",
+                    &format!(
+                        "kind='{bad}' is not a member kind this tool reads. Nothing was queried."
+                    ),
+                    serde_json::json!({
+                        "parameter": "kind",
+                        "received": bad,
+                        "valid": ["methods", "properties", "both"],
+                        "hint": "Omit `kind` for both. It is refused rather than defaulted \
+                                 because a narrowing that silently did not apply looks like a \
+                                 class with more members than you asked about.",
+                    }),
+                );
             }
         };
-        let props = match iris
-            .query(
-                &format!("SELECT Name,Type FROM %Dictionary.CompiledProperty WHERE parent=?{origin_filter} ORDER BY Name"),
-                vec![serde_json::Value::String(class_name.clone())],
+        let member_pattern = p
+            .members
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let like = member_pattern.map(member_like);
+        // ONE `LIKE`, never a disjunction: measured on %Dictionary.CompiledMethod, a single
+        // anchored LIKE under `ORDER BY Name` returns the same 62 rows as the unordered
+        // COUNT(*), while an OR-of-LIKEs under the same sort silently returns a subset.
+        let member_sql = if like.is_some() {
+            " AND Name LIKE ? ESCAPE '\\'"
+        } else {
+            ""
+        };
+        let limit = p.limit.filter(|n| *n > 0);
+        // One more than asked for, so a cap that bit is detectable rather than assumed.
+        let top_sql = match limit {
+            Some(n) => format!("TOP {} ", probe_limit(n)),
+            None => String::new(),
+        };
+        let mut args = vec![serde_json::Value::String(class_name.clone())];
+        if let Some(l) = &like {
+            args.push(serde_json::Value::String(l.clone()));
+        }
+
+        let methods = if kind.wants_methods() {
+            match iris.query(
+                &format!("SELECT {top_sql}Name,FormalSpec,ReturnType FROM %Dictionary.CompiledMethod WHERE parent=?{origin_filter}{member_sql} ORDER BY Name"),
+                args.clone(),
                 &namespace,
                 client,
-            )
-            .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                return introspect_failure(&iris, client, &namespace, &class_name, &e).await
+            ).await {
+                Ok(v) => v,
+                Err(e) => {
+                    return introspect_failure(&iris, client, &namespace, &class_name, &e).await
+                }
             }
+        } else {
+            no_rows()
         };
+        let props = if kind.wants_properties() {
+            match iris
+                .query(
+                    &format!("SELECT {top_sql}Name,Type FROM %Dictionary.CompiledProperty WHERE parent=?{origin_filter}{member_sql} ORDER BY Name"),
+                    args.clone(),
+                    &namespace,
+                    client,
+                )
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    return introspect_failure(&iris, client, &namespace, &class_name, &e).await
+                }
+            }
+        } else {
+            no_rows()
+        };
+        let (method_rows_bounded, methods_capped) = bound_member_rows(&methods, limit);
+        let (prop_rows_bounded, props_capped) = bound_member_rows(&props, limit);
+        let narrowed = like.is_some() || kind != MemberKindFilter::Both;
         // #107: "no members" and "no such class" arrived in the same shape —
         // `{"methods":[],"properties":[],"success":true}` — which reads as "this class
         // exists and is empty". An agent introspecting before writing code concludes there
@@ -8633,8 +8787,44 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
         // The check is on the EMPTY path only: a class with any member never pays for it,
         // and a class with none is exactly the case that is ambiguous. `Undetermined` keeps
         // the empty answer rather than inventing a second wrong fact.
-        let empty = row_count(&methods) == 0 && row_count(&props) == 0;
-        if empty {
+        let empty = method_rows_bounded.is_empty() && prop_rows_bounded.is_empty();
+        // #430: an empty answer under a narrowing means "nothing MATCHED", which is not the same
+        // claim as "no such class" — and the absence probe below would have made it that claim.
+        // It can still be either, so ask: count the members this class has in the SAME population
+        // (the include_inherited choice is carried over) with the filter removed. Zero there means
+        // the probe below is still the right answer; non-zero means the class is fine and the
+        // pattern missed, which is reported as a count rather than as an empty list.
+        let unfiltered_total: Option<i64> = if empty && narrowed {
+            match iris
+                .query(
+                    &format!(
+                        "SELECT COUNT(*) AS N FROM %Dictionary.CompiledMethod WHERE parent=?{origin_filter} \
+                         UNION ALL \
+                         SELECT COUNT(*) AS N FROM %Dictionary.CompiledProperty WHERE parent=?{origin_filter}"
+                    ),
+                    vec![
+                        serde_json::Value::String(class_name.clone()),
+                        serde_json::Value::String(class_name.clone()),
+                    ],
+                    &namespace,
+                    client,
+                )
+                .await
+            {
+                Ok(v) => Some(
+                    v["result"]["content"]
+                        .as_array()
+                        .map(|rows| rows.iter().filter_map(|r| r["N"].as_i64()).sum())
+                        .unwrap_or(0),
+                ),
+                // The count is an EXPLANATION, not the answer. If it cannot be read, fall through
+                // to the probe rather than inventing a number.
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        if empty && unfiltered_total.unwrap_or(0) == 0 {
             match class_presence(&iris, client, &namespace, &class_name).await {
                 ClassPresence::Absent => {
                     let (candidates, in_package) =
@@ -8669,9 +8859,39 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
         }
         // #24/070: structured args alongside the raw FormalSpec. Additive — the raw string stays,
         // because it is the only lossless record of what IRIS holds and a caller may already read it.
-        let mut method_rows = methods["result"]["content"].clone();
+        let mut method_rows = serde_json::Value::Array(method_rows_bounded);
         crate::tools::formal_spec::annotate_methods(&mut method_rows);
-        let mut payload = serde_json::json!({"success": true, "class_name": class_name, "methods": method_rows, "properties": props["result"]["content"], "include_inherited": p.include_inherited});
+        let prop_rows = serde_json::Value::Array(prop_rows_bounded);
+        let mut payload = serde_json::json!({"success": true, "class_name": class_name, "methods": method_rows, "properties": prop_rows, "include_inherited": p.include_inherited});
+        // #430: a cap is never silent, and the counts say what it cut (iris_symbols' own shape).
+        if methods_capped || props_capped {
+            payload["truncated"] = serde_json::Value::Bool(true);
+            payload["truncated_hint"] = serde_json::Value::String(format!(
+                "More members matched than the limit of {}. Raise `limit`, or narrow `members`.",
+                limit.unwrap_or(0)
+            ));
+        }
+        if narrowed {
+            payload["member_filter"] = serde_json::json!({
+                "members": member_pattern,
+                "kind": kind.as_str(),
+                "limit": limit,
+            });
+        }
+        if let Some(total) = unfiltered_total.filter(|t| *t > 0) {
+            // The class is there and has members; the pattern is what matched nothing. Said as a
+            // number, because an empty list plus a sentence is still an empty list to a reader
+            // that does not read the sentence (the #156 finding).
+            payload["matched"] = serde_json::Value::from(0);
+            payload["members_available"] = serde_json::Value::from(total);
+            payload["filter_matched_nothing"] = serde_json::Value::Bool(true);
+            payload["hint"] = serde_json::Value::String(format!(
+                "'{}' exists and declares {} member(s) in this scope, none matching the filter \
+                 — this is NOT an empty or missing class. Re-run without `members`/`kind`, or \
+                 widen the pattern (`*Part*` for a substring).",
+                class_name, total
+            ));
+        }
         if let Some(requested) = &expanded_from {
             // #157: say that the name was expanded, or the caller cannot learn the rule.
             payload["requested_class_name"] = serde_json::Value::String(requested.clone());
@@ -18596,6 +18816,239 @@ mod http_status_answer_tests {
             .await
             .expect("the tool must answer, not error out of the transport");
         (r.is_error, payload(&r))
+    }
+
+    /// #430: `docs_introspect` with the member narrowings applied.
+    async fn introspect_with(
+        server: &MockServer,
+        extra: serde_json::Value,
+    ) -> (Option<bool>, serde_json::Value) {
+        let mut args = serde_json::json!({"class_name": "Ens.Director", "namespace": "APP"});
+        for (k, v) in extra.as_object().expect("an object").clone() {
+            args[k] = v;
+        }
+        let r = tools_for(server)
+            .docs_introspect(Parameters(serde_json::from_value(args).unwrap()))
+            .await
+            .expect("the tool must answer, not error out of the transport");
+        (r.is_error, payload(&r))
+    }
+
+    /// Answers the unfiltered COUNT with `n`, and everything else with no rows — i.e. a class that
+    /// HAS members, none of which match.
+    async fn server_where_the_filter_matches_nothing(n: i64) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r".*/action/query$"))
+            .and(wiremock::matchers::body_string_contains("COUNT(*)"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"result": {"content": [{"N": n}]}})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r".*/action/query$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"result": {"content": []}})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/api/atelier/$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(root_descriptor(&["APP"])))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// #202's shape, applied to this feature: a filter that never reaches the query still
+    /// answers `success: true`, just about a different question. Both member queries must carry
+    /// `LIKE ? ESCAPE`, and the `expect(0)` catch-all is what proves it — if the pattern were
+    /// dropped, the unfiltered SQL would land there instead.
+    #[test]
+    fn the_member_pattern_reaches_the_sql() {
+        rt().block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path_regex(r".*/action/query$"))
+                .and(wiremock::matchers::body_string_contains("LIKE ? ESCAPE"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"result": {"content": [{"Name": "GetSettings", "FormalSpec": "", "ReturnType": ""}]}}),
+                ))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(r".*/action/query$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"result": {"content": []}}),
+                ))
+                .expect(0)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/api/atelier/$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(root_descriptor(&["APP"])))
+                .mount(&server)
+                .await;
+
+            let (is_err, v) = introspect_with(&server, serde_json::json!({"members": "Get*"})).await;
+            assert_ne!(is_err, Some(true), "{v}");
+            assert_eq!(v["methods"][0]["Name"], "GetSettings", "{v}");
+        });
+    }
+
+    /// #430, THE trap: the empty-result path is what decides `CLASS_NOT_FOUND`. Narrowing the
+    /// query means "no member matched" arrives in the shape of "no such class" — this repo's
+    /// dominant bug, newly manufactured by a feature that only adds a WHERE clause.
+    #[test]
+    fn a_filter_that_matches_nothing_is_not_a_missing_class() {
+        rt().block_on(async {
+            let server = server_where_the_filter_matches_nothing(5).await;
+            let (is_err, v) =
+                introspect_with(&server, serde_json::json!({"members": "Zzz*"})).await;
+            assert_ne!(is_err, Some(true), "the class is THERE: {v}");
+            assert_eq!(v["success"], true, "{v}");
+            assert!(
+                v.get("error_code").is_none(),
+                "a pattern that missed is not an error about the class: {v}"
+            );
+            assert_eq!(v["filter_matched_nothing"], true, "{v}");
+            assert_eq!(
+                v["members_available"], 5,
+                "say how many members it HAS, as a number — a sentence beside an empty list is \
+                 still an empty list to a reader that does not read it (#156): {v}"
+            );
+            assert_eq!(v["matched"], 0, "{v}");
+            assert_eq!(
+                v["member_filter"]["members"], "Zzz*",
+                "echo what was applied: {v}"
+            );
+        });
+    }
+
+    /// The positive control for the test above, and the one that proves the narrowing did not
+    /// simply switch the #107 probe off: the IDENTICAL empty response, with no filter, must still
+    /// be reported as a missing class.
+    #[test]
+    fn the_same_empty_answer_without_a_filter_is_still_a_missing_class() {
+        rt().block_on(async {
+            let server = server_where_the_filter_matches_nothing(5).await;
+            let (is_err, v) = introspect_with(&server, serde_json::json!({})).await;
+            assert_eq!(is_err, Some(true), "{v}");
+            assert_eq!(v["error_code"], ERR_CLASS_NOT_FOUND, "{v}");
+            assert!(
+                v.get("filter_matched_nothing").is_none(),
+                "nothing was filtered, so nothing missed: {v}"
+            );
+        });
+    }
+
+    /// `kind` is a narrowing of what is READ, not of what is returned — the table it was not asked
+    /// about is never queried. `expect(0)` is the assertion; wiremock verifies it on drop.
+    #[test]
+    fn the_kind_that_was_not_asked_for_costs_no_query() {
+        rt().block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path_regex(r".*/action/query$"))
+                .and(wiremock::matchers::body_string_contains(
+                    "%Dictionary.CompiledProperty",
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"result": {"content": [{"Name": "ShouldNotBeRead"}]}}),
+                ))
+                .expect(0)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(r".*/action/query$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"result": {"content": [{"Name": "Start", "FormalSpec": "", "ReturnType": "%Status"}]}}),
+                ))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/api/atelier/$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(root_descriptor(&["APP"])))
+                .mount(&server)
+                .await;
+
+            let (is_err, v) = introspect_with(&server, serde_json::json!({"kind": "methods"})).await;
+            assert_ne!(is_err, Some(true), "{v}");
+            assert_eq!(v["methods"][0]["Name"], "Start", "{v}");
+            assert_eq!(
+                v["properties"],
+                serde_json::json!([]),
+                "the kind that was not asked for is empty BECAUSE it was not read: {v}"
+            );
+            assert_eq!(v["member_filter"]["kind"], "methods", "{v}");
+        });
+    }
+
+    /// An unrecognised `kind` is refused BEFORE anything is queried — which is what the message
+    /// claims ("Nothing was queried"), so `expect(0)` on every query is the test of that claim.
+    #[test]
+    fn an_unknown_kind_is_refused_without_querying_anything() {
+        rt().block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path_regex(r".*/action/query$"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"result": {"content": []}})),
+                )
+                .expect(0)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/api/atelier/$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(root_descriptor(&["APP"])))
+                .mount(&server)
+                .await;
+
+            let (is_err, v) = introspect_with(&server, serde_json::json!({"kind": "method"})).await;
+            assert_eq!(is_err, Some(true), "{v}");
+            assert_eq!(v["error_code"], "INVALID_PARAM", "{v}");
+            assert_eq!(v["received"], "method", "name what was sent (#211): {v}");
+            assert_eq!(
+                v["valid"],
+                serde_json::json!(["methods", "properties", "both"]),
+                "list what would work: {v}"
+            );
+        });
+    }
+
+    /// A cap that bit says so, with the shape iris_symbols already uses. The server is asked for
+    /// `limit + 1` rows precisely so this is measured rather than assumed.
+    #[test]
+    fn a_limit_that_bit_is_reported_not_silent() {
+        rt().block_on(async {
+            let rows = serde_json::json!({"result": {"content": [
+                {"Name": "A", "FormalSpec": "", "ReturnType": ""},
+                {"Name": "B", "FormalSpec": "", "ReturnType": ""},
+                {"Name": "C", "FormalSpec": "", "ReturnType": ""}
+            ]}});
+            let server = server_with(
+                "POST",
+                r".*/action/query$",
+                ResponseTemplate::new(200).set_body_json(rows),
+            )
+            .await;
+            let (is_err, v) = introspect_with(&server, serde_json::json!({"limit": 2})).await;
+            assert_ne!(is_err, Some(true), "{v}");
+            assert_eq!(
+                v["methods"].as_array().map(|a| a.len()),
+                Some(2),
+                "the cap applies: {v}"
+            );
+            assert_eq!(v["truncated"], true, "and it is never silent: {v}");
+            assert!(
+                v["truncated_hint"].as_str().unwrap_or("").contains("limit"),
+                "name the knob that widens it (#329): {v}"
+            );
+        });
     }
 
     /// The control that must NOT change: a class that EXISTS and genuinely has no members
