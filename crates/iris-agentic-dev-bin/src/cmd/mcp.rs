@@ -34,18 +34,28 @@ use tokio::sync::watch;
 ///   See: https://github.com/intersystems-community/iris-dev/blob/master/light-skills/skills/iris-vscode-objectscript/SKILL.md
 ///
 /// CONNECTION DISCOVERY (in priority order)
-///   1. --host / IRIS_HOST env var
+///   1. --host flag — an explicitly named target; the config file is not consulted
 ///   2. .iris-agentic-dev.toml in workspace (walks up from cwd)
-///   3. IRIS_CONTAINER env var → Docker named container lookup
-///   4. Localhost port scan (52773, 41773, 51773, 8080)
-///   5. Auto-scan running Docker containers
+///   3. IRIS_HOST / IRIS_WEB_PORT env vars
+///   4. IRIS_CONTAINER env var → Docker named container lookup
+///   5. VS Code settings.json (objectscript.conn)
+///   6. Localhost port scan (52773, 41773, 51773, 8080)
+///   7. Auto-scan running Docker containers
+///
+/// #410: IRIS_HOST used to be merged into the --host slot by clap and so sat at rank 1,
+/// above the file — the opposite of what this list used to claim and of what the rest of
+/// the tree documents. It is now rank 3, served by the discovery cascade's own env step.
 #[derive(Args)]
 pub struct McpCommand {
     #[arg(long, default_value = "stdio")]
     pub transport: String,
     #[arg(long, default_value = "8080")]
     pub port: u16,
-    #[arg(long, env = "IRIS_HOST")]
+    /// #410: deliberately NOT `env = "IRIS_HOST"`. This value is the flag that outranks
+    /// `.iris-agentic-dev.toml`, so letting clap fill it from the environment put every
+    /// IRIS_*-registered server above the file and made the file invisible until it was
+    /// touched. IRIS_HOST is read by `discovery.rs` step 2, below the file.
+    #[arg(long)]
     pub host: Option<String>,
     #[arg(long, env = "IRIS_WEB_PORT")]
     pub web_port: Option<u16>,

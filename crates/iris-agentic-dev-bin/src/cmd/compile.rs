@@ -10,7 +10,10 @@ use iris_agentic_dev_core::tools::wildcard;
 #[derive(Args)]
 pub struct CompileCommand {
     pub target: Option<String>,
-    #[arg(long, env = "IRIS_HOST")]
+    /// #410: NOT `env = "IRIS_HOST"` — see the same arg on `McpCommand`. `compile` WRITES,
+    /// so an env var silently outranking the workspace file is the worst version of this
+    /// defect: the class lands in whichever instance the environment names.
+    #[arg(long)]
     pub host: Option<String>,
     #[arg(long, env = "IRIS_WEB_PORT", default_value = "52773")]
     pub web_port: u16,

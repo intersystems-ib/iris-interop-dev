@@ -131,43 +131,146 @@ async fn probe_atelier_respects_timeout() {
 
 // ── discover_iris cascade ────────────────────────────────────────────────────
 
-/// When IRIS_HOST + IRIS_WEB_PORT env vars are set and valid, discover_iris
-/// should attempt to connect (and fail gracefully if not reachable).
+/// These two tests mutate the SAME process environment and cargo runs them concurrently, so one
+/// could remove `IRIS_HOST` while the other was inside `discover_iris`. That race decided the
+/// outcome rather than the code: #410 made the env step's behaviour visible, and this file passed
+/// on a developer machine (sibling had already cleared the var, blind scan found nothing on the
+/// four scanned ports) while failing in CI, where the var was still set. Serialised here so each
+/// test measures its own input.
+/// A tokio mutex, not a std one: these tests hold the guard across `.await`, and it also means a
+/// panic in one does not poison the other.
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// #410 CONTRACT CHANGE: `IRIS_HOST` NAMES a target, so a failed probe returns that target rather
+/// than abandoning it.
+///
+/// This test previously asserted the opposite — unreachable env host ⇒ NOT `Found` — and the two
+/// contracts cannot both hold:
+///
+/// * `mcp_handshake::unreachable_iris_returns_the_error_envelope_not_a_protocol_error` (#57)
+///   requires a connection OBJECT to exist for a configured-but-down instance, or the tool call
+///   comes back as a JSON-RPC `-32600` instead of this server's envelope.
+/// * `retry_discovery` (#110) needs that same object as the thing to re-probe later; with no
+///   connection there is nothing to retry, and the envelope's own promise ("the probe is retried
+///   on later tool calls") is empty.
+///
+/// Before #410 both held because clap merged `IRIS_HOST` into `--host`: the connection was built
+/// as an explicit seed and step 2 never ran, so its fall-through was unreachable code. Now that
+/// the workspace file outranks `IRIS_*`, step 2 is the live path, and "the operator named an
+/// instance and it is down" must not be reported as "no instance was configured" — that is the
+/// negative-fact shape this tree keeps removing.
 #[tokio::test]
-async fn discover_iris_reads_env_vars() {
-    // Set env vars to a non-existent host
+async fn discover_iris_keeps_an_env_named_target_even_when_it_is_unreachable() {
+    let _guard = ENV_LOCK.lock().await;
     std::env::set_var("IRIS_HOST", "nonexistent.invalid");
     std::env::set_var("IRIS_WEB_PORT", "52773");
     std::env::set_var("IRIS_USERNAME", "testuser");
     std::env::set_var("IRIS_PASSWORD", "testpass");
 
     let result = discover_iris(None).await;
-    // Env vars found but host unreachable — should return NotFound, not panic
-    assert!(
-        !matches!(result, IrisDiscovery::Found(_)),
-        "unreachable host should not return Found"
-    );
 
-    // Clean up
     std::env::remove_var("IRIS_HOST");
     std::env::remove_var("IRIS_WEB_PORT");
     std::env::remove_var("IRIS_USERNAME");
     std::env::remove_var("IRIS_PASSWORD");
+
+    let conn = match result {
+        IrisDiscovery::Found(c) => c,
+        other => panic!(
+            "a host named by IRIS_HOST must come back as the target, not as {other:?} — \
+             abandoning it loses the #57 envelope and the #110 re-probe seed"
+        ),
+    };
+    assert!(
+        matches!(
+            conn.source,
+            iris_agentic_dev_core::iris::connection::DiscoverySource::EnvVar
+        ),
+        "and it reports the step it actually came from, not {:?}",
+        conn.source
+    );
+    assert!(
+        conn.base_url.contains("nonexistent.invalid:52773"),
+        "the target is the one that was named, not a scan result: {}",
+        conn.base_url
+    );
+    assert!(
+        conn.version.is_none(),
+        "the probe failed, so nothing may be claimed about the instance itself"
+    );
 }
 
-/// Without any config, discover_iris returns Ok(None) — not an error.
+/// With nothing configured, `discover_iris` returns a VERDICT rather than an error — and which
+/// verdict is correct depends on the machine, which is the part this test used to get wrong.
+///
+/// It asserted `NotFound` unconditionally and passed anyway in CI's e2e job, where a real IRIS
+/// answers on 52773 — a port the blind scan probes. Measured: it passed only because the sibling
+/// test above raced it and left `IRIS_USERNAME=testuser` in the shared process environment, so the
+/// scan's probe got a 401 and gave up. Serialising the two (`ENV_LOCK`, needed so each test
+/// measures its own input) removed that accident and the test went red in e2e — not a regression,
+/// an assertion that had never been true there.
+///
+/// So the environment is MEASURED instead of assumed, over exactly the cascade's own port list:
+///   * something answers  → the scan must find it, and the verdict must be `Found`
+///   * nothing answers     → the verdict must be `NotFound`/`Explained`
+///
+/// Both branches assert, so this is not a skip. `DOCKER_HOST` is pointed at a socket that cannot
+/// exist, which removes the one part of the population a port probe cannot measure — the Docker
+/// container enumeration — leaving `IRIS_WEB_PORTS` as the whole of it.
 #[tokio::test]
 async fn discover_iris_returns_none_when_nothing_found() {
+    let _guard = ENV_LOCK.lock().await;
     // Ensure no env vars interfere
     std::env::remove_var("IRIS_HOST");
     std::env::remove_var("IRIS_WEB_PORT");
-
-    // With no IRIS running and no config, should return NotFound (not panic)
-    let result = discover_iris(None).await;
-    assert!(
-        matches!(result, IrisDiscovery::NotFound | IrisDiscovery::Explained),
-        "discover_iris should return NotFound or Explained when nothing found"
+    let docker_host_was = std::env::var("DOCKER_HOST").ok();
+    std::env::set_var(
+        "DOCKER_HOST",
+        "unix:///nonexistent/iris-interop-dev-test.sock",
     );
+
+    // Measure the population the scan will search, with the same primitive it uses and the same
+    // credentials it will use, BEFORE asking for the verdict.
+    let user = std::env::var("IRIS_USERNAME").unwrap_or_else(|_| "_SYSTEM".to_string());
+    let pass = std::env::var("IRIS_PASSWORD").unwrap_or_else(|_| "SYS".to_string());
+    let mut answering: Vec<u16> = Vec::new();
+    for port in iris_agentic_dev_core::iris::discovery::IRIS_WEB_PORTS {
+        if probe_atelier("localhost", *port, &user, &pass, "USER", 2000)
+            .await
+            .is_some()
+        {
+            answering.push(*port);
+        }
+    }
+
+    let result = discover_iris(None).await;
+
+    match docker_host_was {
+        Some(v) => std::env::set_var("DOCKER_HOST", v),
+        None => std::env::remove_var("DOCKER_HOST"),
+    }
+
+    if answering.is_empty() {
+        assert!(
+            matches!(result, IrisDiscovery::NotFound | IrisDiscovery::Explained),
+            "no IRIS answered on any of {:?}, so the cascade must report that it found nothing — \
+             got {result:?}",
+            iris_agentic_dev_core::iris::discovery::IRIS_WEB_PORTS
+        );
+    } else {
+        let conn = match result {
+            IrisDiscovery::Found(c) => c,
+            other => panic!(
+                "an IRIS answered on {answering:?}, so the blind scan must find it — got {other:?}. \
+                 A cascade that misses a reachable instance is the defect this direction guards."
+            ),
+        };
+        assert!(
+            conn.version.is_some(),
+            "a scan result is only Found once it has been probed: {:?}",
+            conn.base_url
+        );
+    }
 }
 
 /// Explicit connection passed to discover_iris is returned immediately without scanning.

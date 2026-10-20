@@ -158,23 +158,112 @@ pub fn load_workspace_config_with_path(
     Ok(Some((cfg, config_path)))
 }
 
-/// Like [`apply_workspace_config`] but also returns the path of the config file that was
-/// loaded, so callers can record it in `ConnectionState` at startup rather than only
-/// after the first hot-reload cycle.
+/// #410: which layer actually produced the live connection, and therefore what
+/// `check_config` may name as its provenance.
+///
+/// The two paths that resolve a connection used to decide this separately, and they decided
+/// it differently: startup reported the file's path whenever a file was *read*, and
+/// hot-reload stamped `ConnectionSource::ConfigFile` unconditionally. Both are the same
+/// mistake — **a file that was consulted is not necessarily the file that chose the
+/// target** — and together they produced the measured defect: a bare `touch` of a file
+/// holding only `web_port = 45080` reported `connection_source: config_file` for an
+/// instance reached by a blind localhost scan, on a port named in neither the file nor the
+/// environment, with both `check_config` warnings suppressed because a path *was* set.
+///
+/// Hence the third case, which neither path had: a file IS there, and it named nothing to
+/// connect to.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConfigOrigin {
+    /// A connection passed in from above — a real `--host` flag — outranked the file.
+    ExplicitFlag,
+    /// The file named a target (`host`, or a `container` for discovery to resolve), so the
+    /// file IS this connection's provenance.
+    ConfigFile(std::path::PathBuf),
+    /// A file is present and parsed and named no target at all. Whatever connects next comes
+    /// from BELOW the file in the cascade, and must not be attributed to the file.
+    FileNamedNoTarget(std::path::PathBuf),
+    /// No usable file at the workspace root.
+    NoFile,
+}
+
+impl ConfigOrigin {
+    /// The path `check_config` may report as `config_file` — `Some` only when the file is
+    /// genuinely the provenance.
+    ///
+    /// `FileNamedNoTarget` deliberately answers `None`. Naming the file here is precisely what
+    /// made a blind discovery look chosen, and it is also what silenced the warnings:
+    /// [`ignored_config_path`] returns early on `config_file.is_some()`.
+    pub fn provenance_path(&self) -> Option<&std::path::Path> {
+        match self {
+            Self::ConfigFile(p) => Some(p.as_path()),
+            Self::ExplicitFlag | Self::FileNamedNoTarget(_) | Self::NoFile => None,
+        }
+    }
+
+    /// Whether the live connection is the file's choice. Both stamping sites read this
+    /// rather than `path.is_some()`, which is the distinction they used to lack.
+    pub fn is_config_file(&self) -> bool {
+        matches!(self, Self::ConfigFile(_))
+    }
+}
+
+/// Does this file say WHICH instance to reach, as opposed to decorating one chosen elsewhere?
+///
+/// `host` and `container` are the only two keys that choose a target. `web_port`, `namespace`,
+/// `scheme`, `web_prefix` and the credentials all describe a target picked by another layer —
+/// which is why `web_port = 45080` alone leaves the cascade to answer, and why that answer must
+/// not then be attributed to this file.
+pub fn names_a_target(cfg: &WorkspaceConfig) -> bool {
+    cfg.host.is_some() || cfg.container.is_some()
+}
+
+/// The ONE implementation of "flag, file, or neither", shared by startup and hot-reload.
+pub fn resolve_connection(
+    explicit: Option<IrisConnection>,
+    workspace_path: Option<&str>,
+    namespace: &str,
+) -> Result<(Option<IrisConnection>, ConfigOrigin), UnusableConfig> {
+    if explicit.is_some() {
+        // A real --host flag outranks the file, so a broken file is not consulted and not fatal:
+        // the deliberate escape hatch that gets you moving without editing the file.
+        //
+        // #410 narrowed what reaches this branch. It used to be reached by `IRIS_HOST` as well,
+        // because clap merged the env var into the `--host` slot before the connection was built —
+        // which inverted the precedence this tree documents in five places
+        // (`CLI flags > .iris-agentic-dev.toml > env vars > auto-discovery`) for the *normal*
+        // installation, where the server is registered with IRIS_* set. `IRIS_*` now enters below
+        // the file, at step 2 of the discovery cascade, which already implemented it correctly and
+        // was unreachable for exactly this reason.
+        return Ok((explicit, ConfigOrigin::ExplicitFlag));
+    }
+    match load_workspace_config_with_path(workspace_path)? {
+        Some((cfg, path)) => {
+            let conn = workspace_config_to_connection(&cfg, namespace);
+            let origin = if names_a_target(&cfg) {
+                ConfigOrigin::ConfigFile(path)
+            } else {
+                ConfigOrigin::FileNamedNoTarget(path)
+            };
+            Ok((conn, origin))
+        }
+        None => Ok((None, ConfigOrigin::NoFile)),
+    }
+}
+
+/// Like [`apply_workspace_config`] but also returns the path of the config file that is the
+/// connection's PROVENANCE, so callers can record it in `ConnectionState` at startup rather
+/// than only after the first hot-reload cycle.
+///
+/// #410: "loaded" and "provenance" are not the same question, and this used to answer the
+/// first while its caller asked the second. A file naming only `web_port` is read, and
+/// chooses nothing — see [`ConfigOrigin`].
 pub fn apply_workspace_config_with_path(
     explicit: Option<IrisConnection>,
     workspace_path: Option<&str>,
     namespace: &str,
 ) -> Result<(Option<IrisConnection>, Option<std::path::PathBuf>), UnusableConfig> {
-    if explicit.is_some() {
-        // A CLI flag outranks the file, so a broken file is not consulted and not fatal. This is the
-        // deliberate escape hatch: an explicit --host gets you moving without editing the file.
-        return Ok((explicit, None));
-    }
-    match load_workspace_config_with_path(workspace_path)? {
-        Some((cfg, path)) => Ok((workspace_config_to_connection(&cfg, namespace), Some(path))),
-        None => Ok((None, None)),
-    }
+    let (conn, origin) = resolve_connection(explicit, workspace_path, namespace)?;
+    Ok((conn, origin.provenance_path().map(|p| p.to_path_buf())))
 }
 
 /// #410: whether `check_config` should report a config file that exists but is not in use.
@@ -206,29 +295,40 @@ pub fn ignored_config_path(
 /// #410: what `check_config` says when a workspace config file exists at the watched
 /// path but is not the connection's source.
 ///
-/// Both halves of this are surprising, and the report that prompted it hit them in
-/// order. The file is ignored NOW because [`apply_workspace_config_with_path`]
-/// short-circuits on an explicit flag or `IRIS_HOST` *before the file is read*, and
-/// returns `None` for the path — which is why `config_file` is null rather than naming
-/// the file it declined. And an edit to that same file IS adopted on the next tool call,
-/// because the hot-reload path calls [`load_workspace_config`] directly and that loader
-/// takes no `explicit` argument, so it cannot honour the short-circuit.
+/// There are exactly TWO reasons that can be true now, they call for opposite advice, and
+/// the first version of this message described only one of them:
 ///
-/// So whether a session reaches the flag's instance or the file's depends on whether the
-/// file happened to be touched after startup. Which of the two precedences the fork wants
-/// is an open decision (#410); saying nothing about it is not, because today the three
-/// facts — `connection_source`, a null `config_file`, and a `config_watch_path` pointing at
-/// a real file — are all reported and nothing connects them.
-pub fn ignored_config_warning(path: &str, source: &str) -> String {
-    format!(
-        "A workspace config file exists at {path} but is NOT in use: this connection came from \
-         {source}, which outranks the file at startup (an explicit --host flag or the IRIS_* \
-         environment variables are read instead, and the file is never opened). Note the \
-         asymmetry: if that file is EDITED, the change IS picked up on the next tool call and \
-         WILL replace this connection, including the namespace. To pin one target \
-         deterministically, either delete the file or stop passing the flag/environment \
-         variables — do not rely on which of the two currently wins."
-    )
+/// * `flag_in_force` — a real `--host` was passed, which outranks the file at startup AND
+///   on reload. An edit to the file will NOT be adopted, so the advice is "drop the flag
+///   or delete the file".
+/// * otherwise — the file is there and **named no instance to connect to**, so a lower
+///   layer answered. Here an edit *will* be adopted: adding a `host` retargets the session
+///   on the next tool call, namespace included. Telling this reader "a flag outranks the
+///   file" would be false, and telling the flag reader "your edit will take over" was the
+///   asymmetry #410 was filed about.
+///
+/// The original asymmetry — `IRIS_HOST` winning at startup while an edit to the file won
+/// afterwards — no longer exists: `IRIS_*` now ranks below the file in both paths.
+pub fn ignored_config_warning(path: &str, source: &str, flag_in_force: bool) -> String {
+    if flag_in_force {
+        format!(
+            "A workspace config file exists at {path} but is NOT in use: this connection came \
+             from {source}, and an explicit --host flag outranks the file everywhere — at \
+             startup and on reload alike. Editing the file will NOT replace this connection. To \
+             use the file instead, drop the --host flag; to keep the flag and remove the \
+             ambiguity, delete the file."
+        )
+    } else {
+        format!(
+            "A workspace config file exists at {path} but is NOT in use: it names no instance to \
+             connect to, so this connection came from {source} instead. Only `host` or \
+             `container` choose a target — `web_port`, `namespace`, `scheme` and the credentials \
+             decorate one chosen elsewhere. If that file is EDITED to add a `host` (or \
+             `container`), the change IS picked up on the next tool call and WILL replace this \
+             connection, including the namespace. To pin one target deterministically, give the \
+             file a `host`, or delete the file and keep using {source}."
+        )
+    }
 }
 
 /// Load `.iris-agentic-dev.toml` from the resolved workspace root.
