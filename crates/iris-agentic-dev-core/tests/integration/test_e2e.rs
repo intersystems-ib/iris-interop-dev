@@ -2391,10 +2391,17 @@ fn e2e_symbols_user_defined_class_found() {
 ///
 /// Carries its own control: the same query with `limit=0` must return the number the capped call
 /// REPORTED, which is what proves `total_rows` is the real size rather than an echo of the cap.
+///
+/// The SQL bounds itself with `TOP 10` on purpose. The first version of this test queried
+/// `%Dictionary.ClassDefinition` unbounded; measured on a live instance that is **7205 rows**, and
+/// pushing all of them through the Atelier transport on the `limit=0` leg made the control leg fail
+/// in CI. A server-side `TOP 10` makes `total_rows` deterministic (exactly 10) and keeps both legs
+/// cheap, while 10-vs-3 still proves the total is not an echo of the cap.
 #[test]
 fn e2e_query_reports_the_real_total_when_it_caps_rows() {
     require_iris!();
-    const SQL: &str = "SELECT Name FROM %Dictionary.ClassDefinition";
+    const SQL: &str = "SELECT TOP 10 Name FROM %Dictionary.ClassDefinition";
+    const SERVER_ROWS: u64 = 10;
 
     let capped = call_tool(
         "iris_query",
@@ -2409,9 +2416,9 @@ fn e2e_query_reports_the_real_total_when_it_caps_rows() {
     let total = capped["total_rows"]
         .as_u64()
         .unwrap_or_else(|| panic!("total_rows must be reported: {capped}"));
-    assert!(
-        total > 3,
-        "a namespace has more than 3 classes, so the REAL total must exceed the cap: {capped}"
+    assert_eq!(
+        total, SERVER_ROWS,
+        "total_rows is what IRIS returned, not the cap: {capped}"
     );
 
     // The control: unlimited must return exactly what the capped call claimed was there. Without
@@ -2420,7 +2427,15 @@ fn e2e_query_reports_the_real_total_when_it_caps_rows() {
         "iris_query",
         serde_json::json!({"query": SQL, "namespace": "USER", "limit": 0}),
     );
-    let full_rows = full["rows"].as_array().map(Vec::len).unwrap_or(0) as u64;
+    // NOT `unwrap_or(0)`. The first version of this line read
+    // `full["rows"].as_array().map(Vec::len).unwrap_or(0)`, which turns a call that FAILED — no
+    // `rows` field at all — into the measurement "zero rows". That is the defect class this repo
+    // exists to stop, written into the test meant to guard it: in CI the oversized leg came back
+    // without `rows` and the assertion reported a row-count mismatch instead of a failed call.
+    let full_rows = full["rows"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the unlimited leg returned no `rows` array: {full}"))
+        .len() as u64;
     assert_eq!(
         full_rows, total,
         "limit=0 must yield exactly the total the capped call reported: {full}"
@@ -2442,10 +2457,18 @@ fn e2e_query_reports_the_real_total_when_it_caps_rows() {
 #[test]
 fn e2e_symbols_returns_a_flat_name_array() {
     require_iris!();
+    // "Dictionary", not "Ens". CI runs `intersystemsdc/iris-community:2025.3`, whose USER namespace
+    // is NOT interop-enabled — `Ens.*` lives in ENSLIB and is not mapped there, so the denominator
+    // assertion below would fail on an empty result. The `%Dictionary.*` package is in IRISLIB and
+    // mapped into every namespace (measured: 166 matches), so it is present wherever this runs.
+    //
+    // Note for whoever reads this next: `e2e_symbols_limit_respected` above queries "Ens" and
+    // asserts only `len() <= 3`, which an EMPTY result satisfies. That is why nobody noticed
+    // whether those rows exist — it is an upper bound with no denominator.
     let result = call_tool(
         "iris_symbols",
         serde_json::json!({
-            "query": "Ens", "namespace": "USER", "limit": 3
+            "query": "Dictionary", "namespace": "USER", "limit": 3
         }),
     );
     let symbols = result["symbols"]
@@ -2455,7 +2478,7 @@ fn e2e_symbols_returns_a_flat_name_array() {
     // ever running it, so require that something actually came back before judging its shape.
     assert!(
         !symbols.is_empty(),
-        "the Ens package must yield at least one class: {result}"
+        "the %Dictionary package is mapped into every namespace: {result}"
     );
     for s in symbols {
         assert!(
