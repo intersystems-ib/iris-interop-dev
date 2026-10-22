@@ -63,7 +63,7 @@ async fn trail(server: &MockServer) -> Vec<String> {
 async fn run(server: &MockServer) -> HookVerdict {
     let c = conn(server);
     let client = reqwest::Client::new();
-    upload_and_compile(&c, &client, NS, DOC, SRC, "cuk").await
+    upload_and_compile(&c, &client, DOC, SRC, "cuk").await
 }
 
 /// THE defect, and an ORDER claim rather than a presence one. A test that merely found a PUT and a
@@ -285,7 +285,7 @@ async fn an_unreachable_instance_is_unknown_not_a_clean_compile() {
     };
     let c = IrisConnection::new(uri, NS, "_SYSTEM", "SYS", DiscoverySource::ExplicitFlag);
     let client = reqwest::Client::new();
-    let v = upload_and_compile(&c, &client, NS, DOC, SRC, "cuk").await;
+    let v = upload_and_compile(&c, &client, DOC, SRC, "cuk").await;
     // Matched by reference: `v` is still needed for `is_actionable` afterwards.
     match &v {
         HookVerdict::CouldNotTell { why, .. } => {
@@ -310,4 +310,55 @@ fn only_objectscript_sources_are_acted_on() {
     assert!(!is_objectscript_source("OMORDL.int"));
     // Case is IRIS's, not the filesystem's.
     assert!(is_objectscript_source("Customer.CLS"));
+}
+
+/// #540: the namespace comes from the CONNECTION, not from a caller's default.
+///
+/// `cmd/hook.rs` resolved its connection from `.iris-agentic-dev.toml` — right host, right port,
+/// right credentials — and then compiled into `--namespace`/`IRIS_NAMESPACE`, which defaulted to
+/// `USER`. The result was `Compiled X in USER — no errors.` for a document none of the agent's
+/// other tools can see, which is #529's defect one layer up: a clean verdict about the wrong
+/// thing, visible at all only because #529 made the message name the namespace.
+///
+/// The mocks are mounted ONLY on `/OMS/` paths, so a request sent anywhere else finds no match
+/// and the verdict degrades. The trail assertions then name WHERE it actually went, rather than
+/// leaving a bare "not Compiled" that could mean any of a dozen things.
+#[tokio::test]
+async fn the_namespace_comes_from_the_connection_not_from_a_default() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/api/atelier/v1/OMS/doc/.*"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/atelier/v1/OMS/action/compile"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .mount(&server)
+        .await;
+
+    // `conn` builds it with NS ("USER"), the value the CLI default used to win with; the
+    // connection is then pointed at OMS, which is now the only namespace in play.
+    let mut c = conn(&server);
+    c.namespace = "OMS".to_string();
+    let client = reqwest::Client::new();
+    let v = upload_and_compile(&c, &client, DOC, SRC, "cuk").await;
+
+    let t = trail(&server).await;
+    assert_eq!(
+        v,
+        HookVerdict::Compiled {
+            doc: DOC.to_string()
+        },
+        "the connection's namespace is where this document belongs; requests went to {t:?}"
+    );
+    assert_eq!(t.len(), 2, "expected a PUT then a compile, got {t:?}");
+    assert!(
+        t.iter().all(|p| p.contains("/OMS/")),
+        "every request must target the connection's namespace, got {t:?}"
+    );
+    assert!(
+        !t.iter().any(|p| p.contains("/USER/")),
+        "nothing may be sent to a default namespace the connection never named, got {t:?}"
+    );
 }

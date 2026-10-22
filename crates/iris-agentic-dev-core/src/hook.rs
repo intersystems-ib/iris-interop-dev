@@ -61,10 +61,16 @@ impl HookVerdict {
 /// The upload is awaited before the compile is issued, so a refused upload can never be followed
 /// by a compile verdict about the older copy — that composition is what made the old hook report
 /// on a version the agent did not write.
+///
+/// #540: there is deliberately NO `namespace` parameter. It had one, and `cmd/hook.rs` passed its
+/// own CLI default (`USER`) while the connection had been resolved from a `.iris-agentic-dev.toml`
+/// naming a different namespace — right host, right port, right credentials, and a clean verdict
+/// about a document the agent's other tools cannot see. Reading `iris.namespace` means a caller
+/// cannot hand this function a namespace that disagrees with the connection it is handing over;
+/// the override belongs at the call site, on the connection, via `interop::resolve_namespace`.
 pub async fn upload_and_compile(
     iris: &IrisConnection,
     client: &reqwest::Client,
-    namespace: &str,
     doc_name: &str,
     content: &str,
     flags: &str,
@@ -78,7 +84,7 @@ pub async fn upload_and_compile(
     //    the intended truth here, and a timestamp conflict against the server's copy is exactly
     //    the situation this hook exists to resolve.
     let put_url = iris.versioned_ns_url(
-        namespace,
+        &iris.namespace,
         &format!("/doc/{}?ignoreConflict=1", urlencoding::encode(doc_name)),
     );
     let lines: Vec<&str> = content.lines().collect();
@@ -114,7 +120,7 @@ pub async fn upload_and_compile(
 
     // 2. Only now is a compile verdict about the file the agent edited.
     let result = match iris
-        .compile_document(doc_name, namespace, flags, client)
+        .compile_document(doc_name, &iris.namespace, flags, client)
         .await
     {
         Ok(r) => r,

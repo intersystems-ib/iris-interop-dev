@@ -13,6 +13,7 @@ use iris_agentic_dev_core::iris::{
     discovery::{discover_iris, IrisDiscovery},
 };
 use iris_agentic_dev_core::tools::doc::{doc_name_from_source, SourceDocName};
+use iris_agentic_dev_core::tools::interop::resolve_namespace;
 
 /// How many compile errors to put in front of the model. IRIS can report a cascade from one bad
 /// line (a wrapped macro gives 1 cause and 7 consequences), and only the first few carry the
@@ -33,8 +34,17 @@ pub enum HookAction {
 
 #[derive(Args)]
 pub struct PostEditCommand {
-    #[arg(long, env = "IRIS_NAMESPACE", default_value = "USER")]
-    pub namespace: String,
+    /// Compile into this namespace instead of the one the resolved connection carries.
+    ///
+    /// #540: this deliberately has NO `default_value` and NO `env`. It had both — `USER` and
+    /// `IRIS_NAMESPACE` — and clap cannot tell an explicit `--namespace USER` from the default,
+    /// so the hook had no way to know whether to defer to a `.iris-agentic-dev.toml` that named
+    /// a different namespace. It never deferred, and compiled into `USER` on a connection
+    /// pointing somewhere else. `IRIS_NAMESPACE` still works: it is read where every other input
+    /// is read, during connection resolution, at the precedence the MCP server uses (the config
+    /// file outranks it).
+    #[arg(long)]
+    pub namespace: Option<String>,
     #[arg(long, default_value = "cuk")]
     pub flags: String,
 }
@@ -116,11 +126,18 @@ impl PostEditCommand {
         // The same resolution order as the MCP server, so the hook and the server cannot end up
         // talking to different instances — which is how a "compiles clean" verdict can come from
         // an instance that has never seen the file.
+        //
+        // #540: "instance" was the whole of that promise, and it was TRUE — host, port and
+        // credentials all came from the config file — while the namespace came from a clap
+        // default and went somewhere else entirely. A verdict is about a document, in a
+        // namespace, on an instance; all three have to be resolved from the same place, or the
+        // guarantee covers only the dimension whoever wrote it happened to be thinking about.
         let ws_path = std::env::var("OBJECTSCRIPT_WORKSPACE").ok();
+        let requested = self.namespace.as_deref();
         let explicit = match iris_agentic_dev_core::iris::workspace_config::apply_workspace_config(
             None,
             ws_path.as_deref(),
-            &self.namespace,
+            requested.unwrap_or("USER"),
         ) {
             Ok(c) => c,
             Err(e) => block(format!(
@@ -129,7 +146,7 @@ impl PostEditCommand {
             )),
         };
 
-        let iris = match discover_iris(explicit).await {
+        let mut iris = match discover_iris(explicit).await {
             IrisDiscovery::Found(c) => c,
             // No instance configured anywhere is not a failure to report: this repo may simply not
             // be an IRIS workspace right now. Staying SILENT is safe because silence makes no
@@ -138,9 +155,15 @@ impl PostEditCommand {
             IrisDiscovery::NotFound | IrisDiscovery::Explained => return Ok(()),
         };
 
+        // #540: ONE reader for the namespace, the same one every tool uses — an explicit
+        // `--namespace` wins, otherwise the namespace the connection already settled on. Writing
+        // it onto the connection is what makes the two impossible to disagree: `upload_and_compile`
+        // has no namespace parameter to be handed a different answer.
+        let resolved_ns = resolve_namespace(requested, Some(&iris));
+        iris.namespace = resolved_ns;
+
         let client = IrisConnection::http_client()?;
-        let verdict =
-            upload_and_compile(&iris, &client, &self.namespace, &doc, &content, &self.flags).await;
+        let verdict = upload_and_compile(&iris, &client, &doc, &content, &self.flags).await;
 
         match verdict {
             HookVerdict::Compiled { doc } => {
@@ -149,7 +172,7 @@ impl PostEditCommand {
                 let out = serde_json::json!({
                     "hookSpecificOutput": {
                         "hookEventName": event,
-                        "additionalContext": format!("Compiled {doc} in {} — no errors.", self.namespace),
+                        "additionalContext": format!("Compiled {doc} in {} — no errors.", iris.namespace),
                     }
                 });
                 println!("{out}");
@@ -160,7 +183,7 @@ impl PostEditCommand {
                 errors,
                 undisclosed,
             } => {
-                let mut msg = format!("{doc} did not compile in {}:", self.namespace);
+                let mut msg = format!("{doc} did not compile in {}:", iris.namespace);
                 for e in errors.iter().take(MAX_ERRORS_SHOWN) {
                     msg.push_str(&format!("\n  {e}"));
                 }
