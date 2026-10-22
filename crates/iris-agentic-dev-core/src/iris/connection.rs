@@ -227,6 +227,77 @@ pub(crate) fn interpret_query_response(status: reqwest::StatusCode, text: &str) 
     }
 }
 
+/// Why a generated SqlProc's query reply carried no readable captured output.
+///
+/// A KIND, not a message prefix. This file has had to un-stringify a discriminant twice already
+/// (#102 removed prose-sniffing, #390 re-typed an error whose only discriminant was its wording),
+/// and the caller here needs to name the shape it got without parsing its own text back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnreadableOutput {
+    /// `result.content` was absent, or an empty array: the SELECT returned no row at all.
+    ///
+    /// MEASURED against a live instance's `/api/atelier/v8/<ns>/action/query`: `SELECT 1 AS result
+    /// WHERE 1=0` answers **HTTP 200** with
+    /// `{"status":{"errors":[],"summary":""},"console":[],"result":{"content":[]}}` — no error, no
+    /// row. So this is a real response shape, not a defensive invention.
+    NoRow,
+    /// A row came back, but with no `result` column in it.
+    NoResultColumn,
+    /// The `result` column was there and was not a string.
+    ///
+    /// Not observed from Atelier: a SQL NULL arrives as the empty STRING (measured — `SELECT NULL
+    /// AS result` answers `"content": [{"result": ""}]`), which is what lets the string case keep
+    /// reading `""` as an empty output. Kept as its own case anyway, because the alternative is to
+    /// default it to `""` and that is the reading this enum exists to prevent.
+    NotAString,
+}
+
+impl UnreadableOutput {
+    /// The clause the caller puts in its error, naming the shape that was wrong.
+    pub(crate) fn why(self) -> &'static str {
+        match self {
+            Self::NoRow => "the query returned no row",
+            Self::NoResultColumn => "the row carried no 'result' column",
+            Self::NotAString => "the 'result' column was not a string",
+        }
+    }
+}
+
+/// What a generated SqlProc's `SELECT <proc>() AS result` reply says about the captured output.
+///
+/// The two outcomes are indistinguishable in the VALUE and distinct only in the reply's SHAPE,
+/// which is why this is an enum and not an `Option<&str>`: `content[0].result` read with
+/// `as_str().unwrap_or("")` answers a reply that carried no row with the empty string, and 66 call
+/// sites read an empty string as *the script produced no output*. #362 fixed that for the reply
+/// shapes that carry an ERROR; this is the shape that carries neither an error nor an answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CapturedOutput {
+    /// One row, one string `result`: whatever the script wrote, **the empty string included**. A
+    /// script that writes nothing is a success with no output, and that case has to survive this
+    /// split — it is the one that breaks if the new case over-reaches.
+    Wrote(String),
+    /// Nothing in the reply can be read as the captured output. NOT an empty output.
+    Unreadable(UnreadableOutput),
+}
+
+/// Read the captured output out of a successful (`QueryOutcome::Rows`) generator reply.
+///
+/// The transport decode lives here too — `$C(1)` back to `\n`, the encoding `build_exec_class`
+/// applies on the way out — so a reply shape and its decoding cannot drift apart.
+pub(crate) fn captured_output(body: &serde_json::Value) -> CapturedOutput {
+    let Some(row) = body["result"]["content"]
+        .as_array()
+        .and_then(|rows| rows.first())
+    else {
+        return CapturedOutput::Unreadable(UnreadableOutput::NoRow);
+    };
+    match row.get("result") {
+        Some(serde_json::Value::String(s)) => CapturedOutput::Wrote(s.replace('\x01', "\n")),
+        Some(_) => CapturedOutput::Unreadable(UnreadableOutput::NotAString),
+        None => CapturedOutput::Unreadable(UnreadableOutput::NoResultColumn),
+    }
+}
+
 /// Whether the connected IRIS instance is a production (Live) system.
 /// Detected at probe time via `^%SYS("SystemMode")` SQL query.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -755,12 +826,47 @@ impl IrisConnection {
         let query_status = query_resp.status();
         let query_text = query_resp.text().await?;
         let output = match interpret_query_response(query_status, &query_text) {
-            // A successful SELECT with an empty value IS a script that wrote nothing. The
-            // `unwrap_or("")` is correct here, and only here.
-            QueryOutcome::Rows(body) => body["result"]["content"][0]["result"]
-                .as_str()
-                .unwrap_or("")
-                .replace('\x01', "\n"),
+            // A successful SELECT with an empty value IS a script that wrote nothing — but a
+            // successful SELECT that returned NO ROW is not, and `as_str().unwrap_or("")` gave
+            // both of them the empty string. `captured_output` draws that line; this arm no
+            // longer defaults anything.
+            QueryOutcome::Rows(body) => match captured_output(&body) {
+                CapturedOutput::Wrote(output) => output,
+                CapturedOutput::Unreadable(kind) => {
+                    // Every other arm here returns early and so has to delete the scratch class
+                    // itself; this one now does too, or an unreadable reply leaks an
+                    // `IrisDevTmp.Run*` class into the namespace.
+                    let _ = self.delete_doc(&doc_name, namespace, client).await;
+                    // Deliberately NOT an `IrisReportedError`. That type means IRIS executed the
+                    // code and reported a verdict about it, which makes a second transport neither
+                    // a remedy nor a second opinion. Here IRIS reported nothing at all: the code
+                    // may have run and the reply may still have come back shaped like this, so
+                    // whether it ran is exactly what cannot be concluded — and an untyped error
+                    // leaves the docker leg available as the second opinion it genuinely is.
+                    //
+                    // The body is included because its shape IS the finding, and it is the only
+                    // thing that distinguishes this from the cases #362 already separated.
+                    if compile_diagnosis.is_empty() {
+                        anyhow::bail!(
+                            "the generated SqlProc answered HTTP 200 and reported no error, but \
+                             {}, so nothing can be concluded about the code's output — this is \
+                             NOT an empty result from IRIS. Reply was: {}",
+                            kind.why(),
+                            truncate_body(&body.to_string(), 300)
+                        );
+                    }
+                    // #391: a recorded compile diagnosis is the CAUSE, and leads here as it does
+                    // in the arms either side of this one.
+                    anyhow::bail!(
+                        "the scratch class did not compile: {}; the SqlProc call then answered \
+                         HTTP 200 and reported no error, but {}, so nothing can be concluded \
+                         about the code's output. Reply was: {}",
+                        compile_diagnosis.join("; "),
+                        kind.why(),
+                        truncate_body(&body.to_string(), 300)
+                    );
+                }
+            },
             QueryOutcome::IrisError(msg) => {
                 let _ = self.delete_doc(&doc_name, namespace, client).await;
                 // #391: `Execute()` did not run, so the recorded compile diagnosis is now the
@@ -2101,5 +2207,136 @@ mod atelier_version_from_api_level_tests {
     #[test]
     fn a_missing_api_level_is_v1_not_v8() {
         assert_eq!(AtelierVersion::from_api_level(None), AtelierVersion::V1);
+    }
+}
+
+#[cfg(test)]
+mod captured_output_tests {
+    //! An empty result SET and an empty result VALUE are different answers.
+    //!
+    //! Every body here is a measured Atelier response, not a constructed one. Taken from a live
+    //! instance's `/api/atelier/v8/APP/action/query`:
+    //!
+    //! | query                         | HTTP | `status.errors` | `result.content`      |
+    //! |-------------------------------|------|-----------------|-----------------------|
+    //! | `SELECT 1 AS result WHERE 1=0`| 200  | `[]`            | `[]`                  |
+    //! | `SELECT NULL AS result`       | 200  | `[]`            | `[{"result": ""}]`    |
+    //! | `SELECT NoSuchFunc() AS result`| 200 | populated       | —                     |
+    //!
+    //! Row 2 is why the string case can keep reading `""` as an empty output: a SQL NULL does not
+    //! arrive as JSON null, it arrives as the empty string, so a present row always carries a
+    //! readable value. Row 1 is the case that had no reading of its own.
+    use super::*;
+
+    /// The control, and the case that breaks if the new one over-reaches: a script that wrote
+    /// nothing is a SUCCESS with no output.
+    #[test]
+    fn a_row_holding_an_empty_string_is_an_empty_output() {
+        let body = serde_json::json!({
+            "status": {"errors": [], "summary": ""},
+            "console": [],
+            "result": {"content": [{"result": ""}]}
+        });
+        assert_eq!(
+            captured_output(&body),
+            CapturedOutput::Wrote(String::new()),
+            "an empty VALUE is a real answer and must stay one"
+        );
+    }
+
+    /// The defect, in the exact body a live instance returns for a query with no rows.
+    #[test]
+    fn a_reply_with_no_row_is_not_an_empty_output() {
+        let body = serde_json::json!({
+            "status": {"errors": [], "summary": ""},
+            "console": [],
+            "result": {"content": []}
+        });
+        assert_eq!(
+            captured_output(&body),
+            CapturedOutput::Unreadable(UnreadableOutput::NoRow),
+            "no row is not an empty output — this reply says nothing about what the code wrote"
+        );
+    }
+
+    /// `result` with no `content` key at all — the shape #362 recorded for a failing SqlProc, here
+    /// without the `status.errors` that made that one separable.
+    #[test]
+    fn a_reply_with_no_content_key_is_not_an_empty_output() {
+        let body = serde_json::json!({
+            "status": {"errors": [], "summary": ""},
+            "console": [],
+            "result": {}
+        });
+        assert_eq!(
+            captured_output(&body),
+            CapturedOutput::Unreadable(UnreadableOutput::NoRow)
+        );
+    }
+
+    #[test]
+    fn a_row_without_a_result_column_is_not_an_empty_output() {
+        let body = serde_json::json!({
+            "result": {"content": [{"other": "x"}]}
+        });
+        assert_eq!(
+            captured_output(&body),
+            CapturedOutput::Unreadable(UnreadableOutput::NoResultColumn)
+        );
+    }
+
+    /// A non-string `result` must not be defaulted to `""` either. Atelier is not known to produce
+    /// one, which is exactly why nothing would notice if this silently read as no output.
+    #[test]
+    fn a_non_string_result_column_is_not_an_empty_output() {
+        for value in [
+            serde_json::json!(0),
+            serde_json::json!(null),
+            serde_json::json!({"nested": true}),
+        ] {
+            let body = serde_json::json!({"result": {"content": [{"result": value}]}});
+            assert_eq!(
+                captured_output(&body),
+                CapturedOutput::Unreadable(UnreadableOutput::NotAString),
+                "a {body} must not read as an empty output"
+            );
+        }
+    }
+
+    /// The transport decode travels with the shape it decodes. `build_exec_class` encodes newlines
+    /// as `$C(1)`; moving the read without the decode would return one line with control
+    /// characters in it, and every assertion above would still pass.
+    #[test]
+    fn the_transport_newline_encoding_is_decoded() {
+        let body = serde_json::json!({
+            "result": {"content": [{"result": "first\u{1}second\u{1}"}]}
+        });
+        assert_eq!(
+            captured_output(&body),
+            CapturedOutput::Wrote("first\nsecond\n".to_string())
+        );
+    }
+
+    /// Each unreadable shape says which shape it was, and no two say the same thing — otherwise
+    /// the kind is decoration and the caller is back to one undifferentiated failure.
+    #[test]
+    fn every_unreadable_shape_names_itself_distinctly() {
+        let kinds = [
+            UnreadableOutput::NoRow,
+            UnreadableOutput::NoResultColumn,
+            UnreadableOutput::NotAString,
+        ];
+        let whys: Vec<&str> = kinds.iter().map(|k| k.why()).collect();
+        let mut unique = whys.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            kinds.len(),
+            "three kinds must give three distinct clauses, got {whys:?}"
+        );
+        for why in &whys {
+            assert!(!why.is_empty(), "an empty clause explains nothing");
+        }
     }
 }
