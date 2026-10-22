@@ -33,6 +33,8 @@ enum Commands {
     Mcp(cmd::mcp::McpCommand),
     /// Compile ObjectScript .cls files on IRIS
     Compile(cmd::compile::CompileCommand),
+    /// Claude Code hook entry points (see `hook post-edit`)
+    Hook(cmd::hook::HookCommand),
     /// Initialize a .iris-agentic-dev.toml workspace config
     Init(cmd::init::InitCommand),
     /// Install packages from iris-agentic-dev.toml
@@ -160,6 +162,7 @@ async fn run() -> Result<()> {
     match cli.command {
         Some(Commands::Mcp(cmd)) => cmd.run().await,
         Some(Commands::Compile(cmd)) => cmd.run().await,
+        Some(Commands::Hook(cmd)) => cmd.run().await,
         Some(Commands::Init(cmd)) => cmd.run().await,
         Some(Commands::Install(cmd)) => cmd.run().await,
         Some(Commands::External(argv)) => {
