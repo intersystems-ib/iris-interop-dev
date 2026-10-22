@@ -281,6 +281,100 @@ pub fn has_doc_suffix(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// What a document is CALLED, according to its own header.
+///
+/// #530: the compile hook built this from the path — one parent folder — so
+/// `src/OM/API/Customer.cls` was sent as `API.Customer.cls`, naming a document that does not
+/// exist. No number of parent folders fixes that, because a repo's layout is not its package
+/// structure: `src/Customer.cls` may legitimately hold `Class OM.Customer`, and `src/cls/OM/`
+/// layouts make a one-folder rule right only by coincidence.
+///
+/// So the content settles it or nothing does. A file with no recognisable header is REFUSED
+/// rather than named from its path: a guessed name compiles the WRONG document, or names one
+/// that does not exist and comes back as a 404 that reads as a namespace problem. #530's
+/// acceptance list asks for the refusal explicitly (its prose also floats a path fallback "and
+/// say so"; the two disagree and the acceptance wins, because a named failure is worth more here
+/// than a plausible guess).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceDocName {
+    /// The header named it, suffix included.
+    Named(String),
+    /// Nothing in the file says what it is. Carries the reason, for the caller to print.
+    Unnamed(&'static str),
+}
+
+impl SourceDocName {
+    pub fn named(&self) -> Option<&str> {
+        match self {
+            Self::Named(n) => Some(n),
+            Self::Unnamed(_) => None,
+        }
+    }
+}
+
+/// Whether a token can be an ObjectScript document name: `OM.API.Customer`, `%Foo.Bar`.
+/// Deliberately strict — anything with a brace or paren means the line was not what we thought.
+fn looks_like_a_doc_name(t: &str) -> bool {
+    !t.is_empty()
+        && t.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '%' || c == '_')
+        && !t.starts_with('.')
+        && !t.ends_with('.')
+}
+
+/// Read the document name out of ObjectScript source.
+///
+/// A ROUTINE header is only a header on the FIRST non-empty line, which is IRIS's own rule. A
+/// `Class` line is searched for instead of assumed first, because an exported `.cls` normally
+/// opens with `///` doc comments, and `Include` lines may precede it too — reading only line one
+/// would refuse the commonest file in the repo.
+pub fn doc_name_from_source(content: &str) -> SourceDocName {
+    let mut lines = content.lines().skip_while(|l| l.trim().is_empty());
+
+    if let Some(first) = lines.next() {
+        let upper = first.trim_start().to_ascii_uppercase();
+        if upper.starts_with("ROUTINE ") {
+            // `split_whitespace` already skips leading whitespace, so no trim here.
+            let Some(name) = first.split_whitespace().nth(1) else {
+                return SourceDocName::Unnamed("the ROUTINE header carries no name");
+            };
+            if !looks_like_a_doc_name(name) {
+                return SourceDocName::Unnamed("the ROUTINE header's name is not a document name");
+            }
+            // `[Type=INC]` is an include, `[Type=INT]` an intermediate; anything else is a .mac.
+            // Spaces are stripped first because `[ Type = INC ]` is legal.
+            let flat = upper.replace(' ', "");
+            let suffix = if flat.contains("TYPE=INC") {
+                "inc"
+            } else if flat.contains("TYPE=INT") {
+                "int"
+            } else {
+                "mac"
+            };
+            return SourceDocName::Named(format!("{name}.{suffix}"));
+        }
+    }
+
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if !trimmed.to_ascii_uppercase().starts_with("CLASS ") {
+            continue;
+        }
+        let Some(name) = trimmed.split_whitespace().nth(1) else {
+            continue;
+        };
+        if looks_like_a_doc_name(name) {
+            return SourceDocName::Named(format!("{name}.cls"));
+        }
+        return SourceDocName::Unnamed("the Class line's name is not a document name");
+    }
+
+    SourceDocName::Unnamed(
+        "the file has no `Class <name>` line and no `ROUTINE <name>` header, so what document it \
+         is cannot be read from it",
+    )
+}
+
 /// The corrected name, when the CONTENT says what the document is. `mode=put` with source
 /// starting `Class <name>` is a `.cls` by construction — nothing is being guessed. Returns
 /// `None` when the name already carries a suffix or the content does not settle it; a

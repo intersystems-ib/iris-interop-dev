@@ -5,6 +5,7 @@ use iris_agentic_dev_core::iris::{
     connection::{DiscoverySource, IrisConnection},
     discovery::{discover_iris, IrisDiscovery},
 };
+use iris_agentic_dev_core::tools::doc::{doc_name_from_source, SourceDocName};
 use iris_agentic_dev_core::tools::wildcard;
 
 #[derive(Args)]
@@ -99,19 +100,25 @@ impl CompileCommand {
         if target.ends_with(".cls") && !target.contains('*') {
             let cls_text =
                 std::fs::read_to_string(target).with_context(|| format!("reading {}", target))?;
-            let cls_name = cls_text
-                .lines()
-                .find(|l| l.trim_start().starts_with("Class "))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| {
-                    target
-                        .trim_end_matches(".cls")
-                        .replace(['/', '\\'], ".")
-                        .trim_start_matches('.')
-                        .to_string()
-                });
-            let doc_name = format!("{}.cls", cls_name);
+            // #530: ONE reader of the `Class` line, shared with `hook post-edit`. Two parsers
+            // of the same header in one binary is how they drift — this copy accepted `Class {`
+            // as a name and the hook's did not.
+            //
+            // The path fallback stays, deliberately. `compile` is a user-facing command whose
+            // contract is "compile the thing I named", so renaming the target under the user is
+            // worse here than a guess; the hook, which nobody asked for explicitly, refuses
+            // instead. Same reader, different policy, each stated where it applies.
+            let path_derived = format!(
+                "{}.cls",
+                target
+                    .trim_end_matches(".cls")
+                    .replace(['/', '\\'], ".")
+                    .trim_start_matches('.')
+            );
+            let doc_name = match doc_name_from_source(&cls_text) {
+                SourceDocName::Named(n) if n.ends_with(".cls") => n,
+                _ => path_derived,
+            };
 
             // Upload
             let put_url = iris.versioned_ns_url(
