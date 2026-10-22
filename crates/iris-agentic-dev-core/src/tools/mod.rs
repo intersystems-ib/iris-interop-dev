@@ -2995,7 +2995,7 @@ fn bound_member_rows(
 }
 
 /// The empty body a kind that was not asked for stands in with, so every downstream reader —
-/// `row_count` included — sees the same shape whether a query ran or not.
+/// `get_row_count` included — sees the same shape whether a query ran or not.
 fn no_rows() -> serde_json::Value {
     serde_json::json!({"result": {"content": []}})
 }
@@ -4090,7 +4090,7 @@ async fn declared_members(
         Ok(v) => v,
         Err(_) => return (Vec::new(), None),
     };
-    // `iris.query` answers `{"result":{"content":[…]}}` — the same shape `row_count` reads.
+    // `iris.query` answers `{"result":{"content":[…]}}` — the same shape `get_row_count` reads.
     let empty = Vec::new();
     let rows = rows["result"]["content"].as_array().unwrap_or(&empty);
 
