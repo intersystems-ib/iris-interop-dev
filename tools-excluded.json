@@ -1,10 +1,16 @@
 {
   "$schema_note": "#353: why each upstream tool is NOT in the interop profile. The mechanical half — which upstream tools we ported and pruned versus never ported — is COMPUTED by scripts/validate-tools.sh from the two trees. This file records only the JUDGEMENT: why the fork does not advertise it. Keep no counts here; a count in this file would be a second source of truth for something a command already prints, and every prose count in this repo has gone stale (#359).",
+  "profiles": {
+    "$note": "#531: the fork advertises more than one profile, so an exclusion is a judgement PER PROFILE. A tool's top-level `category`/`why` is its verdict for every profile listed here; an entry may override that for one profile under its own `profiles` key. An override with category `advertised` means that profile DOES advertise the tool, and the top-level reason does not apply to it. Absence of an override is therefore defined, not silent: the top-level reason is the verdict. tests/tools_excluded_is_classified.rs and scripts/validate-tools.sh both read this list and check every profile against its own keep-list.",
+    "interop": "INTEROP_TOOLS — the production-focused default.",
+    "routines": "ROUTINES_TOOLS — legacy routines and globals (#531)."
+  },
   "categories": {
     "unsafe-here": "The capability lets an agent damage an instance or reach past what this fork is for, and no interop task needs it. Excluded on purpose; not a candidate.",
     "not-interop": "A legitimate upstream capability outside this fork's interoperability remit — instance administration, the server registry, the skill/KB machinery, agent telemetry. Excluded on scope, not on merit.",
     "covered-here": "This fork already answers the same question through a tool it does advertise. Adopting it would give a caller two ways to ask one thing.",
-    "wanted": "Would help interop work and is not excluded on principle — only not adopted yet. `tracking` names where the decision is being made."
+    "wanted": "Would help interop work and is not excluded on principle — only not adopted yet. `tracking` names where the decision is being made.",
+    "advertised": "Advertised by this profile. Only ever appears as a per-profile override: it records that a tool excluded elsewhere is IN this profile's keep-list, so the two files cannot disagree silently."
   },
   "tools": {
     "global_kill": {
@@ -230,11 +236,23 @@
     },
     "iris_search": {
       "category": "wanted",
-      "why": "Full-text search across documents via Atelier. The question 'which class references this' has no other answer in the profile; iris_symbols searches names, not bodies."
+      "why": "Full-text search across documents via Atelier. The question 'which class references this' has no other answer in the profile; iris_symbols searches names, not bodies.",
+      "profiles": {
+        "routines": {
+          "category": "advertised",
+          "why": "Advertised by `routines`. \"Which routine references this global\" has no other answer in that profile — `iris_symbols` searches names, not bodies — and legacy code is navigated by exactly that question. Read-only."
+        }
+      }
     },
     "iris_info": {
       "category": "wanted",
-      "why": "Read-only namespace discovery — documents, recently modified, namespace config, IRIS version. what=modified answers 'what did I just change', which nothing advertised here does."
+      "why": "Read-only namespace discovery — documents, recently modified, namespace config, IRIS version. what=modified answers 'what did I just change', which nothing advertised here does.",
+      "profiles": {
+        "routines": {
+          "category": "advertised",
+          "why": "Advertised by `routines`. `what=modified` answers \"what did I just change\" over a namespace of routines, which nothing else in that profile reports. Read-only."
+        }
+      }
     },
     "iris_namespace_list": {
       "category": "wanted",

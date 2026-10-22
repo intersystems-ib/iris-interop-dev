@@ -43,12 +43,24 @@ for field in ("_comment", "profile"):
 
 # ── drift check: every advertised interop tool must appear in the manifest ────────
 src = open(sys.argv[2]).read()
-km = re.search(r"INTEROP_TOOLS[^=]*=\s*&?\[(.*?)\];", src, re.S)
-if not km:
-    print("GATE FAILED: could not find INTEROP_TOOLS in mod.rs, so the manifest was not checked "
-          "against anything. A gate that cannot look must not pass.")
-    sys.exit(1)
-keep = set(re.findall(r'"([a-z_][a-z_0-9]*)"', km.group(1)))
+# #531: the manifest records validation for every tool the fork advertises in ANY profile, so the
+# drift check is against the UNION of the keep-lists. Checking only INTEROP_TOOLS would report
+# "manifest covers all advertised tools" while a routines-only tool had no validation record at
+# all — and iris_search and iris_info were exactly that case when the profile was added.
+#
+# Anchored on the definition: the old `INTEROP_TOOLS[^=]*=` pattern matched the first MENTION, and
+# a keep_list() accessor naming the const earlier in the file shifted the window.
+def _keep_list(name, text):
+    m = re.search(r"pub const %s: &\[&str\] = &\[(.*?)\n\];" % name, text, re.S)
+    if not m:
+        print(f"GATE FAILED: could not find `pub const {name}` in mod.rs, so the manifest was not "
+              "checked against anything. A gate that cannot look must not pass.")
+        sys.exit(1)
+    return set(re.findall(r'"([a-z_][a-z_0-9]*)"', m.group(1)))
+
+keep_interop = _keep_list("INTEROP_TOOLS", src)
+keep_routines = _keep_list("ROUTINES_TOOLS", src)
+keep = keep_interop | keep_routines
 # Plausibility control: a regex that silently matched almost nothing would make the two
 # comparisons below vacuous and the gate would read as clean.
 if len(keep) < 20:
@@ -60,14 +72,15 @@ unlisted = sorted(keep - listed)
 stale = sorted(listed - keep)
 print()
 if unlisted:
-    print(f"advertised in INTEROP_TOOLS but ABSENT from tools-status.json ({len(unlisted)}): "
+    print(f"advertised in a profile but ABSENT from tools-status.json ({len(unlisted)}): "
           f"{', '.join(unlisted)}")
     bad += len(unlisted)
 if stale:
     print(f"in tools-status.json but NOT advertised ({len(stale)}): {', '.join(stale)}")
     bad += len(stale)
 if not unlisted and not stale:
-    print(f"manifest covers all {len(keep)} advertised interop tools.")
+    print(f"manifest covers all {len(keep)} tools advertised by interop or routines "
+          f"({len(keep_interop)} / {len(keep_routines)}, overlapping).")
 
 ps = m["profile_surface"]
 print(f"profile_surface{'':19} {ps['status']:12} {ps['test']}")
@@ -158,8 +171,18 @@ if len(up) < 40 or len(ours) < 40:
 # then reported it UNCLASSIFIED — a false alarm about a tool that is in the profile. One source, and
 # the caveat printed, rather than two sources that agree only after a commit.
 src = git("show", "HEAD:crates/iris-agentic-dev-core/src/tools/mod.rs")
-km = re.search(r"INTEROP_TOOLS[^=]*=\s*&?\[(.*?)\];", src, re.S)
-profile = set(re.findall(r'"([a-z_][a-z_0-9]*)"', km.group(1))) if km else set()
+# Anchored on the DEFINITION. The old pattern was `INTEROP_TOOLS[^=]*=` and #531 added a
+# `keep_list()` accessor naming the const earlier in the file; re.search recovered by advancing to
+# the real definition, but only by luck — the equivalent parse in
+# tests/tools_excluded_is_classified.rs was NOT so lucky and silently read the neighbouring list.
+def keep_list(name):
+    m = re.search(r"pub const %s: &\[&str\] = &\[(.*?)\n\];" % name, src, re.S)
+    if not m:
+        print(f"GATE FAILED: {name} is not defined in mod.rs as `pub const {name}: &[&str] = &[`.")
+        sys.exit(1)
+    return set(re.findall(r'"([a-z_][a-z_0-9]*)"', m.group(1)))
+
+profile = keep_list("INTEROP_TOOLS")
 
 advertised_upstream = sorted(profile & up)
 fork_local          = sorted(profile - up)
@@ -210,6 +233,24 @@ classified = set(doc.get("tools", {}))
 upstream_only = set(pruned) | set(absent)
 unclassified = sorted(upstream_only - classified)
 stale = sorted(classified - upstream_only)
+# #531: a tool may be advertised by one profile and excluded by another, so "contradictory" is a
+# question per profile. An entry may say so with a `profiles.<name>.category = "advertised"`
+# override; without one, advertising a tool that carries an exclusion reason is a contradiction.
+declared = [k for k in doc.get("profiles", {}) if not k.startswith("$")]
+if len(declared) < 2:
+    print("GATE FAILED: tools-excluded.json must declare its profiles (#531); found "
+          f"{declared!r}. Without them this gate checks one profile and reports on all.")
+    sys.exit(1)
+contradictory = {}
+for prof in declared:
+    adv = profile if prof == "interop" else keep_list(f"{prof.upper()}_TOOLS")
+    offenders = []
+    for t in sorted(classified & adv):
+        verdict = (doc["tools"][t].get("profiles", {}).get(prof, {}) or {}).get("category")
+        if verdict != "advertised":
+            offenders.append(f"{t} ({verdict or doc['tools'][t].get('category')})")
+    if offenders:
+        contradictory[prof] = offenders
 also_advertised = sorted(classified & profile)
 
 print()
@@ -226,10 +267,13 @@ if stale:
     bad += len(stale)
     print(f"  STALE (classified, but upstream no longer has it): {', '.join(stale)}")
     print("    Remove the entry: a reason for a tool that does not exist is a claim about nothing.")
-if also_advertised:
-    bad += len(also_advertised)
-    print(f"  CONTRADICTORY (advertised AND excluded): {', '.join(also_advertised)}")
-    print("    A tool in INTEROP_TOOLS must not also carry an exclusion reason.")
+for prof, offenders in contradictory.items():
+    bad += len(offenders)
+    print(f"  CONTRADICTORY in `{prof}` (advertised AND excluded): {', '.join(offenders)}")
+    print(f"    A tool in {prof.upper()}_TOOLS must not carry an exclusion reason for that")
+    print(f"    profile. Either drop it from the keep-list, or add a `profiles.{prof}` override")
+    print("    with category `advertised` and the reason it belongs there.")
+print(f"  profiles checked              {', '.join(declared)}")
 if bad:
     print(f"GATE FAILED: {bad} unexplained or contradictory tool{'' if bad == 1 else 's'} above.")
     sys.exit(1)

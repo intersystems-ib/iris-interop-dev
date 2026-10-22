@@ -154,8 +154,17 @@ Whatever the client:
   down, which makes it the right first call to tell "MCP not registered" from "IRIS unreachable".
 - **`IRIS_TOOLSET` selects the tool surface** (`--toolset` also works). This fork defaults to
   `interop` — the tools listed under [Tools](#tools-interop-profile). `baseline` exposes everything
-  the binary carries. Neither count is written here on purpose: both have been wrong before, and
+  the binary carries. No count is written here on purpose: they have been wrong before, and
   `tools/list` on your own build is the only answer that cannot go stale.
+- **`IRIS_TOOLSET=routines` is for legacy ObjectScript** (#531): `.mac` routines with dot syntax,
+  `$PIECE`-delimited records in globals, cross-reference globals, LOCK/TSTART. Use it when the code
+  you are working on has no production — it drops the production, routing-rule, lookup, credential
+  and HL7 tools, which otherwise invite an agent to look for interop structure that is not there,
+  and it adds two read-only tools the interop profile excluded on scope: `iris_search` (which
+  routine references this global — a name search cannot answer that) and `iris_info` (what did I
+  just change). Execution, compilation, testing and introspection are the same in both profiles,
+  and so are the write gate and the read-only modes. `check_config` reports the active profile in
+  its `toolset` field.
 - **`IRIS_LOG_FILE=<path>` is how a session's traces survive it.** An MCP client keeps the server's
   stderr to itself, so without this there is nothing to read after a failed run.
 - **A running client keeps the binary it started with.** After installing a new release, restart the
@@ -241,7 +250,7 @@ server — run the ISC Web Gateway container alongside IRIS and point `web_port`
 | `IRIS_PASSWORD` | `SYS` | IRIS password |
 | `IRIS_NAMESPACE` | `USER` | Default namespace |
 | `IRIS_CONTAINER` | _(empty)_ | Docker container name — required for Docker-dependent tools |
-| `IRIS_TOOLSET` | `interop` | Tool surface: `interop` (the locked profile) or `baseline` (full upstream surface). Same as `--toolset` |
+| `IRIS_TOOLSET` | `interop` | Tool surface: `interop` (the locked profile), `routines` (legacy routines and globals, #531) or `baseline` (full upstream surface). Same as `--toolset` |
 | `IRIS_LOG_FILE` | _(empty)_ | Mirror server traces to this file — the only trace that outlives an MCP session |
 | `IRIS_DISCOVERY_TIMEOUT_MS` | `2000` | How long startup waits for IRIS discovery before serving. Missing this window is not fatal — the connection is adopted whenever the probe finishes — so raise it only if you would rather `initialize` block than serve unconnected |
 | `IRIS_ALLOW_PROD` | _(unset)_ | Allow MUTATING calls on a connection that is not write-allowed (Live system mode, or a production-looking namespace). Reads are never blocked, so this is only needed to write. Set to `1` deliberately |
