@@ -122,42 +122,146 @@ fn a_tracking_reference_points_somewhere_real() {
     );
 }
 
-/// A tool cannot be both advertised and excluded. This is the half of the join that needs no
-/// `upstream` remote, so it runs in CI where the rest of the join cannot.
+/// The keep-list a profile prunes to, parsed from its `pub const`.
+///
+/// Anchored on the DEFINITION, not on the first mention of the name. The previous version used
+/// `src.find("INTEROP_TOOLS")`, and #531 added a `Toolset::keep_list()` accessor that names the
+/// const EARLIER in the file — so the window started inside that function and ran on to the next
+/// `];`, swallowing a second list. Its `>= 20` size control passed, because the wrong window still
+/// held more than twenty tool names. A size control proves the window is not empty; it cannot
+/// prove the window is the right one.
+fn keep_list(src: &str, const_name: &str) -> Vec<String> {
+    let needle = format!("pub const {const_name}: &[&str] = &[");
+    let at = src
+        .find(&needle)
+        .unwrap_or_else(|| panic!("{const_name} must be defined in mod.rs as `{needle}`"));
+    let rest = &src[at + needle.len()..];
+    let body = &rest[..rest
+        .find("\n];")
+        .unwrap_or_else(|| panic!("{const_name} must be terminated by a line holding `];`"))];
+    body.split('"')
+        .skip(1)
+        .step_by(2)
+        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_lowercase() || c == '_'))
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// A tool cannot be both advertised and excluded — and since #531 that is a question PER PROFILE.
+///
+/// This is the half of the join that needs no `upstream` remote, so it runs in CI where the rest
+/// of the join cannot. It caught the real thing it exists for: adding `iris_search` and
+/// `iris_info` to `ROUTINES_TOOLS` left them carrying a `wanted` exclusion reason written for the
+/// interop profile, which is now recorded as a per-profile override instead.
 #[test]
 fn nothing_is_both_advertised_and_excluded() {
     let src =
         std::fs::read_to_string(repo_root().join("crates/iris-agentic-dev-core/src/tools/mod.rs"))
             .expect("mod.rs");
-    let at = src
-        .find("INTEROP_TOOLS")
-        .expect("INTEROP_TOOLS must be in mod.rs");
-    let rest = &src[at..];
-    let body = &rest[..rest.find("];").expect("the list must be terminated")];
-    let advertised: Vec<&str> = body
-        .split('"')
-        .skip(1)
-        .step_by(2)
-        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_lowercase() || c == '_'))
-        .collect();
-    // CONTROL: the parse found a real list, not an empty one that trivially intersects nothing.
-    assert!(
-        advertised.len() >= 20,
-        "parsed only {} advertised tools, which cannot be right — the check below would pass \
-         vacuously",
-        advertised.len()
-    );
-    assert!(advertised.contains(&"iris_doc"), "{advertised:?}");
-
     let excluded = tools();
-    let both: Vec<&str> = advertised
-        .iter()
-        .filter(|a| excluded.contains_key(**a))
-        .copied()
+
+    // Every profile the rationale file declares must have a keep-list, and vice versa: a profile
+    // nobody classified, or a classification for a profile that does not exist, are both the
+    // silence this file was written to remove.
+    let declared: Vec<String> = doc()["profiles"]
+        .as_object()
+        .expect("the file must declare its profiles (#531)")
+        .keys()
+        .filter(|k| !k.starts_with('$'))
+        .cloned()
         .collect();
     assert!(
-        both.is_empty(),
-        "these are advertised AND carry an exclusion reason: {both:?}"
+        declared.len() >= 2,
+        "with one profile this test cannot distinguish a per-profile verdict from a global one: \
+         {declared:?}"
+    );
+
+    let mut checked = 0usize;
+    for profile in &declared {
+        let const_name = format!("{}_TOOLS", profile.to_ascii_uppercase());
+        let advertised = keep_list(&src, &const_name);
+        // CONTROL: a real list, and the RIGHT list — a window that over-ran into the neighbouring
+        // const would pass a mere length check.
+        assert!(
+            advertised.len() >= 10,
+            "parsed only {} tools for {const_name}; the check below would pass vacuously",
+            advertised.len()
+        );
+        assert!(
+            advertised.contains(&"iris_doc".to_string()),
+            "{const_name} must contain iris_doc: {advertised:?}"
+        );
+        let other = if profile == "interop" {
+            "iris_production"
+        } else {
+            "iris_search"
+        };
+        assert!(
+            advertised.contains(&other.to_string()),
+            "{const_name} must contain {other}, or the parse took the wrong window: {advertised:?}"
+        );
+
+        for tool in &advertised {
+            let Some(entry) = excluded.get(tool) else {
+                continue;
+            };
+            // An entry exists, so SOME profile excludes this tool. For THIS profile it must say so
+            // explicitly, via an `advertised` override.
+            let verdict = entry
+                .get("profiles")
+                .and_then(|p| p.get(profile))
+                .and_then(|v| v.get("category"))
+                .and_then(|c| c.as_str());
+            assert_eq!(
+                verdict,
+                Some("advertised"),
+                "`{tool}` is in {const_name} but tools-excluded.json gives the `{profile}` profile \
+                 the verdict {:?} — a tool cannot be advertised and excluded by the same profile. \
+                 Add a `profiles.{profile}` override with category `advertised` and the reason it \
+                 belongs there.",
+                verdict.or_else(|| entry.get("category").and_then(|c| c.as_str())),
+            );
+            checked += 1;
+        }
+    }
+    // The loop above is only meaningful if some advertised tool DOES carry an entry. If none does,
+    // every assertion was skipped and this test proved nothing.
+    assert!(
+        checked >= 1,
+        "no advertised tool carries an exclusion entry, so the per-profile check never ran"
+    );
+}
+
+/// The inverse, and the one a reader assumes is covered: an `advertised` override must name a
+/// profile that really advertises the tool. Otherwise the override is a claim about nothing, and
+/// the obvious way to silence the test above is to write one for a profile at random.
+#[test]
+fn an_advertised_override_names_a_profile_that_advertises_it() {
+    let src =
+        std::fs::read_to_string(repo_root().join("crates/iris-agentic-dev-core/src/tools/mod.rs"))
+            .expect("mod.rs");
+    let mut overrides = 0usize;
+    for (tool, entry) in tools() {
+        let Some(profiles) = entry.get("profiles").and_then(|p| p.as_object()) else {
+            continue;
+        };
+        for (profile, verdict) in profiles {
+            if verdict.get("category").and_then(|c| c.as_str()) != Some("advertised") {
+                continue;
+            }
+            let const_name = format!("{}_TOOLS", profile.to_ascii_uppercase());
+            let advertised = keep_list(&src, &const_name);
+            assert!(
+                advertised.contains(&tool),
+                "tools-excluded.json says `{profile}` advertises `{tool}`, but {const_name} does \
+                 not list it"
+            );
+            overrides += 1;
+        }
+    }
+    assert!(
+        overrides >= 1,
+        "no `advertised` override exists, so this test asserted nothing"
     );
 }
 

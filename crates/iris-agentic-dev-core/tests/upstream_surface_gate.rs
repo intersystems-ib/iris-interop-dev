@@ -110,6 +110,40 @@ fn an_implausible_scan_refuses_to_print_buckets() {
     );
 }
 
+/// Remove `#<digits>` runs — issue references, which are not counts.
+///
+/// Written out rather than regexed so this test keeps no dependency beyond std, matching the rest
+/// of the file.
+fn strip_issue_refs(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '#' {
+            out.push(c);
+            continue;
+        }
+        // A '#' followed by at least one digit is a reference: drop the '#' and the digits.
+        if chars.peek().is_some_and(|d| d.is_ascii_digit()) {
+            while chars.peek().is_some_and(|d| d.is_ascii_digit()) {
+                chars.next();
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+#[test]
+fn the_issue_reference_allowance_is_a_rule_not_a_list() {
+    // The regression this replaces: a hardcoded allowlist passed #353 and failed #531.
+    assert_eq!(strip_issue_refs("see #353 and #531"), "see  and ");
+    // A real restated count must still survive stripping, or the guard above goes blind.
+    assert_eq!(strip_issue_refs("31 tools"), "31 tools");
+    // A bare '#' is not a reference and must be kept.
+    assert_eq!(strip_issue_refs("a # b"), "a # b");
+}
+
 #[test]
 fn the_section_restates_no_current_count() {
     // Reads COMMENTS deliberately — the opposite of the tests above. The rule being enforced is
@@ -120,16 +154,22 @@ fn the_section_restates_no_current_count() {
         "the comment scan found {} bytes — broken, so this proves nothing",
         prose.len()
     );
-    // Numbers that are allowed: issue references (#353, "48 excluded" quoting the issue) and the
-    // threshold. A bare two-or-more-digit number NOT preceded by '#' and not part of a quoted
-    // historical claim is a restated count.
+    // Numbers that are allowed: issue references (#353, #531, …), the quoted historical figure,
+    // and the threshold. A bare two-or-more-digit number that is NOT an issue reference is a
+    // restated count.
+    //
+    // The allowance used to be a literal list — `.replace("#353", "").replace("#294", "")` — which
+    // pinned a SPELLING rather than the rule it stood for. #531 then cited its own issue number in
+    // a comment in the section and this test failed, flagging `#531` as a restated count. A guard
+    // that forbids every issue number nobody has hardcoded is a guard the next person deletes, so
+    // the allowance is now the rule: strip `#` followed by digits, whatever the digits are.
     let offenders: Vec<&str> = prose
         .lines()
         .filter(|l| {
-            let without_refs = l.replace("#353", "").replace("#294", "");
             // the issue's own wrong figure is quoted, and quoting it is the point
-            let without_quotes = without_refs.replace("\"48 excluded\"", "");
-            without_quotes.split_whitespace().any(|w| {
+            let line = l.replace("\"48 excluded\"", "");
+            let without_refs = strip_issue_refs(&line);
+            without_refs.split_whitespace().any(|w| {
                 let t = w.trim_matches(|c: char| !c.is_ascii_digit());
                 t.len() >= 2 && t.chars().all(|c| c.is_ascii_digit())
             })
