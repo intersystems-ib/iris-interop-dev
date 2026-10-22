@@ -253,3 +253,72 @@ async fn a_successful_query_is_not_retried() {
         "a success must be one attempt, or the retry assertion above proves nothing"
     );
 }
+
+/// The reply a live instance returns for a query that matched no rows: HTTP 200, `status.errors`
+/// EMPTY, and `result.content` an empty array. Measured against
+/// `/api/atelier/v8/APP/action/query` with `SELECT 1 AS result WHERE 1=0` and again with a
+/// `WHERE` that matches no class — both answer exactly this.
+///
+/// It is the one shape #362 left behind. The three it separated all carry something to report (an
+/// error, a status, a non-JSON body); this one carries nothing at all, and
+/// `as_str().unwrap_or("")` turned it into the same empty string that
+/// `a_script_that_writes_nothing_still_succeeds_with_an_empty_output` asserts is a real answer.
+fn no_row() -> serde_json::Value {
+    serde_json::json!({
+        "status": {"errors": [], "summary": ""},
+        "console": [],
+        "result": {"content": []}
+    })
+}
+
+#[tokio::test]
+async fn a_reply_with_no_row_is_not_reported_as_an_empty_output() {
+    let server = scaffold().await;
+    query_answers(&server, ResponseTemplate::new(200).set_body_json(no_row())).await;
+    let c = conn(&server);
+    let client = reqwest::Client::new();
+
+    let r = c.execute_via_generator("Write 1", NS, &client).await;
+
+    let e = match r {
+        Ok(out) => panic!(
+            "a reply carrying no row must not be reported as output; got Ok({out:?}) — an empty \
+             string here is what 66 call sites read as 'the script produced no output'"
+        ),
+        Err(e) => e.to_string(),
+    };
+    // The caller cannot act on "it failed": what it needs is that the reply was SHAPED wrong, so
+    // it looks at the transport rather than at the ObjectScript it just submitted.
+    assert!(
+        e.contains("no row"),
+        "the error must name the shape that was wrong, not just fail: {e}"
+    );
+    assert!(
+        !e.contains("did not compile"),
+        "nothing failed to compile in this run, so the message must not say so: {e}"
+    );
+}
+
+#[tokio::test]
+async fn the_scratch_class_is_deleted_when_the_reply_carries_no_row() {
+    let server = scaffold().await;
+    query_answers(&server, ResponseTemplate::new(200).set_body_json(no_row())).await;
+    let c = conn(&server);
+    let client = reqwest::Client::new();
+
+    let _ = c.execute_via_generator("Write 1", NS, &client).await;
+
+    // This arm used to fall through to step 4, which did the delete. It now returns early like
+    // every other failure arm, so the delete has to be its own statement — and if it is dropped,
+    // every unreadable reply leaves an IrisDevTmp.Run* class behind in the namespace.
+    let puts = counts(&server, "PUT", "/doc/IrisDevTmp.").await;
+    let deletes = counts(&server, "DELETE", "/doc/IrisDevTmp.").await;
+    assert!(
+        puts > 0,
+        "control: the scratch class must have been PUT at all"
+    );
+    assert_eq!(
+        deletes, puts,
+        "every PUT scratch class must be deleted: {puts} put, {deletes} deleted"
+    );
+}
