@@ -232,6 +232,167 @@ pub(crate) fn interpret_query_response(status: reqwest::StatusCode, text: &str) 
 /// A KIND, not a message prefix. This file has had to un-stringify a discriminant twice already
 /// (#102 removed prose-sniffing, #390 re-typed an error whose only discriminant was its wording),
 /// and the caller here needs to name the shape it got without parsing its own text back.
+/// What a DELETE of an Atelier document actually achieved.
+///
+/// HTTP 200 is not the answer on its own. A locked or checked-out document is refused with a
+/// **200** and the diagnosis in `status.errors` (ERROR #5845); `tools/doc.rs:2080` has read it
+/// that way for a long time and says so in a comment. The generator's own delete read neither
+/// half — it sent the request and returned `Ok(())` — so a refused delete and a completed one
+/// were the same event. That is this repo's house bug: a failure answered as a negative fact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DeleteOutcome {
+    /// The document is not there any more: a clean 2xx, or a 404, which is the same outcome
+    /// reached by a different route.
+    Gone,
+    /// IRIS answered 2xx and refused in the envelope, in its own words.
+    Refused(String),
+    /// A non-2xx that is not a 404. Nothing is known about the document.
+    HttpError(u16),
+}
+
+impl DeleteOutcome {
+    /// Whether the document can be treated as deleted. Only `Gone` may disarm a [`ScratchGuard`]:
+    /// on anything else the class may still be compiled in the namespace, and one extra DELETE is
+    /// cheaper than a leak.
+    pub(crate) fn is_gone(&self) -> bool {
+        matches!(self, Self::Gone)
+    }
+
+    /// Text for the warning. Every variant names itself, so a log line cannot read as "deleted".
+    pub(crate) fn why(&self) -> String {
+        match self {
+            Self::Gone => "deleted".to_string(),
+            Self::Refused(e) => format!("IRIS refused the delete: {e}"),
+            Self::HttpError(s) => format!("HTTP {s}"),
+        }
+    }
+}
+
+/// Read a DELETE reply. Takes the raw body text because a 200 can carry a refusal.
+pub(crate) fn delete_outcome(status: reqwest::StatusCode, body: &str) -> DeleteOutcome {
+    // The 404 is tested BEFORE `is_success`: an absent document is exactly what the delete
+    // wanted, and a second attempt cannot improve on it.
+    if status.as_u16() == 404 {
+        return DeleteOutcome::Gone;
+    }
+    if !status.is_success() {
+        return DeleteOutcome::HttpError(status.as_u16());
+    }
+    // A 200 whose body is not JSON is taken as success, matching the sibling at tools/doc.rs:2080
+    // (`r.json().await.unwrap_or_default()`). Deliberate parity, not an oversight: this reads the
+    // two shapes that are KNOWN to carry a refusal and does not invent a third.
+    let parsed: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+    match parsed["status"]["errors"].as_array() {
+        Some(errs) if !errs.is_empty() => DeleteOutcome::Refused(
+            errs[0]["error"]
+                .as_str()
+                .unwrap_or("delete refused with no text")
+                .to_string(),
+        ),
+        _ => DeleteOutcome::Gone,
+    }
+}
+
+/// Deletes the generator's scratch class when the future that created it never reaches its own
+/// delete.
+///
+/// The case this exists for is `tokio::time::timeout`. Four call sites in `tools/mod.rs` wrap
+/// `execute_via_generator` (iris_test twice, iris_coverage, iris_execute), and an elapsed timeout
+/// drops the future where it stands — after the PUT and the compile have already succeeded, with
+/// the `SELECT` still in flight. An early `?` return after the PUT is the same event by another
+/// name. Upstream found 78,183 leaked classes in one namespace; 15 were sitting in namespace APP
+/// on the local instance when this was triaged.
+///
+/// `Drop` is synchronous and this crate builds reqwest without the `blocking` feature, so the
+/// DELETE has to go out on a runtime. The ambient one is used when there is one — the timeout
+/// case, where the runtime outlives the dropped future. Only a drop with no runtime at all falls
+/// back to a thread with its own.
+struct ScratchGuard {
+    /// `Some` while the class may still exist. A guard still holding it on drop sends the DELETE.
+    pending: Option<PendingDelete>,
+}
+
+/// Everything the DELETE needs, owned, because `Drop` cannot borrow from the dropped future.
+struct PendingDelete {
+    url: String,
+    username: String,
+    password: String,
+    client: reqwest::Client,
+}
+
+impl PendingDelete {
+    async fn send(self) {
+        match self
+            .client
+            .delete(&self.url)
+            .basic_auth(&self.username, Some(&self.password))
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                let outcome = delete_outcome(status, &body);
+                if !outcome.is_gone() {
+                    tracing::warn!(
+                        "scratch class at {} was not deleted on drop: {}",
+                        self.url,
+                        outcome.why()
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!("scratch class at {} was not deleted on drop: {e}", self.url)
+            }
+        }
+    }
+}
+
+impl ScratchGuard {
+    fn armed(url: String, username: String, password: String, client: reqwest::Client) -> Self {
+        Self {
+            pending: Some(PendingDelete {
+                url,
+                username,
+                password,
+                client,
+            }),
+        }
+    }
+
+    /// The class is gone, so there is nothing left to clean up.
+    fn disarm(&mut self) {
+        self.pending = None;
+    }
+}
+
+impl Drop for ScratchGuard {
+    fn drop(&mut self) {
+        let Some(pending) = self.pending.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            // Deliberately detached: `Drop` cannot await, and the runtime outlives this future in
+            // the timeout case. `drop` on the handle satisfies `must_use` without `let _ =`,
+            // which would trip `clippy::let_underscore_future` on a JoinHandle.
+            Ok(handle) => drop(handle.spawn(pending.send())),
+            Err(_) => {
+                // No runtime: the process is on its way out, where a detached task would never be
+                // polled. This one brings its own.
+                drop(std::thread::spawn(
+                    move || match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(rt) => rt.block_on(pending.send()),
+                        Err(e) => tracing::warn!("no runtime for the scratch delete: {e}"),
+                    },
+                ))
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UnreadableOutput {
     /// `result.content` was absent, or an empty array: the SELECT returned no row at all.
@@ -754,6 +915,19 @@ impl IrisConnection {
             )));
         }
 
+        // #465: from here the class EXISTS in the namespace, so every exit from this function
+        // owes it a DELETE — including the exits that are not returns. A timeout at any of the
+        // four `tokio::time::timeout` call sites in tools/mod.rs drops this future where it
+        // stands, and the three `?` returns below (the compile send, the query send and the body
+        // read) leave by a path that cannot run cleanup code. The guard covers all four without
+        // any of them changing.
+        let mut scratch = ScratchGuard::armed(
+            put_url,
+            self.username.clone(),
+            self.password.clone(),
+            client.clone(),
+        );
+
         // 2. Compile
         let compile_url = self.versioned_ns_url(namespace, "/action/compile?flags=cuk");
         let compile_resp = client
@@ -764,7 +938,8 @@ impl IrisConnection {
             .await?;
         if !compile_resp.status().is_success() {
             let status = compile_resp.status();
-            let _ = self.delete_doc(&doc_name, namespace, client).await;
+            self.delete_scratch(&mut scratch, &doc_name, namespace, client)
+                .await;
             return Err(anyhow::Error::new(AtelierHttpError::new(
                 status,
                 compile_url,
@@ -836,7 +1011,8 @@ impl IrisConnection {
                     // Every other arm here returns early and so has to delete the scratch class
                     // itself; this one now does too, or an unreadable reply leaks an
                     // `IrisDevTmp.Run*` class into the namespace.
-                    let _ = self.delete_doc(&doc_name, namespace, client).await;
+                    self.delete_scratch(&mut scratch, &doc_name, namespace, client)
+                        .await;
                     // Deliberately NOT an `IrisReportedError`. That type means IRIS executed the
                     // code and reported a verdict about it, which makes a second transport neither
                     // a remedy nor a second opinion. Here IRIS reported nothing at all: the code
@@ -868,7 +1044,8 @@ impl IrisConnection {
                 }
             },
             QueryOutcome::IrisError(msg) => {
-                let _ = self.delete_doc(&doc_name, namespace, client).await;
+                self.delete_scratch(&mut scratch, &doc_name, namespace, client)
+                    .await;
                 // #391: `Execute()` did not run, so the recorded compile diagnosis is now the
                 // CAUSE and the SqlProc failure is its consequence. Tri-state rather than an
                 // unconditional prefix: with nothing recorded this is byte-for-byte the message
@@ -888,7 +1065,8 @@ impl IrisConnection {
                 return Err(anyhow::Error::new(IrisReportedError { text }));
             }
             QueryOutcome::HttpError { status, snippet } => {
-                let _ = self.delete_doc(&doc_name, namespace, client).await;
+                self.delete_scratch(&mut scratch, &doc_name, namespace, client)
+                    .await;
                 return Err(anyhow::Error::new(AtelierHttpError::new(
                     status,
                     query_url,
@@ -897,7 +1075,8 @@ impl IrisConnection {
                 )));
             }
             QueryOutcome::NonJson { status, snippet } => {
-                let _ = self.delete_doc(&doc_name, namespace, client).await;
+                self.delete_scratch(&mut scratch, &doc_name, namespace, client)
+                    .await;
                 // #391: the recorded diagnosis leads here too - it is still the best account of
                 // why nothing usable came back. #390: deliberately NOT typed, though. A 200 whose
                 // body is not JSON is a proxy page or a login redirect, i.e. a TRANSPORT fault,
@@ -914,7 +1093,8 @@ impl IrisConnection {
         };
 
         // 4. Delete the temp class (best-effort)
-        let _ = self.delete_doc(&doc_name, namespace, client).await;
+        self.delete_scratch(&mut scratch, &doc_name, namespace, client)
+            .await;
 
         Ok(output)
     }
@@ -998,23 +1178,51 @@ impl IrisConnection {
         lines
     }
 
-    /// Delete an Atelier document (best-effort).
+    /// Delete an Atelier document and report what happened.
+    ///
+    /// #465: this was "best-effort", which in practice meant it sent the DELETE and returned
+    /// `Ok(())` without reading the reply — so a refusal was indistinguishable from a clean-up.
+    /// A transport failure is still an `Err`; a reply that ARRIVED is `Ok(outcome)` whatever it
+    /// says, because the caller's choice is not "did the request go out" but "is the class gone".
     async fn delete_doc(
         &self,
         doc_name: &str,
         namespace: &str,
         client: &reqwest::Client,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<DeleteOutcome> {
         let url = self.versioned_ns_url(
             namespace,
             &format!("/doc/{}", urlencoding::encode(doc_name)),
         );
-        client
+        let resp = client
             .delete(&url)
             .basic_auth(&self.username, Some(&self.password))
             .send()
             .await?;
-        Ok(())
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        Ok(delete_outcome(status, &body))
+    }
+
+    /// Delete the scratch class, and disarm `guard` only if it is really gone.
+    ///
+    /// A refusal deliberately leaves the guard armed: `Drop` then makes exactly one more attempt
+    /// from a fresh task. The alternative is leaving a compiled class in a user's namespace on the
+    /// strength of a reply nobody read.
+    async fn delete_scratch(
+        &self,
+        guard: &mut ScratchGuard,
+        doc_name: &str,
+        namespace: &str,
+        client: &reqwest::Client,
+    ) {
+        match self.delete_doc(doc_name, namespace, client).await {
+            Ok(outcome) if outcome.is_gone() => guard.disarm(),
+            Ok(outcome) => {
+                tracing::warn!("scratch class {doc_name} not deleted: {}", outcome.why())
+            }
+            Err(e) => tracing::warn!("scratch class {doc_name} delete failed in transport: {e}"),
+        }
     }
 
     /// Execute ObjectScript code via docker exec (iris session stdin).
@@ -2338,5 +2546,116 @@ mod captured_output_tests {
         for why in &whys {
             assert!(!why.is_empty(), "an empty clause explains nothing");
         }
+    }
+}
+
+/// #465: what a DELETE reply means.
+///
+/// The response shapes below are the ones that decide whether a scratch class is gone, and two of
+/// them are refusals that arrive looking like success. The table the arms were written against:
+///
+/// | reply                                   | means              |
+/// |-----------------------------------------|--------------------|
+/// | 200, `status.errors: []`                | deleted            |
+/// | 200, `status.errors: [ERROR #5845 …]`   | refused — locked   |
+/// | 404                                     | already absent     |
+/// | 500                                     | unknown            |
+///
+/// The first and the second differ only in the body, which is exactly why reading the HTTP status
+/// alone is not enough — and why the old code, which read neither, called all four of them done.
+#[cfg(test)]
+mod delete_outcome_tests {
+    use super::{delete_outcome, DeleteOutcome};
+    use reqwest::StatusCode;
+
+    /// A locked or checked-out document, as Atelier actually refuses it.
+    fn locked() -> String {
+        serde_json::json!({
+            "status": {"errors": [{
+                "error": "ERROR #5845: Element 'IrisDevTmp.Run1.CLS' is checked out or locked",
+                "code": 5845
+            }], "summary": "ERROR #5845"},
+            "result": {}
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn a_clean_200_is_gone() {
+        let body = serde_json::json!({"status": {"errors": []}, "result": {}}).to_string();
+        assert_eq!(delete_outcome(StatusCode::OK, &body), DeleteOutcome::Gone);
+    }
+
+    /// The control for the arm above: an EMPTY errors array must not read as a refusal, or every
+    /// successful delete would be retried forever.
+    #[test]
+    fn an_empty_errors_array_is_not_a_refusal() {
+        let body = serde_json::json!({"status": {"errors": []}}).to_string();
+        assert!(delete_outcome(StatusCode::OK, &body).is_gone());
+    }
+
+    /// Absent is the outcome the delete wanted, so a 404 is success by another route. This is
+    /// tested before `is_success`, and that ORDER is the assertion: a 404 is not a 2xx.
+    #[test]
+    fn a_404_is_gone_because_absent_is_the_goal() {
+        assert_eq!(
+            delete_outcome(StatusCode::NOT_FOUND, ""),
+            DeleteOutcome::Gone
+        );
+    }
+
+    #[test]
+    fn a_500_is_an_http_error_not_a_clean_up() {
+        assert_eq!(
+            delete_outcome(StatusCode::INTERNAL_SERVER_ERROR, ""),
+            DeleteOutcome::HttpError(500)
+        );
+    }
+
+    /// The shape an HTTP-status-only fix still gets wrong.
+    #[test]
+    fn a_200_carrying_status_errors_is_a_refusal() {
+        match delete_outcome(StatusCode::OK, &locked()) {
+            DeleteOutcome::Refused(e) => assert!(
+                e.contains("5845") && e.contains("locked"),
+                "the refusal must carry IRIS's own words, got {e:?}"
+            ),
+            other => panic!("a 200 with status.errors is a refusal, got {other:?}"),
+        }
+    }
+
+    /// Documents a deliberate parity with the sibling at `tools/doc.rs:2080`, which also treats an
+    /// unparseable 200 as success. Written down because it is the one shape where this function
+    /// chooses NOT to invent a third state.
+    #[test]
+    fn a_200_whose_body_is_not_json_is_gone_like_the_sibling() {
+        assert!(delete_outcome(StatusCode::OK, "<html>nope</html>").is_gone());
+    }
+
+    /// Only `Gone` may disarm the guard. If this ever widens, a refused delete starts reading as a
+    /// completed one again — the whole defect.
+    #[test]
+    fn only_gone_counts_as_gone() {
+        assert!(DeleteOutcome::Gone.is_gone());
+        assert!(!DeleteOutcome::Refused("x".into()).is_gone());
+        assert!(!DeleteOutcome::HttpError(500).is_gone());
+    }
+
+    /// Three outcomes, three distinct log lines. A shared or defaulted string would make a
+    /// refusal unreadable in a log, which is the only place a dropped guard reports anything.
+    #[test]
+    fn every_outcome_names_itself_distinctly() {
+        let whys = [
+            DeleteOutcome::Gone.why(),
+            DeleteOutcome::Refused("locked".into()).why(),
+            DeleteOutcome::HttpError(403).why(),
+        ];
+        let unique: std::collections::BTreeSet<&str> = whys.iter().map(|s| s.as_str()).collect();
+        assert_eq!(unique.len(), whys.len(), "why() strings collide: {whys:?}");
+        assert!(whys[1].contains("locked"), "the refusal must quote IRIS");
+        assert!(
+            whys[2].contains("403"),
+            "the http error must name the status"
+        );
     }
 }

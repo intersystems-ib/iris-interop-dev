@@ -298,7 +298,47 @@ impl McpCommand {
             .serve(stdio())
             .await
             .inspect_err(|e| tracing::error!("MCP server error: {:?}", e))?;
-        service.waiting().await?;
+        // #465: a SIGTERM used to end the process wherever it stood. Any generator future in
+        // flight was dropped with its scratch class already compiled, and the DELETE went with it.
+        // Returning here instead lets `main` shut the runtime down through its bounded
+        // `shutdown_timeout`, which is the window a dropped `ScratchGuard` needs to get its
+        // request out.
+        // Both arms must have the same type, so the `?` is a statement inside a block rather
+        // than the arm's value — `service.waiting()` resolves to a QuitReason we do not use.
+        tokio::select! {
+            r = service.waiting() => {
+                r?;
+            }
+            _ = shutdown_signal() => tracing::info!("shutting down on signal"),
+        }
         Ok(())
+    }
+}
+
+/// Resolves when the process is asked to stop: SIGTERM (what a container runtime sends) or Ctrl-C.
+///
+/// On a platform without Unix signals only Ctrl-C is available, and that is not a degradation
+/// worth hiding — a missing SIGTERM handler is reported rather than silently skipped, because the
+/// consequence (a scratch class left compiled in the namespace) is invisible from here.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = term.recv() => {}
+                    _ = tokio::signal::ctrl_c() => {}
+                }
+            }
+            Err(e) => {
+                tracing::warn!("no SIGTERM handler ({e}); watching Ctrl-C only");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
