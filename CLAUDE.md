@@ -90,6 +90,8 @@ Each of these was this bug. None had a reported symptom; all were found by readi
 | #312 | absent / unreadable / unparseable config all collapsed to `None` |
 | #313 | a wildcard reached the CLI with none of the tool's guards |
 | #320 | an unrecognised `SystemMode` let writes through on a live instance |
+| #465 | a refused DELETE of the scratch class read as a completed clean-up |
+| #523 | a generator reply that carried no row read as an empty output |
 
 ## Measurement discipline
 

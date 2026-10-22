@@ -130,8 +130,24 @@ fn open_log_file(path: &str) -> std::io::Result<FileSink> {
     Ok(FileSink(Arc::new(Mutex::new(file))))
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// #465: a hand-built runtime rather than `#[tokio::main]`, purely so that `shutdown_timeout`
+/// below has a hook point.
+///
+/// A dropped `ScratchGuard` sends its DELETE from a detached task. Without a bounded window at
+/// exit that task is dropped before it is ever polled, and the scratch class leaks after all —
+/// the guard would be correct and inert. Two seconds is one HTTP round trip to a local instance
+/// with room to spare, and it is an upper bound, not a wait: a process with nothing in flight
+/// exits immediately.
+fn main() -> Result<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = rt.block_on(run());
+    rt.shutdown_timeout(std::time::Duration::from_secs(2));
+    result
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     init_tracing(cli.verbose);
