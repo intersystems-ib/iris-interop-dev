@@ -465,3 +465,82 @@ mod tests {
         );
     }
 }
+
+/// How many rows `iris_query` returns in `rows` mode when the caller names no `limit`.
+///
+/// #430 item 4. The cap is CLIENT-SIDE and deliberately not pushed into the SQL. The caller
+/// supplies the statement, so injecting `TOP` would rewrite their query — it changes what an
+/// aggregate means, and this repo has already measured a sort silently dropping rows when
+/// `ORDER BY` meets an OR-of-LIKE on `%Dictionary.*`. IRIS therefore still computes the whole
+/// result set; what this bounds is how much of it crosses into a model's context, and `total_rows`
+/// always reports the real size so a bounded answer is never mistaken for the whole one.
+pub const DEFAULT_ROW_LIMIT: usize = 200;
+
+/// The per-cell character cap applied to string columns.
+pub const DEFAULT_FIELD_CHARS: usize = 500;
+
+/// The marker a shortened cell carries, inside its own value.
+///
+/// A CONTRACT, not a message: `a_cut_cell_can_never_be_mistaken_for_complete` reads this constant,
+/// so the marker and the test cannot drift apart.
+pub const FIELD_CUT_MARKER: &str = "…[truncated";
+
+/// A bounded result set, with everything a caller needs to tell what was left out.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Bounded {
+    /// The rows that survived the cap, with long cells shortened.
+    pub rows: Vec<serde_json::Value>,
+    /// How many rows IRIS actually returned, before any cap.
+    pub total: usize,
+    /// Whether `rows` is shorter than `total`.
+    pub truncated: bool,
+    /// How many individual cells were shortened.
+    pub fields_truncated: usize,
+}
+
+/// Bound `rows` to `limit` and cap each string cell at `field_chars`, marking every cut.
+///
+/// `limit == 0` and `field_chars == 0` each mean "no cap", matching `iris_doc`'s `max_bytes`.
+///
+/// A shortened CELL carries its marker inside the value, not merely in a payload counter. A caller
+/// that reads one field out of one row never sees the counter, and a silently shortened identifier
+/// is indistinguishable from a real one — which is why `iris_execute_method` refuses a short value
+/// outright rather than return it. Here the value is kept, because a long text column is usually
+/// what was asked for, but it can never be read as complete.
+///
+/// Character-based, not byte-based: slicing a UTF-8 string at a byte offset panics mid-codepoint,
+/// and these cells carry HL7 and patient text where multi-byte characters are the norm, not the
+/// exception.
+pub fn bound_rows(mut rows: Vec<serde_json::Value>, limit: usize, field_chars: usize) -> Bounded {
+    let total = rows.len();
+    let truncated = limit != 0 && total > limit;
+    if truncated {
+        rows.truncate(limit);
+    }
+    let mut fields_truncated = 0usize;
+    if field_chars != 0 {
+        for row in &mut rows {
+            if let Some(obj) = row.as_object_mut() {
+                for (_name, cell) in obj.iter_mut() {
+                    let Some(text) = cell.as_str() else { continue };
+                    let len = text.chars().count();
+                    if len <= field_chars {
+                        continue;
+                    }
+                    let kept: String = text.chars().take(field_chars).collect();
+                    *cell = serde_json::Value::String(format!(
+                        "{kept}{FIELD_CUT_MARKER} +{} chars]",
+                        len - field_chars
+                    ));
+                    fields_truncated += 1;
+                }
+            }
+        }
+    }
+    Bounded {
+        rows,
+        total,
+        truncated,
+        fields_truncated,
+    }
+}

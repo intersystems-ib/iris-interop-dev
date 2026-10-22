@@ -319,8 +319,9 @@ fn sc002_shape_parity() {
         assert!(v.get("file").is_some(), "Symbol missing 'file' field");
     }
 
-    // iris_symbols returns: source, symbols, count, query_hint
-    // We verify the scan result provides these fields when wrapped
+    // iris_symbols returns a FLAT name array: source, symbols, count, truncated (#430 item 3).
+    // iris_symbols_local — the tool this file covers — deliberately keeps OBJECT rows, because
+    // they carry kind/file/formal_spec/line that a bare name cannot express.
     assert!(!result.symbols.is_empty(), "symbols must not be empty");
 }
 

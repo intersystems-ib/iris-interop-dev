@@ -117,12 +117,28 @@ pub struct IrisDocParams {
     #[serde(default)]
     pub test: Option<String>,
     /// For mode=get: cap returned source to this many bytes (0 = unlimited). Large class source is
-    /// the biggest iris_doc token sink — page through with `offset` + `max_bytes`.
+    /// the biggest iris_doc token sink — page through with `offset` + `max_bytes`. OMITTED on a
+    /// built-in class (`%`, `Ens`, `EnsLib`, `HS`) applies a default cap and says so in
+    /// `max_bytes_default_applied`; pass 0 to force the whole document.
+    //
+    // `Option`, not `usize`, and the distinction carries weight: with a bare `usize` an omitted
+    // parameter and an explicit `max_bytes: 0` both arrive as 0, so the built-in default could not
+    // tell "I did not ask" from "I asked for everything" and would silently truncate the second.
     #[serde(default)]
-    pub max_bytes: usize,
+    pub max_bytes: Option<usize>,
     /// For mode=get: byte offset to start returning from (use with max_bytes to paginate).
     #[serde(default)]
     pub offset: usize,
+    /// For mode=get: 'full' (default) returns the document as stored. 'skeleton' returns the class
+    /// header, Parameters, Properties, XData and method SIGNATURES with their `///` comments, but
+    /// NOT method bodies or the Storage block. A skeleton is a PARTIAL VIEW and `put` refuses to
+    /// write one back.
+    #[serde(default)]
+    pub shape: Option<String>,
+    /// For mode=get: drop a leading `/* ... */` license/copyright block. Does not touch `///`
+    /// documentation comments, which are the part of an unfamiliar class worth reading.
+    #[serde(default)]
+    pub strip_license: bool,
     // ── NOT a doc comment, deliberately. ──────────────────────────────────────────────────────
     // A `///` here becomes the advertised inputSchema description, shipped on every tools/list, and
     // `mcp_server_tools_list_returns_interop_profile` rejects Rust-internal commentary in a schema
@@ -204,6 +220,7 @@ fn require_name(
 }
 
 use crate::iris::connection::IrisConnection;
+use crate::tools::doc_shape;
 
 fn ok_json(v: serde_json::Value) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
     Ok(rmcp::model::CallToolResult::success(vec![
@@ -603,19 +620,89 @@ async fn handle_get(
         .unwrap_or("")
         .to_string();
 
+    // #430 item 1: the view transforms, in the only order that works. `strip_license` runs on the
+    // raw text because its `/* */` must still be the first thing in the string; the skeleton banner
+    // is prepended after that; the byte cap applies LAST, to whatever the caller actually receives,
+    // so `total_bytes` and `next_offset` page over the returned view rather than over a string the
+    // caller never saw.
+    let shape = match doc_shape::DocShape::parse(p.shape.as_deref()) {
+        Ok(s) => s,
+        Err(why) => return err_json("INVALID_SHAPE", &why),
+    };
+    let mut view = serde_json::Map::new();
+    let mut content = content;
+    if p.strip_license {
+        let (stripped, removed) = doc_shape::strip_license_header(&content);
+        content = stripped;
+        // Reported either way: "there was no license block" and "I dropped one" are different
+        // answers, and a caller sizing the result needs to know which happened.
+        view.insert("license_stripped".into(), serde_json::json!(removed));
+    }
+    if shape == doc_shape::DocShape::Skeleton {
+        match doc_shape::skeleton(&content) {
+            doc_shape::Skeletonized::Elided {
+                content: elided,
+                bodies,
+                storage,
+            } => {
+                content = elided;
+                view.insert("shape".into(), serde_json::json!("skeleton"));
+                view.insert("bodies_elided".into(), serde_json::json!(bodies));
+                view.insert("storage_elided".into(), serde_json::json!(storage));
+            }
+            doc_shape::Skeletonized::NothingToElide => {
+                // Identical to `full`, and deliberately WITHOUT the banner: a class holding no
+                // method bodies and no Storage loses nothing when written back, so marking it
+                // would make `put` refuse a document that is entirely safe to write.
+                view.insert("shape".into(), serde_json::json!("skeleton"));
+                view.insert("bodies_elided".into(), serde_json::json!(0));
+                view.insert("storage_elided".into(), serde_json::json!(false));
+            }
+            doc_shape::Skeletonized::NotAClass => {
+                // THIRD CASE (CLAUDE.md). Labelling a routine's full source `skeleton` would state
+                // that bodies were removed when none were, and a caller that trusts `shape` would
+                // read a complete routine as a signature list. Name the view that came back.
+                view.insert("shape".into(), serde_json::json!("full"));
+                view.insert("shape_requested".into(), serde_json::json!("skeleton"));
+                view.insert(
+                    "shape_not_applied".into(),
+                    serde_json::json!(
+                        "No UDL class definition was found, so there are no method bodies to \
+                         elide — this is a routine or a non-class document. The FULL document is \
+                         returned."
+                    ),
+                );
+            }
+        }
+    }
+
     // Pagination: cap large source to avoid huge token blowups (iris_doc was the #1 token sink —
     // 274K tokens in the workshop, much of it re-fetching whole library classes). UTF-8 safe.
+    let effective_max = match p.max_bytes {
+        Some(n) => n,
+        None if doc_shape::is_builtin_package(name) => doc_shape::BUILTIN_DEFAULT_MAX_BYTES,
+        None => 0,
+    };
+    let default_cap_applied = p.max_bytes.is_none() && effective_max != 0;
     let total_bytes = content.len();
     let start = floor_char_boundary(&content, p.offset.min(total_bytes));
-    let end = if p.max_bytes == 0 {
+    let end = if effective_max == 0 {
         total_bytes
     } else {
-        floor_char_boundary(&content, (start + p.max_bytes).min(total_bytes))
+        floor_char_boundary(&content, (start + effective_max).min(total_bytes))
     };
     let slice = &content[start..end];
     let mut out = serde_json::json!({
         "success": true, "name": name, "content": slice, "timestamp": ts,
     });
+    for (k, v) in view {
+        out[k] = v;
+    }
+    if default_cap_applied {
+        // Says WHOSE cap cut the document. Without this a built-in read looks like the caller
+        // asked for 8192 bytes, and the obvious next move (lower max_bytes) is the wrong one.
+        out["max_bytes_default_applied"] = serde_json::json!(effective_max);
+    }
     if start > 0 || end < total_bytes {
         out["truncated"] = serde_json::Value::Bool(true);
         out["total_bytes"] = serde_json::json!(total_bytes);
@@ -691,9 +778,19 @@ async fn handle_line_edit(
         mode: "get".into(),
         name: Some(name.clone()),
         names: vec![],
-        // FORCE a complete read. See the truncation note above.
-        max_bytes: 0,
+        // FORCE a complete, VERBATIM read. See the truncation note above.
+        //
+        // `shape` and `strip_license` are forced here for a reason that is not cosmetic: this
+        // struct is finished with `..p.clone()`, so ANY get-side view parameter the caller passed
+        // would be inherited by the read that this edit then writes back. A skeleton read would
+        // write a class whose every method body had been replaced by a comment, and
+        // `strip_license` would silently drop the copyright header of whatever was edited. Both
+        // are total, silent content destruction, and `a_line_edit_never_inherits_a_partial_view`
+        // is the test that keeps this forcing in place.
+        max_bytes: Some(0),
         offset: 0,
+        shape: None,
+        strip_license: false,
         ..p.clone()
     };
     let got = handle_get(iris, client, get_params).await?;
@@ -1023,6 +1120,34 @@ async fn handle_put(
         None => name,
     };
     let name = name.as_str();
+
+    // #430 item 1: REFUSE a skeleton. `get(shape='skeleton')` replaces every method body with a
+    // marker comment and drops the Storage block; writing that back would destroy both. Checked
+    // here — before the ROUTINE header injection and before any SCM checkout — so the refusal
+    // costs nothing and leaves no half-finished state.
+    //
+    // The guard reads `doc_shape::SKELETON_MARKER` rather than spelling the text again, so it
+    // cannot drift from what the skeleton builder emits. It fails CLOSED: a class quoting the
+    // marker in its own comments is refused too, which is the right direction for a write — a
+    // false refusal costs one re-read, a false accept costs every method body in the class.
+    if doc_shape::looks_like_a_skeleton(p.content.as_deref().unwrap_or("")) {
+        return crate::tools::envelope::fail_with(
+            "SKELETON_WRITE_REFUSED",
+            &format!(
+                "REFUSED: this content is a SKELETON, not source — it carries the marker \
+                 \"{}\", which iris_doc(get, shape='skeleton') writes wherever it removed a \
+                 method body. Writing it would replace every body in {name} with a comment and \
+                 drop the generated Storage block. Re-read the document with shape='full' \
+                 (or omit shape), edit THAT, and write it back.",
+                doc_shape::SKELETON_MARKER
+            ),
+            serde_json::json!({
+                "mode": "put",
+                "marker": doc_shape::SKELETON_MARKER,
+                "fix": "iris_doc(get, name, shape='full')",
+            }),
+        );
+    }
 
     // Inject ROUTINE header for .mac/.inc if missing
     let raw_content = p.content.as_deref().unwrap_or("");
@@ -1892,6 +2017,18 @@ async fn do_write(
             crate::tools::detected_error_count(compile_console.iter().map(String::as_str)),
             compile_errors.len(),
             "compile_console",
+        );
+        // #430 item 3, the same rule as iris_compile — with one extra step that is NOT
+        // cosmetic. This path parses ERROR only, so "are there warnings" cannot be read off the
+        // payload the way it can for iris_compile, which collects a `warnings` array of its own.
+        // The console is scanned for one instead of assuming there is none: dropping a console
+        // that held a WARNING would discard the only copy of it.
+        let console_has_warning =
+            crate::tools::console_holds_a_warning(compile_console.iter().map(String::as_str));
+        crate::tools::omit_clean_console(
+            &mut payload,
+            "compile_console",
+            compile_errors.is_empty() && !console_has_warning,
         );
         note_compile_time_methods(&mut payload, &generators);
         return ok_json(payload);
@@ -3233,6 +3370,16 @@ mod line_edit_mode_tests {
     /// the server received, so a test can assert on the BYTES that were written — the only way to know
     /// the document was not corrupted.
     async fn run(p: IrisDocParams) -> (serde_json::Value, Vec<String>) {
+        run_with_doc(doc(), p).await
+    }
+
+    /// `run` against a caller-supplied document.
+    ///
+    /// Split out for `a_line_edit_never_inherits_a_partial_view`, which cannot use `doc()`: its
+    /// `Method A()` body is EMPTY, so the skeleton of it is byte-identical to its full source and
+    /// the test would pass with the forcing deleted. A guard needs a fixture on which the thing it
+    /// forbids would actually show.
+    async fn run_with_doc(src: String, p: IrisDocParams) -> (serde_json::Value, Vec<String>) {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path_regex(r".*/doc/.*"))
@@ -3241,7 +3388,7 @@ mod line_edit_mode_tests {
             // filter_map(as_str) drop everything, so the document parses as ZERO lines and every edit
             // is refused as out of range. The tests caught the harness, which is the right order.
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "result": {"content": doc().split('\n').collect::<Vec<_>>()}
+                "result": {"content": src.split('\n').collect::<Vec<_>>()}
             })))
             .mount(&server)
             .await;
@@ -3713,7 +3860,7 @@ mod line_edit_mode_tests {
             let mut p = params("insert_lines");
             p.at = Some(1);
             p.lines = Some(vec!["// top".into()]);
-            p.max_bytes = 10; // would slice the document to 10 bytes if it were honoured
+            p.max_bytes = Some(10); // would slice the document to 10 bytes if it were honoured
             let (v, puts) = run(p).await;
             assert_eq!(v["success"], true, "{v}");
             let doc = written_doc(&puts);
@@ -3721,6 +3868,186 @@ mod line_edit_mode_tests {
             assert!(doc.contains("Method A()"), "tail must survive: {doc:?}");
             assert!(doc.ends_with("}"), "and the last line: {doc:?}");
             assert_eq!(v["line_edit"]["lines_before"], 6, "a full read: {v}");
+        });
+    }
+
+    /// A class whose method body is NOT empty, carrying a license block.
+    ///
+    /// Both halves matter: with an empty body a skeleton equals the full source, and with no
+    /// `/* */` header `strip_license` is a no-op — either way the assertions below would hold for
+    /// the wrong reason.
+    const BODIED_DOC: &str = "/* Copyright (c) 2026 by InterSystems Corporation. */\n\
+         Class Demo.T Extends %RegisteredObject\n\
+         {\n\
+         Method A()\n\
+         {\n\
+         \tSet x = 41 + 1\n\
+         \tQuit x\n\
+         }\n\
+         }\n";
+
+    /// A document comfortably larger than the built-in default cap.
+    fn oversized() -> String {
+        let mut s = String::from("Class %Library.Big Extends %RegisteredObject\n{\n");
+        // Derived from the constant, not a literal: the fixture must stay oversized if the cap
+        // changes (CLAUDE.md — never restate a number that can be computed).
+        while s.len() < crate::tools::doc_shape::BUILTIN_DEFAULT_MAX_BYTES * 2 {
+            s.push_str("Parameter PADDINGVALUEFORTHISTEST = \"xxxxxxxxxxxxxxxxxxxxxxxx\";\n");
+        }
+        s.push_str("}\n");
+        s
+    }
+
+    /// #430: a built-in class read with NO `max_bytes` is capped by default, and the envelope says
+    /// whose cap did it.
+    ///
+    /// Written because `is_builtin_package` and the cap constant were unit-tested while nothing
+    /// asserted the cap was ever APPLIED — a `pub` function with passing tests and no reachable
+    /// call site looks identical to a working feature (CLAUDE.md).
+    #[test]
+    fn a_builtin_read_is_capped_by_default_and_says_so() {
+        rt().block_on(async {
+            let mut p = params("get");
+            p.name = Some("%Library.Big.cls".into());
+            let (v, _) = run_with_doc(oversized(), p).await;
+            assert_eq!(v["truncated"], true, "{v}");
+            assert_eq!(
+                v["max_bytes_default_applied"],
+                crate::tools::doc_shape::BUILTIN_DEFAULT_MAX_BYTES,
+                "the envelope must name the default that cut it: {v}"
+            );
+            let hint = v["hint"].as_str().unwrap_or_default();
+            assert!(
+                hint.contains("next_offset") || v["next_offset"].is_number(),
+                "{v}"
+            );
+        });
+    }
+
+    /// The other half: a USER class is not capped. Without this, a cap applied to everything would
+    /// pass the test above, and the pair is what makes the built-in check load-bearing.
+    #[test]
+    fn a_user_class_is_not_capped_by_default() {
+        rt().block_on(async {
+            let p = params("get");
+            let (v, _) = run_with_doc(oversized(), p).await;
+            assert!(
+                v["truncated"].is_null(),
+                "a user class must come back whole: {}",
+                v["truncated"]
+            );
+            assert!(
+                v["max_bytes_default_applied"].is_null(),
+                "and no default was applied: {v}"
+            );
+        });
+    }
+
+    /// `max_bytes: 0` means unlimited and must DEFEAT the built-in default.
+    ///
+    /// This is the behavioural proof for making the field `Option<usize>`. With a bare `usize`,
+    /// "I said 0" and "I said nothing" are the same request, so this test and
+    /// `a_builtin_read_is_capped_by_default_and_says_so` could not both pass.
+    #[test]
+    fn an_explicit_zero_defeats_the_builtin_default() {
+        rt().block_on(async {
+            let mut p = params("get");
+            p.name = Some("%Library.Big.cls".into());
+            p.max_bytes = Some(0);
+            let (v, _) = run_with_doc(oversized(), p).await;
+            assert!(
+                v["truncated"].is_null(),
+                "an explicit 0 is unlimited: {}",
+                v["truncated"]
+            );
+            assert!(
+                v["max_bytes_default_applied"].is_null(),
+                "and the default did not fire: {v}"
+            );
+        });
+    }
+
+    /// #430: `put` REFUSES a skeleton, and writes nothing at all.
+    ///
+    /// Written because the guard was unreachable when first added: `SKELETON_WRITE_REFUSED`
+    /// appeared in exactly one place in the workspace — its own source line — so every assertion
+    /// about it was an assertion about text, not about behaviour (CLAUDE.md: existence is not
+    /// reachability). The `puts.is_empty()` half is the one that matters: a refusal that still
+    /// PUT the document would be worse than no guard, because the envelope would say refused.
+    #[test]
+    fn a_skeleton_is_refused_on_write_and_nothing_is_put() {
+        rt().block_on(async {
+            let mut p = params("put");
+            // Built by the real skeleton builder, not hand-written, so the test cannot pass on a
+            // marker that drifted from what `get` actually emits.
+            let built = match crate::tools::doc_shape::skeleton(BODIED_DOC) {
+                crate::tools::doc_shape::Skeletonized::Elided { content, .. } => content,
+                other => panic!("the fixture must yield a skeleton, got {other:?}"),
+            };
+            p.content = Some(built);
+            let (v, puts) = run_with_doc(BODIED_DOC.to_string(), p).await;
+            assert_eq!(v["error_code"], "SKELETON_WRITE_REFUSED", "{v}");
+            assert!(
+                puts.is_empty(),
+                "a refused write must PUT nothing: {puts:?}"
+            );
+            let msg = v["error"].as_str().unwrap_or_default();
+            assert!(
+                msg.contains("shape='full'"),
+                "the refusal must name the way forward: {msg:?}"
+            );
+        });
+    }
+
+    /// The other side of the guard: ordinary source is NOT refused.
+    ///
+    /// Without this, a guard that refused every write would pass the test above, and the pair is
+    /// what makes the refusal a discrimination rather than a blanket.
+    #[test]
+    fn ordinary_source_is_still_written() {
+        rt().block_on(async {
+            let mut p = params("put");
+            p.content = Some(BODIED_DOC.to_string());
+            let (v, puts) = run_with_doc(BODIED_DOC.to_string(), p).await;
+            assert_ne!(v["error_code"], "SKELETON_WRITE_REFUSED", "{v}");
+            assert_eq!(puts.len(), 1, "the document must be written: {puts:?}");
+        });
+    }
+
+    /// #430: a get-side VIEW parameter must never reach the read that an edit writes back.
+    ///
+    /// `insert_lines` builds its read with `..p.clone()`, so every new `get` parameter is inherited
+    /// by default — that is the trap this pins. A `shape='skeleton'` read written back replaces
+    /// every method body with a comment, and `strip_license` would drop the copyright header of
+    /// whatever was edited. Both are silent, total content loss, and both are what the caller
+    /// literally asked for on the READ side, which is why the forcing cannot be left implicit.
+    #[test]
+    fn a_line_edit_never_inherits_a_partial_view() {
+        rt().block_on(async {
+            let mut p = params("insert_lines");
+            p.at = Some(1);
+            p.lines = Some(vec!["// top".into()]);
+            p.shape = Some("skeleton".into());
+            p.strip_license = true;
+            let (v, puts) = run_with_doc(BODIED_DOC.to_string(), p).await;
+            assert_eq!(v["success"], true, "{v}");
+            let written = written_doc(&puts);
+            assert!(
+                written.contains("Set x = 41 + 1"),
+                "the method body must survive the write: {written:?}"
+            );
+            assert!(
+                !written.contains(crate::tools::doc_shape::SKELETON_MARKER),
+                "an elision marker must never be written to IRIS: {written:?}"
+            );
+            assert!(
+                written.contains("Copyright"),
+                "strip_license must not reach the write either: {written:?}"
+            );
+            assert!(
+                written.contains("// top"),
+                "and the edit itself still happened: {written:?}"
+            );
         });
     }
 }

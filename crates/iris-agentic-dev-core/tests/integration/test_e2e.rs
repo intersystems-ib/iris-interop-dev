@@ -324,7 +324,7 @@ fn e2e_symbols_glob_star_returns_package_classes() {
     let symbols = result["symbols"].as_array().cloned().unwrap_or_default();
     let names: Vec<String> = symbols
         .iter()
-        .filter_map(|s| s["Name"].as_str().map(|n| n.to_string()))
+        .filter_map(|s| s.as_str().map(|n| n.to_string()))
         .collect();
     assert!(
         names.iter().any(|n| n.contains("Test022Glob")),
@@ -1440,7 +1440,7 @@ fn e2e_symbols_mid_glob_pattern() {
     );
     if result["symbols"].is_array() {
         let symbols = result["symbols"].as_array().unwrap();
-        let names: Vec<&str> = symbols.iter().filter_map(|s| s["Name"].as_str()).collect();
+        let names: Vec<&str> = symbols.iter().filter_map(|s| s.as_str()).collect();
         // Either found matching classes, or zero results (namespace variation) — both OK
         // The important thing is it returned an array, not an error
         let _ = names; // structure validated above
@@ -2296,7 +2296,7 @@ fn e2e_symbols_limit_respected() {
 }
 
 #[test]
-fn e2e_symbols_returns_name_field() {
+fn e2e_symbols_returns_bare_name_strings() {
     require_iris!();
     let result = call_tool(
         "iris_symbols",
@@ -2307,21 +2307,24 @@ fn e2e_symbols_returns_name_field() {
     let symbols = result["symbols"].as_array().cloned().unwrap_or_default();
     // Without this the test is vacuous: an empty `symbols` skips the loop and reports a pass, and
     // `unwrap_or_default()` turns an ABSENT key into an empty array too. The name of this test claims
-    // symbols come back with a Name field, so it has to establish that symbols came back at all.
+    // symbols come back as non-empty names, so it has to establish that symbols came back at all.
     assert!(
         !symbols.is_empty(),
         "iris_symbols returned no symbols for Ens.Director, so the per-symbol assertions below \
          would pass without examining anything: {result}"
     );
     for sym in &symbols {
+        // #430 item 3: a symbol is a BARE NAME now, not a {Name: ...} wrapper. The CI failure that
+        // led here printed `String("Ens.Director")` — the value was right, the shape assertion was
+        // reading a field that no longer exists.
         assert!(
-            sym["Name"].is_string(),
-            "each symbol must have Name field: {:?}",
+            sym.is_string(),
+            "each symbol must be a bare name string: {:?}",
             sym
         );
         assert!(
-            !sym["Name"].as_str().unwrap_or("").is_empty(),
-            "Name must not be empty: {:?}",
+            !sym.as_str().unwrap_or("").is_empty(),
+            "a name must not be empty: {:?}",
             sym
         );
     }
@@ -2370,7 +2373,7 @@ fn e2e_symbols_user_defined_class_found() {
     let symbols = result["symbols"].as_array().cloned().unwrap_or_default();
     let found = symbols
         .iter()
-        .any(|s| s["Name"].as_str() == Some("Test022.SymFind"));
+        .any(|s| s.as_str() == Some("Test022.SymFind"));
     assert!(
         found,
         "compiled class must appear in symbols: {:?}",
@@ -2382,24 +2385,123 @@ fn e2e_symbols_user_defined_class_found() {
     );
 }
 
+/// #430 item 4: a bounded answer reports what it WITHHELD, and the real total.
+///
+/// The wiring, not the helper. `bound_rows` is unit-tested, but nothing asserted that
+/// `iris_query`'s payload actually carries `total_rows`/`truncated` — and a `pub` function with
+/// passing tests and no reachable call site looks identical to a working feature. There is no
+/// wiremock harness for this tool, so the live path is the only place the wiring is observable.
+///
+/// Carries its own control: the same query with `limit=0` must return the number the capped call
+/// REPORTED, which is what proves `total_rows` is the real size rather than an echo of the cap.
+///
+/// The SQL bounds itself with `TOP 10` on purpose. The first version of this test queried
+/// `%Dictionary.ClassDefinition` unbounded; measured on a live instance that is **7205 rows**, and
+/// pushing all of them through the Atelier transport on the `limit=0` leg made the control leg fail
+/// in CI. A server-side `TOP 10` makes `total_rows` deterministic (exactly 10) and keeps both legs
+/// cheap, while 10-vs-3 still proves the total is not an echo of the cap.
 #[test]
-fn e2e_symbols_query_hint_in_response() {
+fn e2e_query_reports_the_real_total_when_it_caps_rows() {
     require_iris!();
-    // iris_symbols now includes query_hint explaining syntax — verify it's present
+    const SQL: &str = "SELECT TOP 10 Name FROM %Dictionary.ClassDefinition";
+    const SERVER_ROWS: u64 = 10;
+
+    let capped = call_tool(
+        "iris_query",
+        serde_json::json!({"query": SQL, "namespace": "USER", "limit": 3}),
+    );
+    let rows = capped["rows"]
+        .as_array()
+        .unwrap_or_else(|| panic!("rows must be an array: {capped}"));
+    assert_eq!(rows.len(), 3, "the cap is honoured: {capped}");
+    assert_eq!(capped["count"], 3, "count is what came back: {capped}");
+    assert_eq!(capped["truncated"], true, "{capped}");
+    let total = capped["total_rows"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("total_rows must be reported: {capped}"));
+    assert_eq!(
+        total, SERVER_ROWS,
+        "total_rows is what IRIS returned, not the cap: {capped}"
+    );
+
+    // The control: unlimited must return exactly what the capped call claimed was there. Without
+    // this, `total_rows` could be any plausible number and the assertions above would hold.
+    let full = call_tool(
+        "iris_query",
+        serde_json::json!({"query": SQL, "namespace": "USER", "limit": 0}),
+    );
+    // NOT `unwrap_or(0)`. The first version of this line read
+    // `full["rows"].as_array().map(Vec::len).unwrap_or(0)`, which turns a call that FAILED — no
+    // `rows` field at all — into the measurement "zero rows". That is the defect class this repo
+    // exists to stop, written into the test meant to guard it: in CI the oversized leg came back
+    // without `rows` and the assertion reported a row-count mismatch instead of a failed call.
+    let full_rows = full["rows"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the unlimited leg returned no `rows` array: {full}"))
+        .len() as u64;
+    assert_eq!(
+        full_rows, total,
+        "limit=0 must yield exactly the total the capped call reported: {full}"
+    );
+    assert!(
+        full["truncated"].is_null(),
+        "nothing was withheld, so nothing is declared: {full}"
+    );
+}
+
+/// #430 item 3: `iris_symbols` returns a FLAT array of names, and no `query_hint`.
+///
+/// This replaces `e2e_symbols_query_hint_in_response`, whose whole body sat inside
+/// `if result["query_hint"].is_string()`. Removing the field would have left it reporting `ok`
+/// while asserting nothing at all — an env-shaped no-op is exactly the self-skipping test this
+/// repo has been bitten by before, so the test is re-pointed at the new contract instead of left
+/// to pass vacuously. The query syntax now lives in the tool's inputSchema description, which is
+/// sent once per session rather than on every call.
+#[test]
+fn e2e_symbols_returns_a_flat_name_array() {
+    require_iris!();
+    // "Dictionary" rather than "Ens", for robustness only — NOT because Ens is unavailable.
+    //
+    // My first comment here claimed CI's USER namespace is not interop-enabled and that `Ens.*` is
+    // therefore unmapped. That was wrong, and the refuting evidence was already in this suite:
+    // `e2e_symbols_returns_bare_name_strings` queries `Ens.Director` in USER with a non-empty
+    // denominator and passes, and the CI output printed `String("Ens.Director")`. Ens resolves
+    // there. `%Dictionary.*` is kept anyway because it is in IRISLIB and mapped into every
+    // namespace (measured: 166 matches), so this test rests on a WEAKER assumption — not on a
+    // different fact about the image.
+    //
+    // Worth knowing next door: `e2e_symbols_limit_respected` asserts only `len() <= 3`, which an
+    // EMPTY result satisfies — an upper bound with no denominator.
     let result = call_tool(
         "iris_symbols",
         serde_json::json!({
-            "query": "Ens", "namespace": "USER", "limit": 1
+            "query": "Dictionary", "namespace": "USER", "limit": 3
         }),
     );
-    // query_hint is present in v0.4.x+ — may not exist in older versions
-    if result["query_hint"].is_string() {
+    let symbols = result["symbols"]
+        .as_array()
+        .unwrap_or_else(|| panic!("symbols must be an array: {result}"));
+    // The denominator: an empty array would satisfy the per-element assertion below without
+    // ever running it, so require that something actually came back before judging its shape.
+    assert!(
+        !symbols.is_empty(),
+        "the %Dictionary package is mapped into every namespace: {result}"
+    );
+    for s in symbols {
         assert!(
-            !result["query_hint"].as_str().unwrap().is_empty(),
-            "query_hint must not be empty: {}",
-            result
+            s.is_string(),
+            "each symbol is a bare name, not a {{Name: ...}} wrapper: {result}"
         );
     }
+    assert!(
+        result["query_hint"].is_null(),
+        "query_hint moved into the inputSchema description: {result}"
+    );
+    assert_eq!(
+        result["count"],
+        symbols.len(),
+        "count must match what was returned: {result}"
+    );
 }
 
 // ── docs_introspect extended ──────────────────────────────────────────────────
