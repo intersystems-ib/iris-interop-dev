@@ -2382,6 +2382,55 @@ fn e2e_symbols_user_defined_class_found() {
     );
 }
 
+/// #430 item 4: a bounded answer reports what it WITHHELD, and the real total.
+///
+/// The wiring, not the helper. `bound_rows` is unit-tested, but nothing asserted that
+/// `iris_query`'s payload actually carries `total_rows`/`truncated` — and a `pub` function with
+/// passing tests and no reachable call site looks identical to a working feature. There is no
+/// wiremock harness for this tool, so the live path is the only place the wiring is observable.
+///
+/// Carries its own control: the same query with `limit=0` must return the number the capped call
+/// REPORTED, which is what proves `total_rows` is the real size rather than an echo of the cap.
+#[test]
+fn e2e_query_reports_the_real_total_when_it_caps_rows() {
+    require_iris!();
+    const SQL: &str = "SELECT Name FROM %Dictionary.ClassDefinition";
+
+    let capped = call_tool(
+        "iris_query",
+        serde_json::json!({"query": SQL, "namespace": "USER", "limit": 3}),
+    );
+    let rows = capped["rows"]
+        .as_array()
+        .unwrap_or_else(|| panic!("rows must be an array: {capped}"));
+    assert_eq!(rows.len(), 3, "the cap is honoured: {capped}");
+    assert_eq!(capped["count"], 3, "count is what came back: {capped}");
+    assert_eq!(capped["truncated"], true, "{capped}");
+    let total = capped["total_rows"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("total_rows must be reported: {capped}"));
+    assert!(
+        total > 3,
+        "a namespace has more than 3 classes, so the REAL total must exceed the cap: {capped}"
+    );
+
+    // The control: unlimited must return exactly what the capped call claimed was there. Without
+    // this, `total_rows` could be any plausible number and the assertions above would hold.
+    let full = call_tool(
+        "iris_query",
+        serde_json::json!({"query": SQL, "namespace": "USER", "limit": 0}),
+    );
+    let full_rows = full["rows"].as_array().map(Vec::len).unwrap_or(0) as u64;
+    assert_eq!(
+        full_rows, total,
+        "limit=0 must yield exactly the total the capped call reported: {full}"
+    );
+    assert!(
+        full["truncated"].is_null(),
+        "nothing was withheld, so nothing is declared: {full}"
+    );
+}
+
 /// #430 item 3: `iris_symbols` returns a FLAT array of names, and no `query_hint`.
 ///
 /// This replaces `e2e_symbols_query_hint_in_response`, whose whole body sat inside

@@ -489,17 +489,33 @@ pub fn report_json(rep: &CoverageReport, namespace: &str) -> serde_json::Value {
             o
         })
         .collect();
+    // #430 item 4: these aggregates are computed from `rep.routines` — the FULL set — and
+    // deliberately BEFORE the per-routine array is bounded below. Summing the returned subset
+    // instead would hand back a plausible, confidently wrong coverage percentage, which is far
+    // worse than a long answer; `the_percentage_covers_every_routine_not_just_the_returned_ones`
+    // is what keeps this order.
     let total: usize = rep.routines.iter().map(|r| r.routine_lines_total).sum();
     let hit: usize = rep.routines.iter().map(|r| r.routine_lines_hit).sum();
+    let routines_total = routines.len();
+    let bounded = crate::tools::sql_mode::bound_rows(
+        routines,
+        crate::tools::sql_mode::DEFAULT_ROW_LIMIT,
+        // No cell cap: these cells are numbers and hit maps, not text columns.
+        0,
+    );
     let mut out = serde_json::json!({
         "namespace": namespace,
         "metrics": rep.metrics,
         "routines_monitored": rep.routines_monitored,
-        "routines": routines,
+        "routines": bounded.rows,
+        "routines_total": routines_total,
         "routine_lines_total": total,
         "routine_lines_hit": hit,
         "monitor_stopped": rep.stopped,
     });
+    if bounded.truncated {
+        out["routines_truncated"] = serde_json::Value::Bool(true);
+    }
     if total > 0 {
         out["coverage_pct"] =
             serde_json::json!(((hit as f64) * 10000.0 / (total as f64)).round() / 100.0);

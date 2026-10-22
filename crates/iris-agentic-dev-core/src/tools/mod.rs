@@ -2416,6 +2416,12 @@ pub struct QueryParams {
     /// Has no effect on production IRIS instances (where write tools are disabled).
     #[serde(default)]
     pub force: bool,
+    /// mode=rows: cap how many rows come back (0 = no cap). Omitted applies a default cap, and the
+    /// response always reports `total_rows` — the number IRIS actually returned — alongside
+    /// `truncated`, so a bounded answer is never mistaken for the whole result set. Long string
+    /// cells are shortened and carry a marker in the value itself.
+    #[serde(default)]
+    pub limit: Option<usize>,
     /// #24/057: `rows` (default), `count`, or `explain`. `count` returns how many rows the statement
     /// would produce without transferring them; `explain` returns the query plan and its cost without
     /// running it. There is deliberately no `write` mode — `force` is the one write path, and it is
@@ -8032,7 +8038,6 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
             .as_array()
             .cloned()
             .unwrap_or_default();
-        let count = rows.len();
         self.record_call("iris_query", true);
         // #24/057: count and explain answer a different question, so they get their own payload
         // rather than a rows array the caller has to interpret.
@@ -8053,7 +8058,33 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
             }
             sql_mode::QueryMode::Rows => {}
         }
-        let mut resp = serde_json::json!({"success": true, "rows": rows, "count": count, "namespace": namespace});
+        // #430 item 4: bound what crosses into context, and report the real size beside it.
+        // `count` keeps its meaning — how many rows are in `rows` — and `total_rows` is what IRIS
+        // returned, so the two together say what was left out instead of implying nothing was.
+        let bounded = sql_mode::bound_rows(
+            rows,
+            p.limit.unwrap_or(sql_mode::DEFAULT_ROW_LIMIT),
+            sql_mode::DEFAULT_FIELD_CHARS,
+        );
+        let mut resp = serde_json::json!({
+            "success": true,
+            "rows": bounded.rows,
+            "count": bounded.rows.len(),
+            "total_rows": bounded.total,
+            "namespace": namespace,
+        });
+        if bounded.truncated {
+            resp["truncated"] = serde_json::json!(true);
+            resp["hint"] = serde_json::Value::String(format!(
+                "Showing {} of {} rows. Pass limit=0 for all of them, or narrow the query — \
+                 IRIS computed the whole result set either way.",
+                bounded.rows.len(),
+                bounded.total
+            ));
+        }
+        if bounded.fields_truncated > 0 {
+            resp["fields_truncated"] = serde_json::json!(bounded.fields_truncated);
+        }
         if !sql_warnings.is_empty() {
             resp["warnings"] = serde_json::Value::Array(
                 sql_warnings
