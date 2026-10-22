@@ -3,7 +3,7 @@ use clap::Args;
 use iris_agentic_dev_core::{
     iris::discovery::{discover_iris, IrisDiscovery},
     skills::SkillRegistry,
-    tools::{ConfigWatcher, IrisTools, Toolset},
+    tools::{ConfigWatcher, IrisTools, Toolset, ToolsetChoice},
 };
 use rmcp::{transport::stdio, ServiceExt};
 use tokio::sync::watch;
@@ -87,13 +87,39 @@ pub struct McpCommand {
     /// `interop` read "31 interop-focused tools" while INTEROP_TOOLS held 36. `tools/list` on your
     /// own build is the only answer that cannot go stale, and `scripts/validate-tools.sh` prints
     /// the keep-list length on every run.
-    #[arg(long, env = "IRIS_TOOLSET", default_value = "interop")]
+    #[arg(long, env = "IRIS_TOOLSET", default_value = DEFAULT_TOOLSET)]
     pub toolset: String,
+}
+
+/// The profile served when nothing asks for one, as a string because that is what clap's
+/// `default_value` takes. `the_clap_default_is_this_crates_default` pins it to `Toolset::default()`
+/// so the two spellings of the default cannot drift apart.
+const DEFAULT_TOOLSET: &str = "interop";
+
+/// #541: what to tell an operator who named a profile this build does not have.
+///
+/// Extracted so it can be tested: the only thing that makes this refusal useful instead of
+/// annoying is that it quotes the value back AND lists the real names, and a message is the kind
+/// of thing that gets shortened later by someone who cannot see which half was load-bearing.
+fn unrecognised_toolset(value: &str) -> String {
+    format!(
+        "--toolset (IRIS_TOOLSET) is `{value}`, which is not a profile this build has. \
+         Valid profiles: {}. Nothing was started. An unrecognised name used to fall back to \
+         `baseline`, which serves EVERY tool — so a typo silently gave you more than you asked \
+         for, which is the opposite of choosing a profile.",
+        Toolset::NAMES.join(", ")
+    )
 }
 
 impl McpCommand {
     pub async fn run(self) -> Result<()> {
-        let toolset = Toolset::from_str(&self.toolset);
+        let toolset = match Toolset::parse(&self.toolset) {
+            ToolsetChoice::Named(t) => t,
+            // `IRIS_TOOLSET=` is "unset", not "nonsense" — the same reading the namespace
+            // resolver gives a blank override.
+            ToolsetChoice::Blank => Toolset::default(),
+            ToolsetChoice::Unrecognised(v) => anyhow::bail!(unrecognised_toolset(&v)),
+        };
         tracing::info!(
             "iris-agentic-dev mcp starting — toolset={}",
             toolset.as_str()
@@ -346,5 +372,47 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod toolset_cli_tests {
+    use super::*;
+
+    /// The default profile is spelled twice — once as clap's `default_value`, once as
+    /// `Toolset::default()` for the blank case. This is the only thing stopping them drifting.
+    #[test]
+    fn the_clap_default_is_this_crates_default() {
+        assert_eq!(
+            Toolset::parse(DEFAULT_TOOLSET),
+            ToolsetChoice::Named(Toolset::default()),
+            "clap's default_value must name the same profile Toolset::default() returns"
+        );
+        // The control: this would also pass if parse answered Named(default) for EVERYTHING,
+        // which is the bug being fixed. A name that is not the default must not come back as it.
+        assert_eq!(
+            Toolset::parse("routines"),
+            ToolsetChoice::Named(Toolset::Routines)
+        );
+        assert_ne!(Toolset::default(), Toolset::Routines);
+    }
+
+    /// The refusal has exactly two jobs: say what was typed, and say what would have worked.
+    /// A message missing either one sends the operator back to the source.
+    #[test]
+    fn the_refusal_names_the_value_and_every_valid_profile() {
+        let msg = unrecognised_toolset("routnes");
+        assert!(msg.contains("routnes"), "must quote the value back: {msg}");
+        for name in Toolset::NAMES {
+            assert!(
+                msg.contains(name),
+                "every valid profile must be listed; {name} is missing from: {msg}"
+            );
+        }
+        // It must also not read as a fallback having happened.
+        assert!(
+            msg.contains("Nothing was started"),
+            "the refusal must say nothing started, or it reads as a warning: {msg}"
+        );
     }
 }

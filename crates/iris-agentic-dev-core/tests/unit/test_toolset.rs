@@ -2,27 +2,49 @@
 // Tests for Nostub and Merged toolset configurations.
 // Written FIRST — must FAIL until T017–T033 are implemented.
 
-use iris_agentic_dev_core::tools::{IrisTools, Toolset};
+use iris_agentic_dev_core::tools::{IrisTools, Toolset, ToolsetChoice};
 
-// ── Toolset::from_str ────────────────────────────────────────────────────────
+// ── Toolset::parse ──────────────────────────────────────────────────────────
 
 #[test]
-fn test_toolset_from_str_baseline() {
-    assert_eq!(Toolset::from_str("baseline"), Toolset::Baseline);
-    assert_eq!(Toolset::from_str(""), Toolset::Baseline);
-    assert_eq!(Toolset::from_str("unknown"), Toolset::Baseline);
+fn test_toolset_parse_baseline() {
+    assert_eq!(
+        Toolset::parse("baseline"),
+        ToolsetChoice::Named(Toolset::Baseline)
+    );
+    // #541: the two cases below used to answer `Baseline` as well, and Baseline is the LARGEST
+    // profile — so "I typo'd" and "I want everything" were the same request. They are now three
+    // different answers, and neither of these is a profile.
+    assert_eq!(Toolset::parse(""), ToolsetChoice::Blank);
+    assert_eq!(Toolset::parse("   "), ToolsetChoice::Blank);
+    assert_eq!(
+        Toolset::parse("unknown"),
+        ToolsetChoice::Unrecognised("unknown".to_string())
+    );
 }
 
 #[test]
-fn test_toolset_from_str_nostub() {
-    assert_eq!(Toolset::from_str("nostub"), Toolset::Nostub);
-    assert_eq!(Toolset::from_str("NOSTUB"), Toolset::Nostub);
+fn test_toolset_parse_nostub() {
+    assert_eq!(
+        Toolset::parse("nostub"),
+        ToolsetChoice::Named(Toolset::Nostub)
+    );
+    assert_eq!(
+        Toolset::parse("NOSTUB"),
+        ToolsetChoice::Named(Toolset::Nostub)
+    );
 }
 
 #[test]
-fn test_toolset_from_str_merged() {
-    assert_eq!(Toolset::from_str("merged"), Toolset::Merged);
-    assert_eq!(Toolset::from_str("MERGED"), Toolset::Merged);
+fn test_toolset_parse_merged() {
+    assert_eq!(
+        Toolset::parse("merged"),
+        ToolsetChoice::Named(Toolset::Merged)
+    );
+    assert_eq!(
+        Toolset::parse("MERGED"),
+        ToolsetChoice::Named(Toolset::Merged)
+    );
 }
 
 // ── T015: Nostub — stub tools absent ────────────────────────────────────────
@@ -274,9 +296,15 @@ fn test_iris_get_log_absent_from_baseline_and_nostub() {
 // ── Interop profile (fork default) ───────────────────────────────────────────
 
 #[test]
-fn test_toolset_from_str_interop() {
-    assert_eq!(Toolset::from_str("interop"), Toolset::Interop);
-    assert_eq!(Toolset::from_str("INTEROP"), Toolset::Interop);
+fn test_toolset_parse_interop() {
+    assert_eq!(
+        Toolset::parse("interop"),
+        ToolsetChoice::Named(Toolset::Interop)
+    );
+    assert_eq!(
+        Toolset::parse("INTEROP"),
+        ToolsetChoice::Named(Toolset::Interop)
+    );
 }
 
 /// Interop toolset must expose EXACTLY the interop keep-list (INTEROP_TOOLS).
@@ -376,12 +404,29 @@ fn test_routines_is_not_a_subset_of_interop() {
 /// `routines` by accident either.
 #[test]
 fn test_routines_is_selectable_by_name() {
-    assert_eq!(Toolset::from_str("routines"), Toolset::Routines);
-    assert_eq!(Toolset::from_str("  RoUtInEs "), Toolset::Routines);
+    assert_eq!(
+        Toolset::parse("routines"),
+        ToolsetChoice::Named(Toolset::Routines)
+    );
+    assert_eq!(
+        Toolset::parse("  RoUtInEs "),
+        ToolsetChoice::Named(Toolset::Routines)
+    );
     assert_eq!(Toolset::Routines.as_str(), "routines");
     // The control: the default is unchanged, and a typo does not land here.
-    assert_eq!(Toolset::from_str("interop"), Toolset::Interop);
-    assert_eq!(Toolset::from_str("routine"), Toolset::Baseline);
+    assert_eq!(
+        Toolset::parse("interop"),
+        ToolsetChoice::Named(Toolset::Interop)
+    );
+    // #541: this line used to assert `Toolset::from_str("routine") == Toolset::Baseline`, and in
+    // doing so it PINNED the defect. The claim it was making — a near-miss must not become
+    // `routines` — was true. What it also certified, without saying so, was that the near-miss
+    // became every tool in the binary. Checking the wrong neighbour is how an assertion can be
+    // correct and still bless the worse answer.
+    assert_eq!(
+        Toolset::parse("routine"),
+        ToolsetChoice::Unrecognised("routine".to_string())
+    );
 }
 
 /// Interop must keep the interop-critical tools the workshop actually needed.
@@ -557,5 +602,78 @@ fn test_new_uses_pruned_baseline_router() {
     assert_eq!(
         via_new, via_toolset,
         "new() and new_with_toolset(_, Baseline) must register the same tools"
+    );
+}
+
+/// #541: an unrecognised profile is refused, and the refusal carries what was TYPED.
+///
+/// The value is quoted back to the operator, so it must survive case-for-case; lowercasing it on
+/// the way through would make the message describe a string nobody wrote.
+#[test]
+fn an_unrecognised_profile_is_refused_and_quotes_what_was_typed() {
+    for typo in ["routnes", "Routnes", "interrop", "base line", "ROUTINE"] {
+        assert_eq!(
+            Toolset::parse(typo),
+            ToolsetChoice::Unrecognised(typo.to_string()),
+            "{typo} is not a profile, and must not resolve to one"
+        );
+    }
+    // The control. Without it this test would pass against a `parse` that refused EVERYTHING,
+    // including the names that are supposed to work.
+    for good in Toolset::NAMES {
+        assert!(
+            matches!(Toolset::parse(good), ToolsetChoice::Named(_)),
+            "{good} is advertised as valid and must parse"
+        );
+    }
+}
+
+/// `NAMES` is what the refusal offers the operator, so a name in it that does not parse is a lie,
+/// and a variant missing from it is a profile nobody can be told about. Both directions.
+#[test]
+fn every_name_parses_and_every_profile_has_a_name() {
+    for name in Toolset::NAMES {
+        match Toolset::parse(name) {
+            ToolsetChoice::Named(t) => assert_eq!(
+                t.as_str(),
+                *name,
+                "{name} parses to a profile that calls itself {}",
+                t.as_str()
+            ),
+            other => panic!("{name} is offered as valid but parses as {other:?}"),
+        }
+    }
+    for t in [
+        Toolset::Baseline,
+        Toolset::Nostub,
+        Toolset::Merged,
+        Toolset::Interop,
+        Toolset::Routines,
+    ] {
+        assert!(
+            Toolset::NAMES.contains(&t.as_str()),
+            "{} is a profile with no name in NAMES, so no refusal can offer it",
+            t.as_str()
+        );
+    }
+}
+
+/// The defect in one line: the fallback was the LARGEST profile, so a typo widened the surface.
+/// This pins the property that made it dangerous rather than the mechanism that caused it.
+#[test]
+fn the_default_profile_is_smaller_than_baseline() {
+    let default_tools = IrisTools::new_with_toolset(None, Toolset::default())
+        .expect("default IrisTools")
+        .registered_tool_names()
+        .len();
+    let baseline_tools = IrisTools::new_with_toolset(None, Toolset::Baseline)
+        .expect("baseline IrisTools")
+        .registered_tool_names()
+        .len();
+    assert!(
+        default_tools < baseline_tools,
+        "the default profile serves {default_tools} tools and baseline {baseline_tools}; if the \
+         default were not the smaller of the two, falling back to baseline on a typo would have \
+         been harmless and #541 would not exist"
     );
 }

@@ -403,15 +403,56 @@ pub enum Toolset {
     Routines,
 }
 
+/// What a `--toolset` / `IRIS_TOOLSET` value turned out to be.
+///
+/// #541: three cases, because the old two collapsed the one that mattered. `Toolset::from_str`
+/// answered `Baseline` for anything it did not recognise, and `Baseline` is the LARGEST profile — so
+/// `IRIS_TOOLSET=routnes` served EVERY tool, which is the opposite of what was asked for, with
+/// nothing on stderr and `check_config` reporting `"toolset":"baseline"` as though that had been
+/// the request. `keep_list`'s comment below already names this failure shape ("looks like a
+/// working profile that happens to advertise everything"); the parser handed it that case anyway.
+///
+/// `Blank` is separate from `Unrecognised` on purpose: elsewhere in this repo a blank override
+/// means "not set" rather than "set to nonsense" (`interop::resolve_namespace` says so in as many
+/// words), so `IRIS_TOOLSET=` gets the default instead of a refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolsetChoice {
+    /// A profile name this build recognises.
+    Named(Toolset),
+    /// Set to nothing at all — treated as unset, so the default applies.
+    Blank,
+    /// Set to a name this build does not know. Carries the trimmed value so the refusal can quote
+    /// back what was actually typed, which is the whole remedy for a typo.
+    Unrecognised(String),
+}
+
+impl Default for Toolset {
+    /// The profile a server serves when nothing asks for one. `cmd/mcp.rs` states the same default
+    /// as a clap string and `the_clap_default_is_this_crates_default` pins the two together.
+    fn default() -> Self {
+        Toolset::Interop
+    }
+}
+
 impl Toolset {
-    #[allow(clippy::should_implement_trait)]
-    pub fn from_str(s: &str) -> Self {
+    /// Every name this build answers to. Kept beside `parse` so a profile cannot be added to one
+    /// and forgotten in the other — `every_name_parses_and_round_trips` walks this list against
+    /// both `parse` and `as_str`.
+    pub const NAMES: &'static [&'static str] =
+        &["baseline", "nostub", "merged", "interop", "routines"];
+
+    /// Classify a `--toolset` / `IRIS_TOOLSET` value. See `ToolsetChoice` for why an unknown name
+    /// is not quietly turned into a profile.
+    pub fn parse(s: &str) -> ToolsetChoice {
         match s.trim().to_lowercase().as_str() {
-            "nostub" => Toolset::Nostub,
-            "merged" => Toolset::Merged,
-            "interop" => Toolset::Interop,
-            "routines" => Toolset::Routines,
-            _ => Toolset::Baseline,
+            "" => ToolsetChoice::Blank,
+            "baseline" => ToolsetChoice::Named(Toolset::Baseline),
+            "nostub" => ToolsetChoice::Named(Toolset::Nostub),
+            "merged" => ToolsetChoice::Named(Toolset::Merged),
+            "interop" => ToolsetChoice::Named(Toolset::Interop),
+            "routines" => ToolsetChoice::Named(Toolset::Routines),
+            // `s`, not the lowercased match subject: the refusal quotes back what was typed.
+            _ => ToolsetChoice::Unrecognised(s.trim().to_string()),
         }
     }
 

@@ -156,6 +156,11 @@ Whatever the client:
   `interop` — the tools listed under [Tools](#tools-interop-profile). `baseline` exposes everything
   the binary carries. No count is written here on purpose: they have been wrong before, and
   `tools/list` on your own build is the only answer that cannot go stale.
+- **A name this build does not recognise refuses to start** (#541), naming the valid profiles. It
+  used to fall back to `baseline` — the *widest* surface — so a typo bought more tools than any
+  correct value would have, silently. If startup fails with that message, check the spelling
+  against the table below rather than the release you remember: `routines` did not exist before
+  #531, and asking an older binary for it got you everything.
 - **`IRIS_TOOLSET=routines` is for legacy ObjectScript** (#531): `.mac` routines with dot syntax,
   `$PIECE`-delimited records in globals, cross-reference globals, LOCK/TSTART. Use it when the code
   you are working on has no production — it drops the production, routing-rule, lookup, credential
@@ -250,7 +255,7 @@ server — run the ISC Web Gateway container alongside IRIS and point `web_port`
 | `IRIS_PASSWORD` | `SYS` | IRIS password |
 | `IRIS_NAMESPACE` | `USER` | Default namespace |
 | `IRIS_CONTAINER` | _(empty)_ | Docker container name — required for Docker-dependent tools |
-| `IRIS_TOOLSET` | `interop` | Tool surface: `interop` (the locked profile), `routines` (legacy routines and globals, #531) or `baseline` (full upstream surface). Same as `--toolset` |
+| `IRIS_TOOLSET` | `interop` | Tool surface: `interop` (the locked profile), `routines` (legacy routines and globals, #531), `baseline` (full upstream surface), `nostub` or `merged`. An unrecognised name refuses to start (#541). Same as `--toolset` |
 | `IRIS_LOG_FILE` | _(empty)_ | Mirror server traces to this file — the only trace that outlives an MCP session |
 | `IRIS_DISCOVERY_TIMEOUT_MS` | `2000` | How long startup waits for IRIS discovery before serving. Missing this window is not fatal — the connection is adopted whenever the probe finishes — so raise it only if you would rather `initialize` block than serve unconnected |
 | `IRIS_ALLOW_PROD` | _(unset)_ | Allow MUTATING calls on a connection that is not write-allowed (Live system mode, or a production-looking namespace). Reads are never blocked, so this is only needed to write. Set to `1` deliberately |
