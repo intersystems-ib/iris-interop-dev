@@ -115,8 +115,21 @@ fn a_file_with_no_header_is_refused_rather_than_guessed() {
 
 /// A ROUTINE header is a header only on the first line — IRIS's rule. A body that merely mentions
 /// the word must not be read as one, or a `.mac` gets named after its own comment.
+///
+/// The first fixture here is the one that matters, and the first version of this test did NOT have
+/// it. It used only the comment case below, whose `trim_start()` begins with `;` rather than
+/// `ROUTINE`, so a mutant that scanned EVERY line for a ROUTINE header found nothing either and
+/// the test passed for the wrong reason — it survived the mutation pass. A later line that really
+/// does begin `ROUTINE ` at column 0 is what distinguishes the two.
 #[test]
 fn routine_is_only_a_header_on_the_first_line() {
+    // A genuine ROUTINE line, just not the first one. Scanning for it would name this OMOTHER.mac.
+    let why = refusal(" set x=1\nROUTINE OMOTHER\n quit\n");
+    assert!(
+        why.contains("ROUTINE"),
+        "the refusal should say it wanted a header, got {why:?}"
+    );
+    // And the weaker case: the word appearing inside a comment.
     let why = refusal(" ; see ROUTINE OMOTHER for the caller\n set x=1\n");
     assert!(!why.is_empty());
 }
