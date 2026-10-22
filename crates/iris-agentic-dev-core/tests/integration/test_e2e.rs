@@ -2382,24 +2382,47 @@ fn e2e_symbols_user_defined_class_found() {
     );
 }
 
+/// #430 item 3: `iris_symbols` returns a FLAT array of names, and no `query_hint`.
+///
+/// This replaces `e2e_symbols_query_hint_in_response`, whose whole body sat inside
+/// `if result["query_hint"].is_string()`. Removing the field would have left it reporting `ok`
+/// while asserting nothing at all — an env-shaped no-op is exactly the self-skipping test this
+/// repo has been bitten by before, so the test is re-pointed at the new contract instead of left
+/// to pass vacuously. The query syntax now lives in the tool's inputSchema description, which is
+/// sent once per session rather than on every call.
 #[test]
-fn e2e_symbols_query_hint_in_response() {
+fn e2e_symbols_returns_a_flat_name_array() {
     require_iris!();
-    // iris_symbols now includes query_hint explaining syntax — verify it's present
     let result = call_tool(
         "iris_symbols",
         serde_json::json!({
-            "query": "Ens", "namespace": "USER", "limit": 1
+            "query": "Ens", "namespace": "USER", "limit": 3
         }),
     );
-    // query_hint is present in v0.4.x+ — may not exist in older versions
-    if result["query_hint"].is_string() {
+    let symbols = result["symbols"]
+        .as_array()
+        .unwrap_or_else(|| panic!("symbols must be an array: {result}"));
+    // The denominator: an empty array would satisfy the per-element assertion below without
+    // ever running it, so require that something actually came back before judging its shape.
+    assert!(
+        !symbols.is_empty(),
+        "the Ens package must yield at least one class: {result}"
+    );
+    for s in symbols {
         assert!(
-            !result["query_hint"].as_str().unwrap().is_empty(),
-            "query_hint must not be empty: {}",
-            result
+            s.is_string(),
+            "each symbol is a bare name, not a {{Name: ...}} wrapper: {result}"
         );
     }
+    assert!(
+        result["query_hint"].is_null(),
+        "query_hint moved into the inputSchema description: {result}"
+    );
+    assert_eq!(
+        result["count"],
+        symbols.len(),
+        "count must match what was returned: {result}"
+    );
 }
 
 // ── docs_introspect extended ──────────────────────────────────────────────────

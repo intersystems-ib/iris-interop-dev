@@ -64,6 +64,51 @@ pub struct Hl7Field {
     pub values_truncated: bool,
 }
 
+/// One field row with its empty and default-valued members left out (#430 item 3).
+///
+/// Omission is safe HERE in a way it would not be for a count, and the distinction is the house
+/// rule: an absent `description` and an empty-string `description` are the SAME fact — the schema
+/// carries no description for this field — whereas an absent row count would read as zero. So the
+/// members that can be dropped are the ones whose empty value carries no information.
+///
+/// Two are kept whatever happens:
+///
+/// - `number` and `name` identify the row, so they are always present even when blank;
+/// - `values_truncated` is emitted WHENEVER TRUE, because it says `values` is a PARTIAL list.
+///   Dropping a true there would turn "IRIS did not list every permitted value" into "these are
+///   all of them" — a failure answered as a fact, on exactly the field a caller would validate
+///   against.
+///
+/// `type_raw` earns its bytes only when it DIFFERS from the parsed `data_type`: `DS:2.5:CX()` vs
+/// `CX` is worth seeing, `SI` vs `SI` is the same string twice.
+pub fn field_json(f: &Hl7Field) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    m.insert("number".into(), serde_json::json!(f.number));
+    m.insert("name".into(), serde_json::json!(f.name));
+    if f.repeating {
+        m.insert("repeating".into(), serde_json::json!(true));
+    }
+    if !f.description.is_empty() {
+        m.insert("description".into(), serde_json::json!(f.description));
+    }
+    if !f.data_type.is_empty() {
+        m.insert("data_type".into(), serde_json::json!(f.data_type));
+    }
+    if !f.type_raw.is_empty() && f.type_raw != f.data_type {
+        m.insert("type_raw".into(), serde_json::json!(f.type_raw));
+    }
+    if !f.optionality.is_empty() {
+        m.insert("optionality".into(), serde_json::json!(f.optionality));
+    }
+    if !f.values.is_empty() {
+        m.insert("values".into(), serde_json::json!(f.values));
+    }
+    if f.values_truncated {
+        m.insert("values_truncated".into(), serde_json::json!(true));
+    }
+    serde_json::Value::Object(m)
+}
+
 /// A field name arrives as `:PatientIdentifierList()` — a leading colon, and `()` when the
 /// field repeats. Returns the bare name and whether it repeats.
 pub fn parse_field_name(raw: &str) -> (String, bool) {
@@ -679,17 +724,7 @@ pub async fn handle_hl7_schema_inspect(
                 "version": version,
                 "segment": seg,
                 "field_count": fields.len(),
-                "fields": fields.iter().map(|f| serde_json::json!({
-                    "number": f.number,
-                    "name": f.name,
-                    "repeating": f.repeating,
-                    "description": f.description,
-                    "data_type": f.data_type,
-                    "type_raw": f.type_raw,
-                    "optionality": f.optionality,
-                    "values": f.values,
-                    "values_truncated": f.values_truncated,
-                })).collect::<Vec<_>>(),
+                "fields": fields.iter().map(field_json).collect::<Vec<_>>(),
                 // Named because these are the fields `GetFieldNameFromNumber` cannot report
                 // (#246): it matches the stored `N()` against a bare `N` and returns "".
                 "repeating_fields": repeating,

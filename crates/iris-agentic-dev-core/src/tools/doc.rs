@@ -2018,6 +2018,18 @@ async fn do_write(
             compile_errors.len(),
             "compile_console",
         );
+        // #430 item 3, the same rule as iris_compile — with one extra step that is NOT
+        // cosmetic. This path parses ERROR only, so "are there warnings" cannot be read off the
+        // payload the way it can for iris_compile, which collects a `warnings` array of its own.
+        // The console is scanned for one instead of assuming there is none: dropping a console
+        // that held a WARNING would discard the only copy of it.
+        let console_has_warning =
+            crate::tools::console_holds_a_warning(compile_console.iter().map(String::as_str));
+        crate::tools::omit_clean_console(
+            &mut payload,
+            "compile_console",
+            compile_errors.is_empty() && !console_has_warning,
+        );
         note_compile_time_methods(&mut payload, &generators);
         return ok_json(payload);
     }

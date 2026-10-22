@@ -6319,6 +6319,16 @@ impl IrisTools {
             "console": console,
         });
         note_error_undercount(&mut resp, detected, reported, "console");
+        // #430 item 3: on a CLEAN success the console is noise — "Compilation finished
+        // successfully in 0.003s." — and it then rides along in every later model call. It is
+        // dropped only when there is provably nothing to read in it, and the absence is
+        // DECLARED: a caller that simply found `console` missing would be reading an absent
+        // field as "there was no output", which is the inference this repo exists to stop.
+        //
+        // Placed AFTER note_error_undercount and gated on its result, because that function is
+        // what sets `errors_incomplete`, and the hint it writes tells the reader to look in
+        // `console`. Removing the field the hint points at would make the hint a lie.
+        omit_clean_console(&mut resp, "console", success && warnings.is_empty());
         if let Some(uri) = open_uri {
             resp["open_uri"] = serde_json::Value::String(uri);
         }
@@ -8551,14 +8561,26 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                     .cloned()
                     .unwrap_or_default();
                 let (symbols, truncated) = take_with_truncation(rows, p.limit);
-                let count = symbols.len();
-                ok_json(serde_json::json!({
+                // #430 item 3: a flat array of names instead of a `{Name: ...}` wrapper per row.
+                // Lossless here, and MEASURED rather than assumed: `translate_symbols_query`
+                // projects exactly one column (`SELECT TOP n Name FROM
+                // %Dictionary.ClassDefinition`), so there is no second field to lose.
+                //
+                // `iris_symbols_local` deliberately keeps its object rows — those carry kind,
+                // file, formal_spec and line, and the same flattening there WOULD drop them.
+                // #430 describes the two as one change; they are not.
+                let (names, unreadable) = flatten_symbol_names(&symbols);
+                let count = names.len();
+                let mut out = serde_json::json!({
                     "source": "iris_dictionary",
-                    "symbols": symbols,
+                    "symbols": names,
                     "count": count,
                     "truncated": truncated,
-                    "query_hint": "Supports: plain text (substring), 'Pkg.*' (package prefix), 'Pkg.*.Name' (glob)",
-                }))
+                });
+                if unreadable > 0 {
+                    out["rows_unreadable"] = serde_json::json!(unreadable);
+                }
+                ok_json(out)
             }
             Err(e) => {
                 // #102: this said IRIS_UNREACHABLE for BOTH a missing namespace and a wrong
@@ -12137,6 +12159,76 @@ pub fn inline_failed_tests(
         .collect();
     let truncated = failed.len() > inline.len();
     (inline, failed.len(), truncated)
+}
+
+/// Whether a compiler console carries a WARNING line (#430 item 3).
+///
+/// `iris_compile` collects a `warnings` array of its own and does not need this. The
+/// `iris_doc(put, compile=true)` path does: it parses ERROR only, so "are there warnings" is not
+/// answerable from its payload, and a console dropped there would be the only copy of a warning
+/// IRIS emitted. Reuses `parse_console_diag` with the WARNING prefixes rather than matching the
+/// word, so a line merely *mentioning* a warning is not mistaken for one.
+pub fn console_holds_a_warning<'a>(lines: impl IntoIterator<Item = &'a str>) -> bool {
+    lines
+        .into_iter()
+        .any(|l| parse_console_diag(l, "WARNING:", "WARNING ").is_some())
+}
+
+/// Drop a compiler console that provably holds nothing to read, and DECLARE that it was dropped
+/// (#430 item 3).
+///
+/// Returns whether the field was removed. One function with two call sites on purpose:
+/// `iris_compile` spells the field `console` and `iris_doc(put, compile=true)` spells it
+/// `compile_console`, and this repo's dominant failure is a fix applied to one of a pair while the
+/// sibling keeps the old behaviour and looks MORE trustworthy for having a tested neighbour.
+///
+/// Three things it will not do:
+///
+/// - it will not drop the console when `errors_incomplete` is set. That flag means the parsed error
+///   list is a SUBSET and the console holds the rest — and the hint written beside it tells the
+///   reader to look there, so removing the field would make the hint point at nothing;
+/// - it will not drop it when `no_diagnostics` is false. The caller computes that from errors AND
+///   warnings, because a console holding a warning is the only copy of that warning;
+/// - it will not claim an omission it did not make. If the field was already absent, nothing is
+///   inserted — `console_omitted: true` beside a response that never had a console would be an
+///   invented fact, which is the shape this repo exists to avoid.
+pub fn omit_clean_console(
+    payload: &mut serde_json::Value,
+    field: &str,
+    no_diagnostics: bool,
+) -> bool {
+    if !no_diagnostics {
+        return false;
+    }
+    let Some(obj) = payload.as_object_mut() else {
+        return false;
+    };
+    if obj.get("errors_incomplete") == Some(&serde_json::Value::Bool(true)) {
+        return false;
+    }
+    if obj.remove(field).is_none() {
+        return false;
+    }
+    obj.insert(format!("{field}_omitted"), serde_json::json!(true));
+    true
+}
+
+/// Project `{"Name": "..."}` rows to bare names, counting the rows that had no readable `Name`
+/// (#430 item 3).
+///
+/// The count is the point. Dropping an unreadable row silently would shorten `symbols` and make a
+/// projection failure look like a smaller namespace — a failure answered as a fact about the world.
+/// The caller reports it as `rows_unreadable` so a short list is never mistaken for a complete one.
+pub fn flatten_symbol_names(rows: &[serde_json::Value]) -> (Vec<&str>, usize) {
+    let mut names = Vec::with_capacity(rows.len());
+    let mut unreadable = 0usize;
+    for row in rows {
+        match row.get("Name").and_then(|v| v.as_str()) {
+            Some(n) => names.push(n),
+            None => unreadable += 1,
+        }
+    }
+    (names, unreadable)
 }
 
 pub fn note_error_undercount(
