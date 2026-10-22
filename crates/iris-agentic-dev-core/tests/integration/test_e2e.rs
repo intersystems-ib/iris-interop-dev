@@ -324,7 +324,7 @@ fn e2e_symbols_glob_star_returns_package_classes() {
     let symbols = result["symbols"].as_array().cloned().unwrap_or_default();
     let names: Vec<String> = symbols
         .iter()
-        .filter_map(|s| s["Name"].as_str().map(|n| n.to_string()))
+        .filter_map(|s| s.as_str().map(|n| n.to_string()))
         .collect();
     assert!(
         names.iter().any(|n| n.contains("Test022Glob")),
@@ -1440,7 +1440,7 @@ fn e2e_symbols_mid_glob_pattern() {
     );
     if result["symbols"].is_array() {
         let symbols = result["symbols"].as_array().unwrap();
-        let names: Vec<&str> = symbols.iter().filter_map(|s| s["Name"].as_str()).collect();
+        let names: Vec<&str> = symbols.iter().filter_map(|s| s.as_str()).collect();
         // Either found matching classes, or zero results (namespace variation) — both OK
         // The important thing is it returned an array, not an error
         let _ = names; // structure validated above
@@ -2296,7 +2296,7 @@ fn e2e_symbols_limit_respected() {
 }
 
 #[test]
-fn e2e_symbols_returns_name_field() {
+fn e2e_symbols_returns_bare_name_strings() {
     require_iris!();
     let result = call_tool(
         "iris_symbols",
@@ -2307,21 +2307,24 @@ fn e2e_symbols_returns_name_field() {
     let symbols = result["symbols"].as_array().cloned().unwrap_or_default();
     // Without this the test is vacuous: an empty `symbols` skips the loop and reports a pass, and
     // `unwrap_or_default()` turns an ABSENT key into an empty array too. The name of this test claims
-    // symbols come back with a Name field, so it has to establish that symbols came back at all.
+    // symbols come back as non-empty names, so it has to establish that symbols came back at all.
     assert!(
         !symbols.is_empty(),
         "iris_symbols returned no symbols for Ens.Director, so the per-symbol assertions below \
          would pass without examining anything: {result}"
     );
     for sym in &symbols {
+        // #430 item 3: a symbol is a BARE NAME now, not a {Name: ...} wrapper. The CI failure that
+        // led here printed `String("Ens.Director")` — the value was right, the shape assertion was
+        // reading a field that no longer exists.
         assert!(
-            sym["Name"].is_string(),
-            "each symbol must have Name field: {:?}",
+            sym.is_string(),
+            "each symbol must be a bare name string: {:?}",
             sym
         );
         assert!(
-            !sym["Name"].as_str().unwrap_or("").is_empty(),
-            "Name must not be empty: {:?}",
+            !sym.as_str().unwrap_or("").is_empty(),
+            "a name must not be empty: {:?}",
             sym
         );
     }
@@ -2370,7 +2373,7 @@ fn e2e_symbols_user_defined_class_found() {
     let symbols = result["symbols"].as_array().cloned().unwrap_or_default();
     let found = symbols
         .iter()
-        .any(|s| s["Name"].as_str() == Some("Test022.SymFind"));
+        .any(|s| s.as_str() == Some("Test022.SymFind"));
     assert!(
         found,
         "compiled class must appear in symbols: {:?}",
@@ -2457,14 +2460,18 @@ fn e2e_query_reports_the_real_total_when_it_caps_rows() {
 #[test]
 fn e2e_symbols_returns_a_flat_name_array() {
     require_iris!();
-    // "Dictionary", not "Ens". CI runs `intersystemsdc/iris-community:2025.3`, whose USER namespace
-    // is NOT interop-enabled — `Ens.*` lives in ENSLIB and is not mapped there, so the denominator
-    // assertion below would fail on an empty result. The `%Dictionary.*` package is in IRISLIB and
-    // mapped into every namespace (measured: 166 matches), so it is present wherever this runs.
+    // "Dictionary" rather than "Ens", for robustness only — NOT because Ens is unavailable.
     //
-    // Note for whoever reads this next: `e2e_symbols_limit_respected` above queries "Ens" and
-    // asserts only `len() <= 3`, which an EMPTY result satisfies. That is why nobody noticed
-    // whether those rows exist — it is an upper bound with no denominator.
+    // My first comment here claimed CI's USER namespace is not interop-enabled and that `Ens.*` is
+    // therefore unmapped. That was wrong, and the refuting evidence was already in this suite:
+    // `e2e_symbols_returns_bare_name_strings` queries `Ens.Director` in USER with a non-empty
+    // denominator and passes, and the CI output printed `String("Ens.Director")`. Ens resolves
+    // there. `%Dictionary.*` is kept anyway because it is in IRISLIB and mapped into every
+    // namespace (measured: 166 matches), so this test rests on a WEAKER assumption — not on a
+    // different fact about the image.
+    //
+    // Worth knowing next door: `e2e_symbols_limit_respected` asserts only `len() <= 3`, which an
+    // EMPTY result satisfies — an upper bound with no denominator.
     let result = call_tool(
         "iris_symbols",
         serde_json::json!({
