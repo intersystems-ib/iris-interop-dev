@@ -390,6 +390,17 @@ pub enum Toolset {
     /// a_write_disallowed_connection_still_lists_every_tool.
     /// Additive: tool *code* is unchanged so upstream stays mergeable.
     Interop,
+    /// Exactly `ROUTINES_TOOLS` — #531, for legacy ObjectScript: `.mac` routines with dot
+    /// syntax, `$PIECE`-delimited global records, cross-reference globals, LOCK/TSTART. The
+    /// count is not restated here, for the same reason it is not restated for `Interop`.
+    ///
+    /// It is NOT a subset of `Interop` and not a superset either. It drops the production,
+    /// rule, lookup, credential and HL7 surface, which a routine has no use for, and it adds
+    /// read-only tools the interop profile excluded on SCOPE rather than on merit —
+    /// `tools-excluded.json` already marked those `wanted`.
+    ///
+    /// Opt-in: `IRIS_TOOLSET=routines` / `--toolset routines`. The default stays `interop`.
+    Routines,
 }
 
 impl Toolset {
@@ -399,7 +410,23 @@ impl Toolset {
             "nostub" => Toolset::Nostub,
             "merged" => Toolset::Merged,
             "interop" => Toolset::Interop,
+            "routines" => Toolset::Routines,
             _ => Toolset::Baseline,
+        }
+    }
+
+    /// The keep-list this toolset prunes down to, if it is a keep-list profile at all.
+    ///
+    /// Returning it from ONE place is deliberate. The pruner used to test
+    /// `toolset == Toolset::Interop` directly, so adding a second keep-list profile meant
+    /// remembering to widen a condition in a different function — and the `else` branch it
+    /// would otherwise fall into prunes only NOT_IMPLEMENTED stubs, which looks like a working
+    /// profile that happens to advertise everything.
+    pub fn keep_list(&self) -> Option<&'static [&'static str]> {
+        match self {
+            Toolset::Interop => Some(INTEROP_TOOLS),
+            Toolset::Routines => Some(ROUTINES_TOOLS),
+            Toolset::Baseline | Toolset::Nostub | Toolset::Merged => None,
         }
     }
 
@@ -409,9 +436,73 @@ impl Toolset {
             Toolset::Nostub => "nostub",
             Toolset::Merged => "merged",
             Toolset::Interop => "interop",
+            Toolset::Routines => "routines",
         }
     }
 }
+
+/// The legacy-ObjectScript keep-list (Toolset::Routines) — #531.
+///
+/// What this profile is FOR: `.mac` routines with dot syntax, `$PIECE`-delimited records in
+/// globals, cross-reference globals, LOCK/TSTART. Not productions.
+///
+/// Three groups, and the third is the one worth arguing about:
+///
+/// 1. Shared with `Interop` — execution, compilation, testing, introspection. A routine is
+///    compiled and run the same way a class is.
+/// 2. Absent on purpose — production, rule, lookup, credential, HL7, gateway, interop query.
+///    A routine has no production to configure, and advertising those invites an agent to look
+///    for interop structure in code that has none.
+/// 3. Added here, excluded from `Interop` on SCOPE rather than on merit, and both read-only:
+///    `iris_search` answers "which routine references this global", which no name-based search
+///    can, and `iris_info` answers "what did I just change". `tools-excluded.json` already
+///    marked both `wanted`.
+///
+///    `resolve_storage` is NOT here, and should not be. #531 invites it, and the capability is
+///    genuinely the right one for this profile — a class's global maps are exactly the boundary
+///    legacy work sits on. But this fork decided NOT to port it: #248 was closed completed by
+///    #253, which put `stream_global` and `id_global` on `iris_table_info` instead, "a column
+///    rather than a 29th tool, on the owner's call". `iris_table_info` is in this list, so the
+///    capability is present under another name.
+///
+///    Two traps met here, both worth leaving written down. `test_routines_toolset_exact` reported
+///    `resolve_storage` missing the first time this list was written — because the router does not
+///    register it. And `tools-excluded.json` still files it under `wanted`, which was true when
+///    #353 wrote it and has been stale since #253 landed; that entry describes an UPSTREAM
+///    capability, not a gap. Reading the excluded list as a to-do would have re-added a tool the
+///    owner declined.
+///
+/// NOT here yet, deliberately: the global tools (`iris_global`, `global_preview`, `global_kill`)
+/// arrive with #532 and the terminal (`iris_ws_*`) with #535. Listing a tool the router does not
+/// register would make `test_routines_toolset_exact` fail, which is the correct outcome and the
+/// reason the list is not written ahead of the code.
+pub const ROUTINES_TOOLS: &[&str] = &[
+    // ── execution and compilation ──
+    "iris_query",
+    "iris_doc",
+    "iris_execute",
+    "iris_execute_method",
+    "iris_compile",
+    "iris_test",
+    "iris_coverage",
+    // ── diagnostics and introspection ──
+    "iris_symbols",
+    "iris_symbols_local",
+    "iris_doc_search",
+    "docs_introspect",
+    "check_config",
+    "iris_get_log",
+    "iris_debug",
+    "iris_macro",
+    "iris_table_info",
+    // ── reading what is already there ──
+    "compare_document",
+    "compare_namespace",
+    "iris_source_control",
+    // ── group 3: read-only, `wanted` in tools-excluded.json, out of the interop remit ──
+    "iris_search",
+    "iris_info",
+];
 
 /// The interop-focused keep-list (Toolset::Interop). Source of truth for the `Interop`
 /// pruning; `registered_tool_names()` now derives from the pruned router for every
@@ -5503,11 +5594,11 @@ impl IrisTools {
 
         // Remove tools from MCP tool list based on toolset (T017–T019, T033, FR-004–011).
         // The `#[tool_router]` macro registers all tools; we prune at construction time.
-        if toolset == Toolset::Interop {
-            // Interop profile: keep ONLY the interop keep-list; prune everything else.
-            // Derived from the live router so an upstream rename/removal can't silently
-            // leave a stale name behind (test_interop_toolset_exact guards the keep-list).
-            let keep: std::collections::HashSet<&str> = INTEROP_TOOLS.iter().copied().collect();
+        if let Some(keep_list) = toolset.keep_list() {
+            // A keep-list profile: keep ONLY its list; prune everything else. Derived from the
+            // live router so an upstream rename/removal can't silently leave a stale name behind
+            // (test_interop_toolset_exact / test_routines_toolset_exact guard the lists).
+            let keep: std::collections::HashSet<&str> = keep_list.iter().copied().collect();
             let all: Vec<String> = router
                 .list_all()
                 .into_iter()
@@ -5528,7 +5619,9 @@ impl IrisTools {
                     "skill_share",             // FR-005
                     "skill_community_install", // FR-006
                 ],
-                Toolset::Interop => unreachable!("handled above"),
+                Toolset::Interop | Toolset::Routines => {
+                    unreachable!("keep-list profiles are handled above")
+                }
             };
             for name in stubs_to_remove {
                 router.remove_route(name);

@@ -306,6 +306,84 @@ fn test_interop_toolset_exact() {
     );
 }
 
+/// #531: the routines profile advertises exactly `ROUTINES_TOOLS`.
+///
+/// Mirrors `test_interop_toolset_exact` on purpose — the same two-sided diff, because the
+/// one-sided version ("every keep-list entry is registered") passes a profile that also
+/// advertises fifty tools it never named.
+#[test]
+fn test_routines_toolset_exact() {
+    use iris_agentic_dev_core::tools::ROUTINES_TOOLS;
+    let tools = IrisTools::new_with_toolset(None, Toolset::Routines).expect("routines IrisTools");
+    let names = tools.registered_tool_names();
+    let expected: std::collections::HashSet<String> =
+        ROUTINES_TOOLS.iter().map(|s| s.to_string()).collect();
+    let missing: Vec<_> = expected.difference(&names).collect();
+    let unexpected: Vec<_> = names.difference(&expected).collect();
+    assert!(
+        missing.is_empty() && unexpected.is_empty(),
+        "Routines toolset must expose exactly ROUTINES_TOOLS.\n  missing (named in the keep-list \
+         but NOT registered by the router — a typo, or a tool that does not exist yet): {:?}\n  \
+         unexpected (registered but not named): {:?}",
+        missing,
+        unexpected,
+    );
+}
+
+/// The keep-list must be a real pruning, not a no-op. If `Routines` ever advertised everything
+/// the router registers, the test above would still pass — it compares against the keep-list,
+/// and a keep-list that happened to list every tool is self-consistent.
+#[test]
+fn test_routines_is_smaller_than_the_whole_router() {
+    let all = IrisTools::new_with_toolset(None, Toolset::Baseline).expect("baseline");
+    let routines = IrisTools::new_with_toolset(None, Toolset::Routines).expect("routines");
+    let all_n = all.registered_tool_names().len();
+    let routines_n = routines.registered_tool_names().len();
+    assert!(
+        routines_n < all_n,
+        "routines ({routines_n}) must prune the baseline router ({all_n})"
+    );
+}
+
+/// The two profiles are different surfaces, not one nested in the other. Stated as a test
+/// because "routines is interop minus the production tools" is the intuition, and it is wrong:
+/// routines ADDS three read-only tools the interop profile excluded on scope.
+#[test]
+fn test_routines_is_not_a_subset_of_interop() {
+    use iris_agentic_dev_core::tools::{INTEROP_TOOLS, ROUTINES_TOOLS};
+    let interop: std::collections::HashSet<&str> = INTEROP_TOOLS.iter().copied().collect();
+    let only_in_routines: Vec<&&str> = ROUTINES_TOOLS
+        .iter()
+        .filter(|t| !interop.contains(**t))
+        .collect();
+    assert!(
+        !only_in_routines.is_empty(),
+        "routines is supposed to add tools interop excluded on scope; it adds none"
+    );
+    let routines: std::collections::HashSet<&str> = ROUTINES_TOOLS.iter().copied().collect();
+    let only_in_interop: Vec<&&str> = INTEROP_TOOLS
+        .iter()
+        .filter(|t| !routines.contains(**t))
+        .collect();
+    assert!(
+        !only_in_interop.is_empty(),
+        "routines is supposed to drop the production surface; it drops nothing"
+    );
+}
+
+/// `IRIS_TOOLSET=routines` has to resolve, or the profile is unreachable from the CLI and the
+/// tests above are exercising something no user can select. An unknown name must NOT become
+/// `routines` by accident either.
+#[test]
+fn test_routines_is_selectable_by_name() {
+    assert_eq!(Toolset::from_str("routines"), Toolset::Routines);
+    assert_eq!(Toolset::from_str("  RoUtInEs "), Toolset::Routines);
+    assert_eq!(Toolset::Routines.as_str(), "routines");
+    // The control: the default is unchanged, and a typo does not land here.
+    assert_eq!(Toolset::from_str("interop"), Toolset::Interop);
+    assert_eq!(Toolset::from_str("routine"), Toolset::Baseline);
+}
+
 /// Interop must keep the interop-critical tools the workshop actually needed.
 #[test]
 fn test_interop_preserves_critical_tools() {

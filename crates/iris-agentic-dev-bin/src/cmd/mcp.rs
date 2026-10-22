@@ -78,9 +78,15 @@ pub struct McpCommand {
     pub subscribe: Vec<String>,
     #[arg(long, default_value = ".")]
     pub workspace: String,
-    /// Tool set to register: interop (31 interop-focused tools — DEFAULT for this fork),
-    /// merged (49: stubs removed + consolidated), nostub (53: stubs removed),
-    /// or baseline (57: all tools). Also read from IRIS_TOOLSET env var.
+    /// Tool set to register. `interop` is this fork's DEFAULT: the production-focused profile.
+    /// `routines` (#531) is for legacy ObjectScript — routines and globals, no production surface.
+    /// `merged` and `nostub` drop the NOT_IMPLEMENTED stubs, `baseline` is everything the binary
+    /// carries. Also read from the IRIS_TOOLSET env var.
+    ///
+    /// No counts here. The four this line used to carry were written once and never updated —
+    /// `interop` read "31 interop-focused tools" while INTEROP_TOOLS held 36. `tools/list` on your
+    /// own build is the only answer that cannot go stale, and `scripts/validate-tools.sh` prints
+    /// the keep-list length on every run.
     #[arg(long, env = "IRIS_TOOLSET", default_value = "interop")]
     pub toolset: String,
 }
