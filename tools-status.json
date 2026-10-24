@@ -250,6 +250,13 @@
       "unit": "stream_inspect::tests",
       "e2e": null,
       "status": "unit-ok"
+    },
+    {
+      "tool": "iris_global",
+      "unit": "global_reference_and_data + global_wire_framing",
+      "e2e": "global_read_e2e",
+      "status": "unit-ok",
+      "note": "#532, routines profile. Read actions only (get, list, walk); set/kill follow with the write blocklist. Unit tests cover the subscript table, $DATA's four states, the three-way walk end reason and the length-prefixed framing."
     }
   ]
 }
