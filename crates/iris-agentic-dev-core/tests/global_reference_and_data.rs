@@ -251,6 +251,7 @@ fn params(action: &str) -> IrisGlobalParams {
         max_nodes: None,
         after_subscript: None,
         after_node: None,
+        value: None,
     }
 }
 
@@ -267,10 +268,31 @@ fn an_unknown_action_is_refused_and_names_the_valid_ones() {
             assert!(msg.contains(valid), "{msg} should offer {valid}");
         }
     }
-    // The control: the three real actions all plan. Without this the loop above would pass
-    // against a plan_read that refused everything.
-    for good in GlobalAction::NAMES {
-        assert!(plan_read(&params(good)).is_ok(), "{good} must plan");
+    // The control: every READ action plans. Without it the loop above would pass against a
+    // plan_read that refused everything.
+    //
+    // It is filtered by `is_write` rather than written as a literal list, because that is the
+    // defect this control just had: it looped over `GlobalAction::NAMES` assuming every advertised
+    // action was a read, and when #532's write half added `set` to NAMES the control began
+    // asserting something false. A site that measures a population has to ask the population
+    // which members it is about.
+    let reads: Vec<&&str> = GlobalAction::NAMES
+        .iter()
+        .filter(|n| {
+            !GlobalAction::parse(n)
+                .expect("an advertised name parses")
+                .is_write()
+        })
+        .collect();
+    assert!(
+        reads.len() >= 3,
+        "the read actions are the subject of this file; found {reads:?}"
+    );
+    for good in reads {
+        assert!(
+            plan_read(&params(good)).is_ok(),
+            "{good} must plan as a read"
+        );
     }
     // Case and surrounding whitespace are tolerated, deliberately and for the same reason
     // `Toolset::parse` tolerates them — an action is a name the caller typed, not a token. My
@@ -283,18 +305,32 @@ fn an_unknown_action_is_refused_and_names_the_valid_ones() {
     }
 }
 
-/// The write actions are refused as unknown rather than accepted and ignored, and the refusal says
-/// this build reads only — otherwise a caller reads INVALID_ACTION as a typo and retries.
+/// `kill` is not an action of this tool, and the refusal has to say where removal DOES live —
+/// otherwise a caller reads INVALID_ACTION as a typo and retries the same call.
+///
+/// This replaces `set_and_kill_are_refused_as_not_implemented_here`, which pinned the read-only
+/// build: `set` is now implemented, so that test was asserting the absence of a feature that had
+/// arrived. It is recorded here rather than silently deleted because the two halves of its claim
+/// had different fates — `set` landed, `kill` was declined on purpose — and a reader finding only
+/// the deletion would not be able to tell which.
 #[test]
-fn set_and_kill_are_refused_as_not_implemented_here() {
-    for write in ["set", "kill"] {
-        let (code, msg) = plan_read(&params(write)).expect_err("must be refused");
-        assert_eq!(code, "INVALID_ACTION");
+fn kill_is_not_an_action_here_and_the_refusal_names_the_confirmed_path() {
+    for removal in ["kill", "delete", "remove"] {
+        let (code, msg) = plan_read(&params(removal)).expect_err("must be refused");
+        assert_eq!(code, "INVALID_ACTION", "{removal} -> {msg}");
         assert!(
-            msg.contains("reads only"),
-            "the refusal must say why these are absent, not just that they are: {msg}"
+            msg.contains("global_preview") && msg.contains("global_kill"),
+            "a caller asking to remove a global must be told which tools do it, or the refusal \
+             reads as 'you typed it wrong': {msg}"
         );
     }
+    // `set` is an action now, and it must NOT reach the read planner. Different refusal, because
+    // "that is not an action" and "that action is a write" are different facts.
+    let (code, _) = plan_read(&params("set")).expect_err("a write must not plan as a read");
+    assert_eq!(
+        code, "INVALID_PARAMS",
+        "set is a real action in the wrong place, not an unknown one"
+    );
 }
 
 #[test]
