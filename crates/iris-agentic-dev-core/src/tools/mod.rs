@@ -333,6 +333,8 @@ pub mod execute_method;
 pub mod formal_spec;
 pub mod gateway;
 pub mod gateway_manage;
+// #532: globals for the `routines` profile — subscript handling and $DATA.
+pub mod global;
 pub mod hl7_schema;
 pub mod info;
 pub mod interop;
@@ -357,16 +359,16 @@ pub use scm::ScmParams;
 /// Read from `IRIS_TOOLSET` env var or `--toolset` CLI flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Toolset {
-    /// 64 tools advertised (measured 2026-09-24, +1 stream_inspect, +2 compare_*). NOT this fork's default —
+    /// 65 tools advertised (measured 2026-10-23, +1 iris_global for #532). NOT this fork's default —
     /// `--toolset` defaults to `interop`; baseline is opt-in via IRIS_TOOLSET/--toolset.
     /// Note this is already a pruned router: the tools the `#[tool_router]` macro
     /// registers minus the 4 merged-only ones. Was 54 of 58 before iris_execute_method.
     Baseline,
-    /// 60 tools advertised (measured 2026-09-24). Baseline minus the 4 NOT_IMPLEMENTED
+    /// 61 tools advertised (measured 2026-10-23). Baseline minus the 4 NOT_IMPLEMENTED
     /// stubs (skill_propose, skill_optimize, skill_share, skill_community_install).
     /// No merged dispatchers. Not this fork's default.
     Nostub,
-    /// 56 tools advertised (measured 2026-09-24). Nostub minus 8 — the 4 debug_*
+    /// 57 tools advertised (measured 2026-10-23). Nostub minus 8 — the 4 debug_*
     /// folded into iris_debug, the 3 container tools folded into iris_containers, and
     /// agent_info dropped outright — plus the 4 merged-only tools iris_debug,
     /// iris_containers, iris_admin, iris_get_log.
@@ -513,10 +515,16 @@ impl Toolset {
 ///    capability, not a gap. Reading the excluded list as a to-do would have re-added a tool the
 ///    owner declined.
 ///
-/// NOT here yet, deliberately: the global tools (`iris_global`, `global_preview`, `global_kill`)
-/// arrive with #532 and the terminal (`iris_ws_*`) with #535. Listing a tool the router does not
-/// register would make `test_routines_toolset_exact` fail, which is the correct outcome and the
-/// reason the list is not written ahead of the code.
+/// `iris_global` arrives here with #532, READ ACTIONS ONLY — `get`, `list` and `walk`. Its
+/// `tools-excluded.json` entry keeps the interop verdict `unsafe-here` verbatim and adds a
+/// `profiles.routines` override, because the interop reason is about writing under the class layer
+/// and this profile's code has no class layer to write under.
+///
+/// NOT here yet, deliberately: `global_preview` and `global_kill`, which arrive with the write
+/// actions and the system-global blocklist in the second half of #532, and the terminal
+/// (`iris_ws_*`) with #535. Listing a tool the router does not register would make
+/// `test_routines_toolset_exact` fail, which is the correct outcome and the reason the list is not
+/// written ahead of the code.
 pub const ROUTINES_TOOLS: &[&str] = &[
     // ── execution and compilation ──
     "iris_query",
@@ -537,6 +545,9 @@ pub const ROUTINES_TOOLS: &[&str] = &[
     "iris_macro",
     "iris_table_info",
     // ── reading what is already there ──
+    // #532: a legacy routine addresses its data as globals directly, so reading them is not an
+    // escape hatch here — it is the data layer. Read actions only.
+    "iris_global",
     "compare_document",
     "compare_namespace",
     "iris_source_control",
@@ -5240,6 +5251,12 @@ pub(crate) fn mutating_call(tool: &str, args: &serde_json::Value) -> Option<&'st
         // should gate a read at all is #303, open for the ten tools in this position; until it is
         // decided this follows the existing precedent rather than inventing a second rule.
         "stream_inspect" => Some("read a stream by id"),
+        // #532. Reads only, and still gated, for stream_inspect's reason one line up: every
+        // action reaches IRIS through `execute_via_generator`, which PUTs and COMPILES a scratch
+        // class in the namespace. So this is read-only about the GLOBAL and not about the
+        // instance. Opening a second rule for globals is what #303 exists to decide; until then
+        // this follows the precedent rather than inventing an exception for the newest tool.
+        "iris_global" => Some("read a global through a compiled scratch class"),
         // Every action of this tool writes a credential.
         // DELIBERATELY ABSENT: stream_inspect (#352) and compare_namespace / compare_document
         // (#351). All three only read — two SELECTs and a GET between them — so none is write-gated.
@@ -7403,6 +7420,84 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
         Ok(CallToolResult::success(vec![Content::text(
             payload.to_string(),
         )]))
+    }
+
+    #[tool(
+        description = "Read IRIS GLOBALS directly — the data layer legacy ObjectScript routines actually use. `routines` profile only (#532). THREE READ ACTIONS, no writes: `get` one node, `list` one level of subscripts, `walk` a bounded subtree. action=set and action=kill are NOT implemented by this build and are refused by name. Pass `subscripts` as a JSON ARRAY OF VALUES, never as a pre-built reference: a NUMBER addresses the numeric subscript and a STRING addresses that exact string, and every string is rendered with ObjectScript quoting, so a comma, a quote, a caret, an accent or a control character inside a key is DATA and not syntax — `[\"X\", \"ACME, INC.\", 1]` is three subscripts. Note IRIS canonicalises a canonic numeric string, so `\"1\"` and `1` are the SAME node; a non-canonic one such as `\"01\"`, `\"1.0\"` or `\"-0\"` is a DIFFERENT, string-subscripted node, which is why the distinction is preserved rather than normalised away. Every node reports `$DATA` as a NUMBER (0, 1, 10 or 11) plus `data_meaning`, `has_value` and `has_children`, because `$GET` returns the empty string both for a node whose value IS empty and for a node that has children and NO value of its own: `value: \"\"` with `has_value: true` is an empty value, `value: null` with `has_value: false` is no value, and collapsing those is the bug this replaces. `list` and `walk` are PAGED and say why they stopped: `complete` plus `stopped_because` of `done` (that is all of it), `cap` (the node/subscript limit — ask for the next page) or `time` (the walk ran out of its 5-second budget, so how much remains is UNKNOWN — narrow the subtree rather than paging blindly). A truncated or unreadable reply is an ERROR naming the global, never an empty result, because \"this global is empty\" and \"I could not read this global\" are different answers. Resume with `after_subscript` (list) or by passing a previous page's `resume_after` back as `after_node` (walk) — never by rebuilding the reference yourself. Extended references (`^|\"NS\"|G`) are refused: pass the target namespace in `namespace`. namespace: optional, defaults to the connection namespace."
+    )]
+    async fn iris_global(
+        &self,
+        Parameters(p): Parameters<global::IrisGlobalParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let iris = self.get_iris_reloaded().await?;
+        let client = self.http_client();
+        let namespace =
+            crate::tools::interop::resolve_namespace(p.namespace.as_deref(), Some(&iris));
+
+        // Everything that can be wrong about the request is decided here, with no instance
+        // involved, so a bad parameter never costs a scratch-class compile.
+        let plan = match global::plan_read(&p) {
+            Ok(plan) => plan,
+            Err((code, msg)) => {
+                self.record_call("iris_global", false);
+                return envelope::fail(code, &msg);
+            }
+        };
+
+        let output = match iris
+            .execute_via_generator(&plan.code, &namespace, client)
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                self.record_call("iris_global", false);
+                return envelope::transport_fail("iris_global", &e.to_string());
+            }
+        };
+
+        // HTTP 200 and a compiled scratch class do not mean the read happened. The generator
+        // reports an IRIS-side abort inside the captured output, so reading past it would turn a
+        // <PROTECT> on a system global, or an <UNDEFINED> on a bad reference, into "this global is
+        // empty" — a failure wearing the shape of an answer.
+        if let Some(abort) = runtime_abort_line(&output) {
+            self.record_call("iris_global", false);
+            return envelope::fail(
+                "IRIS_RUNTIME_ERROR",
+                &format!(
+                    "reading ^{} in {namespace} failed, so what it holds is UNKNOWN — this is \
+                     not an empty global: {abort}",
+                    plan.name
+                ),
+            );
+        }
+
+        let parsed =
+            match plan.action {
+                global::GlobalAction::Get => global::parse_get_output(&output).map(|n| {
+                    serde_json::json!({
+                        "success": true,
+                        "action": "get",
+                        "namespace": namespace,
+                        "node": global::node_json(&n),
+                    })
+                }),
+                global::GlobalAction::List => global::parse_list_output(&output)
+                    .map(|page| global::list_json(&page, &namespace)),
+                global::GlobalAction::Walk => global::parse_walk_output(&output)
+                    .map(|page| global::walk_json(&page, &namespace)),
+            };
+
+        match parsed {
+            Ok(body) => {
+                self.record_call("iris_global", true);
+                envelope::ok_json(body)
+            }
+            Err(detail) => {
+                self.record_call("iris_global", false);
+                let (code, msg) = global::unreadable(&detail);
+                envelope::fail(code, &msg)
+            }
+        }
     }
 
     #[tool(
@@ -13673,9 +13768,16 @@ mod tool_annotation_tests {
             // `mutating_call` it fell through to the final `_ => None` — so it was announced
             // readOnlyHint:TRUE while able to %CheckIn, %GetLatest and %Disconnect. Classifying it
             // corrects that claim here too, not only in the interop profile.
-            ("nostub", Toolset::Nostub, 60, 35),
-            ("merged", Toolset::Merged, 56, 30),
-            ("baseline", Toolset::Baseline, 64, 39),
+            // #532 is +1 on these three for `iris_global`, and the interop row above is
+            // UNCHANGED because it is not in INTEROP_TOOLS. The read-only figures do not move, and
+            // that is measured rather than assumed: every action of `iris_global` reads, but it
+            // has an arm in `mutating_call` because it reaches IRIS through
+            // `execute_via_generator`, which PUTs and compiles a scratch class. So it is honestly
+            // not advertised readOnlyHint:true — the same reasoning as `stream_inspect` above, and
+            // the figures below were re-run row by row rather than derived by arithmetic.
+            ("nostub", Toolset::Nostub, 61, 35),
+            ("merged", Toolset::Merged, 57, 30),
+            ("baseline", Toolset::Baseline, 65, 39),
         ] {
             let t = IrisTools::new_with_toolset(None, ts).expect("build");
             let all = t.advertised_tools();

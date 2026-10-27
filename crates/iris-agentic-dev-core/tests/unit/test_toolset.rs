@@ -253,7 +253,7 @@ fn test_merged_tool_count() {
     let tools = IrisTools::new_with_toolset(None, Toolset::Merged).expect("IrisTools::new");
     let count = tools.registered_tool_names().len();
     assert_eq!(
-        count, 56,
+        count, 57,
         "Merged toolset must advertise exactly 56 tools, got {}",
         count
     );
@@ -508,8 +508,8 @@ fn test_baseline_tool_count() {
         .registered_tool_names()
         .len();
     assert_eq!(
-        n, 64,
-        "Baseline must advertise exactly 64 tools (Toolset::Baseline doc comment says 64), got {}",
+        n, 65,
+        "Baseline must advertise exactly 65 tools (Toolset::Baseline doc comment says 65), got {}",
         n
     );
 }
@@ -522,18 +522,25 @@ fn test_nostub_tool_count_absolute() {
         .expect("IrisTools::new")
         .registered_tool_names()
         .len();
-    assert_eq!(n, 60, "Nostub must advertise exactly 60 tools, got {}", n);
+    assert_eq!(n, 61, "Nostub must advertise exactly 61 tools, got {}", n);
 }
 
-/// The single regression gate for the four doc-comment numbers. A failure here means the
-/// tool surface moved: update `Toolset`'s doc comments in src/tools/mod.rs, or explain
-/// the change.
+/// The regression gate for the four surface counts. A failure here means the tool surface moved:
+/// update this list AND `Toolset`'s doc comments in src/tools/mod.rs, or explain the change.
+///
+/// It does NOT parse those doc comments — the numbers below are its own. So it catches the surface
+/// drifting away from this list, and cannot catch the doc comment drifting away from either. The
+/// count therefore lives in three places (here, the doc comment, and the per-toolset tests above),
+/// which is two more than it should; deriving it from one source is worth doing and is not this
+/// change.
 #[test]
 fn test_toolset_counts_match_doc_comments() {
     for (ts, expected) in [
-        (Toolset::Baseline, 64usize),
-        (Toolset::Nostub, 60),
-        (Toolset::Merged, 56),
+        // #532: +1 on the first three for `iris_global`. Interop is unchanged — it is not in
+        // INTEROP_TOOLS.
+        (Toolset::Baseline, 65usize),
+        (Toolset::Nostub, 61),
+        (Toolset::Merged, 57),
         (Toolset::Interop, 36),
     ] {
         let n = IrisTools::new_with_toolset(None, ts)
@@ -542,8 +549,10 @@ fn test_toolset_counts_match_doc_comments() {
             .len();
         assert_eq!(
             n, expected,
-            "Toolset::{:?} advertises {} tools but src/tools/mod.rs documents {} — update \
-             the doc comment or explain the change",
+            "Toolset::{:?} advertises {} tools, but this gate expects {} — update BOTH this \
+             list and the matching `N tools advertised` line in `Toolset`'s doc comment in \
+             src/tools/mod.rs, or explain the change. (This test does not read that doc comment: \
+             the number above is its own literal, so the two can only be kept together by hand.)",
             ts, n, expected
         );
     }
@@ -596,7 +605,7 @@ fn test_new_uses_pruned_baseline_router() {
         .registered_tool_names();
     assert_eq!(
         via_new.len(),
-        64,
+        65,
         "new() claims Toolset::Baseline, so it must advertise the baseline surface"
     );
     assert_eq!(

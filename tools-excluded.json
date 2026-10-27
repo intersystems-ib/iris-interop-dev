@@ -23,7 +23,13 @@
     },
     "iris_global": {
       "category": "unsafe-here",
-      "why": "Writes and kills global nodes directly, underneath the class layer that maintains interop indices and search tables. A write that looks correct at the global level can leave a production's own structures inconsistent."
+      "why": "Writes and kills global nodes directly, underneath the class layer that maintains interop indices and search tables. A write that looks correct at the global level can leave a production's own structures inconsistent.",
+      "profiles": {
+        "routines": {
+          "category": "advertised",
+          "why": "Advertised by `routines`, read actions only in this build: get, list and walk. A legacy routine addresses its data as globals directly — there is no class layer to read through — so the interop reason above does not describe this profile's situation. The write actions the interop verdict is about (set, kill) are NOT implemented here yet; when they arrive they are gated and carry a system-global blocklist. Subscripts are rendered with `os_str_expr`, so a comma, quote or caret in a key is data rather than syntax."
+        }
+      }
     },
     "iris_ws_exec": {
       "category": "unsafe-here",
