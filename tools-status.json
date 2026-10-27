@@ -255,8 +255,8 @@
       "tool": "iris_global",
       "unit": "global_reference_and_data + global_wire_framing + global_write_refusals + global_write_framing",
       "e2e": "global_e2e",
-      "status": "unit-ok",
-      "note": "#532, routines profile. Reads (get, list, walk) and one write (set). Removal is NOT an action here: global_preview + global_kill follow, so there is a single destructive path and it is confirmed. A write to a reserved global is refused with SYSTEM_GLOBAL_WRITE_REFUSED and no configuration override; a name differing from one only in letter case is refused separately as GLOBAL_FAMILY_UNDETERMINED, because IRIS global names are case-sensitive and which global was meant is then unknown. The write's success is read back out of IRIS after the Set, so a write that did not land reports WRITE_DID_NOT_LAND rather than success. e2e renamed from global_read_e2e when it stopped being read-only."
+      "status": "OK",
+      "note": "#532, routines profile. Reads (get, list, walk) and one write (set). Removal is NOT an action here: global_preview + global_kill follow, so there is a single destructive path and it is confirmed. A write to a reserved global is refused with SYSTEM_GLOBAL_WRITE_REFUSED and no configuration override; a name differing from one only in letter case is refused separately as GLOBAL_FAMILY_UNDETERMINED, because IRIS global names are case-sensitive and which global was meant is then unknown. The write's success is read back out of IRIS after the Set, so a write that did not land reports WRITE_DID_NOT_LAND rather than success. e2e renamed from global_read_e2e when it stopped being read-only; it has since run green against a live instance in CI (run 40535545094), which is what moves this row from unit-ok to OK."
     }
   ]
 }
