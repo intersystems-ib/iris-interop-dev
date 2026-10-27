@@ -110,6 +110,19 @@ pub fn global_name_error(name: &str) -> Option<String> {
              name here."
         ));
     }
+    // Upstream v1.7.0 added this bound when it collapsed its two name checks into
+    // `canonical_global_name`. It is not an injection guard — the pattern below already admits
+    // only letters, digits, `.` and a leading `%` — it turns a pathological name into a refusal
+    // decided here rather than an abort decided by IRIS, which is what this module's contract
+    // says: everything that can be wrong about a request is wrong before an instance is involved.
+    if name.chars().count() > 128 {
+        let shown: String = name.chars().take(40).collect();
+        return Some(format!(
+            "'{shown}…' is {} characters; a global name is at most 128 here. Subscripts go in \
+             'subscripts', not in the name.",
+            name.chars().count()
+        ));
+    }
     if global_re().is_match(name) {
         return None;
     }
@@ -507,16 +520,20 @@ pub enum GlobalAction {
     List,
     /// A bounded `$QUERY` walk of a subtree, paged, reporting which bound stopped it.
     Walk,
+    /// Write one node's value. The only write action here: removal goes through `global_preview`
+    /// and `global_kill`, so there is exactly one destructive path and it is the confirmed one.
+    Set,
 }
 
 impl GlobalAction {
-    pub const NAMES: &'static [&'static str] = &["get", "list", "walk"];
+    pub const NAMES: &'static [&'static str] = &["get", "list", "walk", "set"];
 
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_lowercase().as_str() {
             "get" => Some(GlobalAction::Get),
             "list" => Some(GlobalAction::List),
             "walk" => Some(GlobalAction::Walk),
+            "set" => Some(GlobalAction::Set),
             _ => None,
         }
     }
@@ -526,6 +543,19 @@ impl GlobalAction {
             GlobalAction::Get => "get",
             GlobalAction::List => "list",
             GlobalAction::Walk => "walk",
+            GlobalAction::Set => "set",
+        }
+    }
+
+    /// Whether this action changes the global.
+    ///
+    /// Written as an exhaustive match with no `_` arm, so a later action cannot be added without
+    /// deciding this. The read actions were classified here rather than by a `!= Set` test for
+    /// the same reason: a negative test silently classifies whatever arrives next as a read.
+    pub fn is_write(&self) -> bool {
+        match self {
+            GlobalAction::Get | GlobalAction::List | GlobalAction::Walk => false,
+            GlobalAction::Set => true,
         }
     }
 }
@@ -533,8 +563,9 @@ impl GlobalAction {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct IrisGlobalParams {
-    /// get, list or walk. Read actions only — this build does not write or kill.
-    #[schemars(extend("enum" = ["get", "list", "walk"]))]
+    /// get, list, walk or set. Removal is not an action here: it goes through `global_preview`
+    /// and `global_kill`, which name what is about to be deleted before deleting it.
+    #[schemars(extend("enum" = ["get", "list", "walk", "set"]))]
     pub action: String,
     /// The global, with or without its leading `^`. Subscripts go in `subscripts`, not here.
     pub global_name: String,
@@ -553,6 +584,10 @@ pub struct IrisGlobalParams {
     pub after_subscript: Option<serde_json::Value>,
     /// walk: resume after this node, passing back a previous page's `resume_after` verbatim.
     pub after_node: Option<String>,
+    /// set: the value to write. Any bytes — quotes, carets, line feeds, accents — are data and
+    /// are escaped on the way in. Required for `set` and refused for the read actions, rather
+    /// than ignored there, because a value silently dropped reads as a write that happened.
+    pub value: Option<String>,
 }
 
 /// A validated request plus the ObjectScript that answers it.
@@ -571,20 +606,21 @@ pub struct ReadPlan {
 /// code and the message, in that order.
 pub fn plan_read(p: &IrisGlobalParams) -> Result<ReadPlan, (&'static str, String)> {
     let Some(action) = GlobalAction::parse(&p.action) else {
+        return Err(unknown_action(&p.action));
+    };
+    if action.is_write() {
         return Err((
-            "INVALID_ACTION",
+            INVALID_PARAMS,
             format!(
-                "'{}' is not an action of iris_global. Valid actions: {}. This build reads only — \
-                 set and kill are not implemented here.",
-                p.action,
-                GlobalAction::NAMES.join(", ")
+                "action={} writes and does not belong on the read path",
+                action.as_str()
             ),
         ));
-    };
+    }
 
     let name = normalize_global_name(&p.global_name);
     if let Some(why) = global_name_error(&name) {
-        return Err(("INVALID_GLOBAL_NAME", why));
+        return Err((INVALID_GLOBAL_NAME, why));
     }
 
     let subscripts: Vec<Subscript> = p
@@ -600,7 +636,7 @@ pub fn plan_read(p: &IrisGlobalParams) -> Result<ReadPlan, (&'static str, String
     // repeats a page.
     if action != GlobalAction::Walk && p.after_node.is_some() {
         return Err((
-            "INVALID_PARAMS",
+            INVALID_PARAMS,
             format!(
                 "after_node resumes a walk; action={} pages with after_subscript",
                 action.as_str()
@@ -609,7 +645,7 @@ pub fn plan_read(p: &IrisGlobalParams) -> Result<ReadPlan, (&'static str, String
     }
     if action != GlobalAction::List && p.after_subscript.is_some() {
         return Err((
-            "INVALID_PARAMS",
+            INVALID_PARAMS,
             format!(
                 "after_subscript resumes a list; action={} pages with after_node",
                 action.as_str()
@@ -634,6 +670,14 @@ pub fn plan_read(p: &IrisGlobalParams) -> Result<ReadPlan, (&'static str, String
             p.max_nodes.unwrap_or(100),
             p.after_node.as_deref(),
         ),
+        // Unreachable: `is_write` above returns early. Spelled out rather than `unreachable!()`
+        // so that adding an action forces a decision here instead of a panic in production.
+        GlobalAction::Set => {
+            return Err((
+                INVALID_PARAMS,
+                "action=set writes and does not belong on the read path".to_string(),
+            ))
+        }
     };
 
     Ok(ReadPlan { action, name, code })
@@ -646,7 +690,7 @@ pub fn plan_read(p: &IrisGlobalParams) -> Result<ReadPlan, (&'static str, String
 /// global is empty" unless the failure is named.
 pub fn unreadable(detail: &str) -> (&'static str, String) {
     (
-        "IRIS_UNREADABLE_OUTPUT",
+        IRIS_UNREADABLE_OUTPUT,
         format!(
             "IRIS answered, but the reply could not be read, so what is in this global is UNKNOWN \
              — this is not an empty result: {detail}"
@@ -714,4 +758,513 @@ pub fn walk_json(page: &WalkPage, namespace: &str) -> serde_json::Value {
         "stopped_because": page.end.wire_code(),
         "resume_after": page.resume_after,
     })
+}
+
+// ─── writing one node ────────────────────────────────────────────────────────────────────────
+//
+// #532's write half. The read actions above needed no opinion about WHICH global they touched;
+// a write does, and the opinion is not a taste question. `envelope.rs:233-237` records a measured
+// run in which a model wrote `Kill ^%Dictionary(...)`, `Set ^SYS("Compile","Names",...)` and
+// `Kill ^oddDEF(...)` into a working namespace across 29 tool calls while chasing a phantom
+// SearchTable registration. Those three names are the class dictionary, the compiler's own state
+// and the routine index: writing them corrupts the namespace in ways no later tool call can
+// explain. So the gate ships WITH the write, not after it.
+//
+// Upstream has such a list and it is not the thing to copy. Two reasons, both read from its
+// source at `v1.6.2`:
+//
+//  1. It is bypassable exactly where it matters. `system_blocklist_gate.rs:27-29` returns `None`
+//     — no refusal — BEFORE consulting the list when `is_kill_op && matches_any_owned(name,
+//     kill_allowlist)`, and that allowlist is the operator-settable config key
+//     `dataPolicyKillAllowlist`. The module's own doc comment says "Not bypassable by any config"
+//     and its remediation string says "No configuration override exists". Both are false for the
+//     destructive operation. An exemption that fires only for `kill` is not a narrowing of the
+//     guard; it is a hole in it.
+//  2. It is a prefix match over a flat list, which upstream's own comments record having to
+//     narrow twice: `^SYS*` swallowed `^SYSCONFIG` and `^SYSDATA`, and `^IRIS.Sys*` swallowed
+//     `^IRIS.SystemPerformance`. A prefix is the wrong shape for a dotted namespace.
+//
+// So this is a segment test, not a prefix test, and it has no override.
+
+/// The refusal codes this module emits, as constants.
+///
+/// Declared rather than written inline because `tests/every_refusal_names_a_remedy.rs` finds a
+/// tool's codes by scanning for `const NAME: &str = "VALUE";` and cannot see one returned as a
+/// tuple literal. `INVALID_GLOBAL_NAME` and `IRIS_UNREADABLE_OUTPUT` have been live since #550
+/// with no remedy row for exactly that reason — invisible to the gate is not absent from the wire.
+pub const INVALID_ACTION: &str = "INVALID_ACTION";
+pub const INVALID_GLOBAL_NAME: &str = "INVALID_GLOBAL_NAME";
+pub const INVALID_PARAMS: &str = "INVALID_PARAMS";
+pub const IRIS_UNREADABLE_OUTPUT: &str = "IRIS_UNREADABLE_OUTPUT";
+pub const SYSTEM_GLOBAL_WRITE_REFUSED: &str = "SYSTEM_GLOBAL_WRITE_REFUSED";
+pub const GLOBAL_FAMILY_UNDETERMINED: &str = "GLOBAL_FAMILY_UNDETERMINED";
+pub const WRITE_DID_NOT_LAND: &str = "WRITE_DID_NOT_LAND";
+
+/// Globals whose whole name is reserved. Matched entire, not as a prefix.
+///
+/// `SYS` is here rather than in [`RESERVED_SEGMENTS`] deliberately: `^SYS` is the compiler's state
+/// and must be refused, while `^SYSCONFIG` and `^SYSDATA` are ordinary application globals that a
+/// prefix test would swallow — the narrowing upstream had to make after shipping.
+pub const RESERVED_EXACT: &[&str] = &[
+    "SYS",
+    "ROUTINE",
+    "rINDEX",
+    "rINDEXEXT",
+    "rMAP",
+    "rOBJ",
+    "rBACKUP",
+    "FilterAlerts",
+    "UnitTestRoot",
+];
+
+/// Globals whose FIRST dot-separated segment is reserved. `Ens` refuses `^Ens.MessageHeaderD` and
+/// `^Ens`, and leaves `^Ensayo` alone — which a `^Ens*` prefix test would not.
+///
+/// `IPM`, `AQDev` and `UnitTest` are not in InterSystems' published reserved list and are here on
+/// measurement: they are writable on a stock instance, they are nobody's application data, and
+/// `^IPM.*` is the package manager's own catalogue. `Ens*` is the interop surface this fork exists
+/// to serve, so a write landing there is the most expensive mistake available here.
+pub const RESERVED_SEGMENTS: &[&str] = &[
+    "Ens",
+    "EnsLib",
+    "EnsPortal",
+    "EnsEDI",
+    "EnsHL7",
+    "EnsiHL7",
+    "IRIS",
+    "IPM",
+    "AQDev",
+    "UnitTest",
+    "CacheTemp",
+    "CacheTempEns",
+    "IRISTemp",
+    "ISC",
+];
+
+/// `name` up to its first period. `"Ens.MessageHeaderD"` → `"Ens"`, `"IIDTest"` → `"IIDTest"`.
+pub fn first_segment(name: &str) -> &str {
+    name.split('.').next().unwrap_or(name)
+}
+
+/// True when `name` is `odd` followed by an upper-case letter, or `odd` alone.
+///
+/// The class dictionary globals are `^oddDEF`, `^oddCOM`, `^oddSQL`, `^oddPROJECT`, `^oddMETA`,
+/// `^oddBIX`, `^oddEXT`, `^oddXML`, `^oddTSQL` — `odd` plus an upper-case tag, every one. Testing
+/// for the bare prefix would also refuse `^oddments`, which is somebody's data.
+pub fn is_class_dictionary(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("odd") else {
+        return false;
+    };
+    rest.is_empty() || rest.starts_with(|c: char| c.is_ascii_uppercase())
+}
+
+/// The same SHAPE with the `odd` spelled in any case: `^OddDEF`, `^ODDDEF`, `^oddDEF`.
+///
+/// Separate from [`is_class_dictionary`] because the case-folded test cannot be "lowercase it and
+/// re-run the strict test" — lowercasing destroys the upper-case tag the strict test keys on, so
+/// `^OddDEF` came back ALLOWED. The shape is what survives case folding: three letters spelling
+/// `odd`, then a tag that begins upper-case. `^oddments` has a lower-case remainder and is a word,
+/// so it is not this shape in any casing.
+pub fn resembles_class_dictionary(name: &str) -> bool {
+    let Some(head) = name.get(..3) else {
+        return false;
+    };
+    if !head.eq_ignore_ascii_case("odd") {
+        return false;
+    }
+    let rest = &name[3..];
+    rest.is_empty() || rest.starts_with(|c: char| c.is_ascii_uppercase())
+}
+
+/// Whether a write to this global may proceed.
+///
+/// Three answers, not two. The third exists because the second would otherwise absorb it: IRIS
+/// global names are CASE-SENSITIVE, so `^ENS.Foo` is a different global from `^Ens.Foo` and this
+/// code cannot know whether the caller meant the reserved family or has a global of their own that
+/// differs from it only in case. Answering "allowed" there would let a mis-cased write through to
+/// the interop surface; answering "refused" would state a fact about the name that is not
+/// established. So it says it cannot tell, and refuses on that basis, naming what it resembles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteVerdict {
+    /// No reserved family matches, in any casing.
+    Allowed,
+    /// A reserved family matches exactly. `family` is the matched rule, for the message.
+    Refused { family: String, why: String },
+    /// Matches a reserved family only when letter case is ignored, so whether this is that global
+    /// is UNKNOWN. Refused, but as a different answer with a different remedy.
+    Undetermined { resembles: String, why: String },
+}
+
+impl WriteVerdict {
+    pub fn is_allowed(&self) -> bool {
+        matches!(self, WriteVerdict::Allowed)
+    }
+
+    /// The `(code, message)` pair for a verdict that refuses, or `None` for [`WriteVerdict::Allowed`].
+    pub fn refusal(&self) -> Option<(&'static str, String)> {
+        match self {
+            WriteVerdict::Allowed => None,
+            WriteVerdict::Refused { why, .. } => Some((SYSTEM_GLOBAL_WRITE_REFUSED, why.clone())),
+            WriteVerdict::Undetermined { why, .. } => {
+                Some((GLOBAL_FAMILY_UNDETERMINED, why.clone()))
+            }
+        }
+    }
+}
+
+/// Classify `name` (already `^`-stripped and validated) against the reserved families.
+///
+/// There is no configuration override, and that is the point of the comment at the top of this
+/// section. A gate with an operator escape hatch for the destructive operation is upstream's
+/// shape, and upstream's own guarantee text is false because of it.
+pub fn write_verdict(name: &str) -> WriteVerdict {
+    // `%z` and `%Z` are reserved for the CUSTOMER, not for InterSystems, so they are the one
+    // exemption inside the `%` family and it is an exemption in the permissive direction only.
+    if let Some(rest) = name.strip_prefix('%') {
+        if rest.starts_with('z') || rest.starts_with('Z') {
+            return WriteVerdict::Allowed;
+        }
+        return WriteVerdict::Refused {
+            family: "%".to_string(),
+            why: format!(
+                "'^{name}' is in the % family, which is InterSystems' own: these globals are \
+                 mapped to the system database and hold the class dictionary, the SQL catalogue \
+                 and instance configuration. Writing one corrupts state no later tool call can \
+                 repair. There is no configuration override for this refusal. Your own globals in \
+                 that family are ^%z… and ^%Z…, which are allowed."
+            ),
+        };
+    }
+
+    if is_class_dictionary(name) {
+        return WriteVerdict::Refused {
+            family: "odd*".to_string(),
+            why: format!(
+                "'^{name}' is a class dictionary global. The compiler owns it: ^oddDEF holds class \
+                 definitions, ^oddCOM the compiled forms, ^oddSQL the SQL projections. Writing one \
+                 leaves classes that cannot be compiled or deleted. Change the class with \
+                 iris_doc(mode=put) and iris_compile instead."
+            ),
+        };
+    }
+
+    if RESERVED_EXACT.contains(&name) {
+        return WriteVerdict::Refused {
+            family: name.to_string(),
+            why: format!(
+                "'^{name}' is a reserved global owned by IRIS itself — the routine index, the \
+                 compiler's state or the unit-test harness's root. Writing it corrupts namespace \
+                 state. There is no configuration override for this refusal."
+            ),
+        };
+    }
+
+    let seg = first_segment(name);
+    if RESERVED_SEGMENTS.contains(&seg) {
+        return WriteVerdict::Refused {
+            family: format!("{seg}.*"),
+            why: format!(
+                "'^{name}' is in the ^{seg} family, which IRIS and the interoperability framework \
+                 own: message headers, bodies, queues, business-host state and the package \
+                 manager's catalogue live there. A write lands in running interop state rather \
+                 than in application data. Use the interop tools — iris_interop_query, \
+                 iris_production_item, iris_lookup_manage — which understand that state. There is \
+                 no configuration override for this refusal."
+            ),
+        };
+    }
+
+    // Same tests again, case-folded. A hit here means the name RESEMBLES a reserved family without
+    // being it, and IRIS would treat the two as different globals.
+    let folded = name.to_ascii_lowercase();
+    let folded_seg = first_segment(&folded);
+    let resembles = RESERVED_EXACT
+        .iter()
+        .find(|r| r.to_ascii_lowercase() == folded)
+        .or_else(|| {
+            RESERVED_SEGMENTS
+                .iter()
+                .find(|r| r.to_ascii_lowercase() == folded_seg)
+        });
+    if let Some(r) = resembles {
+        return WriteVerdict::Undetermined {
+            resembles: (*r).to_string(),
+            why: format!(
+                "'^{name}' differs from the reserved global ^{r} only in letter case. IRIS global \
+                 names are case-sensitive, so these may well be two different globals and yours \
+                 may be perfectly ordinary — but this call cannot establish which you meant, and \
+                 guessing either way is a statement about your data that has not been checked. \
+                 Nothing was written. If ^{name} really is your own, read it first with \
+                 action=get to confirm it is the global you expect."
+            ),
+        };
+    }
+    if resembles_class_dictionary(name) {
+        return WriteVerdict::Undetermined {
+            resembles: "odd*".to_string(),
+            why: format!(
+                "'^{name}' differs from the class dictionary family ^odd… only in letter case. \
+                 IRIS global names are case-sensitive, so this may be your own global — but this \
+                 call cannot establish that, and a write to the real ^oddDEF leaves classes that \
+                 cannot be compiled. Nothing was written. Read it first with action=get to confirm."
+            ),
+        };
+    }
+
+    WriteVerdict::Allowed
+}
+
+/// The refusal for an action this tool does not have.
+///
+/// One builder for all three planners rather than three copies of the same `format!`, which is the
+/// house rule the comment at `skills_tools.rs:304-328` states for `resolve_namespace`.
+///
+/// A caller who asked to remove a global is told which tools remove one. Without that, the refusal
+/// says only "not an action", the caller reads it as a typo, and retries the same call — the thing
+/// `denial-text` discipline is for: name the remedy, not just the rejection.
+pub fn unknown_action(requested: &str) -> (&'static str, String) {
+    let asked_to_remove = matches!(
+        requested.trim().to_lowercase().as_str(),
+        "kill" | "delete" | "remove" | "clear" | "zkill"
+    );
+    let mut msg = format!(
+        "'{}' is not an action of iris_global. Valid actions: {}.",
+        requested,
+        GlobalAction::NAMES.join(", ")
+    );
+    if asked_to_remove {
+        msg.push_str(
+            " Removing a global is deliberately NOT an action here: call global_preview to see \
+             exactly which nodes would go, then global_kill with the token it returns. That way a \
+             deletion is never one call away from a typo, and the preview cannot under-report what \
+             the kill removes.",
+        );
+    }
+    (INVALID_ACTION, msg)
+}
+
+/// Write one node, and report what `$DATA` said before and after.
+///
+/// The success oracle is the re-read, not an echoed literal. Upstream decides a kill worked with
+/// `out.trim().contains("KILLED")` against a string its own generated code wrote unconditionally —
+/// which reports success for any path that reaches the `Write`. Here the final `$DATA` is read
+/// back out of IRIS after the `Set`, so "the write landed" is a measurement. A `Set` that aborts
+/// never reaches the trailing writes at all, the field count comes up short, and
+/// [`parse_set_output`] reports that rather than inventing a node.
+///
+/// `prior` is carried because "created" and "overwrote" are different events and the caller cannot
+/// recover the difference afterwards.
+pub fn build_set_code(name: &str, subscripts: &[Subscript], value: &str) -> String {
+    let gref = build_global_ref(name, subscripts);
+    [
+        format!(" Set pr = $Data({gref})"),
+        format!(
+            " Set {} = {}",
+            gref,
+            crate::objectscript::os_str_expr(value)
+        ),
+        format!(" Set st = $Data({gref})"),
+        format!(" Set nm = $Name({gref})"),
+        r#" Write $Length(pr)_":"_pr"#.to_string(),
+        r#" Write $Length(st)_":"_st"#.to_string(),
+        r#" Write $Length(nm)_":"_nm,$Char(10)"#.to_string(),
+    ]
+    .join("\n")
+}
+
+/// What a `set` did, read back from IRIS rather than assumed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetReport {
+    /// IRIS's own `$NAME` of the node that was written.
+    pub name: String,
+    /// `$DATA` before the write.
+    pub prior: NodeData,
+    /// `$DATA` after the write. A node that was just given a value always has one, so a `current`
+    /// without a value is a failed write, not a node with no value.
+    pub current: NodeData,
+}
+
+impl SetReport {
+    /// True when the node had no value of its own before this write.
+    ///
+    /// Read off `prior`, so a node that already had children but no value reports `created` —
+    /// which is what happened to its value, and the children are reported separately.
+    pub fn created(&self) -> bool {
+        !self.prior.has_value()
+    }
+}
+
+/// Decode [`build_set_code`]'s three fields.
+///
+/// A short read is an error. The write may or may not have landed, and that is exactly what this
+/// says: the alternative — filling in a plausible `current` — would report a node this code never
+/// saw.
+pub fn parse_set_output(raw: &str) -> Result<SetReport, String> {
+    let fields = crate::tools::interop::parse_length_prefixed_entries(raw)?;
+    if fields.len() != 3 {
+        return Err(format!(
+            "a node write returns exactly 3 fields (prior status, new status, name); got {} from \
+             {raw:?}. Whether the write landed is UNKNOWN — read the node with action=get",
+            fields.len()
+        ));
+    }
+    let parse_code = |s: &str| -> Result<NodeData, String> {
+        let code: u8 = s
+            .trim()
+            .parse()
+            .map_err(|_| format!("'{s}' is not a $DATA value"))?;
+        data_status_from_code(code)
+            .ok_or_else(|| format!("$DATA returned {code}, which is not one of 0, 1, 10 or 11"))
+    };
+    let prior = parse_code(&fields[0])?;
+    let current = parse_code(&fields[1])?;
+    Ok(SetReport {
+        name: fields[2].clone(),
+        prior,
+        current,
+    })
+}
+
+/// A validated write request plus the ObjectScript that performs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WritePlan {
+    pub action: GlobalAction,
+    pub name: String,
+    pub code: String,
+}
+
+/// Either half of [`plan`], so a caller holding one knows which it has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GlobalPlan {
+    Read(ReadPlan),
+    Write(WritePlan),
+}
+
+/// Validate a write and generate its code, without touching IRIS.
+///
+/// Refuses before anything is spliced, in this order: the action must be a write, the name must be
+/// a name, the name must not be reserved, and a `set` must carry a value. The blocklist is
+/// consulted HERE rather than at the transport layer so that it is decided in the same place as
+/// every other refusal and is testable without an instance.
+pub fn plan_write(p: &IrisGlobalParams) -> Result<WritePlan, (&'static str, String)> {
+    let Some(action) = GlobalAction::parse(&p.action) else {
+        return Err(unknown_action(&p.action));
+    };
+    if !action.is_write() {
+        return Err((
+            INVALID_PARAMS,
+            format!(
+                "action={} is a read and does not belong on the write path",
+                action.as_str()
+            ),
+        ));
+    }
+
+    let name = normalize_global_name(&p.global_name);
+    if let Some(why) = global_name_error(&name) {
+        return Err((INVALID_GLOBAL_NAME, why));
+    }
+    if let Some(refusal) = write_verdict(&name).refusal() {
+        return Err(refusal);
+    }
+
+    let Some(value) = p.value.as_deref() else {
+        return Err((
+            INVALID_PARAMS,
+            "action=set requires a 'value'. To remove a node use global_preview and global_kill, \
+             which confirm what is being deleted; a set with no value would otherwise be a quiet \
+             way to blank one."
+                .to_string(),
+        ));
+    };
+
+    if p.after_node.is_some() || p.after_subscript.is_some() {
+        return Err((
+            INVALID_PARAMS,
+            "after_node and after_subscript page a read; a write addresses one node".to_string(),
+        ));
+    }
+
+    let subscripts: Vec<Subscript> = p
+        .subscripts
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(Subscript::from_json)
+        .collect();
+
+    Ok(WritePlan {
+        action,
+        name: name.clone(),
+        code: build_set_code(&name, &subscripts, value),
+    })
+}
+
+/// Route a request to the read or the write planner by its action.
+///
+/// One parse of the action for the whole call, so a request cannot be read as one action here and
+/// another there.
+pub fn plan(p: &IrisGlobalParams) -> Result<GlobalPlan, (&'static str, String)> {
+    match GlobalAction::parse(&p.action) {
+        Some(a) if a.is_write() => plan_write(p).map(GlobalPlan::Write),
+        Some(_) => plan_read(p).map(GlobalPlan::Read),
+        None => Err(unknown_action(&p.action)),
+    }
+}
+
+/// Render a completed write.
+///
+/// `created` and the two `$DATA` states are all reported, because "I set a node that did not
+/// exist" and "I overwrote a value" are different outcomes and the caller cannot tell them apart
+/// from the new state alone.
+pub fn set_json(r: &SetReport, namespace: &str) -> serde_json::Value {
+    serde_json::json!({
+        "success": true,
+        "action": "set",
+        "namespace": namespace,
+        "name": r.name,
+        "created": r.created(),
+        "previous_data": r.prior.code(),
+        "previous_data_meaning": r.prior.meaning(),
+        "data": r.current.code(),
+        "data_meaning": r.current.meaning(),
+        "has_children": r.current.has_children(),
+    })
+}
+
+/// Decide what a completed `set` means, as a pure function.
+///
+/// This lives here rather than in the dispatch for a reason a mutation test makes concrete: a
+/// mutant that neuters the read-back check inside `call_tool` SURVIVES, because that branch needs
+/// a live connection to reach and no offline test can get there. Moved here, the same break is
+/// killed by `a_write_whose_read_back_is_absent_is_refused_not_reported`. The transport layer is
+/// left with no judgement to make, which is what `plan_read`'s doc comment already claims for the
+/// read half.
+pub fn set_outcome(
+    r: &SetReport,
+    namespace: &str,
+) -> Result<serde_json::Value, (&'static str, String)> {
+    if !r.current.has_value() {
+        return Err(write_did_not_land(r));
+    }
+    Ok(set_json(r, namespace))
+}
+
+/// The refusal for a write whose read-back says nothing is there.
+///
+/// Reachable only if IRIS accepted the `Set`, answered all three fields, and still reports
+/// `$DATA` without a value. That should be impossible; if it happens the honest answer is that the
+/// write did not land, not a success envelope describing a node with no value in it.
+pub fn write_did_not_land(r: &SetReport) -> (&'static str, String) {
+    (
+        WRITE_DID_NOT_LAND,
+        format!(
+            "the Set was accepted but reading '{}' back reports $DATA={} ({}), so the value is \
+             NOT there — this is not a successful write. Check the namespace is writable and that \
+             no mapping sends this global to a read-only database.",
+            r.name,
+            r.current.code(),
+            r.current.meaning()
+        ),
+    )
 }

@@ -515,13 +515,18 @@ impl Toolset {
 ///    capability, not a gap. Reading the excluded list as a to-do would have re-added a tool the
 ///    owner declined.
 ///
-/// `iris_global` arrives here with #532, READ ACTIONS ONLY — `get`, `list` and `walk`. Its
-/// `tools-excluded.json` entry keeps the interop verdict `unsafe-here` verbatim and adds a
-/// `profiles.routines` override, because the interop reason is about writing under the class layer
-/// and this profile's code has no class layer to write under.
+/// `iris_global` arrives here with #532: `get`, `list` and `walk` read, and `set` writes ONE
+/// node. Its `tools-excluded.json` entry keeps the interop verdict `unsafe-here` verbatim and adds
+/// a `profiles.routines` override, because the interop reason is about writing under the class
+/// layer and this profile's code has no class layer to write under. The write carries the
+/// system-global refusal with it rather than after it — see the comment above `write_verdict` in
+/// `tools/global.rs` for the measured run that justifies that ordering.
 ///
-/// NOT here yet, deliberately: `global_preview` and `global_kill`, which arrive with the write
-/// actions and the system-global blocklist in the second half of #532, and the terminal
+/// Removal is deliberately NOT an action on it. `global_preview` and `global_kill` arrive next, so
+/// there is exactly one destructive path and it is the confirmed one; an untokened `kill` action
+/// sitting beside a token-requiring `global_kill` is upstream's shape, and the split is the hole.
+///
+/// NOT here yet, deliberately: `global_preview` and `global_kill` themselves, and the terminal
 /// (`iris_ws_*`) with #535. Listing a tool the router does not register would make
 /// `test_routines_toolset_exact` fail, which is the correct outcome and the reason the list is not
 /// written ahead of the code.
@@ -546,7 +551,8 @@ pub const ROUTINES_TOOLS: &[&str] = &[
     "iris_table_info",
     // ── reading what is already there ──
     // #532: a legacy routine addresses its data as globals directly, so reading them is not an
-    // escape hatch here — it is the data layer. Read actions only.
+    // escape hatch here — it is the data layer. Writing one node is in scope for the same reason;
+    // removing a subtree is not, and goes through global_preview + global_kill instead.
     "iris_global",
     "compare_document",
     "compare_namespace",
@@ -5256,7 +5262,7 @@ pub(crate) fn mutating_call(tool: &str, args: &serde_json::Value) -> Option<&'st
         // class in the namespace. So this is read-only about the GLOBAL and not about the
         // instance. Opening a second rule for globals is what #303 exists to decide; until then
         // this follows the precedent rather than inventing an exception for the newest tool.
-        "iris_global" => Some("read a global through a compiled scratch class"),
+        "iris_global" => Some("read or write a global through a compiled scratch class"),
         // Every action of this tool writes a credential.
         // DELIBERATELY ABSENT: stream_inspect (#352) and compare_namespace / compare_document
         // (#351). All three only read — two SELECTs and a GET between them — so none is write-gated.
@@ -7423,7 +7429,7 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
     }
 
     #[tool(
-        description = "Read IRIS GLOBALS directly — the data layer legacy ObjectScript routines actually use. `routines` profile only (#532). THREE READ ACTIONS, no writes: `get` one node, `list` one level of subscripts, `walk` a bounded subtree. action=set and action=kill are NOT implemented by this build and are refused by name. Pass `subscripts` as a JSON ARRAY OF VALUES, never as a pre-built reference: a NUMBER addresses the numeric subscript and a STRING addresses that exact string, and every string is rendered with ObjectScript quoting, so a comma, a quote, a caret, an accent or a control character inside a key is DATA and not syntax — `[\"X\", \"ACME, INC.\", 1]` is three subscripts. Note IRIS canonicalises a canonic numeric string, so `\"1\"` and `1` are the SAME node; a non-canonic one such as `\"01\"`, `\"1.0\"` or `\"-0\"` is a DIFFERENT, string-subscripted node, which is why the distinction is preserved rather than normalised away. Every node reports `$DATA` as a NUMBER (0, 1, 10 or 11) plus `data_meaning`, `has_value` and `has_children`, because `$GET` returns the empty string both for a node whose value IS empty and for a node that has children and NO value of its own: `value: \"\"` with `has_value: true` is an empty value, `value: null` with `has_value: false` is no value, and collapsing those is the bug this replaces. `list` and `walk` are PAGED and say why they stopped: `complete` plus `stopped_because` of `done` (that is all of it), `cap` (the node/subscript limit — ask for the next page) or `time` (the walk ran out of its 5-second budget, so how much remains is UNKNOWN — narrow the subtree rather than paging blindly). A truncated or unreadable reply is an ERROR naming the global, never an empty result, because \"this global is empty\" and \"I could not read this global\" are different answers. Resume with `after_subscript` (list) or by passing a previous page's `resume_after` back as `after_node` (walk) — never by rebuilding the reference yourself. Extended references (`^|\"NS\"|G`) are refused: pass the target namespace in `namespace`. namespace: optional, defaults to the connection namespace."
+        description = "Read and write IRIS GLOBALS directly \u{2014} the data layer legacy ObjectScript routines actually use. `routines` profile only (#532). FOUR ACTIONS: `get` one node, `list` one level of subscripts, `walk` a bounded subtree, `set` one node's value. REMOVAL IS NOT AN ACTION HERE: use `global_preview` then `global_kill`, which name what is about to be deleted before deleting it, so there is exactly one destructive path and it is the confirmed one. Pass `subscripts` as a JSON ARRAY OF VALUES, never as a pre-built reference: a NUMBER addresses the numeric subscript and a STRING addresses that exact string, and every string is rendered with ObjectScript quoting, so a comma, a quote, a caret, an accent or a control character inside a key is DATA and not syntax \u{2014} `[\"X\", \"ACME, INC.\", 1]` is three subscripts. The same is true of `value`: any bytes are data and are escaped on the way in. Note IRIS canonicalises a canonic numeric string, so `\"1\"` and `1` are the SAME node; a non-canonic one such as `\"01\"`, `\"1.0\"` or `\"-0\"` is a DIFFERENT, string-subscripted node, which is why the distinction is preserved rather than normalised away. Every node reports `$DATA` as a NUMBER (0, 1, 10 or 11) plus `data_meaning`, `has_value` and `has_children`, because `$GET` returns the empty string both for a node whose value IS empty and for a node that has children and NO value of its own: `value: \"\"` with `has_value: true` is an empty value, `value: null` with `has_value: false` is no value, and collapsing those is the bug this replaces. `set` reports `created` plus the `$DATA` before and after, read back OUT of IRIS after the write rather than assumed from the fact that IRIS accepted the statement \u{2014} so a write that did not land is reported as WRITE_DID_NOT_LAND, not as a success. A write to a RESERVED global is refused: the % family (except your own ^%z\u{2026} and ^%Z\u{2026}), the ^odd\u{2026} class dictionary, ^SYS, ^ROUTINE, ^rINDEX/^rMAP/^rOBJ, and the ^Ens/^EnsLib/^IRIS/^IPM/^AQDev/^UnitTest families \u{2014} with SYSTEM_GLOBAL_WRITE_REFUSED and no configuration override. A name that differs from one of those only in LETTER CASE is refused separately as GLOBAL_FAMILY_UNDETERMINED, because IRIS global names are case-sensitive and this call cannot establish which global you meant. `list` and `walk` are PAGED and say why they stopped: `complete` plus `stopped_because` of `done` (that is all of it), `cap` (the node/subscript limit \u{2014} ask for the next page) or `time` (the walk ran out of its 5-second budget, so how much remains is UNKNOWN \u{2014} narrow the subtree rather than paging blindly). A truncated or unreadable reply is an ERROR naming the global, never an empty result, because \"this global is empty\" and \"I could not read this global\" are different answers. Resume with `after_subscript` (list) or by passing a previous page's `resume_after` back as `after_node` (walk) \u{2014} never by rebuilding the reference yourself. Extended references (`^|\"NS\"|G`) are refused: pass the target namespace in `namespace`. namespace: optional, defaults to the connection namespace."
     )]
     async fn iris_global(
         &self,
@@ -7436,16 +7442,23 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
 
         // Everything that can be wrong about the request is decided here, with no instance
         // involved, so a bad parameter never costs a scratch-class compile.
-        let plan = match global::plan_read(&p) {
+        let plan = match global::plan(&p) {
             Ok(plan) => plan,
             Err((code, msg)) => {
                 self.record_call("iris_global", false);
                 return envelope::fail(code, &msg);
             }
         };
+        // One parse of the action for the whole call. The read and write plans carry the same
+        // three fields; taking them here keeps the transport below identical for both, so a write
+        // cannot acquire a different abort check or a different failure envelope by accident.
+        let (action, plan_name, plan_code) = match &plan {
+            global::GlobalPlan::Read(r) => (r.action, r.name.clone(), r.code.clone()),
+            global::GlobalPlan::Write(w) => (w.action, w.name.clone(), w.code.clone()),
+        };
 
         let output = match iris
-            .execute_via_generator(&plan.code, &namespace, client)
+            .execute_via_generator(&plan_code, &namespace, client)
             .await
         {
             Ok(o) => o,
@@ -7461,18 +7474,28 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
         // empty" — a failure wearing the shape of an answer.
         if let Some(abort) = runtime_abort_line(&output) {
             self.record_call("iris_global", false);
-            return envelope::fail(
-                "IRIS_RUNTIME_ERROR",
-                &format!(
+            // The two aborts need different words. A failed READ must not read as an empty
+            // global; a failed WRITE must not read as a completed one, and it additionally has to
+            // say that whether anything landed is unknown — the abort can have come after the Set.
+            let msg = if action.is_write() {
+                format!(
+                    "writing ^{} in {namespace} failed, and whether the value landed is UNKNOWN \
+                     — this is not a completed write: {abort}. Read the node with action=get \
+                     before retrying.",
+                    plan_name
+                )
+            } else {
+                format!(
                     "reading ^{} in {namespace} failed, so what it holds is UNKNOWN — this is \
                      not an empty global: {abort}",
-                    plan.name
-                ),
-            );
+                    plan_name
+                )
+            };
+            return envelope::fail("IRIS_RUNTIME_ERROR", &msg);
         }
 
         let parsed =
-            match plan.action {
+            match action {
                 global::GlobalAction::Get => global::parse_get_output(&output).map(|n| {
                     serde_json::json!({
                         "success": true,
@@ -7485,6 +7508,22 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                     .map(|page| global::list_json(&page, &namespace)),
                 global::GlobalAction::Walk => global::parse_walk_output(&output)
                     .map(|page| global::walk_json(&page, &namespace)),
+                // The write's success oracle is the read-back, not the fact that IRIS accepted
+                // the statement. A node that was just given a value always has one, so a
+                // `current` without a value means the write did not land, and saying so is the
+                // only honest answer available — issue #465 was a refused DELETE reported as a
+                // completed clean-up, which is this same shape one tool over.
+                global::GlobalAction::Set => match global::parse_set_output(&output) {
+                    // `set_outcome` holds the judgement, so it is reachable from an offline test.
+                    Ok(r) => match global::set_outcome(&r, &namespace) {
+                        Ok(body) => Ok(body),
+                        Err((code, msg)) => {
+                            self.record_call("iris_global", false);
+                            return envelope::fail(code, &msg);
+                        }
+                    },
+                    Err(detail) => Err(detail),
+                },
             };
 
         match parsed {

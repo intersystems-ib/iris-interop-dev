@@ -1,4 +1,9 @@
-//! #532 e2e: `iris_global`'s reads against a live instance, with IRIS itself as the authority.
+//! #532 e2e: `iris_global` against a live instance, with IRIS itself as the authority.
+//!
+//! Renamed from `global_read_e2e.rs` when the write half landed. The old name was about to
+//! become the thing this repo keeps catching itself doing: a file whose guarantee is narrower
+//! than its contents, so a reader checking "is the write path covered end to end?" sees a name
+//! that says no and stops looking.
 //!
 //! The unit tests pin the wire format and the addressing rules against hand-written strings. What
 //! they cannot show is that IRIS agrees — that a comma inside a subscript really addresses the
@@ -175,7 +180,7 @@ fn require_iris() -> String {
 
 #[test]
 #[ignore = "requires live IRIS"]
-fn a_global_read_reports_what_iris_actually_holds() {
+fn iris_global_agrees_with_what_iris_actually_holds() {
     require_iris();
     let ns = namespace();
 
@@ -258,6 +263,69 @@ fn a_global_read_reports_what_iris_actually_holds() {
         serde_json::json!({"action":"walk","global_name":"IIDTest","subscripts":["parent"],"namespace":ns}),
     ));
     // Tear the fixtures down whatever the assertions below decide.
+    // ── the write half (#532 part two) ──────────────────────────────────────────────────
+    // A value and a subscript that would each break naive quoting, written through the tool and
+    // read back through it. The read half proved IRIS agrees about ADDRESSING; this proves it
+    // agrees about what was stored.
+    msgs.push(global_call(
+        60,
+        serde_json::json!({"action":"set","global_name":"IIDTest",
+            "subscripts":["w, \"x\"", 2],
+            "value":"line1\nline2 ^NOTAREF |pipe| \"quoted\" \u{00e9}",
+            "namespace":ns}),
+    ));
+    msgs.push(global_call(
+        61,
+        serde_json::json!({"action":"get","global_name":"IIDTest",
+            "subscripts":["w, \"x\"", 2],"namespace":ns}),
+    ));
+    // The same node again: the second write must report created=false. "I made a node" and "I
+    // overwrote somebody's value" are different events, and only the prior $DATA distinguishes them.
+    msgs.push(global_call(
+        62,
+        serde_json::json!({"action":"set","global_name":"IIDTest",
+            "subscripts":["w, \"x\"", 2],"value":"second","namespace":ns}),
+    ));
+    // An empty value is a value: $DATA must come back 1, not 0.
+    msgs.push(global_call(
+        63,
+        serde_json::json!({"action":"set","global_name":"IIDTest","subscripts":["blank"],
+            "value":"","namespace":ns}),
+    ));
+    msgs.push(global_call(
+        64,
+        serde_json::json!({"action":"get","global_name":"IIDTest","subscripts":["blank"],"namespace":ns}),
+    ));
+    // The blocklist, through the SERVER. The unit tests show `write_verdict` refuses these; only
+    // a live call shows the refusal is REACHED by the dispatch rather than merely present in the
+    // module — a guard that exists and is never consulted passes every source-level assertion.
+    msgs.push(global_call(
+        70,
+        serde_json::json!({"action":"set","global_name":"oddDEF","subscripts":["x"],
+            "value":"never","namespace":ns}),
+    ));
+    msgs.push(global_call(
+        71,
+        serde_json::json!({"action":"set","global_name":"Ens.MessageHeaderD","subscripts":[1],
+            "value":"never","namespace":ns}),
+    ));
+    msgs.push(global_call(
+        72,
+        serde_json::json!({"action":"set","global_name":"%Dictionary","subscripts":["x"],
+            "value":"never","namespace":ns}),
+    ));
+    msgs.push(global_call(
+        73,
+        serde_json::json!({"action":"set","global_name":"ENS.Foo","subscripts":[1],
+            "value":"never","namespace":ns}),
+    ));
+    // The positive control for all four: the same shape of call, on an ordinary global, succeeds.
+    // Without it a blanket refusal of every write would pass 70-73 while breaking the tool.
+    msgs.push(global_call(
+        74,
+        serde_json::json!({"action":"set","global_name":"IIDTest","subscripts":["allowed"],
+            "value":"yes","namespace":ns}),
+    ));
     msgs.push(call(
         90,
         "iris_execute",
@@ -439,6 +507,110 @@ fn a_global_read_reports_what_iris_actually_holds() {
     assert!(
         nodes10.iter().any(|n| n["value"].as_str() == Some("leaf")),
         "the child must be walked as well: {walk10}"
+    );
+
+    // ── the write half ──────────────────────────────────────────────────────────────────
+    let w = body(&r, 60);
+    assert_eq!(
+        w["success"],
+        serde_json::json!(true),
+        "the write itself must land before anything below means anything: {w}"
+    );
+    assert_eq!(
+        w["created"],
+        serde_json::json!(true),
+        "this node did not exist, so the write created it: {w}"
+    );
+    assert_eq!(
+        w["previous_data"],
+        serde_json::json!(0),
+        "$DATA before the write was read from IRIS and must be 0: {w}"
+    );
+    assert_eq!(
+        w["data"],
+        serde_json::json!(1),
+        "and after the write the node has a value and no children: {w}"
+    );
+
+    let back = body(&r, 61);
+    assert_eq!(
+        back["node"]["value"],
+        serde_json::json!("line1\nline2 ^NOTAREF |pipe| \"quoted\" \u{00e9}"),
+        "every byte written must come back identical — the line feed, the caret, the pipes, the \
+         doubled quotes and the accent are DATA, and this is the assertion that proves the \
+         escaping round-trips through IRIS rather than merely through our own parser: {back}"
+    );
+    assert_eq!(
+        back["node"]["name"],
+        serde_json::json!("^IIDTest(\"w, \"\"x\"\"\",2)"),
+        "IRIS's own $NAME must show the comma and the quotes inside ONE subscript, and the \
+         numeric subscript bare: {back}"
+    );
+
+    let again = body(&r, 62);
+    assert_eq!(
+        again["created"],
+        serde_json::json!(false),
+        "the node already had a value, so this write overwrote rather than created: {again}"
+    );
+    assert_eq!(
+        again["previous_data"],
+        serde_json::json!(1),
+        "and the prior $DATA proves it: {again}"
+    );
+
+    let blank_set = body(&r, 63);
+    let blank_get = body(&r, 64);
+    assert_eq!(
+        blank_set["data"],
+        serde_json::json!(1),
+        "setting the empty string gives the node a value; $DATA is 1, not 0: {blank_set}"
+    );
+    assert_eq!(
+        blank_get["node"]["has_value"],
+        serde_json::json!(true),
+        "and reading it back agrees: an empty value is not an absent one: {blank_get}"
+    );
+    assert_eq!(
+        blank_get["node"]["value"],
+        serde_json::json!(""),
+        "the value is the empty string, reported as such rather than as null: {blank_get}"
+    );
+
+    // ── the blocklist is reached, and it is not a blanket refusal ───────────────────────
+    for (id, global) in [
+        (70, "oddDEF"),
+        (71, "Ens.MessageHeaderD"),
+        (72, "%Dictionary"),
+    ] {
+        let v = body(&r, id);
+        assert_eq!(
+            v["error_code"],
+            serde_json::json!("SYSTEM_GLOBAL_WRITE_REFUSED"),
+            "^{global} is reserved and the live dispatch must refuse it, not merely the unit \
+             test: {v}"
+        );
+        assert_ne!(
+            v["success"],
+            serde_json::json!(true),
+            "^{global} must not report a successful write: {v}"
+        );
+    }
+    let cased = body(&r, 73);
+    assert_eq!(
+        cased["error_code"],
+        serde_json::json!("GLOBAL_FAMILY_UNDETERMINED"),
+        "^ENS.Foo differs from ^Ens.Foo only in case, and IRIS treats those as different \
+         globals, so the answer is 'I cannot tell' under its own code — not the reserved \
+         refusal and not an allow: {cased}"
+    );
+
+    let control = body(&r, 74);
+    assert_eq!(
+        control["success"],
+        serde_json::json!(true),
+        "the positive control: an ordinary global still accepts the same shape of write, so the \
+         four refusals above are the blocklist and not a broken write path: {control}"
     );
 
     // ── the fixtures are gone ────────────────────────────────────────────────────────────
