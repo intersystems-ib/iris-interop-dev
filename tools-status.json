@@ -257,6 +257,20 @@
       "e2e": "global_e2e",
       "status": "OK",
       "note": "#532, routines profile. Reads (get, list, walk) and one write (set). Removal is NOT an action here: global_preview + global_kill follow, so there is a single destructive path and it is confirmed. A write to a reserved global is refused with SYSTEM_GLOBAL_WRITE_REFUSED and no configuration override; a name differing from one only in letter case is refused separately as GLOBAL_FAMILY_UNDETERMINED, because IRIS global names are case-sensitive and which global was meant is then unknown. The write's success is read back out of IRIS after the Set, so a write that did not land reports WRITE_DID_NOT_LAND rather than success. e2e renamed from global_read_e2e when it stopped being read-only; it has since run green against a live instance in CI (run 40535545094), which is what moves this row from unit-ok to OK."
+    },
+    {
+      "tool": "global_preview",
+      "unit": "global_kill_grants",
+      "e2e": "global_e2e",
+      "status": "OK",
+      "note": "#532, routines profile. Enumerates a subtree with the walk machinery from #550 and mints a single-use deletion token bound to namespace + global + exact subscripts. Mints ONLY on a complete walk; a node-cap stop and a clock stop are two different refusals because raising max_nodes fixes one and cannot fix the other. The round trip has since run green against a live instance in CI (run 40694689502): an over-cap preview mints nothing, a complete preview issues a token, the token redeems once and removes exactly the nodes the preview listed with $DATA read back as 0, the same token again reports CONSUMED, and a sibling subtree is untouched. That live run is what moves this row from unit-ok to OK."
+    },
+    {
+      "tool": "global_kill",
+      "unit": "global_kill_grants",
+      "e2e": "global_e2e",
+      "status": "OK",
+      "note": "#532, routines profile. The only path that deletes a global. Requires a global_preview token, re-walks and requires an exact match before deleting, and reads $DATA back afterwards in the same program — 0 is the only success. Four token states, four codes: expired, consumed (tombstoned, so a redeemed token is not reported as missing), not found, target mismatch. Uses its own grant store, not ElicitationStore, because of #551. The round trip has since run green against a live instance in CI (run 40694689502): an over-cap preview mints nothing, a complete preview issues a token, the token redeems once and removes exactly the nodes the preview listed with $DATA read back as 0, the same token again reports CONSUMED, and a sibling subtree is untouched. That live run is what moves this row from unit-ok to OK."
     }
   ]
 }

@@ -35,12 +35,23 @@ fn namespace() -> String {
     std::env::var("IRIS_NAMESPACE").unwrap_or_else(|_| "USER".to_string())
 }
 
-/// Speak MCP to a `routines`-profile server over stdio.
+/// Drive one MCP session to a `routines`-profile server over stdio, in two phases, the second
+/// computed from the first's replies.
 ///
 /// `IRIS_TOOLSET=routines` is not incidental: `iris_global` is advertised by that profile only, so
 /// started on the fork's default the server would answer "tool not found" and every assertion
 /// below would be unreachable for a reason unrelated to the behaviour under test.
-fn mcp_routines(messages: &[serde_json::Value]) -> Vec<serde_json::Value> {
+///
+/// Two phases rather than two sessions because `global_kill` needs a token that only exists at run
+/// time, and the grant store is per PROCESS — a second spawn gets an empty store, so the kill
+/// could only ever be tested through a refusal, and "every refusal fires" is also what a
+/// completely broken kill looks like. A phase keeps the spawn, the environment and the read loop
+/// to one copy; a second entry point for the no-follow-up case was written first and deleted
+/// unused, since the only test here needs the second phase.
+fn mcp_routines_then(
+    messages: &[serde_json::Value],
+    follow_up: impl Fn(&[serde_json::Value]) -> Vec<serde_json::Value>,
+) -> Vec<serde_json::Value> {
     let bin = iris_dev_bin();
     let mut cmd = Command::new(&bin);
     cmd.args(["mcp"])
@@ -90,6 +101,29 @@ fn mcp_routines(messages: &[serde_json::Value]) -> Vec<serde_json::Value> {
                 }
                 if std::time::Instant::now() > deadline {
                     panic!("no response to id {:?} within 30s", msg.get("id"));
+                }
+            }
+        }
+    }
+    for msg in follow_up(&results) {
+        stdin
+            .write_all((serde_json::to_string(&msg).expect("serialise") + "\n").as_bytes())
+            .expect("write");
+        stdin.flush().expect("flush");
+        if msg.get("id").is_some() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) > 0 {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                        results.push(v);
+                        break;
+                    }
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                if std::time::Instant::now() > deadline {
+                    panic!("no response to follow-up id {:?} within 30s", msg.get("id"));
                 }
             }
         }
@@ -326,13 +360,93 @@ fn iris_global_agrees_with_what_iris_actually_holds() {
         serde_json::json!({"action":"set","global_name":"IIDTest","subscripts":["allowed"],
             "value":"yes","namespace":ns}),
     ));
+    // ── the deletion flow (#532 part three) ────────────────────────────────────────────
+    // A subtree of its own, so the preview's node list is exactly known and the kill cannot be
+    // confused with the fixtures the earlier assertions still need.
     msgs.push(call(
-        90,
+        79,
         "iris_execute",
-        serde_json::json!({"code": " Kill ^IIDTest\n Write \"killed\"", "namespace": ns}),
+        serde_json::json!({"code":
+            " Set ^IIDTest(\"doomed\",1)=\"a\"\n Set ^IIDTest(\"doomed\",2)=\"b\"\n              Set ^IIDTest(\"doomed\",2,\"deep\")=\"c\"", "namespace": ns}),
     ));
+    // A preview whose cap is smaller than the subtree must mint NOTHING.
+    msgs.push(call(
+        80,
+        "global_preview",
+        serde_json::json!({"global_name":"IIDTest","subscripts":["doomed"],
+            "max_nodes":2,"namespace":ns}),
+    ));
+    // The real preview.
+    msgs.push(call(
+        81,
+        "global_preview",
+        serde_json::json!({"global_name":"IIDTest","subscripts":["doomed"],"namespace":ns}),
+    ));
+    // A kill with no token at all.
+    msgs.push(call(
+        82,
+        "global_kill",
+        serde_json::json!({"global_name":"IIDTest","subscripts":["doomed"],"namespace":ns}),
+    ));
+    // A kill with a token that was never issued.
+    msgs.push(call(
+        83,
+        "global_kill",
+        serde_json::json!({"global_name":"IIDTest","subscripts":["doomed"],
+            "confirm_token":"00000000-0000-0000-0000-000000000000","namespace":ns}),
+    ));
+    // A preview of a reserved global must refuse rather than hand back an unusable token.
+    msgs.push(call(
+        84,
+        "global_preview",
+        serde_json::json!({"global_name":"Ens.MessageHeaderD","namespace":ns}),
+    ));
+    // Teardown (id 90) is emitted in PHASE TWO below, after the kill, so the kill runs against
+    // a subtree that still exists.
 
-    let r = mcp_routines(&msgs);
+    let r = mcp_routines_then(&msgs, |first| {
+        // The token exists only now. Everything after it is the part no refusal can stand in for:
+        // a deletion that actually happens, and a second attempt with the spent token.
+        let token = body(first, 81)["confirm_token"]
+            .as_str()
+            .unwrap_or_else(|| panic!("phase one must have minted a token: {}", body(first, 81)))
+            .to_string();
+        let ns = namespace();
+        vec![
+            call(
+                91,
+                "global_kill",
+                serde_json::json!({"global_name":"IIDTest","subscripts":["doomed"],
+                    "confirm_token": token, "namespace": ns}),
+            ),
+            // The same token again. A kill is not idempotent, so this must be CONSUMED and must
+            // not read as a second deletion or as a missing token.
+            call(
+                92,
+                "global_kill",
+                serde_json::json!({"global_name":"IIDTest","subscripts":["doomed"],
+                    "confirm_token": token, "namespace": ns}),
+            ),
+            // IRIS is the authority on whether it is gone, not the kill's own report.
+            global_call(
+                93,
+                serde_json::json!({"action":"get","global_name":"IIDTest",
+                    "subscripts":["doomed"],"namespace": ns}),
+            ),
+            // And the siblings the kill must NOT have touched.
+            global_call(
+                94,
+                serde_json::json!({"action":"get","global_name":"IIDTest",
+                    "subscripts":["plain"],"namespace": ns}),
+            ),
+            call(
+                90,
+                "iris_execute",
+                serde_json::json!({"code": " Kill ^IIDTest\n Write \"killed\"",
+                    "namespace": ns}),
+            ),
+        ]
+    });
 
     // The fixtures were written. Without this, every read below could fail for the same one
     // reason and each assertion would report it as its own finding.
@@ -611,6 +725,106 @@ fn iris_global_agrees_with_what_iris_actually_holds() {
         serde_json::json!(true),
         "the positive control: an ordinary global still accepts the same shape of write, so the \
          four refusals above are the blocklist and not a broken write path: {control}"
+    );
+
+    // ── the deletion flow ───────────────────────────────────────────────────────────────
+    assert_eq!(
+        body(&r, 79)["success"],
+        serde_json::json!(true),
+        "the doomed fixtures must exist before any of this means anything"
+    );
+
+    let capped = body(&r, 80);
+    assert_eq!(
+        capped["error_code"],
+        serde_json::json!("GLOBAL_PREVIEW_NODE_CAP"),
+        "a preview that could not enumerate the whole subtree must refuse: {capped}"
+    );
+    assert!(
+        capped.get("confirm_token").is_none(),
+        "and it must not hand back a token for a subtree it never counted: {capped}"
+    );
+
+    let prev = body(&r, 81);
+    assert_eq!(prev["success"], serde_json::json!(true), "{prev}");
+    assert_eq!(
+        prev["count"],
+        serde_json::json!(4),
+        "the walk descends AND reports the base: `^IIDTest(\"doomed\")` itself holds no value but \
+         has children, so $DATA is 10 there and the Kill takes it too, plus two children and one \
+         grandchild: {prev}"
+    );
+    let token = prev["confirm_token"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a complete preview issues a token: {prev}"))
+        .to_string();
+    assert!(!token.is_empty(), "{prev}");
+
+    let no_token = body(&r, 82);
+    assert_eq!(
+        no_token["error_code"],
+        serde_json::json!("GLOBAL_CONFIRM_REQUIRED"),
+        "a kill without a token must refuse and name the call to make: {no_token}"
+    );
+    let bad_token = body(&r, 83);
+    assert_eq!(
+        bad_token["error_code"],
+        serde_json::json!("GLOBAL_CONFIRM_NOT_FOUND"),
+        "a token this server never issued is not found, which is a different answer from \
+         expired or consumed: {bad_token}"
+    );
+    let reserved = body(&r, 84);
+    assert_eq!(
+        reserved["error_code"],
+        serde_json::json!("SYSTEM_GLOBAL_WRITE_REFUSED"),
+        "previewing a reserved global must refuse at step one rather than issue a token that \
+         could never be redeemed: {reserved}"
+    );
+
+    // ── the kill itself ─────────────────────────────────────────────────────────────────
+    let killed = body(&r, 91);
+    assert_eq!(
+        killed["success"],
+        serde_json::json!(true),
+        "the token from the preview must redeem: {killed}"
+    );
+    assert_eq!(
+        killed["removed_nodes"], prev["count"],
+        "and it removes exactly the nodes the preview listed — compared against the preview's own \
+         count rather than a second literal, so the two cannot drift apart: {killed}"
+    );
+    assert_eq!(
+        killed["remaining_data"],
+        serde_json::json!(0),
+        "proved by reading $DATA back after the Kill, not by an echoed literal: {killed}"
+    );
+
+    let twice = body(&r, 92);
+    assert_eq!(
+        twice["error_code"],
+        serde_json::json!("GLOBAL_CONFIRM_CONSUMED"),
+        "the same token a second time is CONSUMED — not NOT_FOUND, which would tell the caller \
+         to check for a typo when the fact is that the deletion already ran: {twice}"
+    );
+
+    let gone = body(&r, 93);
+    assert_eq!(
+        gone["node"]["data"],
+        serde_json::json!(0),
+        "IRIS agrees the subtree is gone: {gone}"
+    );
+    assert_eq!(
+        gone["node"]["has_value"],
+        serde_json::json!(false),
+        "{gone}"
+    );
+
+    let survivor = body(&r, 94);
+    assert_eq!(
+        survivor["node"]["value"],
+        serde_json::json!("simple"),
+        "the kill removed the subtree it was authorised for and NOTHING else — a sibling under \
+         the same global is still there: {survivor}"
     );
 
     // ── the fixtures are gone ────────────────────────────────────────────────────────────

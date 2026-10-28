@@ -359,16 +359,17 @@ pub use scm::ScmParams;
 /// Read from `IRIS_TOOLSET` env var or `--toolset` CLI flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Toolset {
-    /// 65 tools advertised (measured 2026-10-23, +1 iris_global for #532). NOT this fork's default —
+    /// 67 tools advertised (measured 2026-10-28, +3 for #532: iris_global, global_preview,
+    /// global_kill). NOT this fork's default —
     /// `--toolset` defaults to `interop`; baseline is opt-in via IRIS_TOOLSET/--toolset.
     /// Note this is already a pruned router: the tools the `#[tool_router]` macro
     /// registers minus the 4 merged-only ones. Was 54 of 58 before iris_execute_method.
     Baseline,
-    /// 61 tools advertised (measured 2026-10-23). Baseline minus the 4 NOT_IMPLEMENTED
+    /// 63 tools advertised (measured 2026-10-28). Baseline minus the 4 NOT_IMPLEMENTED
     /// stubs (skill_propose, skill_optimize, skill_share, skill_community_install).
     /// No merged dispatchers. Not this fork's default.
     Nostub,
-    /// 57 tools advertised (measured 2026-10-23). Nostub minus 8 — the 4 debug_*
+    /// 59 tools advertised (measured 2026-10-28). Nostub minus 8 — the 4 debug_*
     /// folded into iris_debug, the 3 container tools folded into iris_containers, and
     /// agent_info dropped outright — plus the 4 merged-only tools iris_debug,
     /// iris_containers, iris_admin, iris_get_log.
@@ -552,8 +553,13 @@ pub const ROUTINES_TOOLS: &[&str] = &[
     // ── reading what is already there ──
     // #532: a legacy routine addresses its data as globals directly, so reading them is not an
     // escape hatch here — it is the data layer. Writing one node is in scope for the same reason;
-    // removing a subtree is not, and goes through global_preview + global_kill instead.
+    // removing a subtree goes through the two tools below, never through iris_global.
     "iris_global",
+    // #532: the deletion flow. Two tools rather than one action because the authorisation and the
+    // deletion must be separate calls — a preview that showed you the nodes, and a kill that
+    // refuses unless they are still the nodes.
+    "global_preview",
+    "global_kill",
     "compare_document",
     "compare_namespace",
     "iris_source_control",
@@ -4928,6 +4934,12 @@ pub struct IrisTools {
     pub history: Arc<std::sync::Mutex<VecDeque<ToolCallEntry>>>,
     /// Pending elicitation state for SCM dialogs.
     pub elicitation_store: Arc<ElicitationStore>,
+    /// Grants to delete a global subtree (#532).
+    ///
+    /// A separate store, not a variant on the one above. `PendingElicitation.action` is written
+    /// at five sites and read at none (#551), so a kill grant placed there would be redeemable
+    /// by `iris_doc(mode=put)` — which writes `content.unwrap_or("")`, i.e. empties the document.
+    pub kill_grants: Arc<crate::elicitation::KillGrantStore>,
     /// Session-scoped cache of documents already checked out by us — lets chained
     /// iris_doc writes skip the pre-write SCM probe (invalidated by SCM actions).
     pub checkout_cache: Arc<crate::elicitation::CheckoutCache>,
@@ -5263,6 +5275,11 @@ pub(crate) fn mutating_call(tool: &str, args: &serde_json::Value) -> Option<&'st
         // instance. Opening a second rule for globals is what #303 exists to decide; until then
         // this follows the precedent rather than inventing an exception for the newest tool.
         "iris_global" => Some("read or write a global through a compiled scratch class"),
+        // Both halves of the deletion flow are gated. The preview only reads, but it reaches IRIS
+        // the same way everything here does — by compiling a scratch class — and it mints a token
+        // that authorises a deletion, which is not a thing a read-only connection should hand out.
+        "global_preview" => Some("enumerate a global subtree and issue a deletion token"),
+        "global_kill" => Some("delete a global subtree"),
         // Every action of this tool writes a credential.
         // DELIBERATELY ABSENT: stream_inspect (#352) and compare_namespace / compare_document
         // (#351). All three only read — two SELECTs and a GET between them — so none is write-gated.
@@ -5771,6 +5788,7 @@ impl IrisTools {
             client,
             history: Arc::new(std::sync::Mutex::new(VecDeque::with_capacity(50))),
             elicitation_store: Arc::new(ElicitationStore::new()),
+            kill_grants: Arc::new(crate::elicitation::KillGrantStore::new()),
             checkout_cache: Arc::new(crate::elicitation::CheckoutCache::new()),
             log_store: Arc::new(std::sync::Mutex::new(log_store::LogStore::new(
                 log_max, log_ttl,
@@ -7536,6 +7554,214 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                 let (code, msg) = global::unreadable(&detail);
                 envelope::fail(code, &msg)
             }
+        }
+    }
+
+    #[tool(
+        description = "List EXACTLY which nodes a global_kill would remove, and issue the token that authorises removing them. `routines` profile only (#532). This is step one of the only way to delete a global here: iris_global has no kill action, so there is no path that deletes without having shown you the list first. The preview is a bounded $QUERY walk — the same machinery as iris_global(action=walk), descending into the whole subtree rather than listing one level — and it issues a token ONLY when the walk COMPLETED. If it stops at the node cap you get GLOBAL_PREVIEW_NODE_CAP and no token (raise max_nodes, ceiling 1000, or pass more subscripts to narrow it); if it runs out of its 5-second budget you get GLOBAL_PREVIEW_TIME_LIMIT and no token, and raising max_nodes will NOT help because the clock stopped it, not the cap. A token over a subtree that was never fully enumerated cannot cover that subtree, which is why no token is better than a partial one. The token is single use, expires in 5 minutes, and is bound to the namespace, the global name AND the exact subscripts — passing it to a different target is refused rather than resolved in the token's favour. A reserved global is refused here rather than at the kill, so you are never handed a token that cannot be redeemed. namespace: optional, defaults to the connection namespace."
+    )]
+    async fn global_preview(
+        &self,
+        Parameters(p): Parameters<global::GlobalPreviewParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let iris = self.get_iris_reloaded().await?;
+        let client = self.http_client();
+        let namespace =
+            crate::tools::interop::resolve_namespace(p.namespace.as_deref(), Some(&iris));
+
+        let plan = match global::plan_preview(&p) {
+            Ok(plan) => plan,
+            Err((code, msg)) => {
+                self.record_call("global_preview", false);
+                return envelope::fail(code, &msg);
+            }
+        };
+
+        let output = match iris
+            .execute_via_generator(&plan.code, &namespace, client)
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                self.record_call("global_preview", false);
+                return envelope::transport_fail("global_preview", &e.to_string());
+            }
+        };
+        if let Some(abort) = runtime_abort_line(&output) {
+            self.record_call("global_preview", false);
+            return envelope::fail(
+                "IRIS_RUNTIME_ERROR",
+                &format!(
+                    "enumerating ^{} in {namespace} failed, so what it holds is UNKNOWN and no \
+                     deletion token was issued — this is not an empty subtree: {abort}",
+                    plan.name
+                ),
+            );
+        }
+
+        let page = match global::parse_walk_output(&output) {
+            Ok(page) => page,
+            Err(detail) => {
+                self.record_call("global_preview", false);
+                let (code, msg) = global::unreadable(&detail);
+                return envelope::fail(code, &msg);
+            }
+        };
+
+        // The rule the whole flow rests on: mint ONLY on a complete walk.
+        if !page.end.is_complete() {
+            self.record_call("global_preview", false);
+            let (code, msg) =
+                global::preview_incomplete(&page.end, page.nodes.len(), p.max_nodes.unwrap_or(100));
+            return envelope::fail(code, &msg);
+        }
+
+        let exprs: Vec<String> = p
+            .subscripts
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|v| global::subscript_expr(&global::Subscript::from_json(v)))
+            .collect();
+        let fingerprints: Vec<String> = page.nodes.iter().map(global::node_fingerprint).collect();
+        let token = self
+            .kill_grants
+            .insert(&namespace, &plan.name, exprs, fingerprints);
+
+        self.record_call("global_preview", true);
+        envelope::ok_json(global::preview_json(
+            &page, &namespace, &plan.name, &token, 300,
+        ))
+    }
+
+    #[tool(
+        description = "Delete a global subtree, but ONLY the one a global_preview token authorises. `routines` profile only (#532). Requires confirm_token from global_preview; without one you get GLOBAL_CONFIRM_REQUIRED naming the call to make, and nothing is deleted. Before deleting, this re-walks the subtree and requires it to be IDENTICAL to what the preview showed — same nodes, same $DATA states, same values, same order. If it changed you get GLOBAL_CHANGED naming the first difference and nothing is deleted; if the re-walk itself could not finish you get GLOBAL_REVERIFY_INCOMPLETE, which is NOT a report that it changed but a statement that this call could not tell, and nothing is deleted either. The token is single use and the three ways it can fail are three different codes on purpose: GLOBAL_CONFIRM_EXPIRED (five minutes passed — preview again), GLOBAL_CONFIRM_CONSUMED (this token already ran; if the subtree is back, something re-created it), GLOBAL_CONFIRM_NOT_FOUND (never issued here, or swept — the store is in memory and empties on restart). A token bound to a different namespace, global or subscript list gives GLOBAL_CONFIRM_TARGET_MISMATCH. The deletion runs in the namespace the PREVIEW ran in, not a freshly resolved one, because the connection can move between the two calls. Afterwards $DATA is read back in the same program and must be 0; anything else is KILL_DID_NOT_LAND, not a success. Reserved globals are refused outright."
+    )]
+    async fn global_kill(
+        &self,
+        Parameters(p): Parameters<global::GlobalKillParams>,
+    ) -> Result<CallToolResult, McpError> {
+        // Everything decidable without the grant or an instance, first.
+        let name = match global::plan_kill_name(&p) {
+            Ok(n) => n,
+            Err((code, msg)) => {
+                self.record_call("global_kill", false);
+                return envelope::fail(code, &msg);
+            }
+        };
+        let token = p.confirm_token.clone().unwrap_or_default();
+
+        // ONE lookup, matched once. Two lookups can disagree, and the second would be reporting
+        // on a store the first may have changed.
+        let lookup = self.kill_grants.lookup(token.trim());
+        if let Some((code, msg)) = global::grant_refusal(&lookup) {
+            self.record_call("global_kill", false);
+            return envelope::fail(code, &msg);
+        }
+        let crate::elicitation::GrantLookup::Found(grant) = lookup else {
+            unreachable!("grant_refusal returns None only for Found")
+        };
+
+        let iris = self.get_iris_reloaded().await?;
+        let client = self.http_client();
+        let asked_ns =
+            crate::tools::interop::resolve_namespace(p.namespace.as_deref(), Some(&iris));
+
+        if let Some((code, msg)) =
+            global::target_mismatch(&grant.namespace, &grant.name, &asked_ns, &name)
+        {
+            self.record_call("global_kill", false);
+            return envelope::fail(code, &msg);
+        }
+        let asked_exprs = global::kill_subscript_exprs(&p);
+        if let Some((code, msg)) =
+            global::subscript_mismatch(&grant.subscript_exprs, &asked_exprs, &name)
+        {
+            self.record_call("global_kill", false);
+            return envelope::fail(code, &msg);
+        }
+
+        // Spend the grant BEFORE anything can change the subtree. A crash between here and the
+        // Kill must not leave a token a retry could redeem against a half-changed tree.
+        self.kill_grants.consume(&grant.id);
+
+        // Run in the GRANT's namespace. `check_reload` can move the connection between the
+        // preview and here, and the grant is a statement about one namespace's data.
+        let ns = grant.namespace.clone();
+        let subs: Vec<global::Subscript> = p
+            .subscripts
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(global::Subscript::from_json)
+            .collect();
+
+        let verify_code = global::build_walk_code(&name, &subs, 1000, None);
+        let verify_out = match iris.execute_via_generator(&verify_code, &ns, client).await {
+            Ok(o) => o,
+            Err(e) => {
+                self.record_call("global_kill", false);
+                return envelope::transport_fail("global_kill", &e.to_string());
+            }
+        };
+        if let Some(abort) = runtime_abort_line(&verify_out) {
+            self.record_call("global_kill", false);
+            return envelope::fail(
+                global::GLOBAL_REVERIFY_INCOMPLETE,
+                &format!(
+                    "re-checking ^{name} in {ns} before deleting it failed, so whether it still \
+                     matches the preview is UNKNOWN and NOTHING was deleted: {abort}"
+                ),
+            );
+        }
+        let page = match global::parse_walk_output(&verify_out) {
+            Ok(page) => page,
+            Err(detail) => {
+                self.record_call("global_kill", false);
+                let (code, msg) = global::unreadable(&detail);
+                return envelope::fail(code, &msg);
+            }
+        };
+        if let Err((code, msg)) = global::reverify(&grant.fingerprints, &page) {
+            self.record_call("global_kill", false);
+            return envelope::fail(code, &msg);
+        }
+
+        let removed = page.nodes.len();
+        let kill_code = global::build_kill_code(&name, &subs);
+        let kill_out = match iris.execute_via_generator(&kill_code, &ns, client).await {
+            Ok(o) => o,
+            Err(e) => {
+                self.record_call("global_kill", false);
+                return envelope::transport_fail("global_kill", &e.to_string());
+            }
+        };
+        if let Some(abort) = runtime_abort_line(&kill_out) {
+            self.record_call("global_kill", false);
+            return envelope::fail(
+                global::KILL_DID_NOT_LAND,
+                &format!(
+                    "deleting ^{name} in {ns} failed, and how much of the subtree was removed is \
+                     UNKNOWN — read it with iris_global(action=get) before retrying: {abort}"
+                ),
+            );
+        }
+        match global::parse_kill_output(&kill_out) {
+            Err(detail) => {
+                self.record_call("global_kill", false);
+                let (code, msg) = global::unreadable(&detail);
+                envelope::fail(code, &msg)
+            }
+            Ok(remaining) => match global::kill_outcome(remaining, &ns, &name, removed) {
+                Ok(body) => {
+                    self.record_call("global_kill", true);
+                    envelope::ok_json(body)
+                }
+                Err((code, msg)) => {
+                    self.record_call("global_kill", false);
+                    envelope::fail(code, &msg)
+                }
+            },
         }
     }
 
@@ -13807,16 +14033,20 @@ mod tool_annotation_tests {
             // `mutating_call` it fell through to the final `_ => None` — so it was announced
             // readOnlyHint:TRUE while able to %CheckIn, %GetLatest and %Disconnect. Classifying it
             // corrects that claim here too, not only in the interop profile.
-            // #532 is +1 on these three for `iris_global`, and the interop row above is
-            // UNCHANGED because it is not in INTEROP_TOOLS. The read-only figures do not move, and
-            // that is measured rather than assumed: every action of `iris_global` reads, but it
-            // has an arm in `mutating_call` because it reaches IRIS through
-            // `execute_via_generator`, which PUTs and compiles a scratch class. So it is honestly
-            // not advertised readOnlyHint:true — the same reasoning as `stream_inspect` above, and
-            // the figures below were re-run row by row rather than derived by arithmetic.
-            ("nostub", Toolset::Nostub, 61, 35),
-            ("merged", Toolset::Merged, 57, 30),
-            ("baseline", Toolset::Baseline, 65, 39),
+            // #532 is +3 on these three — `iris_global`, then `global_preview` and `global_kill`
+            // — and the interop row above is UNCHANGED because none of them is in INTEROP_TOOLS.
+            // The read-only figures do not move for any of the three, and that is measured rather
+            // than assumed. `iris_global` only reads on three of its four actions, yet it has an
+            // arm in `mutating_call` because it reaches IRIS through `execute_via_generator`,
+            // which PUTs and compiles a scratch class — the same reasoning as `stream_inspect`
+            // above. `global_kill` obviously writes. `global_preview` only reads, and is still
+            // gated: it mints a token that AUTHORISES a deletion, which is not something a
+            // read-only connection should hand out, and it reaches IRIS the same scratch-class
+            // way. So all three are honestly not advertised readOnlyHint:true. The figures below
+            // were re-run row by row rather than derived by arithmetic.
+            ("nostub", Toolset::Nostub, 63, 35),
+            ("merged", Toolset::Merged, 59, 30),
+            ("baseline", Toolset::Baseline, 67, 39),
         ] {
             let t = IrisTools::new_with_toolset(None, ts).expect("build");
             let all = t.advertised_tools();

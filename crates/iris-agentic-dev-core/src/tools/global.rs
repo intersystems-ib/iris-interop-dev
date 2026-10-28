@@ -1268,3 +1268,411 @@ pub fn write_did_not_land(r: &SetReport) -> (&'static str, String) {
         ),
     )
 }
+
+// ─── preview and kill (#532) ─────────────────────────────────────────────────────────────────
+//
+// Removing a subtree is the one operation here that cannot be undone and cannot be partially
+// reported. So it is two calls: `global_preview` enumerates exactly what would go and mints a
+// grant; `global_kill` spends the grant, re-checks that the subtree still matches, and only then
+// removes it.
+//
+// Three things upstream's equivalent does that this does not:
+//
+//  1. Its preview is a depth-1 `$Order` loop and its `total_subscripts` saturates at the page
+//     size, so a preview of a million-node subtree and of a twenty-node one are the same answer.
+//     The kill then removes the whole tree. Here the preview is the `walk` that landed in #550,
+//     which descends with `$Query` and reports which bound stopped it.
+//  2. Its token binds `{global, server}` — not the namespace, not the subscripts, not what was
+//     shown. Here it binds all four, and the kill runs in the grant's namespace rather than a
+//     re-resolved one, because `check_reload` can move the connection between the two calls.
+//  3. It has an `iris_global action=kill` with no token at all sitting beside the token-requiring
+//     tool. That split is the hole; this fork has no untokened path.
+
+pub const GLOBAL_CONFIRM_REQUIRED: &str = "GLOBAL_CONFIRM_REQUIRED";
+pub const GLOBAL_CONFIRM_EXPIRED: &str = "GLOBAL_CONFIRM_EXPIRED";
+pub const GLOBAL_CONFIRM_NOT_FOUND: &str = "GLOBAL_CONFIRM_NOT_FOUND";
+pub const GLOBAL_CONFIRM_CONSUMED: &str = "GLOBAL_CONFIRM_CONSUMED";
+pub const GLOBAL_CONFIRM_TARGET_MISMATCH: &str = "GLOBAL_CONFIRM_TARGET_MISMATCH";
+pub const GLOBAL_CHANGED: &str = "GLOBAL_CHANGED";
+pub const GLOBAL_REVERIFY_INCOMPLETE: &str = "GLOBAL_REVERIFY_INCOMPLETE";
+pub const GLOBAL_PREVIEW_NODE_CAP: &str = "GLOBAL_PREVIEW_NODE_CAP";
+pub const GLOBAL_PREVIEW_TIME_LIMIT: &str = "GLOBAL_PREVIEW_TIME_LIMIT";
+pub const KILL_DID_NOT_LAND: &str = "KILL_DID_NOT_LAND";
+
+/// One node rendered as an opaque, unambiguous string, for comparing a re-walk against a preview.
+///
+/// Length-prefixed for the same reason the wire is: a name or a value may contain any byte,
+/// including whatever separator a naive join would pick. There is no hashing crate in this
+/// workspace and none is needed — the comparison is between two in-memory lists, not a stored
+/// digest.
+///
+/// The two prefixes are not the same kind of defence, and the mutation verdicts say so even though
+/// both come back red. Removing the NAME's length makes two different nodes fingerprint
+/// identically — a global whose subscripts contain the separator wears a bare global's
+/// fingerprint, and `global_kill_grants.rs` builds exactly that pair. Removing the VALUE's length
+/// breaks that pair's alignment WITHOUT producing a collision: nothing follows the value to be
+/// confused with it. So the trailing prefix is kept against a field being appended here later,
+/// not against an attack that exists today.
+///
+/// The `$DATA` code is part of the identity: a node that loses its children between the preview
+/// and the kill is not the node that was shown, even if its value is unchanged.
+pub fn node_fingerprint(n: &NodeReport) -> String {
+    let v = n.value.as_deref().unwrap_or("");
+    format!(
+        "{}:{}|{}|{}:{}",
+        n.name.chars().count(),
+        n.name,
+        n.data.code(),
+        v.chars().count(),
+        v
+    )
+}
+
+/// Why a preview refused to mint a grant.
+///
+/// A `cap` and a `time` stop are different refusals with different remedies, which is exactly the
+/// distinction `walk` already draws and the reason it is not collapsed here: raising `max_nodes`
+/// fixes the first and cannot fix the second.
+pub fn preview_incomplete(end: &WalkEnd, counted: usize, max_nodes: i64) -> (&'static str, String) {
+    match end {
+        WalkEnd::NodeCap => (
+            GLOBAL_PREVIEW_NODE_CAP,
+            format!(
+                "the subtree has more than {max_nodes} nodes, so this preview enumerated {counted} \
+                 of an unknown total and NO deletion token was issued — a token over a subtree \
+                 that was never fully listed cannot cover it. Raise max_nodes (1000 is the \
+                 ceiling) or preview a narrower subtree by passing more subscripts."
+            ),
+        ),
+        WalkEnd::TimeLimit => (
+            GLOBAL_PREVIEW_TIME_LIMIT,
+            format!(
+                "the walk ran out of its {WALK_SECONDS}-second budget after {counted} nodes, so \
+                 how much of this subtree remains is UNKNOWN and no deletion token was issued. \
+                 Raising max_nodes will NOT help — the clock stopped it, not the cap. Narrow the \
+                 subtree by passing more subscripts."
+            ),
+        ),
+        WalkEnd::Complete => unreachable!("a complete walk is not an incomplete preview"),
+    }
+}
+
+/// What the caller is being asked to authorise.
+pub fn preview_json(
+    page: &WalkPage,
+    namespace: &str,
+    name: &str,
+    token: &str,
+    expires_in_seconds: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "success": true,
+        "action": "preview",
+        "namespace": namespace,
+        "global_name": name,
+        "nodes": page.nodes.iter().map(node_json).collect::<Vec<_>>(),
+        "count": page.nodes.len(),
+        "complete": true,
+        "confirm_token": token,
+        "confirm_expires_in_seconds": expires_in_seconds,
+        "what_happens_next": format!(
+            "global_kill with this token removes all {} node(s) above, and nothing else. The \
+             token is single use, expires in {expires_in_seconds} seconds, and is refused if the \
+             subtree has changed in the meantime.",
+            page.nodes.len()
+        ),
+    })
+}
+
+/// Build the ObjectScript that removes a subtree and proves it is gone.
+///
+/// `Kill` then `$Data`, in the same program, with the status written through the same
+/// length-prefixed framing as every other read here. The alternative — upstream's
+/// `Write "KILLED"` and a substring test on the output — is true for any path that reaches the
+/// `Write`, including one where the `Kill` removed nothing.
+pub fn build_kill_code(name: &str, subscripts: &[Subscript]) -> String {
+    let gref = build_global_ref(name, subscripts);
+    [
+        format!(" Kill {gref}"),
+        format!(" Set st = $Data({gref})"),
+        r#" Write $Length(st)_":"_st,$Char(10)"#.to_string(),
+    ]
+    .join("\n")
+}
+
+/// Decode [`build_kill_code`]'s single field into the `$DATA` that remains.
+pub fn parse_kill_output(raw: &str) -> Result<NodeData, String> {
+    let fields = crate::tools::interop::parse_length_prefixed_entries(raw)?;
+    if fields.len() != 1 {
+        return Err(format!(
+            "a kill returns exactly 1 field (the remaining $DATA); got {} from {raw:?}. Whether \
+             the subtree was removed is UNKNOWN — read it with iris_global(action=get)",
+            fields.len()
+        ));
+    }
+    let code: u8 = fields[0]
+        .trim()
+        .parse()
+        .map_err(|_| format!("'{}' is not a $DATA value", fields[0]))?;
+    data_status_from_code(code)
+        .ok_or_else(|| format!("$DATA returned {code}, which is not one of 0, 1, 10 or 11"))
+}
+
+/// Decide whether a kill actually removed the subtree.
+///
+/// `$DATA` 0 is the only success. Anything else means something is still there, and saying so is
+/// the only honest answer — #465 was a refused DELETE reported as a completed clean-up, which is
+/// this same shape one tool over.
+pub fn kill_outcome(
+    remaining: NodeData,
+    namespace: &str,
+    name: &str,
+    removed: usize,
+) -> Result<serde_json::Value, (&'static str, String)> {
+    if remaining != NodeData::Absent {
+        return Err((
+            KILL_DID_NOT_LAND,
+            format!(
+                "the Kill was accepted but reading ^{name} back reports $DATA={} ({}), so the \
+                 subtree is NOT gone — this is not a successful deletion, and how much of it was \
+                 removed is unknown. Read it with iris_global(action=get) before retrying.",
+                remaining.code(),
+                remaining.meaning()
+            ),
+        ));
+    }
+    Ok(serde_json::json!({
+        "success": true,
+        "action": "kill",
+        "namespace": namespace,
+        "global_name": name,
+        "removed_nodes": removed,
+        "remaining_data": 0,
+        "verified": "read back with $DATA after the Kill, in the same program",
+    }))
+}
+
+/// Why a grant cannot be spent. Each case has its own code because each has its own remedy.
+///
+/// `Consumed` is the case upstream has no concept of: without a tombstone a redeemed token reads
+/// as `NotFound`, which tells a caller to check for a typo when the fact is that the kill already
+/// ran. For a destructive operation those two readings lead to opposite next actions.
+pub fn grant_refusal(lookup: &crate::elicitation::GrantLookup) -> Option<(&'static str, String)> {
+    use crate::elicitation::GrantLookup as G;
+    match lookup {
+        G::Found(_) => None,
+        G::Expired => Some((
+            GLOBAL_CONFIRM_EXPIRED,
+            "that deletion token has expired. Tokens live five minutes, deliberately: the point \
+             of the preview is that what you authorise is what is there NOW. Run global_preview \
+             again and use the new token — nothing was deleted."
+                .to_string(),
+        )),
+        G::Consumed => Some((
+            GLOBAL_CONFIRM_CONSUMED,
+            "that deletion token has already been redeemed, so this call did NOTHING — it is not \
+             a second deletion and it is not a failed one. A token is single use because a kill \
+             is not idempotent: if the subtree is back, something re-created it. Read it with \
+             iris_global(action=get) before previewing again."
+                .to_string(),
+        )),
+        G::NotFound => Some((
+            GLOBAL_CONFIRM_NOT_FOUND,
+            "no deletion token with that id is held here. Either it was never issued by this \
+             server, or it expired long enough ago to have been swept — the store is in memory \
+             and is empty again after a restart. Nothing was deleted. Run global_preview to get \
+             a token."
+                .to_string(),
+        )),
+    }
+}
+
+/// Refuse a grant that names a different target than this call.
+///
+/// Upstream compares `{global, server}`. The namespace is included here because a grant is a
+/// statement about a specific subtree in a specific namespace, and the same global name in two
+/// namespaces is two different sets of data.
+pub fn target_mismatch(
+    grant_ns: &str,
+    grant_name: &str,
+    call_ns: &str,
+    call_name: &str,
+) -> Option<(&'static str, String)> {
+    if grant_ns == call_ns && grant_name == call_name {
+        return None;
+    }
+    Some((
+        GLOBAL_CONFIRM_TARGET_MISMATCH,
+        format!(
+            "that token authorises deleting ^{grant_name} in {grant_ns}, but this call asks to \
+             delete ^{call_name} in {call_ns}. Nothing was deleted. A token is bound to the exact \
+             subtree its preview showed — preview the one you mean and use that token."
+        ),
+    ))
+}
+
+/// Compare a re-walk against what the preview showed.
+///
+/// Two refusals, never one. "It changed" and "I could not tell whether it changed" are different
+/// facts: the first is a safe refusal the caller can act on, the second means the re-verification
+/// itself was bounded and the subtree's current state is unknown. Collapsing them would let an
+/// unverifiable kill wear the shape of a verified one.
+pub fn reverify(granted: &[String], page: &WalkPage) -> Result<(), (&'static str, String)> {
+    if !page.end.is_complete() {
+        return Err((
+            GLOBAL_REVERIFY_INCOMPLETE,
+            format!(
+                "re-checking the subtree before deleting it stopped early ({}), so whether it \
+                 still matches the preview is UNKNOWN — this is NOT a report that it changed, and \
+                 nothing was deleted. Preview it again with a larger max_nodes, or narrow the \
+                 subtree.",
+                page.end.wire_code()
+            ),
+        ));
+    }
+    let current: Vec<String> = page.nodes.iter().map(node_fingerprint).collect();
+    if current == granted {
+        return Ok(());
+    }
+    let first_diff = granted
+        .iter()
+        .zip(current.iter())
+        .position(|(a, b)| a != b)
+        .unwrap_or(granted.len().min(current.len()));
+    let where_ = page
+        .nodes
+        .get(first_diff)
+        .map(|n| n.name.clone())
+        .unwrap_or_else(|| "(past the end of the current subtree)".to_string());
+    Err((
+        GLOBAL_CHANGED,
+        format!(
+            "the subtree changed after it was previewed: it held {} node(s) then and {} now, and \
+             the first difference is at {where_}. NOTHING was deleted — the token authorised \
+             removing what the preview showed, and that is no longer what is there. Preview again \
+             and look at the difference before deciding.",
+            granted.len(),
+            current.len()
+        ),
+    ))
+}
+
+/// Parameters for `global_preview`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GlobalPreviewParams {
+    /// The global, with or without its leading `^`.
+    pub global_name: String,
+    /// Subscripts addressing the subtree root. Omit to preview the whole global.
+    pub subscripts: Option<Vec<serde_json::Value>>,
+    /// Defaults to the connection's namespace.
+    pub namespace: Option<String>,
+    /// How many nodes the preview may enumerate (default 100, max 1000). A subtree larger than
+    /// this gets NO token: a grant over a subtree that was never fully listed cannot cover it.
+    pub max_nodes: Option<i64>,
+}
+
+/// Parameters for `global_kill`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GlobalKillParams {
+    /// The global, with or without its leading `^`. Must match the preview's.
+    pub global_name: String,
+    /// Must match the preview's.
+    pub subscripts: Option<Vec<serde_json::Value>>,
+    /// Must match the preview's. The kill runs in the GRANT's namespace regardless, and a
+    /// mismatch here is refused rather than silently resolved in the grant's favour.
+    pub namespace: Option<String>,
+    /// The token from `global_preview`. Optional in the schema ON PURPOSE: omitting it must
+    /// produce GLOBAL_CONFIRM_REQUIRED, which names the call to make, rather than a
+    /// deserialization error that names a field.
+    pub confirm_token: Option<String>,
+}
+
+/// Validate a preview request and generate the walk that answers it.
+///
+/// Reuses `build_walk_code` unchanged. The preview IS a walk — making it a second, shallower
+/// enumeration is what gives upstream a preview that under-reports what its kill removes.
+pub fn plan_preview(p: &GlobalPreviewParams) -> Result<ReadPlan, (&'static str, String)> {
+    let name = normalize_global_name(&p.global_name);
+    if let Some(why) = global_name_error(&name) {
+        return Err((INVALID_GLOBAL_NAME, why));
+    }
+    // A preview of a reserved global is refused here rather than at the kill. Enumerating one is
+    // harmless, but handing back a token that authorises deleting it is not, and refusing at the
+    // first step is the answer that cannot be misread as "this will work".
+    if let Some(refusal) = write_verdict(&name).refusal() {
+        return Err(refusal);
+    }
+    let subscripts: Vec<Subscript> = p
+        .subscripts
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(Subscript::from_json)
+        .collect();
+    Ok(ReadPlan {
+        action: GlobalAction::Walk,
+        name: name.clone(),
+        code: build_walk_code(&name, &subscripts, p.max_nodes.unwrap_or(100), None),
+    })
+}
+
+/// The subscripts of a kill request, rendered the way the grant stored them.
+pub fn kill_subscript_exprs(p: &GlobalKillParams) -> Vec<String> {
+    p.subscripts
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(|v| subscript_expr(&Subscript::from_json(v)))
+        .collect()
+}
+
+/// Validate a kill request as far as is possible without the grant or an instance.
+pub fn plan_kill_name(p: &GlobalKillParams) -> Result<String, (&'static str, String)> {
+    let name = normalize_global_name(&p.global_name);
+    if let Some(why) = global_name_error(&name) {
+        return Err((INVALID_GLOBAL_NAME, why));
+    }
+    if let Some(refusal) = write_verdict(&name).refusal() {
+        return Err(refusal);
+    }
+    if p.confirm_token.as_deref().unwrap_or("").trim().is_empty() {
+        return Err((
+            GLOBAL_CONFIRM_REQUIRED,
+            format!(
+                "deleting ^{name} needs a token from global_preview, and none was given, so \
+                 NOTHING was deleted. Call global_preview with this global_name and the same \
+                 subscripts: it lists every node that would go and returns a confirm_token. Pass \
+                 that token back here."
+            ),
+        ));
+    }
+    Ok(name)
+}
+
+/// Refuse a kill whose subscripts differ from the grant's, after the name and namespace match.
+///
+/// Separate from [`target_mismatch`] only in what it compares; it reports the same code, because
+/// to a caller "this token is for a different subtree" is one fact however it differs.
+pub fn subscript_mismatch(
+    granted: &[String],
+    asked: &[String],
+    name: &str,
+) -> Option<(&'static str, String)> {
+    if granted == asked {
+        return None;
+    }
+    Some((
+        GLOBAL_CONFIRM_TARGET_MISMATCH,
+        format!(
+            "that token authorises deleting ^{name} at {} subscript(s) [{}], but this call asks \
+             for {} [{}]. Nothing was deleted — a token covers the exact subtree its preview \
+             enumerated, and a different depth is a different subtree.",
+            granted.len(),
+            granted.join(","),
+            asked.len(),
+            asked.join(",")
+        ),
+    ))
+}
