@@ -262,15 +262,15 @@
       "tool": "global_preview",
       "unit": "global_kill_grants",
       "e2e": "global_e2e",
-      "status": "unit-ok",
-      "note": "#532, routines profile. Enumerates a subtree with the walk machinery from #550 and mints a single-use deletion token bound to namespace + global + exact subscripts. Mints ONLY on a complete walk; a node-cap stop and a clock stop are two different refusals because raising max_nodes fixes one and cannot fix the other."
+      "status": "OK",
+      "note": "#532, routines profile. Enumerates a subtree with the walk machinery from #550 and mints a single-use deletion token bound to namespace + global + exact subscripts. Mints ONLY on a complete walk; a node-cap stop and a clock stop are two different refusals because raising max_nodes fixes one and cannot fix the other. The round trip has since run green against a live instance in CI (run 40694689502): an over-cap preview mints nothing, a complete preview issues a token, the token redeems once and removes exactly the nodes the preview listed with $DATA read back as 0, the same token again reports CONSUMED, and a sibling subtree is untouched. That live run is what moves this row from unit-ok to OK."
     },
     {
       "tool": "global_kill",
       "unit": "global_kill_grants",
       "e2e": "global_e2e",
-      "status": "unit-ok",
-      "note": "#532, routines profile. The only path that deletes a global. Requires a global_preview token, re-walks and requires an exact match before deleting, and reads $DATA back afterwards in the same program — 0 is the only success. Four token states, four codes: expired, consumed (tombstoned, so a redeemed token is not reported as missing), not found, target mismatch. Uses its own grant store, not ElicitationStore, because of #551."
+      "status": "OK",
+      "note": "#532, routines profile. The only path that deletes a global. Requires a global_preview token, re-walks and requires an exact match before deleting, and reads $DATA back afterwards in the same program — 0 is the only success. Four token states, four codes: expired, consumed (tombstoned, so a redeemed token is not reported as missing), not found, target mismatch. Uses its own grant store, not ElicitationStore, because of #551. The round trip has since run green against a live instance in CI (run 40694689502): an over-cap preview mints nothing, a complete preview issues a token, the token redeems once and removes exactly the nodes the preview listed with $DATA read back as 0, the same token again reports CONSUMED, and a sibling subtree is untouched. That live run is what moves this row from unit-ok to OK."
     }
   ]
 }
