@@ -35,24 +35,19 @@ fn namespace() -> String {
     std::env::var("IRIS_NAMESPACE").unwrap_or_else(|_| "USER".to_string())
 }
 
-/// Speak MCP to a `routines`-profile server over stdio.
+/// Drive one MCP session to a `routines`-profile server over stdio, in two phases, the second
+/// computed from the first's replies.
 ///
 /// `IRIS_TOOLSET=routines` is not incidental: `iris_global` is advertised by that profile only, so
 /// started on the fork's default the server would answer "tool not found" and every assertion
 /// below would be unreachable for a reason unrelated to the behaviour under test.
-fn mcp_routines(messages: &[serde_json::Value]) -> Vec<serde_json::Value> {
-    mcp_routines_then(messages, |_| Vec::new())
-}
-
-/// Drive one MCP session in two phases, the second computed from the first's replies.
 ///
-/// `global_kill` needs a token that only exists at run time, and the grant store is per PROCESS —
-/// a second `mcp_routines` call would spawn a second server whose store is empty, so the kill
-/// could only ever be tested through a refusal. Hence a phase, not a second session.
-///
-/// This is the same function as `mcp_routines`, which now delegates to it: the spawn, the
-/// environment and the read loop exist once. Copying them would have made a fourth reader of the
-/// stdio protocol in a file whose whole subject is not doing that.
+/// Two phases rather than two sessions because `global_kill` needs a token that only exists at run
+/// time, and the grant store is per PROCESS — a second spawn gets an empty store, so the kill
+/// could only ever be tested through a refusal, and "every refusal fires" is also what a
+/// completely broken kill looks like. A phase keeps the spawn, the environment and the read loop
+/// to one copy; a second entry point for the no-follow-up case was written first and deleted
+/// unused, since the only test here needs the second phase.
 fn mcp_routines_then(
     messages: &[serde_json::Value],
     follow_up: impl Fn(&[serde_json::Value]) -> Vec<serde_json::Value>,
