@@ -318,10 +318,14 @@ impl McpCommand {
         // FR-007: periodically sweep expired elicitation entries.
         {
             let store = tools.elicitation_store.clone();
+            let grants = tools.kill_grants.clone();
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     store.sweep();
+                    // #532: the kill-grant store expires on the same clock and is swept by the
+                    // same task, so there is one place that decides how often this happens.
+                    grants.sweep();
                 }
             });
         }

@@ -253,8 +253,8 @@ fn test_merged_tool_count() {
     let tools = IrisTools::new_with_toolset(None, Toolset::Merged).expect("IrisTools::new");
     let count = tools.registered_tool_names().len();
     assert_eq!(
-        count, 57,
-        "Merged toolset must advertise exactly 56 tools, got {}",
+        count, 59,
+        "Merged toolset must advertise exactly 59 tools, got {}",
         count
     );
     // The derivation, executed. 8 folded away (4 debug_*, 3 container, agent_info) and 4
@@ -508,8 +508,8 @@ fn test_baseline_tool_count() {
         .registered_tool_names()
         .len();
     assert_eq!(
-        n, 65,
-        "Baseline must advertise exactly 65 tools (Toolset::Baseline doc comment says 65), got {}",
+        n, 67,
+        "Baseline must advertise exactly 67 tools (Toolset::Baseline doc comment says 67), got {}",
         n
     );
 }
@@ -522,7 +522,7 @@ fn test_nostub_tool_count_absolute() {
         .expect("IrisTools::new")
         .registered_tool_names()
         .len();
-    assert_eq!(n, 61, "Nostub must advertise exactly 61 tools, got {}", n);
+    assert_eq!(n, 63, "Nostub must advertise exactly 63 tools, got {}", n);
 }
 
 /// The regression gate for the four surface counts. A failure here means the tool surface moved:
@@ -536,11 +536,11 @@ fn test_nostub_tool_count_absolute() {
 #[test]
 fn test_toolset_counts_match_doc_comments() {
     for (ts, expected) in [
-        // #532: +1 on the first three for `iris_global`. Interop is unchanged — it is not in
-        // INTEROP_TOOLS.
-        (Toolset::Baseline, 65usize),
-        (Toolset::Nostub, 61),
-        (Toolset::Merged, 57),
+        // #532: +1 on the first three for `iris_global`, then +2 more for `global_preview` and
+        // `global_kill`. Interop is unchanged throughout — none of the three is in INTEROP_TOOLS.
+        (Toolset::Baseline, 67usize),
+        (Toolset::Nostub, 63),
+        (Toolset::Merged, 59),
         (Toolset::Interop, 36),
     ] {
         let n = IrisTools::new_with_toolset(None, ts)
@@ -605,7 +605,7 @@ fn test_new_uses_pruned_baseline_router() {
         .registered_tool_names();
     assert_eq!(
         via_new.len(),
-        65,
+        67,
         "new() claims Toolset::Baseline, so it must advertise the baseline surface"
     );
     assert_eq!(

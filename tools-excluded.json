@@ -15,11 +15,23 @@
   "tools": {
     "global_kill": {
       "category": "unsafe-here",
-      "why": "Deletes an entire global. Interop message headers, bodies and queues live in globals, so a wrong argument destroys a production's history with nothing to roll back to."
+      "why": "Deletes an entire global. Interop message headers, bodies and queues live in globals, so a wrong argument destroys a production's history with nothing to roll back to.",
+      "profiles": {
+        "routines": {
+          "category": "advertised",
+          "why": "Advertised by `routines`, and reachable ONLY with a token from global_preview — iris_global has no kill action, so no path deletes a global without having listed it first. Before deleting it re-walks the subtree and refuses unless it is identical to what the preview showed, with a separate refusal for 'the re-check could not finish', which is not the same answer as 'it changed'. The interop verdict above still holds for interop: message headers, bodies and queues live in globals — and this profile refuses those families outright, so the data that verdict protects is unreachable from here."
+        }
+      }
     },
     "global_preview": {
       "category": "unsafe-here",
-      "why": "Its purpose is to mint the confirm_token global_kill requires; without that tool it authorises nothing. Excluded with the capability it belongs to rather than left as a half."
+      "why": "Its purpose is to mint the confirm_token global_kill requires; without that tool it authorises nothing. Excluded with the capability it belongs to rather than left as a half.",
+      "profiles": {
+        "routines": {
+          "category": "advertised",
+          "why": "Advertised by `routines` as the first half of the only deletion path. It reads — a bounded $QUERY walk, the same machinery as iris_global(action=walk) — and mints a single-use token bound to the namespace, the global and the exact subscripts. It mints ONLY when the walk completed: a token over a subtree that was never fully enumerated cannot cover it, so an incomplete preview returns no token and says which bound stopped it. The interop reason above is about a half-capability; here it is the half that makes the other half safe."
+        }
+      }
     },
     "iris_global": {
       "category": "unsafe-here",
@@ -27,7 +39,7 @@
       "profiles": {
         "routines": {
           "category": "advertised",
-          "why": "Advertised by `routines`, read actions only in this build: get, list and walk. A legacy routine addresses its data as globals directly — there is no class layer to read through — so the interop reason above does not describe this profile's situation. The write actions the interop verdict is about (set, kill) are NOT implemented here yet; when they arrive they are gated and carry a system-global blocklist. Subscripts are rendered with `os_str_expr`, so a comma, quote or caret in a key is data rather than syntax."
+          "why": "Advertised by `routines`: get, list and walk read, and set writes ONE node. A legacy routine addresses its data as globals directly — there is no class layer to read through — so the interop reason above does not describe this profile's situation. The write it does carry is gated: a reserved global (the % family, the ^odd class dictionary, ^SYS, ^ROUTINE, the routine index, and the ^Ens/^IRIS/^IPM/^AQDev/^UnitTest families) is refused with no configuration override, and a name differing from one of those only in letter case is refused separately because IRIS global names are case-sensitive and which global was meant is then unknown. Removal is NOT an action here and never will be: it goes through global_preview + global_kill."
         }
       }
     },

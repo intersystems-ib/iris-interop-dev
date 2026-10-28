@@ -520,3 +520,164 @@ mod tests {
         assert!(cache.0.lock().unwrap().is_empty());
     }
 }
+
+// ─── kill grants (#532) ──────────────────────────────────────────────────────────────────────
+//
+// A sibling store, deliberately NOT a variant of `ElicitationAction` on the store above.
+//
+// `PendingElicitation.action` records which tool minted a grant and is read at NO call site —
+// written at five, matched at none (#551). So an id minted by `iris_doc(mode=put)` is redeemable
+// at `iris_source_control(action=execute)` today, and the reverse. Adding a `GlobalKill` variant
+// to that enum would make a grant to DELETE A GLOBAL redeemable as a document write, where
+// `content` is `None` and becomes `unwrap_or("")` — an empty document written over the named one.
+//
+// The three-way `LookupResult` above is the discipline this copies. It is copied rather than
+// shared because a kill grant has a FOURTH outcome the elicitation store has no concept of: a
+// grant that was already redeemed. Without a tombstone that case collapses into `NotFound`, which
+// tells a caller to check for a typo when the fact is "it already ran" — and for a destructive
+// operation those two readings lead to opposite next actions.
+
+/// A granted permission to kill one exact subtree, as it was seen at preview time.
+#[derive(Debug, Clone)]
+pub struct KillGrant {
+    pub id: String,
+    /// The namespace the preview ran in. The kill runs here too, never in a re-resolved one:
+    /// `check_reload` can move the connection under a long-lived router between the two calls.
+    pub namespace: String,
+    /// Global name, `^`-stripped and already validated.
+    pub name: String,
+    /// The subscripts as rendered ObjectScript expressions, so the reference is reproduced
+    /// exactly rather than re-derived from JSON that may deserialize differently.
+    pub subscript_exprs: Vec<String>,
+    /// One opaque fingerprint per node the preview showed, in walk order. Built by
+    /// `tools::global::node_fingerprint` so this module needs no knowledge of a node's shape.
+    pub fingerprints: Vec<String>,
+    pub expires_at: Instant,
+}
+
+/// What a [`KillGrantStore::lookup`] found — FOUR outcomes.
+///
+/// `Consumed` is the one the elicitation store does not have, and the reason this type is not
+/// shared with [`LookupResult`]. See the module comment above.
+#[derive(Debug)]
+pub enum GrantLookup {
+    Found(Box<KillGrant>),
+    /// The grant existed and its window passed. Removed, and a tombstone left in its place.
+    Expired,
+    /// The grant was redeemed already. A kill is not idempotent, so this must not read as a miss.
+    Consumed,
+    /// No grant with that id, in this process, ever.
+    NotFound,
+}
+
+impl GrantLookup {
+    pub fn is_found(&self) -> bool {
+        matches!(self, GrantLookup::Found(_))
+    }
+}
+
+/// Why an id is no longer live, kept after the grant itself is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tombstone {
+    Expired,
+    Consumed,
+}
+
+/// Grants to kill a global subtree, keyed by UUID, five minutes, single use.
+///
+/// Tombstones are swept on the same timer as the grants. After a sweep an id that expired does
+/// read as `NotFound`, which is the honest limit of an in-memory store and is why the
+/// `GLOBAL_CONFIRM_NOT_FOUND` message says "never existed here, or expired long enough ago to
+/// have been swept" rather than claiming the id was never issued.
+#[derive(Clone, Default)]
+pub struct KillGrantStore {
+    live: Arc<Mutex<HashMap<String, KillGrant>>>,
+    spent: Arc<Mutex<HashMap<String, (Tombstone, Instant)>>>,
+}
+
+impl KillGrantStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Mint a grant. The caller is responsible for only calling this when the preview was
+    /// COMPLETE — a grant over a subtree that was never fully enumerated cannot cover it.
+    pub fn insert(
+        &self,
+        namespace: impl Into<String>,
+        name: impl Into<String>,
+        subscript_exprs: Vec<String>,
+        fingerprints: Vec<String>,
+    ) -> String {
+        let id = Uuid::new_v4().to_string();
+        let grant = KillGrant {
+            id: id.clone(),
+            namespace: namespace.into(),
+            name: name.into(),
+            subscript_exprs,
+            fingerprints,
+            expires_at: Instant::now() + EXPIRY,
+        };
+        self.live.lock().unwrap().insert(id.clone(), grant);
+        id
+    }
+
+    /// Look up a grant WITHOUT consuming it. One lookup per call site, matched once.
+    pub fn lookup(&self, id: &str) -> GrantLookup {
+        let mut live = self.live.lock().unwrap();
+        match live.get(id) {
+            Some(g) if Instant::now() <= g.expires_at => GrantLookup::Found(Box::new(g.clone())),
+            Some(_) => {
+                live.remove(id);
+                self.spent
+                    .lock()
+                    .unwrap()
+                    .insert(id.to_string(), (Tombstone::Expired, Instant::now()));
+                GrantLookup::Expired
+            }
+            None => match self.spent.lock().unwrap().get(id) {
+                Some((Tombstone::Consumed, _)) => GrantLookup::Consumed,
+                Some((Tombstone::Expired, _)) => GrantLookup::Expired,
+                None => GrantLookup::NotFound,
+            },
+        }
+    }
+
+    /// Spend a grant. Called BEFORE the kill runs, so a crash mid-kill cannot leave a grant that
+    /// a retry would redeem against a subtree the first attempt already changed.
+    pub fn consume(&self, id: &str) {
+        self.live.lock().unwrap().remove(id);
+        self.spent
+            .lock()
+            .unwrap()
+            .insert(id.to_string(), (Tombstone::Consumed, Instant::now()));
+    }
+
+    /// Drop expired grants and the tombstones that have outlived their usefulness.
+    ///
+    /// A tombstone is kept for twice the grant window: long enough that a caller retrying a
+    /// redeemed token still gets `Consumed` rather than `NotFound`, bounded so the map cannot grow
+    /// without limit in a long-lived server.
+    pub fn sweep(&self) -> usize {
+        let now = Instant::now();
+        let mut live = self.live.lock().unwrap();
+        let dead: Vec<String> = live
+            .iter()
+            .filter(|(_, g)| now > g.expires_at)
+            .map(|(k, _)| k.clone())
+            .collect();
+        let mut spent = self.spent.lock().unwrap();
+        for k in &dead {
+            live.remove(k);
+            spent.insert(k.clone(), (Tombstone::Expired, now));
+        }
+        let count = dead.len();
+        spent.retain(|_, (_, at)| now.duration_since(*at) < EXPIRY * 2);
+        count
+    }
+
+    /// How many grants are live. For tests and diagnostics.
+    pub fn live_count(&self) -> usize {
+        self.live.lock().unwrap().len()
+    }
+}
