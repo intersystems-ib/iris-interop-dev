@@ -1301,10 +1301,18 @@ pub const KILL_DID_NOT_LAND: &str = "KILL_DID_NOT_LAND";
 
 /// One node rendered as an opaque, unambiguous string, for comparing a re-walk against a preview.
 ///
-/// Length-prefixed for the same reason the wire is: a value may contain any byte, including
-/// whatever separator a naive join would pick, so `name|value` would make two different subtrees
-/// compare equal. There is no hashing crate in this workspace and none is needed — the comparison
-/// is between two in-memory lists, not a stored digest.
+/// Length-prefixed for the same reason the wire is: a name or a value may contain any byte,
+/// including whatever separator a naive join would pick. There is no hashing crate in this
+/// workspace and none is needed — the comparison is between two in-memory lists, not a stored
+/// digest.
+///
+/// The two prefixes are not the same kind of defence, and the mutation verdicts say so even though
+/// both come back red. Removing the NAME's length makes two different nodes fingerprint
+/// identically — a global whose subscripts contain the separator wears a bare global's
+/// fingerprint, and `global_kill_grants.rs` builds exactly that pair. Removing the VALUE's length
+/// breaks that pair's alignment WITHOUT producing a collision: nothing follows the value to be
+/// confused with it. So the trailing prefix is kept against a field being appended here later,
+/// not against an attack that exists today.
 ///
 /// The `$DATA` code is part of the identity: a node that loses its children between the preview
 /// and the kill is not the node that was shown, even if its value is unchanged.

@@ -227,8 +227,19 @@ fn an_unfinished_recheck_is_unknown_not_changed() {
 }
 
 /// The fingerprint has to distinguish nodes that a naive join would merge.
+///
+/// There are two length prefixes, and dropping either one turns this test red — but for two
+/// different reasons, which is why the last two assertions are a pair and not a belt-and-braces
+/// duplicate. Measured, with the panic read in each case rather than the exit code:
+///
+/// * Drop the NAME's length and the two nodes below fingerprint IDENTICALLY: `assert_ne!` fails on
+///   a real collision. A name can hold the separator, because `$Name` renders subscripts into it,
+///   and then one node's name ends exactly where another node's `$DATA` field begins.
+/// * Drop the VALUE's length and it is the CONTROL that fails. The pair stops lining up, so no
+///   collision is demonstrated in either direction. That prefix is pinned by this test, not proven
+///   by it: nothing follows the value to be confused with it.
 #[test]
-fn a_fingerprint_cannot_be_forged_by_a_value_containing_the_separator() {
+fn distinct_nodes_fingerprint_distinctly_even_when_a_name_holds_the_separator() {
     let a = node("^X(\"a\")", NodeData::ValueOnly, Some("1|2"));
     let b = node("^X(\"a\")", NodeData::ValueOnly, Some("1"));
     assert_ne!(
@@ -244,6 +255,31 @@ fn a_fingerprint_cannot_be_forged_by_a_value_containing_the_separator() {
     assert_eq!(
         node_fingerprint(&b),
         node_fingerprint(&node("^X(\"a\")", NodeData::ValueOnly, Some("1")))
+    );
+
+    // The forgery the name's length exists to stop. Two different nodes: a global whose
+    // subscripts render separators into its name, and a bare `^X` whose value happens to spell
+    // out the rest of the other one's fingerprint.
+    let subscripted = node("^X|1|10:aaa", NodeData::ValueAndChildren, Some("z"));
+    let bare = node("^X", NodeData::ValueOnly, Some("aaa|11|1:z"));
+    assert_ne!(
+        node_fingerprint(&subscripted),
+        node_fingerprint(&bare),
+        "a separator inside a name must not let one node wear another's fingerprint"
+    );
+    // ...and the control that the case above is testing the PREFIX and not some incidental
+    // difference between the two nodes: strip the name's length from both and they collide.
+    let without_name_length = |n: &NodeReport| {
+        node_fingerprint(n)
+            .split_once(':')
+            .expect("a fingerprint opens with the name's length")
+            .1
+            .to_string()
+    };
+    assert_eq!(
+        without_name_length(&subscripted),
+        without_name_length(&bare),
+        "these must differ ONLY by the name's length, or the assertion above proves nothing"
     );
 }
 
