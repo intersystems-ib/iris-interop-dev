@@ -749,8 +749,10 @@ fn iris_global_agrees_with_what_iris_actually_holds() {
     assert_eq!(prev["success"], serde_json::json!(true), "{prev}");
     assert_eq!(
         prev["count"],
-        serde_json::json!(3),
-        "the walk descends: two children and one grandchild: {prev}"
+        serde_json::json!(4),
+        "the walk descends AND reports the base: `^IIDTest(\"doomed\")` itself holds no value but \
+         has children, so $DATA is 10 there and the Kill takes it too, plus two children and one \
+         grandchild: {prev}"
     );
     let token = prev["confirm_token"]
         .as_str()
@@ -787,9 +789,9 @@ fn iris_global_agrees_with_what_iris_actually_holds() {
         "the token from the preview must redeem: {killed}"
     );
     assert_eq!(
-        killed["removed_nodes"],
-        serde_json::json!(3),
-        "and it removes exactly the nodes the preview listed: {killed}"
+        killed["removed_nodes"], prev["count"],
+        "and it removes exactly the nodes the preview listed — compared against the preview's own \
+         count rather than a second literal, so the two cannot drift apart: {killed}"
     );
     assert_eq!(
         killed["remaining_data"],
