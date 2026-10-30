@@ -22,7 +22,7 @@ mod interop_production_status {
             },
         ));
         let result = r.unwrap();
-        let text = result.content[0].raw.as_text().unwrap().text.clone();
+        let text = result.content[0].as_text().unwrap().text.clone();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["success"], false);
         assert_eq!(v["error_code"], "IRIS_UNREACHABLE");
@@ -112,7 +112,7 @@ mod interop_production_start {
             },
         ));
         let result = r.unwrap();
-        let text = result.content[0].raw.as_text().unwrap().text.clone();
+        let text = result.content[0].as_text().unwrap().text.clone();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["error_code"], "IRIS_UNREACHABLE");
     }
@@ -138,7 +138,7 @@ mod production_start_missing_name {
             ));
             let result = r.unwrap();
             assert_eq!(result.is_error, Some(true), "for {missing:?}");
-            let text = result.content[0].raw.as_text().unwrap().text.clone();
+            let text = result.content[0].as_text().unwrap().text.clone();
             let v: serde_json::Value = serde_json::from_str(&text).unwrap();
             assert_eq!(v["error_code"], "MISSING_PARAMETER", "for {missing:?}");
             let err = v["error"].as_str().unwrap();
@@ -175,7 +175,7 @@ mod interop_production_stop {
             },
         ));
         let result = r.unwrap();
-        let text = result.content[0].raw.as_text().unwrap().text.clone();
+        let text = result.content[0].as_text().unwrap().text.clone();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["error_code"], "IRIS_UNREACHABLE");
     }
@@ -195,7 +195,7 @@ mod interop_production_update {
             },
         ));
         let result = r.unwrap();
-        let text = result.content[0].raw.as_text().unwrap().text.clone();
+        let text = result.content[0].as_text().unwrap().text.clone();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["error_code"], "IRIS_UNREACHABLE");
     }
@@ -213,7 +213,7 @@ mod interop_production_needs_update {
             },
         ));
         let result = r.unwrap();
-        let text = result.content[0].raw.as_text().unwrap().text.clone();
+        let text = result.content[0].as_text().unwrap().text.clone();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["error_code"], "IRIS_UNREACHABLE");
     }
@@ -231,7 +231,7 @@ mod interop_production_recover {
             },
         ));
         let result = r.unwrap();
-        let text = result.content[0].raw.as_text().unwrap().text.clone();
+        let text = result.content[0].as_text().unwrap().text.clone();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["error_code"], "IRIS_UNREACHABLE");
     }
@@ -254,7 +254,7 @@ mod interop_logs {
             },
         ));
         let result = r.unwrap();
-        let text = result.content[0].raw.as_text().unwrap().text.clone();
+        let text = result.content[0].as_text().unwrap().text.clone();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["error_code"], "IRIS_UNREACHABLE");
     }
@@ -267,7 +267,7 @@ mod interop_queues {
     fn iris_unreachable() {
         let r = rt().block_on(interop_queues_impl(None, None));
         let result = r.unwrap();
-        let text = result.content[0].raw.as_text().unwrap().text.clone();
+        let text = result.content[0].as_text().unwrap().text.clone();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["error_code"], "IRIS_UNREACHABLE");
     }
@@ -295,7 +295,7 @@ mod interop_message_search {
             },
         ));
         let result = r.unwrap();
-        let text = result.content[0].raw.as_text().unwrap().text.clone();
+        let text = result.content[0].as_text().unwrap().text.clone();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["error_code"], "IRIS_UNREACHABLE");
     }
@@ -841,8 +841,10 @@ mod interop_depth_redaction_detail {
 /// Pull the JSON payload out of a tool result for assertions.
 fn tool_payload(r: &Result<rmcp::model::CallToolResult, rmcp::ErrorData>) -> serde_json::Value {
     let r = r.as_ref().expect("tool returned a transport error");
-    match &r.content[0].raw {
-        rmcp::model::RawContent::Text(t) => serde_json::from_str(&t.text).expect("payload is JSON"),
+    match &r.content[0] {
+        rmcp::model::ContentBlock::Text(t) => {
+            serde_json::from_str(&t.text).expect("payload is JSON")
+        }
         _ => panic!("expected text content"),
     }
 }
@@ -1006,7 +1008,7 @@ mod production_item_name_arg {
                 let r = rt().block_on(interop_production_item_impl(None, params(action, blank)));
                 let result = r.unwrap();
                 assert_eq!(result.is_error, Some(true), "for {action}/{blank:?}");
-                let text = result.content[0].raw.as_text().unwrap().text.clone();
+                let text = result.content[0].as_text().unwrap().text.clone();
                 let v: serde_json::Value = serde_json::from_str(&text).unwrap();
                 assert_eq!(
                     v["error_code"], "MISSING_PARAMETER",
@@ -1253,7 +1255,7 @@ mod enumeration_redirect_tests {
 
     fn envelope(r: Result<rmcp::model::CallToolResult, rmcp::ErrorData>) -> serde_json::Value {
         let result = r.unwrap();
-        let text = result.content[0].raw.as_text().unwrap().text.clone();
+        let text = result.content[0].as_text().unwrap().text.clone();
         serde_json::from_str(&text).unwrap()
     }
 

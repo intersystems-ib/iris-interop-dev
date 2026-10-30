@@ -287,7 +287,7 @@ use std::collections::VecDeque;
 
 fn ok_json(v: serde_json::Value) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
     Ok(rmcp::model::CallToolResult::success(vec![
-        rmcp::model::Content::text(v.to_string()),
+        rmcp::model::ContentBlock::text(v.to_string()),
     ]))
 }
 fn err_json(code: &str, msg: &str) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
@@ -1089,8 +1089,8 @@ mod objectscript_escaping_tests {
     #[test]
     fn unreachable_and_unparseable_are_different_error_codes() {
         fn payload(r: &rmcp::model::CallToolResult) -> serde_json::Value {
-            let text = match &r.content[0].raw {
-                rmcp::model::RawContent::Text(t) => &t.text,
+            let text = match &r.content[0] {
+                rmcp::model::ContentBlock::Text(t) => &t.text,
                 _ => panic!("expected text content"),
             };
             serde_json::from_str(text).unwrap()
@@ -1135,8 +1135,8 @@ mod objectscript_escaping_tests {
     #[test]
     fn a_rejected_password_is_not_reported_as_a_missing_container() {
         fn payload(r: &rmcp::model::CallToolResult) -> serde_json::Value {
-            let text = match &r.content[0].raw {
-                rmcp::model::RawContent::Text(t) => &t.text,
+            let text = match &r.content[0] {
+                rmcp::model::ContentBlock::Text(t) => &t.text,
                 _ => panic!("expected text content"),
             };
             serde_json::from_str(text).unwrap()
@@ -1244,8 +1244,8 @@ mod objectscript_escaping_tests {
     #[test]
     fn an_unreadable_registry_is_never_a_count_of_zero() {
         fn payload(r: &rmcp::model::CallToolResult) -> serde_json::Value {
-            let text = match &r.content[0].raw {
-                rmcp::model::RawContent::Text(t) => &t.text,
+            let text = match &r.content[0] {
+                rmcp::model::ContentBlock::Text(t) => &t.text,
                 _ => panic!("expected text content"),
             };
             serde_json::from_str(text).unwrap()
@@ -1485,8 +1485,8 @@ mod agent_stats_shape_tests {
             SkillsReadError::Unreachable("no IRIS connection configured".into()),
         )
         .unwrap();
-        let text = match &fail.content[0].raw {
-            rmcp::model::RawContent::Text(t) => t.text.clone(),
+        let text = match &fail.content[0] {
+            rmcp::model::ContentBlock::Text(t) => t.text.clone(),
             _ => panic!("expected text content"),
         };
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();

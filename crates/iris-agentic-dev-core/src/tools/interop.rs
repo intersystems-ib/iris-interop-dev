@@ -5,7 +5,9 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 fn ok_json(v: serde_json::Value) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::success(vec![Content::text(v.to_string())]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(
+        v.to_string(),
+    )]))
 }
 fn err_json(code: &str, msg: &str) -> Result<CallToolResult, McpError> {
     crate::tools::envelope::fail(code, msg)
@@ -5878,8 +5880,8 @@ mod namespace_missing_tests {
     }
 
     fn payload(r: &CallToolResult) -> serde_json::Value {
-        let text = match &r.content[0].raw {
-            rmcp::model::RawContent::Text(t) => t.text.clone(),
+        let text = match &r.content[0] {
+            rmcp::model::ContentBlock::Text(t) => t.text.clone(),
             _ => panic!("expected text content"),
         };
         serde_json::from_str(&text).unwrap()
@@ -5914,8 +5916,8 @@ mod namespace_missing_tests {
         .await?;
         let r = out.unwrap();
         assert_eq!(r.is_error, Some(true));
-        let text = match &r.content[0].raw {
-            rmcp::model::RawContent::Text(t) => t.text.clone(),
+        let text = match &r.content[0] {
+            rmcp::model::ContentBlock::Text(t) => t.text.clone(),
             _ => panic!("expected text content"),
         };
         Some(serde_json::from_str(&text).unwrap())
@@ -6181,8 +6183,8 @@ mod interop_preflight_tests {
             DiscoverySource::EnvVar,
         );
         let r = ensure_interop_namespace(&iris, ns).await?.unwrap();
-        match &r.content[0].raw {
-            rmcp::model::RawContent::Text(t) => Some(serde_json::from_str(&t.text).unwrap()),
+        match &r.content[0] {
+            rmcp::model::ContentBlock::Text(t) => Some(serde_json::from_str(&t.text).unwrap()),
             _ => panic!("expected text content"),
         }
     }
@@ -6228,8 +6230,8 @@ mod interop_preflight_tests {
                 .await
                 .expect("USER has no interop, so the pre-flight must answer")
                 .unwrap();
-            let v: serde_json::Value = match &r.content[0].raw {
-                rmcp::model::RawContent::Text(t) => serde_json::from_str(&t.text).unwrap(),
+            let v: serde_json::Value = match &r.content[0] {
+                rmcp::model::ContentBlock::Text(t) => serde_json::from_str(&t.text).unwrap(),
                 _ => panic!("expected text content"),
             };
             assert_eq!(v["error_code"], "NAMESPACE_NOT_INTEROP", "{v}");
