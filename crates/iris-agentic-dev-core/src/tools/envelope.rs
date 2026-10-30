@@ -15,7 +15,9 @@ use rmcp::{model::*, ErrorData as McpError};
 
 /// Success result — `isError: false` on the wire.
 pub fn ok_json(v: serde_json::Value) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::success(vec![Content::text(v.to_string())]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(
+        v.to_string(),
+    )]))
 }
 
 /// Failure result: consistent envelope + `isError: true`.
@@ -46,7 +48,7 @@ pub fn fail_with(
             obj.insert(k, v);
         }
     }
-    Ok(CallToolResult::error(vec![Content::text(
+    Ok(CallToolResult::error(vec![ContentBlock::text(
         serde_json::Value::Object(obj).to_string(),
     )]))
 }
@@ -464,7 +466,7 @@ mod tests {
 
         fn payload(r: Result<CallToolResult, McpError>) -> serde_json::Value {
             let result = r.unwrap();
-            let text = result.content[0].raw.as_text().unwrap().text.clone();
+            let text = result.content[0].as_text().unwrap().text.clone();
             serde_json::from_str(&text).unwrap()
         }
 
@@ -524,8 +526,8 @@ mod tests {
     }
 
     fn payload(r: &CallToolResult) -> serde_json::Value {
-        let text = match &r.content[0].raw {
-            RawContent::Text(t) => &t.text,
+        let text = match &r.content[0] {
+            ContentBlock::Text(t) => &t.text,
             _ => panic!("expected text content"),
         };
         serde_json::from_str(text).unwrap()

@@ -224,7 +224,7 @@ use crate::tools::doc_shape;
 
 fn ok_json(v: serde_json::Value) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
     Ok(rmcp::model::CallToolResult::success(vec![
-        rmcp::model::Content::text(v.to_string()),
+        rmcp::model::ContentBlock::text(v.to_string()),
     ]))
 }
 fn err_json(code: &str, msg: &str) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
@@ -971,8 +971,8 @@ fn read_was_truncated(payload: &serde_json::Value) -> bool {
 
 /// The JSON a handler put in its `CallToolResult`, for composing one handler out of another.
 fn result_payload(r: &rmcp::model::CallToolResult) -> Option<serde_json::Value> {
-    match &r.content.first()?.raw {
-        rmcp::model::RawContent::Text(t) => serde_json::from_str(&t.text).ok(),
+    match r.content.first()? {
+        rmcp::model::ContentBlock::Text(t) => serde_json::from_str(&t.text).ok(),
         _ => None,
     }
 }
@@ -1530,7 +1530,7 @@ fn write_result_succeeded(result: &rmcp::model::CallToolResult) -> bool {
     result
         .content
         .first()
-        .and_then(|c| c.raw.as_text())
+        .and_then(|c| c.as_text())
         .and_then(|t| serde_json::from_str::<serde_json::Value>(&t.text).ok())
         .map(|v| v["success"] == serde_json::Value::Bool(true))
         .unwrap_or(false)
@@ -2949,8 +2949,8 @@ mod head_get_delete_status_tests {
     }
 
     fn payload(r: &rmcp::model::CallToolResult) -> serde_json::Value {
-        match &r.content[0].raw {
-            rmcp::model::RawContent::Text(t) => serde_json::from_str(&t.text).unwrap(),
+        match &r.content[0] {
+            rmcp::model::ContentBlock::Text(t) => serde_json::from_str(&t.text).unwrap(),
             _ => panic!("expected text content"),
         }
     }
@@ -3512,8 +3512,8 @@ mod line_edit_mode_tests {
         let r = handle_iris_doc(&iris, &client, p, &store, &cache)
             .await
             .expect("the tool must answer, not error out of the transport");
-        let payload = match &r.content[0].raw {
-            rmcp::model::RawContent::Text(t) => {
+        let payload = match &r.content[0] {
+            rmcp::model::ContentBlock::Text(t) => {
                 serde_json::from_str(&t.text).unwrap_or(serde_json::Value::Null)
             }
             _ => serde_json::Value::Null,
@@ -3619,8 +3619,8 @@ mod line_edit_mode_tests {
             let r = handle_iris_doc(&iris, &client, p, &store, &cache)
                 .await
                 .unwrap();
-            let v = match &r.content[0].raw {
-                rmcp::model::RawContent::Text(t) => {
+            let v = match &r.content[0] {
+                rmcp::model::ContentBlock::Text(t) => {
                     serde_json::from_str::<serde_json::Value>(&t.text).unwrap()
                 }
                 _ => panic!("text"),
@@ -3704,8 +3704,8 @@ mod line_edit_mode_tests {
                 let r = handle_iris_doc(&iris, &client, p, &store, &cache)
                     .await
                     .expect("the tool must answer");
-                let v = match &r.content[0].raw {
-                    rmcp::model::RawContent::Text(t) => {
+                let v = match &r.content[0] {
+                    rmcp::model::ContentBlock::Text(t) => {
                         serde_json::from_str(&t.text).unwrap_or(serde_json::Value::Null)
                     }
                     _ => serde_json::Value::Null,
@@ -3793,8 +3793,8 @@ mod line_edit_mode_tests {
             let r = handle_iris_doc(&iris, &client, p, &store, &cache)
                 .await
                 .unwrap();
-            let v = match &r.content[0].raw {
-                rmcp::model::RawContent::Text(t) => {
+            let v = match &r.content[0] {
+                rmcp::model::ContentBlock::Text(t) => {
                     serde_json::from_str::<serde_json::Value>(&t.text).unwrap()
                 }
                 _ => panic!("text"),
@@ -4247,8 +4247,8 @@ mod prop_collision_put_tests {
         )
         .await
         .expect("the tool must answer, not error out of the transport");
-        match &r.content[0].raw {
-            rmcp::model::RawContent::Text(t) => serde_json::from_str(&t.text).unwrap(),
+        match &r.content[0] {
+            rmcp::model::ContentBlock::Text(t) => serde_json::from_str(&t.text).unwrap(),
             _ => panic!("expected text content"),
         }
     }

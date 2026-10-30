@@ -2826,7 +2826,9 @@ fn discovery_retry_cooldown() -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 fn ok_json(v: serde_json::Value) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::success(vec![Content::text(v.to_string())]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(
+        v.to_string(),
+    )]))
 }
 fn err_json(code: &str, msg: &str) -> Result<CallToolResult, McpError> {
     crate::tools::envelope::fail(code, msg)
@@ -7359,7 +7361,7 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                 }
             ));
         }
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             out.to_string(),
         )]))
     }
@@ -7441,7 +7443,7 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
         if let Some(h) = coverage::report_hint(&rep) {
             payload["hint"] = serde_json::Value::String(h);
         }
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             payload.to_string(),
         )]))
     }
@@ -8115,7 +8117,7 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
         let payload = ok
             .content
             .first()
-            .and_then(|c| c.raw.as_text())
+            .and_then(|c| c.as_text())
             .and_then(|t| serde_json::from_str::<serde_json::Value>(&t.text).ok());
         match doc::test_gate(want_test, payload.as_ref()) {
             doc::TestGate::NotRequested => result,
@@ -8143,11 +8145,10 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                 let run = self.iris_test(Parameters(Described::new(args))).await;
                 match run {
                     Ok(r) => {
-                        let body = r
-                            .content
-                            .first()
-                            .and_then(|c| c.raw.as_text())
-                            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t.text).ok());
+                        let body =
+                            r.content.first().and_then(|c| c.as_text()).and_then(|t| {
+                                serde_json::from_str::<serde_json::Value>(&t.text).ok()
+                            });
                         match body {
                             Some(b) => doc::attach_test_result(&mut payload, &pattern, b),
                             // The run produced a result this code cannot read. Say that, rather
@@ -8539,14 +8540,14 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
             sql_mode::QueryMode::Count => {
                 self.record_call("iris_query", true);
                 let payload = sql_mode::count_payload(&rows, &namespace, &effective_sql);
-                return Ok(CallToolResult::success(vec![Content::text(
+                return Ok(CallToolResult::success(vec![ContentBlock::text(
                     payload.to_string(),
                 )]));
             }
             sql_mode::QueryMode::Explain => {
                 self.record_call("iris_query", true);
                 let payload = sql_mode::explain_payload(&rows, &namespace);
-                return Ok(CallToolResult::success(vec![Content::text(
+                return Ok(CallToolResult::success(vec![ContentBlock::text(
                     payload.to_string(),
                 )]));
             }
@@ -11338,8 +11339,8 @@ Methods:
 // `toolset_pruning_is_enforced_at_dispatch` in tests/unit/test_toolset.rs guards this.
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for IrisTools {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
                 "iris-interop-dev".to_string(),
                 env!("CARGO_PKG_VERSION").to_string(),
@@ -11363,7 +11364,7 @@ impl ServerHandler for IrisTools {
         &self,
         request: rmcp::model::CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<rmcp::model::CallToolResponse, McpError> {
         if !self.tool_router.has_route(&request.name) {
             return Err(self.unreachable_tool_error(&request.name));
         }
@@ -11400,11 +11401,23 @@ impl ServerHandler for IrisTools {
         _request: Option<rmcp::model::PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
-        Ok(rmcp::model::ListToolsResult {
-            tools: self.advertised_tools(),
-            next_cursor: None,
-            meta: None,
-        })
+        // Built through the constructor rather than a literal: rmcp 3.x added
+        // `result_type`, `ttl_ms` and `cache_scope` to every paginated result, and
+        // `with_all_items` supplies their defaults. Leaving the two caching hints
+        // unset is deliberate, and it is what keeps this bump off the wire.
+        //
+        // rmcp fills those hints only for a peer that negotiated `2026-07-28`, and no
+        // client reaching this server over `initialize` can be one: that revision
+        // removed the `initialize` handshake (SEP-2567), so negotiation falls back to
+        // `2025-11-25` and the result keeps its rmcp 1.x shape. Writing a hint HERE
+        // would escape that, because the fallback path strips `result_type` and
+        // nothing else — the hint would then be sent to every client, including one
+        // pinned to `2024-11-05` whose library never asked for it.
+        //
+        // `negotiated_version_shapes_the_tool_list.rs` pins both halves.
+        Ok(rmcp::model::ListToolsResult::with_all_items(
+            self.advertised_tools(),
+        ))
     }
 }
 
@@ -14159,11 +14172,11 @@ mod tool_annotation_tests {
 #[cfg(test)]
 mod compile_envelope_tests {
     use super::{compile_failure, note_error_undercount};
-    use rmcp::model::RawContent;
+    use rmcp::model::ContentBlock;
 
     fn payload(r: &rmcp::model::CallToolResult) -> serde_json::Value {
-        let text = match &r.content[0].raw {
-            RawContent::Text(t) => &t.text,
+        let text = match &r.content[0] {
+            ContentBlock::Text(t) => &t.text,
             _ => panic!("expected text content"),
         };
         serde_json::from_str(text).unwrap()
@@ -14374,8 +14387,8 @@ mod prop_collision_enrich_tests {
         )
         .await
         .unwrap();
-        match &r.content[0].raw {
-            rmcp::model::RawContent::Text(t) => serde_json::from_str(&t.text).unwrap(),
+        match &r.content[0] {
+            rmcp::model::ContentBlock::Text(t) => serde_json::from_str(&t.text).unwrap(),
             _ => panic!("expected text content"),
         }
     }
@@ -16402,8 +16415,8 @@ mod near_miss_tests {
     #[test]
     fn a_failed_package_lookup_is_not_reported_as_an_empty_package() {
         let r = class_not_found_error("A.Baz", "APP", &v(&[]), None, None).unwrap();
-        let text = match &r.content[0].raw {
-            rmcp::model::RawContent::Text(t) => t.text.clone(),
+        let text = match &r.content[0] {
+            rmcp::model::ContentBlock::Text(t) => t.text.clone(),
             _ => panic!("expected text"),
         };
         let j: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -16431,8 +16444,8 @@ mod near_miss_tests {
         // CONTROL: a genuinely empty package must still say so, or the assertion above would pass on
         // an implementation that reports "could not look" for everything.
         let empty = class_not_found_error("A.Baz", "APP", &v(&[]), Some(0), None).unwrap();
-        let etext = match &empty.content[0].raw {
-            rmcp::model::RawContent::Text(t) => t.text.clone(),
+        let etext = match &empty.content[0] {
+            rmcp::model::ContentBlock::Text(t) => t.text.clone(),
             _ => panic!("expected text"),
         };
         let ej: serde_json::Value = serde_json::from_str(&etext).unwrap();
@@ -16453,8 +16466,8 @@ mod near_miss_tests {
     fn the_envelope_says_absent_not_empty() {
         for (candidates, in_package) in [(v(&[]), Some(0usize)), (v(&["A.Bar"]), Some(4usize))] {
             let r = class_not_found_error("A.Baz", "APP", &candidates, in_package, None).unwrap();
-            let text = match &r.content[0].raw {
-                rmcp::model::RawContent::Text(t) => t.text.clone(),
+            let text = match &r.content[0] {
+                rmcp::model::ContentBlock::Text(t) => t.text.clone(),
                 _ => panic!("expected text"),
             };
             let j: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -16535,8 +16548,8 @@ mod query_parity_tests {
             )))
             .await
             .expect("the tool must answer, not error out of the transport");
-        let text = match &r.content[0].raw {
-            rmcp::model::RawContent::Text(t) => t.text.clone(),
+        let text = match &r.content[0] {
+            rmcp::model::ContentBlock::Text(t) => t.text.clone(),
             _ => panic!("expected text content"),
         };
         serde_json::from_str(&text).unwrap()
@@ -16733,8 +16746,8 @@ mod wildcard_listing_failure_tests {
             )))
             .await
             .expect("the tool must answer, not error out of the transport");
-        let text = match &r.content[0].raw {
-            rmcp::model::RawContent::Text(t) => t.text.clone(),
+        let text = match &r.content[0] {
+            rmcp::model::ContentBlock::Text(t) => t.text.clone(),
             _ => panic!("expected text content"),
         };
         (r.is_error, serde_json::from_str(&text).unwrap())
@@ -16823,8 +16836,8 @@ mod wildcard_listing_failure_tests {
                 .expect("the tool must answer, not error out of the transport");
 
             assert_eq!(r.is_error, Some(true), "a wildcard must FAIL, not guess");
-            let text = match &r.content[0].raw {
-                rmcp::model::RawContent::Text(t) => t.text.clone(),
+            let text = match &r.content[0] {
+                rmcp::model::ContentBlock::Text(t) => t.text.clone(),
                 _ => panic!("expected text content"),
             };
             let v: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -18112,8 +18125,8 @@ mod docname_expansion_tests {
     #[test]
     fn test_refusal_envelopes_name_the_pattern_and_the_fix() {
         let payload = |r: &CallToolResult| -> serde_json::Value {
-            let text = match &r.content[0].raw {
-                rmcp::model::RawContent::Text(t) => &t.text,
+            let text = match &r.content[0] {
+                rmcp::model::ContentBlock::Text(t) => &t.text,
                 _ => panic!("expected text content"),
             };
             serde_json::from_str(text).unwrap()
@@ -18556,8 +18569,8 @@ mod console_diag_tests {
         let mut payload = serde_json::json!({"errors": []});
         note_error_undercount(&mut payload, Some(13), 1, "console");
         let result = crate::tools::envelope::fail_with("COMPILE_ERROR", "boom", payload);
-        let text = match &result.expect("envelope").content[0].raw {
-            rmcp::model::RawContent::Text(t) => t.text.clone(),
+        let text = match &result.expect("envelope").content[0] {
+            rmcp::model::ContentBlock::Text(t) => t.text.clone(),
             other => panic!("unexpected content: {other:?}"),
         };
         let v: serde_json::Value = serde_json::from_str(&text).expect("json");
@@ -18650,8 +18663,8 @@ mod get_log_params_tests {
     }
 
     fn payload(r: &CallToolResult) -> serde_json::Value {
-        let text = match &r.content[0].raw {
-            RawContent::Text(t) => &t.text,
+        let text = match &r.content[0] {
+            ContentBlock::Text(t) => &t.text,
             _ => panic!("expected text content"),
         };
         serde_json::from_str(text).unwrap()
@@ -19412,8 +19425,8 @@ mod http_status_answer_tests {
     }
 
     fn payload(r: &CallToolResult) -> serde_json::Value {
-        match &r.content[0].raw {
-            rmcp::model::RawContent::Text(t) => serde_json::from_str(&t.text).unwrap(),
+        match &r.content[0] {
+            rmcp::model::ContentBlock::Text(t) => serde_json::from_str(&t.text).unwrap(),
             _ => panic!("expected text content"),
         }
     }
@@ -20476,8 +20489,8 @@ mod agent_stats_wiring_tests {
                 .agent_stats(rmcp::handler::server::wrapper::Parameters(NoParams {}))
                 .await
                 .expect("the tool must answer, not error out of the transport");
-            let v: serde_json::Value = match &r.content[0].raw {
-                rmcp::model::RawContent::Text(t) => serde_json::from_str(&t.text).unwrap(),
+            let v: serde_json::Value = match &r.content[0] {
+                rmcp::model::ContentBlock::Text(t) => serde_json::from_str(&t.text).unwrap(),
                 _ => panic!("expected text content"),
             };
             assert_eq!(r.is_error, Some(true), "a false zero is not success: {v}");
@@ -21344,8 +21357,8 @@ mod reported_error_routing_tests {
     }
 
     fn payload(r: &CallToolResult) -> serde_json::Value {
-        match &r.content[0].raw {
-            rmcp::model::RawContent::Text(t) => serde_json::from_str(&t.text).unwrap(),
+        match &r.content[0] {
+            rmcp::model::ContentBlock::Text(t) => serde_json::from_str(&t.text).unwrap(),
             _ => panic!("expected text content"),
         }
     }

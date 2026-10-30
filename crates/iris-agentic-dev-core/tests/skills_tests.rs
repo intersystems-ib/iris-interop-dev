@@ -249,8 +249,8 @@ fn agent_info_stats_reports_unreachable_not_a_count_of_zero() {
     use iris_agentic_dev_core::tools::skills_tools::{handle_agent_info, AgentInfoParams};
 
     fn payload(r: &rmcp::model::CallToolResult) -> serde_json::Value {
-        let text = match &r.content[0].raw {
-            rmcp::model::RawContent::Text(t) => &t.text,
+        let text = match &r.content[0] {
+            rmcp::model::ContentBlock::Text(t) => &t.text,
             _ => panic!("expected text content"),
         };
         serde_json::from_str(text).unwrap()
@@ -359,8 +359,8 @@ fn agent_stats_reports_unreachable_not_a_count_of_zero() {
     };
 
     fn payload(r: &rmcp::model::CallToolResult) -> serde_json::Value {
-        let text = match &r.content[0].raw {
-            rmcp::model::RawContent::Text(t) => &t.text,
+        let text = match &r.content[0] {
+            rmcp::model::ContentBlock::Text(t) => &t.text,
             _ => panic!("expected text content"),
         };
         serde_json::from_str(text).unwrap()
