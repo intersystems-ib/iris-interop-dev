@@ -40,7 +40,10 @@
 
 use iris_agentic_dev_core::elicitation::{CheckoutCache, ElicitationStore};
 use iris_agentic_dev_core::iris::connection::{DiscoverySource, IrisConnection};
-use iris_agentic_dev_core::tools::doc::{doc_name_with_suffix, handle_iris_doc, IrisDocParams};
+use iris_agentic_dev_core::tools::doc::{
+    doc_name_with_suffix, handle_iris_doc, int_put_outcome, plan_put_name, IntPut, IrisDocParams,
+    MacSibling, PutNamePlan,
+};
 use wiremock::matchers::{method, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -479,5 +482,140 @@ async fn no_other_explicitly_named_document_is_probed() {
         "{} of {} non-.int documents paid for the sibling probe",
         probed.len(),
         cases.len()
+    );
+}
+
+// ── The decision itself, with no HTTP in the way ───────────────────────────────────────────────
+//
+// There is NO IRIS instance behind any test in this file. The write is behind a seam — one HEAD in
+// `probe_mac_sibling` — and everything that decides whether a document is written, including the
+// text the caller reads, is `int_put_outcome`, a function of three values a test can pass in. What
+// a real compile of `X.mac` does to `X.int` is the documented relationship between the two routine
+// types; it is not measured here, and nothing in this file claims it is.
+
+/// All three outcomes, each distinguishable by a caller, and each refusal naming a next step.
+#[test]
+fn the_decision_is_a_pure_function_of_the_sibling_probe() {
+    assert_eq!(
+        int_put_outcome("X.int", "X.mac", &MacSibling::Absent),
+        IntPut::Store("X.int".to_string()),
+        "no .mac beside it is the INT-only legacy case: store the .int"
+    );
+
+    let refusal = |s: &MacSibling| match int_put_outcome("X.int", "X.mac", s) {
+        IntPut::Refuse { code, detail } => (code, detail),
+        IntPut::Store(n) => panic!("{s:?} must REFUSE, but it stored {n}"),
+    };
+    let (present, present_detail) = refusal(&MacSibling::Present);
+    let (unknown, unknown_detail) = refusal(&MacSibling::Unknown("HTTP 401".into()));
+
+    assert_eq!(present, "INT_GENERATED_FROM_MAC");
+    assert_eq!(unknown, "INT_SIBLING_UNKNOWN");
+    assert_ne!(
+        present, unknown,
+        "a probe that did not answer is not a namespace with a .mac in it — a caller must be able \
+         to tell the two refusals apart"
+    );
+
+    for (code, detail) in [(present, &present_detail), (unknown, &unknown_detail)] {
+        assert!(
+            detail.contains("nothing was written"),
+            "{code} must say the write did not happen: {detail}"
+        );
+        assert!(
+            detail.contains("X.mac"),
+            "{code} must NAME the document to edit instead: {detail}"
+        );
+        let lower = detail.to_ascii_lowercase();
+        for bypass in ["delete", "remove", "rename"] {
+            assert!(
+                !lower.contains(bypass),
+                "{code} names '{bypass}' — a denial that spells out how to get the write accepted \
+                 is a recipe, not a remedy: {detail}"
+            );
+        }
+    }
+    assert!(
+        unknown_detail.contains("HTTP 401"),
+        "the unknown must carry WHY the probe did not answer, or the caller cannot act on it: \
+         {unknown_detail}"
+    );
+}
+
+/// The POPULATION `plan_put_name` probes, as a set rather than one example.
+///
+/// Both halves matter and each would pass alone: probing too little leaves the refusal
+/// side-steppable, and probing everything makes every put pay a round trip.
+#[test]
+fn every_way_a_put_can_name_an_int_is_probed_and_nothing_else_is() {
+    let probed: &[(&str, &str)] = &[
+        ("ZZ537Legacy", INT_SOURCE),     // the header names it
+        ("ZZ537Legacy.int", INT_SOURCE), // header and caller agree
+        ("ZZ537Legacy.int", "ROUTINE ZZ537Legacy\n quit\n"), // the caller alone
+        ("ZZ537Legacy.INT", INT_SOURCE), // folded case
+    ];
+    let unprobed: &[(&str, &str)] = &[
+        ("ZZ537Legacy", "ROUTINE ZZ537Legacy\n quit\n"),
+        ("ZZ537Legacy.mac", "ROUTINE ZZ537Legacy\n quit\n"),
+        (
+            "ZZ537Macros",
+            "ROUTINE ZZ537Macros [Type=INC]\n#define A 1\n",
+        ),
+        (
+            "ZZ537Macros.inc",
+            "ROUTINE ZZ537Macros [Type=INC]\n#define A 1\n",
+        ),
+        (
+            "ZZ537.Thing",
+            "Class ZZ537.Thing Extends %RegisteredObject\n{\n}\n",
+        ),
+        (
+            "ZZ537.Thing.cls",
+            "Class ZZ537.Thing Extends %RegisteredObject\n{\n}\n",
+        ),
+    ];
+
+    let probes: Vec<String> = probed
+        .iter()
+        .map(|(name, content)| match plan_put_name(name, Some(content)) {
+            PutNamePlan::NeedsMacSiblingProbe { int, mac } => format!("{int} -> {mac}"),
+            other => panic!("{name} must be probed, but the plan was {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        probes,
+        vec![
+            "ZZ537Legacy.int -> ZZ537Legacy.mac",
+            "ZZ537Legacy.int -> ZZ537Legacy.mac",
+            "ZZ537Legacy.int -> ZZ537Legacy.mac",
+            "ZZ537Legacy.INT -> ZZ537Legacy.mac",
+        ],
+        "{} of {} int puts planned a probe for the right sibling",
+        probes.len(),
+        probed.len()
+    );
+
+    let leaked: Vec<&str> = unprobed
+        .iter()
+        .filter(|(name, content)| {
+            matches!(
+                plan_put_name(name, Some(content)),
+                PutNamePlan::NeedsMacSiblingProbe { .. }
+            )
+        })
+        .map(|(name, _)| *name)
+        .collect();
+    assert_eq!(
+        leaked,
+        Vec::<&str>::new(),
+        "{} of {} documents that are not .int planned a probe",
+        leaked.len(),
+        unprobed.len()
+    );
+    eprintln!(
+        "plan_put_name: {}/{} probed, 0/{} others probed",
+        probes.len(),
+        probed.len(),
+        unprobed.len()
     );
 }
