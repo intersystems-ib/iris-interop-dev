@@ -65,7 +65,10 @@ fn the_offending_reference_is_not_part_of_the_routine_name() {
         f.class, "OMCUSTL",
         "and the name carried into any lookup must not contain a space either"
     );
-    assert_eq!(f.label, "F2", "the label is unaffected by the trailing detail");
+    assert_eq!(
+        f.label, "F2",
+        "the label is unaffected by the trailing detail"
+    );
 }
 
 /// The same shape measured on a CLASS frame, from `unittest_result::extract_frame`'s own doc
@@ -263,7 +266,10 @@ fn the_last_label_block_runs_to_the_end_of_the_routine() {
             map_label_offset(INT, "zINIT", 2),
             IntLineOutcome::Resolved {
                 block_lines: 3,
-                line: IntLine { line_number: 11, .. },
+                line: IntLine {
+                    line_number: 11,
+                    ..
+                },
                 ..
             }
         ),
@@ -411,7 +417,10 @@ fn a_routine_frame_is_never_answered_as_a_missing_class() {
         !whole.contains("is not a compiled class"),
         "nor with its wording: {whole}"
     );
-    assert!(!is_error, "the frame WAS decomposed, so this is not a failure");
+    assert!(
+        !is_error,
+        "the frame WAS decomposed, so this is not a failure"
+    );
     assert_eq!(v["frame_kind"], "routine");
     assert_eq!(v["routine"], "OMORDL");
     assert_eq!(v["label"], "LIST");
@@ -487,6 +496,40 @@ fn each_refusal_reaches_the_caller_as_an_error_envelope_with_its_own_code() {
     );
 }
 
+/// Every refusal carries a remedy IN THE ENVELOPE, not only in the review table.
+/// `every_refusal_names_a_remedy`'s own header says it "does not assert the server puts that
+/// sentence in the envelope at runtime" — this does, over all four at once.
+#[test]
+fn every_refusal_envelope_names_what_the_caller_should_do() {
+    let cases: Vec<(&str, &str, Option<&str>)> = vec![
+        ("INT_SOURCE_UNUSABLE", "<UNDEFINED>LIST+1^OMORDL", Some("")),
+        ("INT_LABEL_NOT_FOUND", "<UNDEFINED>NOPE+1^OMORDL", Some(INT)),
+        (
+            "INT_OFFSET_PAST_LABEL_BLOCK",
+            "<UNDEFINED>LIST+99^OMORDL",
+            Some(INT),
+        ),
+        ("INT_OFFSET_INVALID", "<UNDEFINED>LIST+-1^OMORDL", Some(INT)),
+    ];
+    // CONTROL: the population is the four refusals it claims to be, driven through the real
+    // entry point — otherwise the sweep below passes over whatever happened to come back.
+    assert_eq!(cases.len(), 4, "4 refusals requested");
+    let mut seen = Vec::new();
+    for (code, err, src) in &cases {
+        let frame = parse_int_frame(err).unwrap_or_else(|| panic!("{err} must parse"));
+        let (is_error, v) = payload(map_int_answer(err, &frame, *src));
+        assert!(is_error, "{code} must set isError: {v}");
+        assert_eq!(v["error_code"], *code, "drove the wrong refusal: {v}");
+        let hint = v["hint"].as_str().unwrap_or_default();
+        assert!(
+            !hint.trim().is_empty(),
+            "{code} reaches a caller with nothing to do next: {v}"
+        );
+        seen.push(v["error_code"].as_str().unwrap_or_default().to_string());
+    }
+    assert_eq!(seen.len(), 4, "4 refusals requested / 4 envelopes read");
+}
+
 // ─── the dispatch, measured at the wire ──────────────────────────────────────────────────────
 //
 // "A routine frame is not looked up as a class" is a claim about a request that must NOT be
@@ -496,13 +539,6 @@ fn each_refusal_reaches_the_caller_as_an_error_envelope_with_its_own_code() {
 // the zero above and read exactly like the fix.
 
 const NS: &str = "USER";
-
-fn rt() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-}
 
 /// An Atelier that answers every `/action/query` with "no such class". No IRIS instance and no
 /// credentials: `wiremock` binds a loopback port, and the strings below are placeholders it
@@ -531,107 +567,102 @@ fn params(error_string: &str, int_source: Option<&str>) -> DebugParams {
 }
 
 async fn queries_seen(server: &MockServer) -> usize {
+    // `.expect`, not `.unwrap_or_default()`: with recording off this returns None, and a
+    // defaulted empty Vec would make "no query was sent" true for a reason that has nothing
+    // to do with the handler — the exact shape this whole issue is about.
     server
         .received_requests()
         .await
-        .unwrap_or_default()
+        .expect("wiremock records requests")
         .iter()
         .filter(|r| r.url.path().ends_with("/action/query"))
         .count()
 }
 
-#[test]
-fn the_handler_asks_iris_about_a_class_only_when_the_frame_names_one() {
-    rt().block_on(async {
-        let server = atelier().await;
-        let iris = IrisConnection::new(
-            server.uri(),
-            NS,
-            "placeholder",
-            "placeholder",
-            DiscoverySource::ExplicitFlag,
-        );
-        let client = reqwest::Client::new();
+#[tokio::test]
+async fn the_handler_asks_iris_about_a_class_only_when_the_frame_names_one() {
+    let server = atelier().await;
+    let iris = IrisConnection::new(
+        server.uri(),
+        NS,
+        "placeholder",
+        "placeholder",
+        DiscoverySource::ExplicitFlag,
+    );
+    let client = reqwest::Client::new();
 
-        // The frame from the issue. It names a ROUTINE, so no class is looked up.
-        let err = "<UNDEFINED>LIST+2^OMORDL";
-        let (is_error, v) = payload(handle_iris_debug(&iris, &client, params(err, None)).await);
-        let after_routine = queries_seen(&server).await;
-        assert_eq!(
-            after_routine, 0,
-            "a routine frame sent {after_routine} SQL queries; it must send none, because \
-             %Dictionary.CompiledClass cannot answer a question about a routine"
-        );
-        assert!(!is_error, "{v}");
-        assert_eq!(v["frame_kind"], "routine");
-        assert_eq!(v["outcome"], "INT_SOURCE_REQUIRED");
-        assert!(
-            !v.to_string().contains("ROUTINE_NOT_FOUND"),
-            "the old answer must be gone: {v}"
-        );
+    // The frame from the issue. It names a ROUTINE, so no class is looked up.
+    let err = "<UNDEFINED>LIST+2^OMORDL";
+    let (is_error, v) = payload(handle_iris_debug(&iris, &client, params(err, None)).await);
+    let after_routine = queries_seen(&server).await;
+    assert_eq!(
+        after_routine, 0,
+        "a routine frame sent {after_routine} SQL queries; it must send none, because \
+         %Dictionary.CompiledClass cannot answer a question about a routine"
+    );
+    assert!(!is_error, "{v}");
+    assert_eq!(v["frame_kind"], "routine");
+    assert_eq!(v["outcome"], "INT_SOURCE_REQUIRED");
+    assert!(
+        !v.to_string().contains("ROUTINE_NOT_FOUND"),
+        "the old answer must be gone: {v}"
+    );
 
-        // THE CONTROL: a class frame against the same mock does query, and the mock says the
-        // class is absent, so the class refusal is unchanged and still reachable.
-        let err = "<ILLEGAL VALUE>zSlotKey+1^Radio.BO.RisWorklistOut.1";
-        let (is_error, v) = payload(handle_iris_debug(&iris, &client, params(err, None)).await);
-        let after_class = queries_seen(&server).await;
-        assert_eq!(
-            after_class - after_routine,
-            1,
-            "a class frame must still be looked up: {v}"
-        );
-        assert!(is_error, "{v}");
-        assert_eq!(v["error_code"], "ROUTINE_NOT_FOUND");
-        assert_eq!(v["class"], "Radio.BO.RisWorklistOut");
-    });
+    // THE CONTROL: a class frame against the same mock does query, and the mock says the
+    // class is absent, so the class refusal is unchanged and still reachable.
+    let err = "<ILLEGAL VALUE>zSlotKey+1^Radio.BO.RisWorklistOut.1";
+    let (is_error, v) = payload(handle_iris_debug(&iris, &client, params(err, None)).await);
+    let after_class = queries_seen(&server).await;
+    assert_eq!(
+        after_class - after_routine,
+        1,
+        "a class frame must still be looked up: {v}"
+    );
+    assert!(is_error, "{v}");
+    assert_eq!(v["error_code"], "ROUTINE_NOT_FOUND");
+    assert_eq!(v["class"], "Radio.BO.RisWorklistOut");
 }
 
 /// The whole offline half, through the tool's own entry point: a routine frame plus the `.INT`
 /// text the caller read for themselves resolves to an exact INT line, still without a query.
-#[test]
-fn a_routine_frame_with_int_text_resolves_through_the_handler_without_any_query() {
-    rt().block_on(async {
-        let server = atelier().await;
-        let iris = IrisConnection::new(
-            server.uri(),
-            NS,
-            "placeholder",
-            "placeholder",
-            DiscoverySource::ExplicitFlag,
-        );
-        let client = reqwest::Client::new();
-        let err = "<UNDEFINED>zINIT+1^OMORDL";
-        let (is_error, v) =
-            payload(handle_iris_debug(&iris, &client, params(err, Some(INT))).await);
-        assert_eq!(queries_seen(&server).await, 0, "still no class lookup: {v}");
-        assert!(!is_error, "{v}");
-        assert_eq!(
-            v["label"], "zINIT",
-            "the routine's own label, z intact — stripping it would have looked for INIT"
-        );
-        assert_eq!(v["int_line_number"], 10);
-        assert_eq!(v["int_line"], " set ^OMORD(\"init\")=1");
-    });
+#[tokio::test]
+async fn a_routine_frame_with_int_text_resolves_through_the_handler_without_any_query() {
+    let server = atelier().await;
+    let iris = IrisConnection::new(
+        server.uri(),
+        NS,
+        "placeholder",
+        "placeholder",
+        DiscoverySource::ExplicitFlag,
+    );
+    let client = reqwest::Client::new();
+    let err = "<UNDEFINED>zINIT+1^OMORDL";
+    let (is_error, v) = payload(handle_iris_debug(&iris, &client, params(err, Some(INT))).await);
+    assert_eq!(queries_seen(&server).await, 0, "still no class lookup: {v}");
+    assert!(!is_error, "{v}");
+    assert_eq!(
+        v["label"], "zINIT",
+        "the routine's own label, z intact — stripping it would have looked for INIT"
+    );
+    assert_eq!(v["int_line_number"], 10);
+    assert_eq!(v["int_line"], " set ^OMORD(\"init\")=1");
 }
 
 /// And the refusals reach the caller through the handler, not only through the pure function.
-#[test]
-fn a_refusal_survives_the_handler() {
-    rt().block_on(async {
-        let server = atelier().await;
-        let iris = IrisConnection::new(
-            server.uri(),
-            NS,
-            "placeholder",
-            "placeholder",
-            DiscoverySource::ExplicitFlag,
-        );
-        let client = reqwest::Client::new();
-        let err = "<UNDEFINED>LIST+42^OMORDL";
-        let (is_error, v) =
-            payload(handle_iris_debug(&iris, &client, params(err, Some(INT))).await);
-        assert!(is_error, "{v}");
-        assert_eq!(v["error_code"], "INT_OFFSET_PAST_LABEL_BLOCK");
-        assert_eq!(queries_seen(&server).await, 0);
-    });
+#[tokio::test]
+async fn a_refusal_survives_the_handler() {
+    let server = atelier().await;
+    let iris = IrisConnection::new(
+        server.uri(),
+        NS,
+        "placeholder",
+        "placeholder",
+        DiscoverySource::ExplicitFlag,
+    );
+    let client = reqwest::Client::new();
+    let err = "<UNDEFINED>LIST+42^OMORDL";
+    let (is_error, v) = payload(handle_iris_debug(&iris, &client, params(err, Some(INT))).await);
+    assert!(is_error, "{v}");
+    assert_eq!(v["error_code"], "INT_OFFSET_PAST_LABEL_BLOCK");
+    assert_eq!(queries_seen(&server).await, 0);
 }

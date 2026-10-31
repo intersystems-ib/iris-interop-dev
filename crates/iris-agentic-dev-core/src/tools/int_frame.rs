@@ -328,8 +328,18 @@ pub fn map_int_answer(
             let (msg, extra) = match refusal {
                 IntLineOutcome::Resolved { .. } => unreachable!("matched by the arm above"),
                 IntLineOutcome::SourceUnusable { reason } => (
-                    format!("{reason}. The label '{}' was never looked for.", frame.label),
-                    serde_json::json!({}),
+                    format!(
+                        "{reason}. The label '{}' was never looked for.",
+                        frame.label
+                    ),
+                    serde_json::json!({
+                        "hint": format!(
+                            "Read the routine's own listing with iris_doc(mode='get', \
+                             name='{}.int') and pass that text as int_source. A class source, a \
+                             .MAC whose every line is indented, and an empty read all land here.",
+                            frame.routine
+                        ),
+                    }),
                 ),
                 IntLineOutcome::LabelNotFound {
                     label,
@@ -345,6 +355,13 @@ pub fn map_int_answer(
                         "labels_present": labels_present.iter().take(LABELS_LISTED).collect::<Vec<_>>(),
                         "labels_total": labels_present.len(),
                         "labels_listed": labels_present.len().min(LABELS_LISTED),
+                        "hint": format!(
+                            "Compare labels_present with the label the frame names. If they are \
+                             not the labels you expected, the text is from another document: \
+                             re-read it with iris_doc(mode='get', name='{}.int') and pass that as \
+                             int_source.",
+                            frame.routine
+                        ),
                     }),
                 ),
                 IntLineOutcome::OffsetPastLabelBlock {
@@ -363,6 +380,13 @@ pub fn map_int_answer(
                         "label_line_number": label_line,
                         "label_block_lines": block_lines,
                         "highest_offset_in_block": block_lines - 1,
+                        "hint": format!(
+                            "Re-read the listing with iris_doc(mode='get', name='{}.int') and \
+                             retry — the usual cause is that the routine was recompiled after \
+                             the error was raised, so the text no longer matches the frame. Do \
+                             not count the offset from a different label.",
+                            frame.routine
+                        ),
                     }),
                 ),
                 IntLineOutcome::OffsetInvalid { offset } => (
@@ -370,7 +394,11 @@ pub fn map_int_answer(
                         "offset {offset} is negative, so there is no line to count to. A frame \
                          is <SIGNAL>LABEL+N^ROUTINE, with N a count of lines past LABEL."
                     ),
-                    serde_json::json!({}),
+                    serde_json::json!({
+                        "hint": "Re-send error_string as <SIGNAL>LABEL+N^ROUTINE with a \
+                                 non-negative N, or with no +N at all, which means offset 0 — \
+                                 the label line itself.",
+                    }),
                 ),
             };
             let mut obj = common;

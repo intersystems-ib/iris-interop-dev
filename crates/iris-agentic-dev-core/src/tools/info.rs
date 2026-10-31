@@ -688,12 +688,8 @@ pub async fn handle_iris_debug(
             // #534: the class exists and the caller brought its .INT, so the same arithmetic
             // the routine path uses applies here — a class's INT routine is `Pkg.Class.N` and
             // its labels are counted the same way. Without the text, the note below stands.
-            if p.int_source.is_some() {
-                return crate::tools::int_frame::map_int_answer(
-                    err,
-                    &frame,
-                    p.int_source.as_deref(),
-                );
+            if let Some(src) = p.int_source.as_deref() {
+                return crate::tools::int_frame::map_int_answer(err, &frame, Some(src));
             }
             ok_json(serde_json::json!({
                 "success": true,
