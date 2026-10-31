@@ -500,3 +500,117 @@ fn the_three_outcomes_take_three_different_channels() {
         );
     }
 }
+
+// ── mechanisms the inherited draft did not assert ────────────────────────────
+//
+// Each of the four below is a DIFFERENT way the question is answered wrongly, and each one is
+// invisible to the tests above: an implementation that handles the four mechanisms in the header
+// table and gets one of these wrong passes every assertion written before this line.
+
+/// A symlinked **directory** on the way to the file, as opposed to the file itself being a link.
+///
+/// `a_symlink_in_the_root_pointing_outside_is_outside` resolves the LAST component. An
+/// implementation that reads the link on the final component only — `symlink_metadata` plus a
+/// `read_link`, which is the obvious hand-rolled version — is Outside for that test and Inside
+/// here, because the escape happens two components earlier. Only a full resolution of every
+/// component answers both.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_directory_on_the_way_out_of_the_root_is_outside() {
+    let t = Tree::new();
+    let real = t.file("elsewhere/Draft.cls");
+    let link_dir = t.root.join("src/linked");
+    std::os::unix::fs::symlink(t.outside().join("elsewhere"), &link_dir).expect("symlink dir");
+
+    let via_dir = link_dir.join("Draft.cls");
+    let got = path_within_project(&via_dir, &t.root);
+    assert!(
+        matches!(got, PathContainment::Outside { .. }),
+        "the escape is an intermediate component, not the leaf — every component has to be \
+         resolved, not just the last. got {got:?}"
+    );
+    if let PathContainment::Outside { path, .. } = got {
+        assert_eq!(
+            path,
+            real.canonicalize().expect("canon"),
+            "the reported path must be the file the link leads to"
+        );
+    }
+}
+
+/// `..` that leaves the root and comes back must stay Inside.
+///
+/// `dot_dot_traversal_out_of_the_root_is_outside` is satisfied by a check that rejects any path
+/// whose TEXT contains `..` — a cheap and tempting guard, and one that would refuse the project's
+/// own files. This is the half of that mechanism which says the normalisation is real.
+#[test]
+fn dot_dot_that_lands_back_inside_the_root_is_inside() {
+    let t = Tree::new();
+    let f = t.file("project/src/Thing.cls");
+    let scenic = t.root.join("src/../src/Thing.cls");
+    let got = path_within_project(&scenic, &t.root);
+    assert!(
+        matches!(got, PathContainment::Inside { .. }),
+        "a `..` that resolves back inside the root is the project's own file — a textual `..` \
+         veto passes the Outside case and refuses this one. got {got:?}"
+    );
+    if let PathContainment::Inside { path, .. } = got {
+        assert_eq!(path, f.canonicalize().expect("canon"));
+    }
+}
+
+/// A relative path is resolved against the process cwd, not joined onto the root.
+///
+/// Joining it onto the root is the other plausible reading of a bare `Thing.cls`, and it is the
+/// dangerous one: every relative path would then be judged Inside, and the file actually read
+/// would be whichever one the join happened to name. The hook's payload normally carries an
+/// absolute path, so nothing upstream rules this spelling out.
+#[test]
+fn a_relative_path_is_resolved_against_the_cwd_not_joined_to_the_root() {
+    let t = Tree::new();
+    // Exists relative to the cwd of a cargo test (the package directory), and NOT under the root.
+    let cwd = std::env::current_dir().expect("cwd");
+    let got = path_within_project(Path::new("Cargo.toml"), &t.root);
+    assert!(
+        matches!(got, PathContainment::Outside { .. }),
+        "a relative path resolves against the cwd; this one is not in the tempdir root, so it is \
+         Outside. A root-relative join would call it Inside. got {got:?}"
+    );
+    if let PathContainment::Outside { path, .. } = got {
+        assert_eq!(
+            path,
+            cwd.join("Cargo.toml").canonicalize().expect("canon"),
+            "it must resolve to the cwd-relative file, not to <root>/Cargo.toml"
+        );
+    }
+}
+
+/// An empty root resolves to nothing, not to the process cwd.
+///
+/// `project_root_for_hook` filters empty candidates out, so this is the belt behind that brace:
+/// a `ProjectRoot::Named` carrying `""` — constructed anywhere, now or later — must not come back
+/// as a verdict. Measured here rather than reasoned about, because the draft's own comment stated
+/// that an empty path canonicalises to the cwd, and it does not: `realpath("")` is ENOENT, so the
+/// answer is Undetermined. Either way the requirement is the same, and only one of the two
+/// readings is true.
+#[test]
+fn an_empty_root_answers_nothing_rather_than_the_process_cwd() {
+    let t = Tree::new();
+    let f = t.file("project/src/Thing.cls");
+    let got = path_within_project(&f, Path::new(""));
+    assert!(
+        matches!(got, PathContainment::Undetermined { .. }),
+        "an empty root names no directory, so it bounds nothing and answers nothing. got {got:?}"
+    );
+    let got = decide_hook_path(
+        &f.to_string_lossy(),
+        &ProjectRoot::Named {
+            root: PathBuf::from(""),
+            source: RootSource::ExplicitWorkspace,
+        },
+    );
+    assert!(
+        matches!(got, HookPathDecision::Refuse { .. }),
+        "and the hook must not compile against a root it could not resolve. got {got:?}"
+    );
+}
