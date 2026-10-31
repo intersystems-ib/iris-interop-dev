@@ -119,6 +119,24 @@ fn an_objectscript_abort_is_a_failed_read() {
 }
 
 #[test]
+fn two_trailing_fields_that_are_not_the_terminator_are_a_failed_read() {
+    // Found by mutation: deleting the marker COMPARISON and keeping only the field-count check
+    // left every other test green. Every other truncation shape is caught downstream — a partial
+    // entry by the modulus, a non-numeric trailing field by the parse — so this is the one input
+    // on which the marker's VALUE is load-bearing: two fields that happen to have the
+    // terminator's shape. `1:51:0` decodes to ["5", "0"], i.e. a walk that stopped after writing
+    // the first two fields of an entry, and without the marker it reads as a completed walk over
+    // an empty log.
+    match parse_error_log_output("1:51:0") {
+        ErrorLogRead::Unreadable(why) => assert!(
+            why.contains("EL_END"),
+            "the marker, not the field count, is what rejects this: {why}"
+        ),
+        other => panic!("two arbitrary fields are not a completed walk: {other:?}"),
+    }
+}
+
+#[test]
 fn a_completed_walk_over_an_empty_log_is_read_and_empty() {
     // The one way to legitimately report nothing: the terminator is present and the total is 0.
     assert_eq!(parse_error_log_output(&end(0)), ErrorLogRead::ReadAndEmpty);
