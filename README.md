@@ -25,16 +25,36 @@ arch=$([ "$(uname -m)" = "arm64" ] && echo arm64 || echo x64)
 curl -fsSL "https://github.com/intersystems-ib/iris-interop-dev/releases/latest/download/iris-interop-dev-macos-$arch" \
   -o /usr/local/bin/iris-interop-dev && chmod +x /usr/local/bin/iris-interop-dev
 xattr -d com.apple.quarantine /usr/local/bin/iris-interop-dev 2>/dev/null
+```
 
-# Linux x64
-curl -fsSL https://github.com/intersystems-ib/iris-interop-dev/releases/latest/download/iris-interop-dev-linux-x64 \
+<!-- install:linux — this block is EXTRACTED AND EXECUTED, against a stubbed `uname` and `curl`, by
+     crates/iris-agentic-dev-core/tests/a_wrong_arch_download_verifies_before_it_fails.rs. The
+     marker is how that test finds it; move the marker if you move the block. -->
+
+```bash
+# Linux — picks x64 or arm64 from `uname -m`, and REFUSES an architecture with no published
+# asset instead of downloading one built for a different machine. That is deliberate: the
+# wrong-architecture binary downloads, hash-verifies, and only then dies at exec, which reads
+# as a broken release rather than a missing build (#543, and #423 before it on macOS).
+case "$(uname -m)" in
+  x86_64|amd64)  asset=iris-interop-dev-linux-x64 ;;
+  aarch64|arm64) asset=iris-interop-dev-linux-arm64 ;;
+  *) echo "iris-interop-dev: no Linux release asset for $(uname -m) — published: x86_64/amd64, aarch64/arm64" >&2
+     exit 1 ;;
+esac
+curl -fsSL "https://github.com/intersystems-ib/iris-interop-dev/releases/latest/download/$asset" \
   -o /usr/local/bin/iris-interop-dev && chmod +x /usr/local/bin/iris-interop-dev
 ```
 
-On a distribution with an older glibc — Amazon Linux 2023, RHEL 8-9, Debian 12 — use
-`iris-interop-dev-linux-x64-musl` instead. It is statically linked, so it has no glibc floor; the
-`-linux-x64` asset above is built on Ubuntu 24.04 and needs GLIBC 2.39, which those distributions do
-not have. The symptom is a download that hash-verifies and then fails at exec.
+On a distribution with an older glibc — Amazon Linux 2023, RHEL 8-9, Debian 12 — append `-musl` to
+whichever asset the block above selected (`iris-interop-dev-linux-x64-musl`,
+`iris-interop-dev-linux-arm64-musl`). Those are statically linked, so they have no glibc floor; the
+two assets above are built on Ubuntu 24.04 and need GLIBC 2.39, which those distributions do not
+have. The symptom is a download that hash-verifies and then fails at exec.
+
+`scripts/select-release-asset.sh` in this repo answers the same question for any host, including
+the refusal — `bash scripts/select-release-asset.sh` prints the asset name for the machine it runs
+on, `--musl` asks for the static flavour, and `--list` prints every published asset.
 
 **Windows**: download `iris-interop-dev-windows-x64.exe` from the
 [releases page](https://github.com/intersystems-ib/iris-interop-dev/releases/latest), rename it to

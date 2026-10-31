@@ -41,6 +41,14 @@ check "linux x64 asset, musl binary"     0 x86_64 \
   "ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, stripped"
 check "windows x64 asset"                0 x86_64 \
   "PE32+ executable (console) x86-64, for MS Windows"
+# #543 added the two Linux arm64 assets. Only the MISLABEL direction for ELF aarch64 was covered
+# below; the case where an aarch64 asset is correctly named arm64 — the one every arm64 release row
+# now depends on — was not exercised at all, so the guard could have rejected every arm64 asset and
+# this file would still have printed "all cases passed".
+check "linux arm64 asset, aarch64 gnu binary"  0 arm64 \
+  "ELF 64-bit LSB pie executable, ARM aarch64, version 1 (SYSV), dynamically linked, interpreter /lib/ld-linux-aarch64.so.1"
+check "linux arm64 asset, aarch64 musl binary" 0 arm64 \
+  "ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, stripped"
 
 # ── the mislabels this guard exists to stop ──────────────────────────────────────────────
 check "arm64 binary under an x64 name"   1 x86_64 \
@@ -61,8 +69,8 @@ check "universal binary is not single-arch" 1 x86_64 \
 # would prove nothing about the matcher, only that the script exits consistently.
 echo
 echo "cases run: $ran"
-if [ "$ran" -lt 12 ]; then
-  echo "FAIL: only $ran cases ran — this file was expected to exercise at least 12"
+if [ "$ran" -lt 14 ]; then
+  echo "FAIL: only $ran cases ran — this file was expected to exercise at least 14"
   exit 1
 fi
 if [ "$fails" -ne 0 ]; then

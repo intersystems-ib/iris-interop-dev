@@ -61,6 +61,35 @@ jobs:
             bin: iris-interop-dev
             arch: x86_64
             zig: true
+          # #543: Linux published x64 ONLY, so an arm64 Linux host (Graviton, an arm64 runner,
+          # Docker Desktop's arm64 Linux VM on Apple silicon) had no asset it could execute — it
+          # picked the only Linux asset on offer, the download and the digest check both
+          # succeeded, and `exec` was the first thing that failed. #174 and #423 were the same
+          # sentence with a different floor; #423's architecture guard below proves an asset is
+          # built for the arch its NAME promises, which cannot report an arch that is simply
+          # absent.
+          #
+          # Built on an arm64 RUNNER (`ubuntu-24.04-arm`), not cross-compiled from x64, for
+          # exactly the reason #423 gives each macOS asset a runner of its own architecture: the
+          # `guard: binary --version` step below EXECUTES the staged asset, and that guard is the
+          # one proving the binary is the version it claims. Cross-compiling would have to skip it
+          # for the asset whose architecture is least verifiable.
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset: iris-interop-dev-linux-arm64
+            bin: iris-interop-dev
+            arch: arm64
+          # The arm64 half of #174. An arm64 host on AL2023 / RHEL 8-9 / Debian 12 would otherwise
+          # land back in download-verify-fail-at-exec by the other door, with GLIBC as the floor
+          # instead of the instruction set. zigbuild for the same reason as the x64 musl row (no
+          # musl linker on the runner); the output is still native to this arm64 runner, so both
+          # the static guard and the `--version` guard execute it.
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            asset: iris-interop-dev-linux-arm64-musl
+            bin: iris-interop-dev
+            arch: arm64
+            zig: true
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -84,7 +113,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      # musl is cross-compiled with zig; the other three are native to their runner.
+      # The musl assets are cross-compiled with zig (no musl linker on the runners); every
+      # other target is native to its runner. #543 keeps that true for arm64 by using an
+      # arm64 runner rather than cross-compiling, so the `--version` guard still executes
+      # the artifact it vouches for. Do not restate how many rows there are — the matrix is
+      # the count.
       - uses: mlugg/setup-zig@v2
         if: matrix.zig
       - name: install cargo-zigbuild
@@ -124,9 +157,14 @@ jobs:
       - name: ad-hoc codesign (macOS — avoids Gatekeeper quarantine hang)
         if: runner.os == 'macOS'
         run: codesign --force --deep --sign - "${{ matrix.asset }}"
-      # Every target except musl is native to its runner, so the staged asset is executable here —
-      # including the two macOS assets, which is why each is built on a runner of its own
-      # architecture rather than cross-compiled from the other.
+      # Every asset's ARCHITECTURE is native to its runner, so the staged asset is executable
+      # here and this guard runs for all of them — including the two macOS assets and (since
+      # #543) the two Linux arm64 assets, each built on a runner of its own architecture rather
+      # than cross-compiled from the other. The musl rows are cross-compiled by zig, but to the
+      # runner's own architecture, so they execute here too. Keeping that invariant is the whole
+      # reason arm64 Linux uses ubuntu-24.04-arm: cross-compiling would force this guard — the
+      # one proving the binary is the version it claims — to be skipped for the asset whose
+      # provenance is hardest to check.
       - name: "guard: binary --version matches Cargo.toml"
         shell: bash
         run: |
@@ -181,6 +219,8 @@ jobs:
             | macOS, Intel | `iris-interop-dev-macos-x64` |
             | Linux x64 | `iris-interop-dev-linux-x64` |
             | Linux x64, older glibc (AL2023, RHEL 8-9, Debian 12) | `iris-interop-dev-linux-x64-musl` |
+            | Linux arm64 (Graviton, arm64 runners, arm64 Docker VMs) | `iris-interop-dev-linux-arm64` |
+            | Linux arm64, older glibc | `iris-interop-dev-linux-arm64-musl` |
             | Windows x64 | `iris-interop-dev-windows-x64.exe` |
 
             **Workshop VM (Windows):** download `iris-interop-dev-windows-x64.exe`, place it at

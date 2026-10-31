@@ -423,4 +423,28 @@ jobs:
           fi
           echo "SC-002 PASS: static binary confirmed"
 
+      # #543: this job already installed aarch64-unknown-linux-musl in the toolchain above and
+      # then never built it, so the arm64 asset's compile was unproven until someone pushed a
+      # tag. release.yml builds the arm64 assets on an arm64 runner; this step builds the same
+      # target from this x64 runner, which is weaker evidence about the LINK but is the only
+      # evidence available on a branch. It is here so a change that breaks the aarch64 build goes
+      # red on the PR rather than on the release.
+      - run: cargo zigbuild --release --target aarch64-unknown-linux-musl -p iris-agentic-dev
+      # `file`, not `ldd`: ldd on a foreign-architecture binary cannot load it and answers "not a
+      # dynamic executable", which is the exact wording the static check accepts. That would pass
+      # vacuously for every arm64 build, static or not — a clean zero with no positive control.
+      # `file` reports the linkage from the ELF header and does not have to run anything.
+      - name: "#543: the arm64 musl build is static AND is actually arm64"
+        run: |
+          set -euo pipefail
+          desc=$(file -b target/aarch64-unknown-linux-musl/release/iris-interop-dev)
+          echo "$desc"
+          # Same matcher the release uses to check an asset against the arch its name promises.
+          bash scripts/verify-asset-arch.sh arm64 "$desc"
+          if ! grep -q "statically linked" <<<"$desc"; then
+            echo "::error::the aarch64 musl build is not statically linked: $desc"
+            exit 1
+          fi
+          echo "PASS: aarch64 static binary confirmed"
+
 # (workflow registered under intersystems-ib/iris-interop-dev)
