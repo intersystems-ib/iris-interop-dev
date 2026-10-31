@@ -455,18 +455,41 @@ pub enum PutNamePlan {
     AsGiven,
 }
 
+/// The stem of a document named `*.int`, case-folded exactly as `has_doc_suffix` folds a suffix.
+///
+/// `X.INT` is an `.int` write as far as every other part of this file is concerned, so a
+/// case-sensitive test here would have left that one spelling as a way round the probe.
+fn int_document_stem(doc: &str) -> Option<&str> {
+    let (stem, ext) = doc.rsplit_once('.')?;
+    ext.eq_ignore_ascii_case("int").then_some(stem)
+}
+
 /// The document `mode=put` should write, or the probe it must run first.
+///
+/// BOTH ways a put can arrive at an `.int` are read, and that is the sibling half of #537.
+/// `doc_name_with_suffix` exists to ADD a missing suffix, so it answers `None` the moment the
+/// caller's name already carries one — and `iris_doc(mode=get, name='X.int')` → edit →
+/// `iris_doc(mode=put, name='X.int')` is the round trip a caller actually performs, carrying the
+/// suffix every time. Keying the probe on the HEADER alone therefore left the commoner input
+/// unprobed, and the refusal could be stepped round by typing the three characters it is about.
+///
+/// The issue thread states the rule per-DOCUMENT — an `.int` put where a `.mac` of that name
+/// exists — and says nothing about where the suffix came from. So the probe is keyed on the
+/// document about to be written, not on which branch named it.
 pub fn plan_put_name(name: &str, content: Option<&str>) -> PutNamePlan {
-    match doc_name_with_suffix(name, content) {
+    let corrected = doc_name_with_suffix(name, content);
+    // The document this put would actually write: the content's correction if it made one, and
+    // otherwise the caller's own name.
+    let writing = corrected.as_deref().unwrap_or(name);
+    if let Some(stem) = int_document_stem(writing) {
+        return PutNamePlan::NeedsMacSiblingProbe {
+            int: writing.to_string(),
+            mac: format!("{stem}.mac"),
+        };
+    }
+    match corrected {
+        Some(settled) => PutNamePlan::Settled(settled),
         None => PutNamePlan::AsGiven,
-        Some(settled) => {
-            if let Some(stem) = settled.strip_suffix(".int") {
-                let mac = format!("{stem}.mac");
-                PutNamePlan::NeedsMacSiblingProbe { int: settled, mac }
-            } else {
-                PutNamePlan::Settled(settled)
-            }
-        }
     }
 }
 
