@@ -329,8 +329,12 @@ pub fn project_root_for_hook(
     ];
     for (source, candidate) in candidates {
         // `OBJECTSCRIPT_WORKSPACE=` is how a shell spells "unset" by accident, and an empty path
-        // canonicalises to the process cwd — a root that would silently be something else
-        // entirely. `workspace_root` already treats the empty string as absent.
+        // names no directory at all. Measured rather than assumed: `std::fs::canonicalize("")` is
+        // `ENOENT`, not the process cwd, so a root of `""` reaching `path_within_project` makes
+        // every edit `Undetermined` and the hook refuses all of them — loud, but wrong about why.
+        // Filtering it here is what makes `ProcessCwd` the thing that answers instead, and
+        // `workspace_root` already treats the empty string as absent, so the two agree.
+        // `an_empty_root_answers_nothing_rather_than_the_process_cwd` pins the resolution side.
         if let Some(root) = candidate.filter(|p| !p.as_os_str().is_empty()) {
             return ProjectRoot::Named {
                 root: root.to_path_buf(),
