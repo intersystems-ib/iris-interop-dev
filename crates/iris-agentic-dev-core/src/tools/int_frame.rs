@@ -272,14 +272,17 @@ pub fn map_int_answer(
             "offset": frame.offset,
             "mapped_to_source_line": false,
             "outcome": INT_SOURCE_REQUIRED,
+            // The note must not QUOTE the old refusal's wording: the payload is read by a
+            // model, and a sentence saying the routine is not a class reads the same whether
+            // it is the answer or a note about a bug. `a_routine_frame_is_never_answered_as_a
+            // _missing_class` sweeps the whole payload for that text and caught this one.
             "note": format!(
-                "The frame names the ROUTINE '{rtn}', not a class, so the old \
-                 '{rtn} is not a compiled class' answer was about the wrong question — nothing \
-                 here says the routine is missing. This server does not fetch the .INT itself: \
-                 read it with iris_doc(mode='get', name='{rtn}.int') and call map_int again \
-                 with int_source set to that text, and the exact INT line for {label}+{offset} \
-                 comes back. Counting it by hand works too: offset 0 is the {label} line \
-                 itself.",
+                "The frame names the ROUTINE '{rtn}', and no class lookup was attempted — \
+                 nothing here is a report that anything is missing. This server does not fetch \
+                 the .INT itself: read it with iris_doc(mode='get', name='{rtn}.int') and call \
+                 map_int again with int_source set to that text, and the exact INT line for \
+                 {label}+{offset} comes back. Counting it by hand works too: offset 0 is the \
+                 {label} line itself.",
                 rtn = frame.routine,
                 label = frame.label,
                 offset = frame.offset,

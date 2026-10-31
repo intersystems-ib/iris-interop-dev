@@ -493,11 +493,13 @@ pub struct DebugParams {
     pub action: String,
     /// Error string for map_int e.g. "<UNDEFINED>x+3^MyApp.Foo.1"
     pub error_string: Option<String>,
+    // #534. The issue number stays in this `//` comment: a `///` line is the advertised schema
+    // description, and `mcp_handshake` refuses maintainer bookkeeping on the wire.
     /// map_int ONLY, optional: the .INT listing the frame's routine compiled to, as text —
     /// read it with iris_doc(mode="get", name="<routine>.int"). Supply it and map_int counts
     /// LABEL+offset against it and returns the exact INT line, or refuses with a named reason
-    /// (#534). Omit it for a routine frame and map_int decomposes the frame and asks you for
-    /// this text; it does not fetch the document itself.
+    /// rather than guessing. Omit it for a routine frame and map_int decomposes the frame and
+    /// asks you for this text; it does not fetch the document itself.
     #[serde(default)]
     pub int_source: Option<String>,
     /// Class name for source_map
