@@ -322,6 +322,29 @@ fn looks_like_a_doc_name(t: &str) -> bool {
         && !t.ends_with('.')
 }
 
+/// The suffix a ROUTINE header declares: `inc` for an include, `int` for intermediate code, and
+/// `mac` when the header names no type — IRIS's own default.
+///
+/// #537: ONE reader for all three. There were two, both in this file, and they disagreed about
+/// exactly one type. `doc_name_from_source` (#530) read all three, while `doc_name_with_suffix` —
+/// `mode=put`'s contract — tested for `INC` and sent everything else to `.mac`, so a put of
+/// `ROUTINE OMORDL [Type=INT]` stored IRIS's intermediate code as MAC source, reported success,
+/// and nothing anywhere pinned it. Keeping the rule in one function is the part that stops the
+/// pair drifting again; which document an `.int` may be written to is a separate decision, and
+/// one this function cannot make — see `plan_put_name`.
+///
+/// Spaces are stripped first because `[ Type = INT ]` is legal ObjectScript.
+fn routine_suffix(header_line: &str) -> &'static str {
+    let flat = header_line.to_ascii_uppercase().replace(' ', "");
+    if flat.contains("TYPE=INC") {
+        "inc"
+    } else if flat.contains("TYPE=INT") {
+        "int"
+    } else {
+        "mac"
+    }
+}
+
 /// Read the document name out of ObjectScript source.
 ///
 /// A ROUTINE header is only a header on the FIRST non-empty line, which is IRIS's own rule. A
@@ -341,17 +364,7 @@ pub fn doc_name_from_source(content: &str) -> SourceDocName {
             if !looks_like_a_doc_name(name) {
                 return SourceDocName::Unnamed("the ROUTINE header's name is not a document name");
             }
-            // `[Type=INC]` is an include, `[Type=INT]` an intermediate; anything else is a .mac.
-            // Spaces are stripped first because `[ Type = INC ]` is legal.
-            let flat = upper.replace(' ', "");
-            let suffix = if flat.contains("TYPE=INC") {
-                "inc"
-            } else if flat.contains("TYPE=INT") {
-                "int"
-            } else {
-                "mac"
-            };
-            return SourceDocName::Named(format!("{name}.{suffix}"));
+            return SourceDocName::Named(format!("{name}.{}", routine_suffix(first)));
         }
     }
 
@@ -393,15 +406,176 @@ pub fn doc_name_with_suffix(name: &str, content: Option<&str>) -> Option<String>
         return Some(format!("{name}.cls"));
     }
     if head.starts_with("ROUTINE ") {
-        let first_line = body.lines().next().unwrap_or("").to_ascii_uppercase();
-        // `ROUTINE X [Type=INC]` is an include file; anything else is a .mac.
-        return Some(if first_line.replace(' ', "").contains("TYPE=INC") {
-            format!("{name}.inc")
-        } else {
-            format!("{name}.mac")
-        });
+        // #537: one reader for the type flag, shared with `doc_name_from_source`. This branch
+        // used to test for `INC` alone, so `[Type=INT]` fell through to `.mac`.
+        return Some(format!(
+            "{name}.{}",
+            routine_suffix(body.lines().next().unwrap_or(""))
+        ));
     }
     None
+}
+
+/// `[Type=INT]` content offered where a `.mac` of the same name already exists.
+pub const INT_GENERATED_FROM_MAC: &str = "INT_GENERATED_FROM_MAC";
+/// `[Type=INT]` content whose sibling-`.mac` probe did not answer, so neither outcome is known.
+pub const INT_SIBLING_UNKNOWN: &str = "INT_SIBLING_UNKNOWN";
+
+/// Whether the routine a put is about to write already exists as `.mac` in the target namespace.
+///
+/// Three states, and the third is the point. A probe that FAILED — a 401, a 500, a timeout — has
+/// not discovered an absence, and `Absent` is a FACT claim that decides whether the write happens
+/// (CLAUDE.md: a failure must never be answered with a negative fact). Collapsing `Unknown` into
+/// `Absent` writes an `.int` on a measurement nobody took; collapsing it into `Present` refuses on
+/// one. It is therefore carried, with its reason, to `int_put_outcome`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MacSibling {
+    /// Measured present: `X.mac` is in the namespace.
+    Present,
+    /// Measured absent: the namespace answered, and there is no `X.mac` in it.
+    Absent,
+    /// Nothing was established. Carries the reason, for the refusal to print.
+    Unknown(String),
+}
+
+/// What `mode=put` must do before it can name the document it is about to write.
+///
+/// `Settled` and `AsGiven` are the two halves of what `doc_name_with_suffix` returns on its own.
+/// `NeedsMacSiblingProbe` is the case the content CANNOT settle, and it is a variant rather than a
+/// name so that the type system asks the question: the caller cannot obtain a document name for
+/// `[Type=INT]` content without first answering what is beside it. The put path reached this gap
+/// precisely because the decision looked pure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PutNamePlan {
+    /// The content settled the suffix on its own: write this document.
+    Settled(String),
+    /// The content declares `[Type=INT]`. Probe for `mac`, then call `int_put_outcome`.
+    NeedsMacSiblingProbe { int: String, mac: String },
+    /// The content settles nothing; the caller's own name stands (`doc_suffix_hint` explains it).
+    AsGiven,
+}
+
+/// The stem of a document named `*.int`, case-folded exactly as `has_doc_suffix` folds a suffix.
+///
+/// `X.INT` is an `.int` write as far as every other part of this file is concerned, so a
+/// case-sensitive test here would have left that one spelling as a way round the probe.
+fn int_document_stem(doc: &str) -> Option<&str> {
+    let (stem, ext) = doc.rsplit_once('.')?;
+    ext.eq_ignore_ascii_case("int").then_some(stem)
+}
+
+/// The document `mode=put` should write, or the probe it must run first.
+///
+/// BOTH ways a put can arrive at an `.int` are read, and that is the sibling half of #537.
+/// `doc_name_with_suffix` exists to ADD a missing suffix, so it answers `None` the moment the
+/// caller's name already carries one — and `iris_doc(mode=get, name='X.int')` → edit →
+/// `iris_doc(mode=put, name='X.int')` is the round trip a caller actually performs, carrying the
+/// suffix every time. Keying the probe on the HEADER alone therefore left the commoner input
+/// unprobed, and the refusal could be stepped round by typing the three characters it is about.
+///
+/// The issue thread states the rule per-DOCUMENT — an `.int` put where a `.mac` of that name
+/// exists — and says nothing about where the suffix came from. So the probe is keyed on the
+/// document about to be written, not on which branch named it.
+pub fn plan_put_name(name: &str, content: Option<&str>) -> PutNamePlan {
+    let corrected = doc_name_with_suffix(name, content);
+    // The document this put would actually write: the content's correction if it made one, and
+    // otherwise the caller's own name.
+    let writing = corrected.as_deref().unwrap_or(name);
+    if let Some(stem) = int_document_stem(writing) {
+        return PutNamePlan::NeedsMacSiblingProbe {
+            int: writing.to_string(),
+            mac: format!("{stem}.mac"),
+        };
+    }
+    match corrected {
+        Some(settled) => PutNamePlan::Settled(settled),
+        None => PutNamePlan::AsGiven,
+    }
+}
+
+/// The two outcomes of an `[Type=INT]` put, and the refusal — all three distinguishable by a
+/// caller, which is the whole of #537's acceptance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IntPut {
+    /// No `X.mac` in the namespace: the INT-only legacy case, whose `.mac` source was lost years
+    /// ago and whose `.int` is the only thing left to maintain. Write it.
+    Store(String),
+    /// Write NOTHING, and tell the caller which document to edit instead.
+    Refuse { code: &'static str, detail: String },
+}
+
+/// Decide an `[Type=INT]` put, once the sibling probe has answered.
+///
+/// Pure on purpose: the probe is one HTTP call in `probe_mac_sibling`, and everything that decides
+/// whether a document gets written — including the text the caller reads — is a function of three
+/// values a test can pass in.
+///
+/// Where `X.mac` is present, `X.int` IS its generated output: the next compile of `X.mac`
+/// overwrites whatever the put stored, so accepting the write reports a success whose effect is
+/// silently discarded. The remedy names the `.mac` to edit; it deliberately does NOT suggest
+/// removing the `.mac` to get the `.int` accepted, because a denial that spells out its own bypass
+/// is a recipe rather than a remedy.
+pub fn int_put_outcome(int: &str, mac: &str, sibling: &MacSibling) -> IntPut {
+    match sibling {
+        MacSibling::Absent => IntPut::Store(int.to_string()),
+        MacSibling::Present => IntPut::Refuse {
+            code: INT_GENERATED_FROM_MAC,
+            detail: format!(
+                "REFUSED: nothing was written. '{int}' is the INTERMEDIATE code IRIS generates \
+                 from '{mac}', and '{mac}' exists in this namespace — so the next compile of \
+                 '{mac}' overwrites whatever this put stored, and the write would be reported as \
+                 a success and then silently discarded. Edit the source that generates it: \
+                 iris_doc(mode=put, name='{mac}', compile=true), which rebuilds '{int}' from it."
+            ),
+        },
+        MacSibling::Unknown(why) => IntPut::Refuse {
+            code: INT_SIBLING_UNKNOWN,
+            detail: format!(
+                "REFUSED: nothing was written. '{int}' is the INTERMEDIATE code IRIS generates \
+                 from '{mac}', so it may only be written where no '{mac}' exists — and whether \
+                 '{mac}' exists could not be established: {why}. A probe that did not answer is \
+                 not a namespace with no '{mac}' in it. Check the connection with check_config \
+                 and retry, or write the MAC source instead with iris_doc(mode=put, name='{mac}', \
+                 compile=true)."
+            ),
+        },
+    }
+}
+
+/// Is there a `.mac` beside the `.int` this put would write?
+///
+/// HEAD, so nothing is read and nothing is written by the probe itself — and it runs ONLY for
+/// `[Type=INT]` content, so no other put pays for a round trip
+/// (`a_plain_mac_routine_is_unaffected` pins that).
+///
+/// **A 404 is read as `Absent`, and that is a boundary rather than the #102 defect.** A 404 is an
+/// answer: `handle_head` has to work harder because `exists:false` is its whole RESULT, reported
+/// to a caller who will act on it. Here the 404 only decides which document the PUT that follows
+/// goes to, over the same `/doc/` space on the same connection — so a wrong web prefix or a
+/// missing namespace, the two cases that make a 404 mean something else, fail that PUT with their
+/// own error instead of silently storing anything. What must NOT be read as absence is a reply
+/// that answered a different question: a 401, a 5xx, a timeout. Those become `Unknown`.
+async fn probe_mac_sibling(
+    iris: &IrisConnection,
+    client: &reqwest::Client,
+    namespace: &str,
+    mac: &str,
+) -> MacSibling {
+    let url = iris.versioned_ns_url(namespace, &format!("/doc/{}", urlencoding::encode(mac)));
+    match client
+        .head(&url)
+        .basic_auth(&iris.username, Some(&iris.password))
+        .send()
+        .await
+    {
+        Err(e) => MacSibling::Unknown(format!("the probe for '{mac}' did not reach IRIS: {e}")),
+        Ok(resp) if resp.status().is_success() => MacSibling::Present,
+        Ok(resp) if resp.status().as_u16() == 404 => MacSibling::Absent,
+        Ok(resp) => MacSibling::Unknown(format!(
+            "the probe for '{mac}' answered HTTP {}, which says nothing about whether it is there",
+            resp.status()
+        )),
+    }
 }
 
 /// What to tell a caller whose document name has no suffix. `(suggestion, hint)`.
@@ -1206,12 +1380,41 @@ async fn handle_put(
     };
     // #71: `Class <name>` in the content settles the type, so add the suffix instead of
     // letting Atelier answer "#16006 name is invalid" about a perfectly good class name.
-    let name = match doc_name_with_suffix(&name, p.content.as_deref()) {
-        Some(fixed) => {
+    //
+    // #537: `[Type=INT]` is the one header the content cannot settle alone — see `plan_put_name`.
+    let name = match plan_put_name(&name, p.content.as_deref()) {
+        PutNamePlan::AsGiven => name,
+        PutNamePlan::Settled(fixed) => {
             tracing::info!(from = %name, to = %fixed, "iris_doc: added the missing document suffix");
             fixed
         }
-        None => name,
+        PutNamePlan::NeedsMacSiblingProbe { int, mac } => {
+            let sibling = probe_mac_sibling(iris, client, ns, &mac).await;
+            match int_put_outcome(&int, &mac, &sibling) {
+                IntPut::Store(fixed) => {
+                    tracing::info!(
+                        from = %name, to = %fixed, sibling = %mac,
+                        "iris_doc: [Type=INT] with no MAC beside it — storing the intermediate"
+                    );
+                    fixed
+                }
+                // Before the skeleton guard, before the ROUTINE header injection, before any SCM
+                // checkout: the refusal costs one HEAD and leaves nothing half-finished.
+                IntPut::Refuse { code, detail } => {
+                    return crate::tools::envelope::fail_with(
+                        code,
+                        &detail,
+                        serde_json::json!({
+                            "mode": "put",
+                            "namespace": ns,
+                            "refused_document": int,
+                            "generated_from": mac,
+                            "fix": format!("iris_doc(mode=put, name='{mac}', compile=true)"),
+                        }),
+                    );
+                }
+            }
+        }
     };
     let name = name.as_str();
 
