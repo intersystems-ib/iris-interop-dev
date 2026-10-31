@@ -126,6 +126,27 @@ pub fn workspace_root(workspace_path: Option<&str>) -> PathBuf {
     legacy_root.unwrap_or(cwd)
 }
 
+/// The directory holding a workspace config file, when one was actually FOUND.
+///
+/// #549: [`workspace_root`] cannot answer this. It always returns a path — falling back to the
+/// process cwd when the walk finds nothing — so its result does not distinguish "the project root
+/// is here" from "nothing was found and this is where we happened to be standing". Code that
+/// bounds writes to a project root needs that difference: a root which is really just cwd bounds
+/// nothing, and `None` here lets the caller fall through to a candidate that knows what it is
+/// naming instead of silently treating cwd as the project.
+///
+/// The two filenames are the same pair, in the same order, that
+/// [`load_workspace_config_with_path`] accepts — one of them existing is exactly the condition
+/// under which that function returns a config rather than `Ok(None)`.
+pub fn located_config_root(workspace_path: Option<&str>) -> Option<PathBuf> {
+    let root = workspace_root(workspace_path);
+    if root.join(".iris-agentic-dev.toml").exists() || root.join(".iris-dev.toml").exists() {
+        Some(root)
+    } else {
+        None
+    }
+}
+
 /// Like [`load_workspace_config`] but also returns the path of the file that was loaded,
 /// so callers can record it in `ConnectionState` at startup (issue #21, upstream #82).
 pub fn load_workspace_config_with_path(

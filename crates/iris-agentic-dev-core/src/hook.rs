@@ -12,6 +12,7 @@
 //! counting them shows that.
 
 use crate::iris::connection::IrisConnection;
+use std::path::{Path, PathBuf};
 
 /// What the hook has to say.
 ///
@@ -156,5 +157,231 @@ pub fn is_objectscript_source(path: &str) -> bool {
     match path.rsplit_once('.') {
         Some((_, ext)) => HOOK_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()),
         None => false,
+    }
+}
+
+// ── #549: does this path belong to the project the hook is running for? ──────
+
+/// Where a path lies relative to the project root.
+///
+/// Three cases, not two. `Undetermined` is deliberately NOT folded into `Outside`: "this file is
+/// not in the project" and "I could not work out whether this file is in the project" send the
+/// agent in different directions, and the second must never arrive wearing the first's clothes.
+/// That folding is the defect class CLAUDE.md opens with, and a containment check is a place it
+/// would be free to happen — `canonicalize` fails for a missing file, a permission error and a
+/// symlink loop alike, and every one of those is "I cannot tell", not "it lives elsewhere".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathContainment {
+    /// Resolved, and under the root. Both paths are CANONICAL, so a caller that reads
+    /// `path` reads the file that was judged rather than the string it passed in.
+    Inside { path: PathBuf, root: PathBuf },
+    /// Resolved, and not under the root.
+    Outside { path: PathBuf, root: PathBuf },
+    /// One of the two paths would not resolve, so there is no answer. `path` is the path as it
+    /// was GIVEN — there is no canonical form of it to report.
+    Undetermined { path: PathBuf, why: String },
+}
+
+impl PathContainment {
+    /// What the agent is told when the hook declines to act on this path.
+    ///
+    /// `None` for `Inside`: a file the project owns has nothing to report, and a hook that
+    /// comments on every successful edit is one the user switches off.
+    pub fn refusal(&self) -> Option<String> {
+        match self {
+            Self::Inside { .. } => None,
+            Self::Outside { path, root } => Some(outside_refusal(path, root)),
+            Self::Undetermined { path, why } => Some(undetermined_refusal(path, why)),
+        }
+    }
+}
+
+/// ONE reader of this sentence, shared by the containment verdict and the hook's decision.
+///
+/// Two copies is how a report and the thing it reports on drift apart — the same shape as #530's
+/// two parsers of the `Class` line, which disagreed about whether `Class {` was a name.
+fn outside_refusal(path: &Path, root: &Path) -> String {
+    format!(
+        "{} was NOT uploaded or compiled: it is outside the project root {}.\n  \
+         The hook compiles only files inside the project it is running for — uploading one the \
+         project does not own is a write into a shared namespace that nobody asked for.\n  \
+         Edit that file from its own project, or point the hook at the tree that owns it: set \
+         OBJECTSCRIPT_WORKSPACE to that root, or put a .iris-agentic-dev.toml there.",
+        path.display(),
+        root.display()
+    )
+}
+
+fn undetermined_refusal(path: &Path, why: &str) -> String {
+    format!(
+        "Whether {} is inside the project root is UNKNOWN: {why}.\n  \
+         It was NOT uploaded or compiled. This is not a finding that the file lives elsewhere — \
+         treat the edit as unverified, and re-run it once the path resolves.",
+        path.display()
+    )
+}
+
+/// Whether `path` is a file of the project rooted at `root`.
+///
+/// Both sides are canonicalised first, and the comparison is then `Path::starts_with`, which
+/// compares path COMPONENTS rather than characters. Both halves are load-bearing and each was
+/// wrong in a different reported way:
+///
+/// * **Unresolved strings.** On macOS `/tmp` is a symlink to `/private/tmp`, so a path and a root
+///   naming the same directory through different links compare as different trees — in either
+///   direction. That is what defeated the first attempt at this check, and
+///   `a_root_reached_through_a_symlink_is_the_same_tree` builds its own symlink to pin it on every
+///   platform rather than relying on macOS's.
+/// * **A textual prefix.** `/a/project-other` begins with every character of `/a/project` and is
+///   not inside it. `a_sibling_sharing_the_roots_name_prefix_is_outside` is that case, and it is
+///   the one a `starts_with` on strings accepts.
+///
+/// Resolving also settles `..` and any symlink on the way: a link inside the root pointing out of
+/// it resolves to its target and is correctly Outside, which a lexical normalisation would miss.
+pub fn path_within_project(path: &Path, root: &Path) -> PathContainment {
+    let resolved_root = match root.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            return PathContainment::Undetermined {
+                path: path.to_path_buf(),
+                why: format!(
+                    "the project root {} would not resolve ({e})",
+                    root.display()
+                ),
+            }
+        }
+    };
+    let resolved_path = match path.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            return PathContainment::Undetermined {
+                path: path.to_path_buf(),
+                why: format!("{} would not resolve ({e})", path.display()),
+            }
+        }
+    };
+    if resolved_path.starts_with(&resolved_root) {
+        PathContainment::Inside {
+            path: resolved_path,
+            root: resolved_root,
+        }
+    } else {
+        PathContainment::Outside {
+            path: resolved_path,
+            root: resolved_root,
+        }
+    }
+}
+
+/// Which input named the project root, in the order they are consulted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootSource {
+    /// `OBJECTSCRIPT_WORKSPACE`, or an explicit workspace argument — somebody said outright which
+    /// tree this hook serves, so nothing else gets to overrule it.
+    ExplicitWorkspace,
+    /// The directory holding `.iris-agentic-dev.toml`: the project whose connection the hook is
+    /// about to use. Bounding to anything else would let the file that chooses the NAMESPACE and
+    /// the directory that bounds the WRITES disagree, which is #540 one layer out.
+    ConfigFile,
+    /// The `cwd` in the hook payload — Claude Code's own idea of which project this edit belongs
+    /// to. Present on `PostToolUse`.
+    PayloadCwd,
+    /// `CLAUDE_PROJECT_DIR`. The `FileChanged` payload carries only `file_path`, so for that event
+    /// this is the first candidate the payload cannot supply.
+    ClaudeProjectDir,
+    /// Where the hook process happens to be standing. Last, and weakest: launched from a
+    /// subdirectory it bounds to that subdirectory, which is narrower than the project. It is here
+    /// so that a tree with no config file and a payload with no `cwd` still bounds to SOMETHING
+    /// rather than refusing every edit.
+    ProcessCwd,
+}
+
+/// The project root, or the fact that nothing named one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectRoot {
+    Named {
+        root: PathBuf,
+        source: RootSource,
+    },
+    /// No candidate named a root. Not quietly defaulted to one: a root nobody named bounds
+    /// nothing while making the hook look bounded.
+    Unknown,
+}
+
+/// Pick the directory the hook bounds edits to, highest-precedence candidate first.
+///
+/// Every input is a parameter rather than an environment read, so the precedence can be tested
+/// without `set_var` — two tests mutating the process environment in parallel make each other
+/// pass, and this crate's test binaries run threaded by default.
+pub fn project_root_for_hook(
+    explicit_workspace: Option<&Path>,
+    config_root: Option<&Path>,
+    payload_cwd: Option<&Path>,
+    claude_project_dir: Option<&Path>,
+    process_cwd: Option<&Path>,
+) -> ProjectRoot {
+    let candidates = [
+        (RootSource::ExplicitWorkspace, explicit_workspace),
+        (RootSource::ConfigFile, config_root),
+        (RootSource::PayloadCwd, payload_cwd),
+        (RootSource::ClaudeProjectDir, claude_project_dir),
+        (RootSource::ProcessCwd, process_cwd),
+    ];
+    for (source, candidate) in candidates {
+        // `OBJECTSCRIPT_WORKSPACE=` is how a shell spells "unset" by accident, and an empty path
+        // names no directory at all. Measured rather than assumed: `std::fs::canonicalize("")` is
+        // `ENOENT`, not the process cwd, so a root of `""` reaching `path_within_project` makes
+        // every edit `Undetermined` and the hook refuses all of them — loud, but wrong about why.
+        // Filtering it here is what makes `ProcessCwd` the thing that answers instead, and
+        // `workspace_root` already treats the empty string as absent, so the two agree.
+        // `an_empty_root_answers_nothing_rather_than_the_process_cwd` pins the resolution side.
+        if let Some(root) = candidate.filter(|p| !p.as_os_str().is_empty()) {
+            return ProjectRoot::Named {
+                root: root.to_path_buf(),
+                source,
+            };
+        }
+    }
+    ProjectRoot::Unknown
+}
+
+/// What the hook does with the path it was handed, before anything is read or uploaded.
+///
+/// One variant per CHANNEL at the CLI boundary, the same discipline as `HookVerdict`: a decision
+/// the binary cannot tell apart is a decision it cannot report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HookPathDecision {
+    /// Compile it. Carries the CANONICAL path, so the file that gets read is the file that was
+    /// judged — a check on one path followed by a read of another is no check at all.
+    Proceed { path: PathBuf },
+    /// Do not compile it, exit 0, and print this. Exit 0 because an edit outside the project is
+    /// not the agent's mistake; the message because #529 was filed for exiting 0 with nothing to
+    /// say, which the agent reads as a clean compile.
+    Skip { message: String },
+    /// Do not compile it, and interrupt with this. The question could not be answered, and an
+    /// unanswered question must not be delivered through the same channel as an answer.
+    Refuse { message: String },
+}
+
+/// Bound an edited path to the project, and say which channel the answer takes.
+pub fn decide_hook_path(file_path: &str, root: &ProjectRoot) -> HookPathDecision {
+    let ProjectRoot::Named { root, .. } = root else {
+        return HookPathDecision::Refuse {
+            message: format!(
+                "{file_path} was NOT uploaded or compiled: the project root could not be \
+                 identified, so there is no tree to check it against.\n  \
+                 Set OBJECTSCRIPT_WORKSPACE to the project root, or put a \
+                 .iris-agentic-dev.toml there."
+            ),
+        };
+    };
+    match path_within_project(Path::new(file_path), root) {
+        PathContainment::Inside { path, .. } => HookPathDecision::Proceed { path },
+        PathContainment::Outside { path, root } => HookPathDecision::Skip {
+            message: outside_refusal(&path, &root),
+        },
+        PathContainment::Undetermined { path, why } => HookPathDecision::Refuse {
+            message: undetermined_refusal(&path, &why),
+        },
     }
 }
