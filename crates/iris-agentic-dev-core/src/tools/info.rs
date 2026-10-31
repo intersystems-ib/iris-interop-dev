@@ -709,14 +709,43 @@ pub async fn handle_iris_debug(
             }))
         }
         "error_logs" => {
-            // IRIS error log tables (%SYSTEM.Error, %SYS.ErrorLog) are not SQL-accessible
-            // via Atelier REST in IRIS Community edition.
-            // Return empty list with a clear note rather than null.
-            ok_json(serde_json::json!({
-                "success": true,
-                "logs": [],
-                "note": "IRIS error log is not accessible via Atelier REST SQL. Set IRIS_CONTAINER to enable docker exec access to the full error log."
-            }))
+            // #533: this arm used to return `{"success": true, "logs": [], "note": "…Set
+            // IRIS_CONTAINER…"}` WITHOUT MAKING A REQUEST. A caller reads `success: true,
+            // logs: []` as "this namespace logged no errors"; measured on a live 2026.2 stack,
+            // `^ERRORS` held two entries at that moment. Both halves of the note were false
+            // besides: the log is a GLOBAL, so plain HTTP reaches it — no container needed —
+            // and the reporting instance already had `container` set, so the remedy it named
+            // was already in force.
+            //
+            // It now walks ^ERRORS and reports one of three outcomes. The refusal carries no
+            // `logs` key at all: a present `[]` beside `success: false` is how a caller turns a
+            // failure straight back into the negative fact this is fixing.
+            let code = crate::tools::error_log::build_error_log_code(p.limit);
+            let read = match iris.execute_via_generator(&code, &namespace, client).await {
+                Ok(output) => crate::tools::error_log::parse_error_log_output(&output),
+                // A transport or generator failure is a failed READ, not an empty log — the same
+                // discrimination, one layer out.
+                Err(e) => crate::tools::error_log::ErrorLogRead::Unreadable(format!(
+                    "the ^ERRORS walk could not be run: {e}"
+                )),
+            };
+            match crate::tools::error_log::read_json(&read, &namespace) {
+                Some(v) => ok_json(v),
+                None => {
+                    let why = crate::tools::error_log::unreadable_reason(&read)
+                        .unwrap_or("the error log could not be read");
+                    crate::tools::envelope::fail_with(
+                        // The literal, not the const: see `error_log::ERROR_LOG_UNAVAILABLE`.
+                        "ERROR_LOG_UNAVAILABLE",
+                        why,
+                        serde_json::json!({
+                            "global": "^ERRORS",
+                            "namespace": namespace,
+                            "hint": "Nothing was read, so nothing is known about what this namespace logged. Read ^ERRORS directly with iris_global(action=walk, name='ERRORS') or iris_execute to see the raw layout, and check the connecting user holds READ on the database holding it.",
+                        }),
+                    )
+                }
+            }
         }
         "capture" => {
             let code = "set err=$ZERROR write \"error:\"_err,! set loc=$ZPOSITION write \"position:\"_loc,!";
