@@ -86,6 +86,7 @@ const REMEDIES: &[(&str, &str)] = &[
     ("ELICITATION_EXPIRED", "pending dialogs are held for five minutes only; re-run the original write to get a fresh one and confirm it promptly"),
     ("ELICITATION_NOT_FOUND", "no pending dialog has that id; re-run the write to get a new one, and note a server restart discards the in-memory store"),
     ("EMPTY_QUERY", "the statement was empty once comments were stripped; send the SQL itself rather than a comment block"),
+    ("ERROR_LOG_UNAVAILABLE", "the error log could not be read, so nothing is known about what this namespace logged — do NOT read it as `no errors`; the message carries the reason, and ^ERRORS can be read directly with iris_global(action=walk, name='ERRORS') or iris_execute once the connecting user holds READ on the database that holds it"),
     ("EXECUTE_FAILED", "the method could not be run at all; the message carries IRIS's reason — check the class is compiled and the arguments match the signature before retrying"),
     ("EXECUTION_FAILED", "the code reached IRIS and IRIS refused it; the message carries the ObjectScript error — fix the code, do not retry unchanged"),
     ("GATEWAY_BAD_OUTPUT", "the connection test returned something that is not a verdict, so whether the gateway works is unknown and no query was sent; re-run the test and treat this as unknown, not as a failed connection"),

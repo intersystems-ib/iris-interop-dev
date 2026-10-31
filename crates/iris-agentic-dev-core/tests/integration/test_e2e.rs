@@ -1802,17 +1802,29 @@ fn e2e_debug_error_logs_returns_list() {
         "debug_get_error_logs",
         serde_json::json!({"namespace": "USER", "max_entries": 10}),
     );
-    assert_eq!(
-        result["success"], true,
-        "debug_get_error_logs should succeed: {}",
-        result
-    );
-    // logs may be null (no recent errors) or an array — both are valid
-    assert!(
-        result["logs"].is_array() || result["logs"].is_null(),
-        "error logs must be array or null: {}",
-        result
-    );
+    // #533: this used to assert `success: true` unconditionally, and it passed BECAUSE of the
+    // defect — `%SYSTEM.Error` has no SQL projection, so the SELECT fails on every instance and
+    // the handler turned that failure into `{"success": true, "logs": []}`. Two outcomes are
+    // legitimate now, and the old one is not either of them.
+    if result["success"] == serde_json::Value::Bool(true) {
+        assert!(
+            result["logs"].is_array(),
+            "a successful read returns the entries it read: {}",
+            result
+        );
+    } else {
+        assert_eq!(
+            result["error_code"], "ERROR_LOG_UNAVAILABLE",
+            "a read that could not happen says so: {}",
+            result
+        );
+        assert!(
+            result["logs"].is_null(),
+            "a failed read must carry no `logs` key — a present `[]` reads as `no errors were \
+             logged`, which is the invented fact #533 removed: {}",
+            result
+        );
+    }
 }
 
 #[test]
@@ -1822,17 +1834,25 @@ fn e2e_debug_capture_packet_returns_errors() {
         "debug_capture_packet",
         serde_json::json!({"namespace": "USER"}),
     );
-    assert_eq!(
-        result["success"], true,
-        "debug_capture_packet should succeed: {}",
-        result
-    );
-    // errors may be null (no recent errors) or an array — both are valid
-    assert!(
-        result["errors"].is_array() || result["errors"].is_null(),
-        "capture packet must return errors array or null: {}",
-        result
-    );
+    // #533's sibling, same reasoning as `e2e_debug_error_logs_returns_list` above.
+    if result["success"] == serde_json::Value::Bool(true) {
+        assert!(
+            result["errors"].is_array(),
+            "a successful read returns the entries it read: {}",
+            result
+        );
+    } else {
+        assert_eq!(
+            result["error_code"], "ERROR_LOG_UNAVAILABLE",
+            "a read that could not happen says so: {}",
+            result
+        );
+        assert!(
+            result["errors"].is_null(),
+            "a failed read must carry no `errors` key: {}",
+            result
+        );
+    }
 }
 
 #[test]
@@ -2843,13 +2863,25 @@ fn e2e_debug_error_logs_max_entries_cap() {
             "max_entries": 5000
         }),
     );
-    assert_eq!(result["success"], true, "debug_get_error_logs: {}", result);
-    let logs = result["logs"].as_array().cloned().unwrap_or_default();
-    assert!(
-        logs.len() <= 1000,
-        "max_entries=5000 must be capped at 1000: {}",
-        logs.len()
-    );
+    // #533: `success` is no longer guaranteed — `%SYSTEM.Error` is not SQL-readable, and that is
+    // now reported rather than papered over. The cap is still the point of this test, so assert it
+    // on the successful shape and assert the refusal is the named one otherwise.
+    if result["success"] == serde_json::Value::Bool(true) {
+        let logs = result["logs"]
+            .as_array()
+            .unwrap_or_else(|| panic!("a successful read returns an array: {result}"));
+        assert!(
+            logs.len() <= 1000,
+            "max_entries=5000 must be capped at 1000: {}",
+            logs.len()
+        );
+    } else {
+        assert_eq!(
+            result["error_code"], "ERROR_LOG_UNAVAILABLE",
+            "debug_get_error_logs: {}",
+            result
+        );
+    }
 }
 
 #[test]
@@ -2862,17 +2894,25 @@ fn e2e_debug_error_logs_small_limit() {
             "max_entries": 1
         }),
     );
-    assert_eq!(
-        result["success"], true,
-        "debug_get_error_logs max=1: {}",
-        result
-    );
-    let logs = result["logs"].as_array().cloned().unwrap_or_default();
-    assert!(
-        logs.len() <= 1,
-        "max_entries=1 must return at most 1 entry: {}",
-        logs.len()
-    );
+    // #533: see `e2e_debug_error_logs_max_entries_cap`. `unwrap_or_default()` here was itself an
+    // instance of the house bug in a test's own control: a failed call read as "zero rows", so the
+    // length assertion passed on a call that had learned nothing.
+    if result["success"] == serde_json::Value::Bool(true) {
+        let logs = result["logs"]
+            .as_array()
+            .unwrap_or_else(|| panic!("a successful read returns an array: {result}"));
+        assert!(
+            logs.len() <= 1,
+            "max_entries=1 must return at most 1 entry: {}",
+            logs.len()
+        );
+    } else {
+        assert_eq!(
+            result["error_code"], "ERROR_LOG_UNAVAILABLE",
+            "debug_get_error_logs max=1: {}",
+            result
+        );
+    }
 }
 
 #[test]
@@ -2882,13 +2922,22 @@ fn e2e_debug_capture_packet_success_field() {
         "debug_capture_packet",
         serde_json::json!({"namespace":"USER"}),
     );
-    assert_eq!(result["success"], true, "capture packet: {}", result);
-    // errors field must be array or null (never absent when success=true)
-    assert!(
-        result["errors"].is_array() || result["errors"].is_null(),
-        "errors field must be present and array or null: {}",
-        result
-    );
+    // #533: `errors` must be an array WHEN the read succeeded, and absent when it did not.
+    // "array or null" accepted both and so pinned neither.
+    if result["success"] == serde_json::Value::Bool(true) {
+        assert!(
+            result["errors"].is_array(),
+            "errors field must be present and an array on a successful read: {}",
+            result
+        );
+    } else {
+        assert_eq!(
+            result["error_code"], "ERROR_LOG_UNAVAILABLE",
+            "capture packet: {}",
+            result
+        );
+        assert!(result["errors"].is_null(), "{}", result);
+    }
 }
 
 #[test]
