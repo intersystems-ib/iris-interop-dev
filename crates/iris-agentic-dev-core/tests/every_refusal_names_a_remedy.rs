@@ -107,6 +107,8 @@ const REMEDIES: &[(&str, &str)] = &[
     ("INDETERMINATE", "the probe ran but its answer does not decide the question either way; treat it as unknown rather than as a no, and re-read the specific object the message names"),
     ("INSUFFICIENT_HISTORY", "a skill is mined from recent tool calls and there are too few so far; keep working and retry later, or author the skill by hand"),
     ("INTERNAL_ERROR", "a bug in this server, not in the request; the message names the failing step — please report it with that text"),
+    ("INT_GENERATED_FROM_MAC", "the content's header says [Type=INT] and a .mac of that name exists, so the .int is that routine's GENERATED output and the next compile of the .mac would overwrite this write — nothing was stored; edit the .mac the payload names with iris_doc(mode=put, name='<routine>.mac', compile=true), which rebuilds the .int from it"),
+    ("INT_SIBLING_UNKNOWN", "whether a .mac of that name exists could not be established, so whether this .int would survive the next compile is unknown and nothing was written — a probe that did not answer is not a namespace without that .mac; check the connection with check_config and retry, or write the MAC source instead with iris_doc(mode=put, name='<routine>.mac', compile=true)"),
     ("INTEROP_ERROR", "the interop call reached IRIS and failed; the message carries the Ens error — check the production is running and the item name is exact"),
     ("INTEROP_NOT_AVAILABLE", "Interoperability is not enabled in that namespace; pick an interop namespace (check_config lists them) or enable interop there before retrying"),
     ("INVALID_ACTION", "the action argument is not one this tool accepts; the message lists the accepted values — resend with one of those"),
