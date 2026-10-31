@@ -338,3 +338,146 @@ fn the_suffix_reader_knows_all_three_routine_types() {
         cases.len()
     );
 }
+
+// ── The SIBLING: the suffix the CALLER typed ───────────────────────────────────────────────────
+//
+// `plan_put_name` asks `doc_name_with_suffix`, which returns `None` the moment the name already
+// carries a suffix — it exists to ADD a missing one. So `name="X.int"` took the `AsGiven` branch
+// and reached `do_write` with no probe: the refusal above could be stepped round by typing the
+// three characters it is about.
+//
+// That is not the rarer input, it is the commoner one. `iris_doc(mode=get, name='X.int')` →
+// edit → `iris_doc(mode=put, name='X.int')` is the round trip a caller actually performs, and it
+// carries the suffix every time. The issue thread states the rule per-DOCUMENT — "an `.int` put
+// when a `.mac` of the same name exists" — and says nothing about where the suffix came from, so
+// the probe is keyed on the document about to be written rather than on which branch named it.
+
+/// The refusal the header path already gives, through the path a get/edit/put round trip uses.
+#[tokio::test]
+async fn a_caller_supplied_int_suffix_is_refused_when_the_mac_exists() {
+    let server = server_with(ResponseTemplate::new(200).insert_header("ETag", "64")).await;
+    let (is_error, payload) = put(
+        &server,
+        "ZZ537Legacy.int",
+        INT_SOURCE,
+        &["ZZ537Legacy.int", "ZZ537Legacy.mac"],
+    )
+    .await;
+    assert_eq!(
+        payload["error_code"], "INT_GENERATED_FROM_MAC",
+        "typing the .int suffix must not be a way round the refusal: {payload}"
+    );
+    assert_eq!(is_error, Some(true));
+    assert_eq!(
+        requests(&server, "PUT").await,
+        Vec::<String>::new(),
+        "and nothing may be written: {payload}"
+    );
+}
+
+/// The probe keys on the DOCUMENT, not on the header: here the caller's name is the only thing
+/// that says `.int`, and the content's bare `ROUTINE` header would have settled on `.mac`.
+#[tokio::test]
+async fn a_caller_supplied_int_suffix_is_probed_even_when_the_content_says_nothing() {
+    let server = server_with(ResponseTemplate::new(200).insert_header("ETag", "64")).await;
+    let (_, payload) = put(
+        &server,
+        "ZZ537Legacy.int",
+        "ROUTINE ZZ537Legacy\nLIST ; list orders\n quit\n",
+        &["ZZ537Legacy.int", "ZZ537Legacy.mac"],
+    )
+    .await;
+    assert_eq!(
+        payload["error_code"], "INT_GENERATED_FROM_MAC",
+        "the hazard is the document being written, not the header that named it: {payload}"
+    );
+    assert_eq!(
+        requests(&server, "PUT").await,
+        Vec::<String>::new(),
+        "nothing may be written: {payload}"
+    );
+}
+
+/// `has_doc_suffix` lower-cases before comparing, so `X.INT` reaches `mode=put` as an `.int`
+/// write. A case-sensitive test in the probe would have left this spelling as the bypass.
+#[tokio::test]
+async fn an_upper_case_int_suffix_is_not_a_way_round_the_probe() {
+    let server = server_with(ResponseTemplate::new(200).insert_header("ETag", "64")).await;
+    let (_, payload) = put(
+        &server,
+        "ZZ537Legacy.INT",
+        INT_SOURCE,
+        &["ZZ537Legacy.INT", "ZZ537Legacy.mac"],
+    )
+    .await;
+    assert_eq!(
+        payload["error_code"], "INT_GENERATED_FROM_MAC",
+        "the suffix test must fold case, as has_doc_suffix does: {payload}"
+    );
+    assert_eq!(
+        requests(&server, "PUT").await,
+        Vec::<String>::new(),
+        "nothing may be written: {payload}"
+    );
+}
+
+/// The legacy case still works through the explicit-name path: no `.mac` in the namespace, so the
+/// `.int` the caller named is written. The refusal must not become "no caller may ever put an
+/// .int", which is the blanket (b) the issue thread rejected.
+#[tokio::test]
+async fn a_caller_supplied_int_suffix_with_no_mac_beside_it_is_stored() {
+    let server = server_with(ResponseTemplate::new(404)).await;
+    let (is_error, payload) = put(
+        &server,
+        "ZZ537Legacy.int",
+        INT_SOURCE,
+        &["ZZ537Legacy.int", "ZZ537Legacy.mac"],
+    )
+    .await;
+    assert_eq!(
+        requests(&server, "PUT").await,
+        vec![format!("/api/atelier/v1/{NS}/doc/ZZ537Legacy.int")],
+        "payload: {payload}"
+    );
+    assert_eq!(is_error, Some(false), "the write must succeed: {payload}");
+}
+
+/// The control for the whole sibling fix, as a POPULATION rather than one name: every other
+/// explicitly-suffixed document still writes with NO extra round trip. Without this, keying the
+/// probe on the target name could have made every put pay a HEAD, and each test above would still
+/// have passed.
+#[tokio::test]
+async fn no_other_explicitly_named_document_is_probed() {
+    let cases: &[(&str, &str)] = &[
+        ("ZZ537Legacy.mac", "ROUTINE ZZ537Legacy\n quit\n"),
+        (
+            "ZZ537Macros.inc",
+            "ROUTINE ZZ537Macros [Type=INC]\n#define ZZ537 1\n",
+        ),
+        (
+            "ZZ537.Thing.cls",
+            "Class ZZ537.Thing Extends %RegisteredObject\n{\n}\n",
+        ),
+    ];
+    let mut probed: Vec<&str> = Vec::new();
+    for (name, content) in cases {
+        let server = server_with(ResponseTemplate::new(200).insert_header("ETag", "64")).await;
+        let (is_error, payload) = put(&server, name, content, &[name]).await;
+        assert_eq!(
+            requests(&server, "PUT").await,
+            vec![format!("/api/atelier/v1/{NS}/doc/{name}")],
+            "{name} must be written as named: {payload}"
+        );
+        assert_eq!(is_error, Some(false), "{name} must succeed: {payload}");
+        if !requests(&server, "HEAD").await.is_empty() {
+            probed.push(name);
+        }
+    }
+    assert_eq!(
+        probed,
+        Vec::<&str>::new(),
+        "{} of {} non-.int documents paid for the sibling probe",
+        probed.len(),
+        cases.len()
+    );
+}
