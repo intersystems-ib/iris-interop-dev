@@ -337,6 +337,7 @@ pub mod gateway_manage;
 pub mod global;
 pub mod hl7_schema;
 pub mod info;
+pub mod int_frame;
 pub mod interop;
 pub mod line_edit;
 pub mod log_store;
@@ -10343,7 +10344,7 @@ Methods:
     }
 
     #[tool(
-        description = "IRIS debug tools. action=map_int DECOMPOSES an ObjectScript error frame (<SIGNAL>label+offset^Pkg.Class.1) into signal/class/method/offset and verifies the class is compiled — it returns ROUTINE_NOT_FOUND for a class that does not exist and INVALID_PARAM for a string that is not a frame, and it does NOT return a source line: %Studio.Debugger.SourceLine answers identically for every input on IRIS 2026.1, so `mapped_to_source_line` is false and the note says what to read instead. For an error raised by code you ran through iris_execute, that tool already reports source_line and source_line_number directly — prefer it. action=error_logs fetches recent error log entries. action=capture captures current error state. action=source_map builds a .INT to .CLS mapping, and fails with UNSUPPORTED_IRIS_VERSION where %Studio.Debugger.MapToINT is absent (it is absent on 2026.1)."
+        description = "IRIS debug tools. action=map_int DECOMPOSES an ObjectScript error frame (<SIGNAL>label+offset^Pkg.Class.1) into signal/class/method/offset and verifies the class is compiled — it returns ROUTINE_NOT_FOUND for a class that does not exist and INVALID_PARAM for a string that is not a frame, and it does NOT return a source line: %Studio.Debugger.SourceLine answers identically for every input on IRIS 2026.1, so `mapped_to_source_line` is false and the note says what to read instead. A frame naming a plain ROUTINE (<UNDEFINED>LIST+2^OMORDL) is classified as one and is never looked up as a class: pass the routine's .INT listing as int_source — read it with iris_doc(mode=get, name='OMORDL.int') — and map_int counts LABEL+offset against that text and returns the exact INT line, or refuses with INT_LABEL_NOT_FOUND / INT_OFFSET_PAST_LABEL_BLOCK / INT_SOURCE_UNUSABLE rather than naming a line it did not count. It does not fetch the .INT itself and it does not map an INT line to a .MAC line. For an error raised by code you ran through iris_execute, that tool already reports source_line and source_line_number directly — prefer it. action=error_logs fetches recent error log entries. action=capture captures current error state. action=source_map builds a .INT to .CLS mapping, and fails with UNSUPPORTED_IRIS_VERSION where %Studio.Debugger.MapToINT is absent (it is absent on 2026.1)."
     )]
     async fn iris_debug(
         &self,

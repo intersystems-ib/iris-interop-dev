@@ -493,6 +493,13 @@ pub struct DebugParams {
     pub action: String,
     /// Error string for map_int e.g. "<UNDEFINED>x+3^MyApp.Foo.1"
     pub error_string: Option<String>,
+    /// map_int ONLY, optional: the .INT listing the frame's routine compiled to, as text —
+    /// read it with iris_doc(mode="get", name="<routine>.int"). Supply it and map_int counts
+    /// LABEL+offset against it and returns the exact INT line, or refuses with a named reason
+    /// (#534). Omit it for a routine frame and map_int decomposes the frame and asks you for
+    /// this text; it does not fetch the document itself.
+    #[serde(default)]
+    pub int_source: Option<String>,
     /// Class name for source_map
     pub class_name: Option<String>,
     #[serde(default = "default_limit")]
@@ -508,6 +515,10 @@ pub struct DebugParams {
 /// `<ILLEGAL VALUE>SlotKey+1^Radio.BO.RisWorklistOut.1` is
 /// signal `<ILLEGAL VALUE>`, label `SlotKey`, offset `1`, INT routine
 /// `Radio.BO.RisWorklistOut.1`, whose class is `Radio.BO.RisWorklistOut`.
+///
+/// #534: `class` is only meaningful when `kind` is
+/// [`FrameKind::Class`](crate::tools::int_frame::FrameKind::Class). For a routine frame it
+/// holds the routine's own name, which is NOT a class and must never be looked up as one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IntFrame {
     pub signal: String,
@@ -515,6 +526,8 @@ pub struct IntFrame {
     pub offset: i64,
     pub routine: String,
     pub class: String,
+    /// Whether `routine` is a class's generated INT routine or a routine's own.
+    pub kind: crate::tools::int_frame::FrameKind,
 }
 
 /// #142: the old parse was `$piece($piece(err,"^",2),".",1)` — the FIRST
@@ -522,17 +535,20 @@ pub struct IntFrame {
 /// The trailing `.1` is the INT-routine suffix and only IT should come off; a
 /// class name has dots all through it.
 pub fn parse_int_frame(err: &str) -> Option<IntFrame> {
+    use crate::tools::int_frame::{class_of_int_routine, classify_routine, FrameKind};
     let err = err.trim();
     let (left, routine) = err.split_once('^')?;
-    let routine = routine.trim();
+    // #534: `routine.trim()` was not enough. IRIS appends the offending reference to the
+    // frame, so `<UNDEFINED>F2+1^OMCUSTL *X` carried `OMCUSTL *X` into the lookup — a name
+    // nothing could ever match, measured on a live 2026.2 stack.
+    let routine = crate::tools::int_frame::routine_reference(routine);
     if routine.is_empty() {
         return None;
     }
-    // Strip a trailing numeric INT suffix, and only a numeric one.
-    let class = match routine.rsplit_once('.') {
-        Some((head, tail)) if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) => head,
-        _ => routine,
-    };
+    // #534: the trailing numeric INT suffix, and whether there is one at all, are decided in
+    // ONE place — so the class NAME and the class/routine KIND cannot disagree.
+    let kind = classify_routine(routine);
+    let class = class_of_int_routine(routine).unwrap_or(routine);
     // The signal is the leading <...>, when present.
     let (signal, rest) = match (left.find('<'), left.find('>')) {
         (Some(a), Some(b)) if b > a => (left[a..=b].to_string(), left[b + 1..].trim()),
@@ -545,13 +561,20 @@ pub fn parse_int_frame(err: &str) -> Option<IntFrame> {
     if label.is_empty() {
         return None;
     }
+    // #534: `z` is the CLASS compiler's generated method-label prefix, so stripping it is a
+    // CLASS rule. In a routine `zINIT` is a label its author typed and `INIT` need not exist
+    // at all, which turned the label lookup into a second failure the caller could not see.
+    let label = match kind {
+        FrameKind::Class => label.strip_prefix('z').unwrap_or(&label).to_string(),
+        FrameKind::Routine => label,
+    };
     Some(IntFrame {
         signal,
-        // A generated method label carries a `z` prefix in the INT routine.
-        label: label.strip_prefix('z').unwrap_or(&label).to_string(),
+        label,
         offset,
         routine: routine.to_string(),
         class: class.to_string(),
+        kind,
     })
 }
 
@@ -612,6 +635,18 @@ pub async fn handle_iris_debug(
                     serde_json::json!({"error_string": err}),
                 );
             };
+            // #534: a routine frame is answered WITHOUT asking %Dictionary.CompiledClass
+            // anything. `OMORDL` is not a class, so "'OMORDL' is not a compiled class" was a
+            // true sentence about the wrong question standing in for the answer. What comes
+            // back instead is the decomposition plus, when the caller supplied the .INT text,
+            // the exact INT line — see `int_frame`.
+            if frame.kind == crate::tools::int_frame::FrameKind::Routine {
+                return crate::tools::int_frame::map_int_answer(
+                    err,
+                    &frame,
+                    p.int_source.as_deref(),
+                );
+            }
             let exists = match iris
                 .query(
                     "SELECT COUNT(*) AS N FROM %Dictionary.CompiledClass WHERE Name = ?",
@@ -648,6 +683,16 @@ pub async fn handle_iris_debug(
                         "class": frame.class,
                         "namespace": namespace,
                     }),
+                );
+            }
+            // #534: the class exists and the caller brought its .INT, so the same arithmetic
+            // the routine path uses applies here — a class's INT routine is `Pkg.Class.N` and
+            // its labels are counted the same way. Without the text, the note below stands.
+            if p.int_source.is_some() {
+                return crate::tools::int_frame::map_int_answer(
+                    err,
+                    &frame,
+                    p.int_source.as_deref(),
                 );
             }
             ok_json(serde_json::json!({

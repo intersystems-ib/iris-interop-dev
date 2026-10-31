@@ -107,11 +107,8 @@ pub fn classify_routine(routine: &str) -> FrameKind {
 pub fn routine_reference(raw: &str) -> &str {
     let raw = raw.trim_start();
     let end = raw
-        .char_indices()
-        .take_while(|(_, c)| c.is_ascii_alphanumeric() || *c == '_' || *c == '.' || *c == '%')
-        .map(|(i, c)| i + c.len_utf8())
-        .last()
-        .unwrap_or(0);
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '%'))
+        .unwrap_or(raw.len());
     raw[..end].trim_end_matches('.')
 }
 
@@ -188,11 +185,8 @@ pub fn label_of_line(line: &str) -> Option<&str> {
         return None;
     }
     let end = line
-        .char_indices()
-        .take_while(|(_, c)| c.is_ascii_alphanumeric() || *c == '_' || *c == '%')
-        .map(|(i, c)| i + c.len_utf8())
-        .last()
-        .unwrap_or(0);
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '%'))
+        .unwrap_or(line.len());
     Some(&line[..end])
 }
 
