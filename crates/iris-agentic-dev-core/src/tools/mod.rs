@@ -329,6 +329,7 @@ pub mod doc;
 pub mod doc_search;
 pub mod doc_shape;
 pub mod envelope;
+pub mod error_log;
 pub mod execute_method;
 pub mod formal_spec;
 pub mod gateway;
@@ -9542,13 +9543,19 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
         match iris.query("SELECT TOP 20 ErrorCode,ErrorText,TimeStamp FROM %SYSTEM.Error ORDER BY TimeStamp DESC", vec![], &namespace, client).await {
             Ok(resp) => ok_json(serde_json::json!({"success": true, "errors": resp["result"]["content"]})),
             Err(e) => {
+                // #533's sibling. This arm used to answer `{"success": true, "errors": [],
+                // "note": "%SYSTEM.Error not available on this IRIS edition"}`. "The table is
+                // absent" is a fact about the SERVER; "there are no errors" is a fact about the
+                // WORLD, and only the first had been established. `errors` is omitted entirely,
+                // not emptied.
                 let msg = e.to_string();
-                // %SYSTEM.Error is not available on community edition — return empty gracefully
-                if msg.contains("SQLCODE: -30") || msg.contains("Table") && msg.contains("not found") {
-                    ok_json(serde_json::json!({"success": true, "errors": [], "note": "%SYSTEM.Error not available on this IRIS edition"}))
-                } else {
-                    err_json(interop::classify_iris_error_or(&msg, "IRIS_REQUEST_FAILED"), &msg)
-                }
+                let read = error_log::sql_error_log_outcome(&msg);
+                envelope::fail_with(
+                    // The literal, not the const: see `error_log::ERROR_LOG_UNAVAILABLE`.
+                    "ERROR_LOG_UNAVAILABLE",
+                    error_log::unreadable_reason(&read).unwrap_or(&msg),
+                    serde_json::json!({"table": "%SYSTEM.Error", "namespace": namespace}),
+                )
             }
         }
     }
@@ -9581,20 +9588,17 @@ do ##class(%UnitTest.Manager).RunTest({pattern},"{flags}","{token}")"#,
                 ok_json(result)
             }
             Err(e) => {
+                // #533's second sibling, identical shape: `{"success": true, "logs": [], "note":
+                // "%SYSTEM.Error not available on this IRIS edition"}` for a SELECT that failed.
+                // `logs` is omitted, not emptied — see `debug_capture_packet` above.
                 let msg = e.to_string();
-                // %SYSTEM.Error not available on community edition — return empty gracefully
-                if msg.contains("SQLCODE: -30")
-                    || (msg.contains("Table") && msg.contains("not found"))
-                {
-                    ok_json(
-                        serde_json::json!({"success": true, "logs": [], "note": "%SYSTEM.Error not available on this IRIS edition"}),
-                    )
-                } else {
-                    err_json(
-                        interop::classify_iris_error_or(&msg, "IRIS_REQUEST_FAILED"),
-                        &msg,
-                    )
-                }
+                let read = error_log::sql_error_log_outcome(&msg);
+                envelope::fail_with(
+                    // The literal, not the const: see `error_log::ERROR_LOG_UNAVAILABLE`.
+                    "ERROR_LOG_UNAVAILABLE",
+                    error_log::unreadable_reason(&read).unwrap_or(&msg),
+                    serde_json::json!({"table": "%SYSTEM.Error", "namespace": namespace}),
+                )
             }
         }
     }
@@ -10343,7 +10347,7 @@ Methods:
     }
 
     #[tool(
-        description = "IRIS debug tools. action=map_int DECOMPOSES an ObjectScript error frame (<SIGNAL>label+offset^Pkg.Class.1) into signal/class/method/offset and verifies the class is compiled — it returns ROUTINE_NOT_FOUND for a class that does not exist and INVALID_PARAM for a string that is not a frame, and it does NOT return a source line: %Studio.Debugger.SourceLine answers identically for every input on IRIS 2026.1, so `mapped_to_source_line` is false and the note says what to read instead. For an error raised by code you ran through iris_execute, that tool already reports source_line and source_line_number directly — prefer it. action=error_logs fetches recent error log entries. action=capture captures current error state. action=source_map builds a .INT to .CLS mapping, and fails with UNSUPPORTED_IRIS_VERSION where %Studio.Debugger.MapToINT is absent (it is absent on 2026.1)."
+        description = "IRIS debug tools. action=map_int DECOMPOSES an ObjectScript error frame (<SIGNAL>label+offset^Pkg.Class.1) into signal/class/method/offset and verifies the class is compiled — it returns ROUTINE_NOT_FOUND for a class that does not exist and INVALID_PARAM for a string that is not a frame, and it does NOT return a source line: %Studio.Debugger.SourceLine answers identically for every input on IRIS 2026.1, so `mapped_to_source_line` is false and the note says what to read instead. For an error raised by code you ran through iris_execute, that tool already reports source_line and source_line_number directly — prefer it. action=error_logs walks the routine-era application error log ^ERRORS in the namespace, bounded by `limit`, and distinguishes THREE outcomes: entries found, the log was read and is empty (`success` true with `log_read` true and `logs` []), and the log could not be read (ERROR_LOG_UNAVAILABLE, carrying the reason and NO `logs` key — so an unread log is never mistaken for an empty one). action=capture captures current error state. action=source_map builds a .INT to .CLS mapping, and fails with UNSUPPORTED_IRIS_VERSION where %Studio.Debugger.MapToINT is absent (it is absent on 2026.1)."
     )]
     async fn iris_debug(
         &self,
