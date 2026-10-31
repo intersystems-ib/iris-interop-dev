@@ -7,13 +7,17 @@
 
 use anyhow::Result;
 use clap::{Args, Subcommand};
-use iris_agentic_dev_core::hook::{is_objectscript_source, upload_and_compile, HookVerdict};
+use iris_agentic_dev_core::hook::{
+    decide_hook_path, is_objectscript_source, project_root_for_hook, upload_and_compile,
+    HookPathDecision, HookVerdict,
+};
 use iris_agentic_dev_core::iris::{
     connection::IrisConnection,
     discovery::{discover_iris, IrisDiscovery},
 };
 use iris_agentic_dev_core::tools::doc::{doc_name_from_source, SourceDocName};
 use iris_agentic_dev_core::tools::interop::resolve_namespace;
+use std::path::Path;
 
 /// How many compile errors to put in front of the model. IRIS can report a cascade from one bad
 /// line (a wrapped macro gives 1 cause and 7 consequences), and only the first few carry the
@@ -105,7 +109,54 @@ impl PostEditCommand {
             return Ok(());
         }
 
-        let content = match std::fs::read_to_string(file_path) {
+        // #549: the path arrives in the payload, and until now its EXTENSION was the only test it
+        // ever had to pass. A `PostToolUse` hook fires on whatever the agent just edited, and that
+        // is not always a file this project owns — a scratch draft in a temp directory, or a file
+        // in another checkout, was uploaded into the namespace from `.iris-agentic-dev.toml` and
+        // compiled there. Measured consequence: two draft classes written outside a project
+        // appeared in that project's namespace while someone else was using the instance.
+        //
+        // This is the third time the hook has reported a verdict about something other than what
+        // the agent edited — #529 the wrong VERSION, #540 the wrong NAMESPACE, this the wrong
+        // FILE. So the check lives in the library next to the other two, as one total function
+        // over three outcomes, rather than as an `if` here: the binary's only job is to pick the
+        // channel, and `decide_hook_path` is what makes that choice visible to a test.
+        let ws_path = std::env::var("OBJECTSCRIPT_WORKSPACE").ok();
+        let config_root =
+            iris_agentic_dev_core::iris::workspace_config::located_config_root(ws_path.as_deref());
+        let claude_project_dir = std::env::var("CLAUDE_PROJECT_DIR").ok();
+        let process_cwd = std::env::current_dir().ok();
+        let root = project_root_for_hook(
+            ws_path.as_deref().map(Path::new),
+            config_root.as_deref(),
+            payload["cwd"].as_str().map(Path::new),
+            claude_project_dir.as_deref().map(Path::new),
+            process_cwd.as_deref(),
+        );
+        let source_path = match decide_hook_path(file_path, &root) {
+            // The CANONICAL path, so the file that is read below is the file that was judged.
+            HookPathDecision::Proceed { path } => path,
+            // Exit 0 — an edit outside this project is not the agent's mistake — but SAY SO on the
+            // channel the model reads. A silent exit 0 is what #529 was filed for: the agent then
+            // has no verdict and no indication that it has none, and proceeds as though the edit
+            // compiled. "I did not check this file" and "this file is fine" have to look different.
+            HookPathDecision::Skip { message } => {
+                let out = serde_json::json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": event,
+                        "additionalContext": message,
+                    }
+                });
+                println!("{out}");
+                return Ok(());
+            }
+            HookPathDecision::Refuse { message } => block(message),
+        };
+        // Shadowed deliberately: every reader below this line gets the path that was JUDGED, and
+        // the payload's unresolved spelling of it is out of scope from here on.
+        let file_path = source_path.display();
+
+        let content = match std::fs::read_to_string(&source_path) {
             Ok(c) => c,
             Err(e) => block(format!(
                 "{file_path} was not compiled: it could not be read ({e})."
@@ -132,7 +183,11 @@ impl PostEditCommand {
         // default and went somewhere else entirely. A verdict is about a document, in a
         // namespace, on an instance; all three have to be resolved from the same place, or the
         // guarantee covers only the dimension whoever wrote it happened to be thinking about.
-        let ws_path = std::env::var("OBJECTSCRIPT_WORKSPACE").ok();
+        //
+        // #549: `ws_path` is read ONCE, above, and used both to bound the path and to resolve the
+        // connection. Reading it twice would let the directory the writes are bounded to and the
+        // file that chooses where they go be answered from different places — which is the same
+        // mistake as #540, one layer out.
         let requested = self.namespace.as_deref();
         let explicit = match iris_agentic_dev_core::iris::workspace_config::apply_workspace_config(
             None,
