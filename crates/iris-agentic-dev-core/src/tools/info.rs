@@ -495,11 +495,12 @@ pub struct DebugParams {
     pub error_string: Option<String>,
     // #534. The issue number stays in this `//` comment: a `///` line is the advertised schema
     // description, and `mcp_handshake` refuses maintainer bookkeeping on the wire.
-    /// map_int ONLY, optional: the .INT listing the frame's routine compiled to, as text —
-    /// read it with iris_doc(mode="get", name="<routine>.int"). Supply it and map_int counts
-    /// LABEL+offset against it and returns the exact INT line, or refuses with a named reason
-    /// rather than guessing. Omit it for a routine frame and map_int decomposes the frame and
-    /// asks you for this text; it does not fetch the document itself.
+    /// map_int ONLY, optional: the .INT listing the frame's routine compiled to, as text.
+    /// Supply it and map_int counts LABEL+offset against THAT text, or refuses with a named
+    /// reason rather than guessing. Omit it for a routine frame and map_int reads the .int and
+    /// the .mac itself and returns the exact INT line plus the .MAC line it was generated
+    /// from. Supply it to map a frame against a listing this server cannot reach, or to map
+    /// one against a specific generation of the routine.
     #[serde(default)]
     pub int_source: Option<String>,
     /// Class name for source_map
@@ -747,10 +748,35 @@ pub async fn handle_iris_debug(
             // back instead is the decomposition plus, when the caller supplied the .INT text,
             // the exact INT line — see `int_frame`.
             if frame.kind == crate::tools::int_frame::FrameKind::Routine {
-                // #534: establish that the routine EXISTS before anything is counted. The
-                // original path asked %Dictionary.CompiledClass and answered ROUTINE_NOT_FOUND
-                // for a routine that was there; not asking at all was honest about the class but
-                // still never said when the routine was genuinely absent.
+                // #534: when the CALLER brings the listing, map against it and probe nothing.
+                // That is the offline path and it is deliberate — it maps a frame against a
+                // listing from an instance this server cannot reach, or against a specific
+                // generation of the routine. Probing existence there could only fail for
+                // reasons that have nothing to do with the text in hand.
+                if let Some(src) = p.int_source.as_deref() {
+                    // The `.mac` is still worth trying: it costs one document read and, where it
+                    // is reachable, turns the INT line into the source line. `.ok()` because its
+                    // absence is not an error — see the best-effort note below.
+                    let mac_text = fetch_document_text(
+                        iris,
+                        client,
+                        &namespace,
+                        &format!("{}.mac", frame.routine),
+                    )
+                    .await
+                    .ok();
+                    return crate::tools::int_frame::map_int_answer(
+                        err,
+                        &frame,
+                        Some(src),
+                        mac_text.as_deref(),
+                    );
+                }
+                // Nothing was supplied, so this server reads it — and before anything is
+                // counted, establishes that the routine EXISTS. The original path asked
+                // %Dictionary.CompiledClass and answered ROUTINE_NOT_FOUND for a routine that
+                // was there; not asking at all was honest about the class but still never said
+                // when the routine was genuinely absent.
                 match probe_int_routine(iris, client, &namespace, &frame.routine).await {
                     RoutineSource::Explained(e) => return e,
                     RoutineSource::Absent => {
@@ -800,45 +826,42 @@ pub async fn handle_iris_debug(
                     }
                     RoutineSource::Present => {}
                 }
-                // The caller's own text wins when supplied; otherwise read the listing, which is
-                // what #534 asks for — the caller should not have to fetch it to get an answer.
-                let fetched_int = match p.int_source.as_deref() {
-                    Some(_) => None,
-                    None => {
-                        match fetch_document_text(
-                            iris,
-                            client,
-                            &namespace,
-                            &format!("{}.int", frame.routine),
-                        )
-                        .await
-                        {
-                            Ok(t) => Some(t),
-                            Err(why) => {
-                                return crate::tools::envelope::fail_with(
-                                    "INT_SOURCE_UNREADABLE",
-                                    &format!(
-                                        "{why}. The routine is there — the HEAD probe confirmed \
+                // Read the listing, which is what #534 asks for: the caller should not have to
+                // fetch it to get an answer.
+                let fetched_int = {
+                    match fetch_document_text(
+                        iris,
+                        client,
+                        &namespace,
+                        &format!("{}.int", frame.routine),
+                    )
+                    .await
+                    {
+                        Ok(t) => t,
+                        Err(why) => {
+                            return crate::tools::envelope::fail_with(
+                                "INT_SOURCE_UNREADABLE",
+                                &format!(
+                                    "{why}. The routine is there — the HEAD probe confirmed \
                                          it — so this is a failed READ, not a missing routine, \
                                          and no line was counted."
+                                ),
+                                serde_json::json!({
+                                    "error_string": err,
+                                    "routine": frame.routine,
+                                    "namespace": namespace,
+                                    "hint": format!(
+                                        "Retry, or read it yourself with \
+                                         iris_doc(mode='get', name='{}.int') and pass the \
+                                         text as int_source.",
+                                        frame.routine
                                     ),
-                                    serde_json::json!({
-                                        "error_string": err,
-                                        "routine": frame.routine,
-                                        "namespace": namespace,
-                                        "hint": format!(
-                                            "Retry, or read it yourself with \
-                                             iris_doc(mode='get', name='{}.int') and pass the \
-                                             text as int_source.",
-                                            frame.routine
-                                        ),
-                                    }),
-                                );
-                            }
+                                }),
+                            );
                         }
                     }
                 };
-                let int_text = p.int_source.as_deref().or(fetched_int.as_deref());
+                let int_text = Some(fetched_int.as_str());
                 // The `.mac` is best effort on purpose: a routine with no `.mac` is the INT-only
                 // legacy case the routines profile exists to serve (#537), not an error. Its
                 // absence costs the caller the source line and nothing else.

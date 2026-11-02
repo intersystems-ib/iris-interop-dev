@@ -94,6 +94,28 @@ BOOM ; label BOOM on MAC line 11
  set y=zzAlsoUndefined
  quit";
 
+/// `IIDInBlock.mac`: a `#define` and a `#;` INSIDE a label block, below the label and above the
+/// target line. Added because a mutation that stopped dropping directive lines SURVIVED the
+/// fixtures above — the walk anchors on the label, so a directive ABOVE the label can never
+/// affect the result, and neither `IIDFrame` nor `IIDMacro` has one BELOW it. That is the only
+/// position where the rule is load-bearing, and nothing was asserting it.
+const INBLOCK_MAC: &str = "ROUTINE IIDInBlock [Type=MAC]
+MAIN ; label MAIN on MAC line 2
+ new a
+#define Inner(%x) (%x+1)
+ set a=$$$Inner(5)
+#; a directive-style comment inside the block
+ set b=zzBoomHere
+ quit";
+
+/// `IIDInBlock.int` as IRIS generated it: 8 MAC lines became 6, both in-block directives gone.
+const INBLOCK_INT: &str = "ROUTINE IIDInBlock [Type=INT,Generated]
+MAIN ; label MAIN on MAC line 2
+ new a
+ set a=(5+1)
+ set b=zzBoomHere
+ quit";
+
 // ── the premise: these fixtures really are the shape the rule describes ──────────────────────
 
 /// If this fails, every mapping assertion below is being checked against the wrong fixture.
@@ -262,6 +284,42 @@ fn a_mac_for_another_routine_is_undetermined_and_says_why() {
     match map_int_line_to_mac(other, FRAME_INT, "BOOM", 12) {
         MacMapping::Undetermined(why) => {
             assert!(why.contains("not the same routine"), "{why}")
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The position where dropping directive lines actually matters: BETWEEN the label and the
+/// target. Measured on 2026.1 — an 8-line `.mac` with a `#define` and a `#;` inside the block
+/// compiled to a 6-line `.int`, both directives gone.
+///
+/// Without the `#` rule the walk lands on MAC 5 instead of MAC 7, off by the two directives, so
+/// this is the assertion that was missing.
+#[test]
+fn directives_inside_a_label_block_are_crossed_exactly() {
+    assert_eq!(INBLOCK_MAC.lines().count(), 8);
+    assert_eq!(INBLOCK_INT.lines().count(), 6);
+    match map_int_line_to_mac(INBLOCK_MAC, INBLOCK_INT, "MAIN", 5) {
+        MacMapping::Exact { line_number, text } => {
+            assert_eq!(line_number, 7, "two in-block directives must be skipped");
+            assert_eq!(text, " set b=zzBoomHere");
+        }
+        other => panic!("expected MAC 7 across two in-block directives, got {other:?}"),
+    }
+}
+
+/// The same block, on the line where a macro expanded AND a directive was crossed above it.
+#[test]
+fn an_expansion_below_an_in_block_directive_still_names_its_mac_line() {
+    match map_int_line_to_mac(INBLOCK_MAC, INBLOCK_INT, "MAIN", 4) {
+        MacMapping::ExpandedOnThatLine {
+            line_number,
+            mac_text,
+            int_text,
+        } => {
+            assert_eq!(line_number, 5, "one in-block #define must be skipped");
+            assert_eq!(mac_text, " set a=$$$Inner(5)");
+            assert_eq!(int_text, " set a=(5+1)");
         }
         other => panic!("{other:?}"),
     }
