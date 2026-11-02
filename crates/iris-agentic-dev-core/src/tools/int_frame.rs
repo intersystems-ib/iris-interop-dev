@@ -190,6 +190,153 @@ pub fn label_of_line(line: &str) -> Option<&str> {
     Some(&line[..end])
 }
 
+/// Whether a `.MAC` line survives into the generated `.INT`.
+///
+/// Measured on IRIS for Health 2026.1 against two fixtures written for #534. The `.int` is the
+/// `.mac` with exactly two kinds of line REMOVED — blank lines, and preprocessor DIRECTIVE lines
+/// — and every surviving line keeps its order:
+///
+/// * a 16-line `.mac` with one blank line compiled to a 15-line `.int`, the blank gone and both
+///   comment-only lines carried VERBATIM
+/// * a 14-line `.mac` with two `#define`s and one blank compiled to an 11-line `.int`
+///
+/// Macro INVOCATIONS expand IN PLACE and never change the line count: ` set a=$$$Twice(7)`
+/// became ` set a=($select(7>7:7,1:7))` on a single line. That is why an exact mapping is
+/// computable WITHOUT running the preprocessor — the only lines that shift the count are the
+/// ones identifiable by reading the `.mac` alone. `#include` is one such directive line, so what
+/// it brings in lives in the `.inc` and never occupies a line of this `.mac`.
+fn mac_line_is_dropped(mac_line: &str) -> bool {
+    let t = mac_line.trim_start();
+    t.is_empty() || t.starts_with('#')
+}
+
+/// The `.MAC` line an `.INT` line was generated from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MacMapping {
+    /// The MAC line, whose text is byte-identical to the INT line.
+    Exact { line_number: usize, text: String },
+    /// The MAC line is identified and a macro expanded on it, so the two texts are not the same
+    /// string. The LINE is exact; only the text differs, and both are reported so the caller can
+    /// see the expansion rather than wonder which is authoritative.
+    ExpandedOnThatLine {
+        line_number: usize,
+        mac_text: String,
+        int_text: String,
+    },
+    /// No mapping is offered, and why. Never a line number salvaged from a partial walk — that
+    /// is the guess this whole module exists to refuse.
+    Undetermined(String),
+}
+
+impl MacMapping {
+    /// The MAC line number, where one was established.
+    pub fn line_number(&self) -> Option<usize> {
+        match self {
+            MacMapping::Exact { line_number, .. }
+            | MacMapping::ExpandedOnThatLine { line_number, .. } => Some(*line_number),
+            MacMapping::Undetermined(_) => None,
+        }
+    }
+
+    /// The word this mapping is reported under.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            MacMapping::Exact { .. } => "exact",
+            MacMapping::ExpandedOnThatLine { .. } => "exact_line_macro_expanded",
+            MacMapping::Undetermined(_) => "undetermined",
+        }
+    }
+}
+
+/// Map a 1-based `.INT` line to its `.MAC` line, anchored on the label the two share.
+///
+/// Anchoring on the LABEL rather than counting from line 1 is what keeps this exact across a
+/// `#include`: only the lines between the label and the target can shift the count, and those are
+/// visible in the `.mac`.
+///
+/// The text comparison at the end is a confidence check, not the answer. A differing text means a
+/// macro expanded on that line, which is still the right line — reporting it as undetermined would
+/// discard a correct result, and reporting it as `Exact` would claim the two texts are the same
+/// when the caller can see they are not.
+pub fn map_int_line_to_mac(
+    mac_text: &str,
+    int_text: &str,
+    label: &str,
+    int_line: usize,
+) -> MacMapping {
+    let mac: Vec<&str> = mac_text.lines().collect();
+    let int: Vec<&str> = int_text.lines().collect();
+    if int_line == 0 || int_line > int.len() {
+        return MacMapping::Undetermined(format!(
+            "INT line {int_line} is outside the .int text supplied, which has {} line(s)",
+            int.len()
+        ));
+    }
+    let Some(int_anchor) = line_of_label(&int, label) else {
+        return MacMapping::Undetermined(format!(
+            "the label '{label}' is not at the start of any line of the .int supplied, so there \
+             is nothing to anchor the walk on"
+        ));
+    };
+    let Some(mac_anchor) = line_of_label(&mac, label) else {
+        return MacMapping::Undetermined(format!(
+            "the label '{label}' is in the .int but not in the .mac, so the two texts are not \
+             the same routine — re-read both for the same name"
+        ));
+    };
+    if int_line < int_anchor {
+        return MacMapping::Undetermined(format!(
+            "INT line {int_line} is above the label '{label}', which starts at INT line \
+             {int_anchor}, so it belongs to another label's block"
+        ));
+    }
+    // Walk both from the label, consuming a MAC line only when it survives into the .int.
+    let steps = int_line - int_anchor;
+    let mut m = mac_anchor;
+    let mut taken = 0usize;
+    while taken < steps {
+        m += 1;
+        if m > mac.len() {
+            return MacMapping::Undetermined(format!(
+                "the .mac ends after {taken} of the {steps} line(s) between '{label}' and INT \
+                 line {int_line}, so the two documents are not the same generation — recompile \
+                 and re-read both"
+            ));
+        }
+        if mac_line_is_dropped(mac[m - 1]) {
+            continue;
+        }
+        taken += 1;
+    }
+    let mac_line = mac[m - 1].to_string();
+    let int_line_text = int[int_line - 1].to_string();
+    if mac_line == int_line_text {
+        MacMapping::Exact {
+            line_number: m,
+            text: mac_line,
+        }
+    } else {
+        MacMapping::ExpandedOnThatLine {
+            line_number: m,
+            mac_text: mac_line,
+            int_text: int_line_text,
+        }
+    }
+}
+
+/// The 1-based line on which `label` starts, in any routine listing.
+///
+/// `label_of_line` is reused rather than reimplemented: it is already the positive test this
+/// needs, so it skips a `}` closing a generated method body, a `;` comment and a blank line
+/// without enumerating them. Searching for an exact NAME also makes the `ROUTINE …` header on
+/// line 1 harmless — it parses as a label called `ROUTINE`, which no frame names.
+fn line_of_label(lines: &[&str], label: &str) -> Option<usize> {
+    lines
+        .iter()
+        .position(|l| label_of_line(l) == Some(label))
+        .map(|i| i + 1)
+}
+
 /// `LABEL+offset` against `.INT` text, counting the lines of that text exactly as given.
 ///
 /// Offset 0 IS the label line: `LABEL^RTN` with no `+n` trapped on the label line itself.
@@ -260,6 +407,7 @@ pub fn map_int_answer(
     err: &str,
     frame: &IntFrame,
     int_source: Option<&str>,
+    mac_source: Option<&str>,
 ) -> Result<CallToolResult, McpError> {
     let Some(text) = int_source else {
         return crate::tools::envelope::ok_json(serde_json::json!({
@@ -313,15 +461,78 @@ pub fn map_int_answer(
                     "int_line": line.text,
                     "label_line_number": label_line,
                     "label_block_lines": block_lines,
-                    "mapped_to_source_line": false,
-                    "note": "int_line_number counts the lines of the int_source text supplied, \
-                             and offset 0 is the label line itself. It is an .INT line, NOT a \
-                             .MAC or .cls line: the .int IRIS stores drops the blank lines of \
-                             the .mac it was compiled from (measured: a 28-line .mac, a 26-line \
-                             .int), so every blank line above the target shifts the source line \
-                             by one and no source line is offered here.",
                 }),
             );
+            // #534: with the `.mac` in hand the INT line maps back to the SOURCE line, which is
+            // what a caller actually wants to open. Without it, the old note stands — and it must
+            // keep saying that an .INT line is not a .MAC line, because a caller who reads
+            // int_line_number as a source line is off by one for every blank line above it.
+            match mac_source
+                .map(|mac| map_int_line_to_mac(mac, text, &frame.label, line.line_number))
+            {
+                Some(MacMapping::Exact {
+                    line_number,
+                    text: mac_text,
+                }) => merge(
+                    &mut obj,
+                    serde_json::json!({
+                        "mapped_to_source_line": true,
+                        "mac_line_number": line_number,
+                        "mac_line": mac_text,
+                        "mac_mapping": "exact",
+                        "note": "mac_line_number is the line of the .mac this .INT line was \
+                                 generated from, and the two texts are identical. The .int is the \
+                                 .mac with its blank lines and its preprocessor directive lines \
+                                 removed (measured on 2026.1), so the mapping is counted rather \
+                                 than guessed.",
+                    }),
+                ),
+                Some(MacMapping::ExpandedOnThatLine {
+                    line_number,
+                    mac_text,
+                    int_text,
+                }) => merge(
+                    &mut obj,
+                    serde_json::json!({
+                        "mapped_to_source_line": true,
+                        "mac_line_number": line_number,
+                        "mac_line": mac_text,
+                        "mac_mapping": "exact_line_macro_expanded",
+                        "int_line_as_generated": int_text,
+                        "note": "mac_line_number is the line of the .mac this .INT line was \
+                                 generated from. The LINE is exact; the two texts differ because \
+                                 a macro expanded on it, so both are given — mac_line is what you \
+                                 edit, int_line_as_generated is what ran.",
+                    }),
+                ),
+                Some(MacMapping::Undetermined(why)) => merge(
+                    &mut obj,
+                    serde_json::json!({
+                        "mapped_to_source_line": false,
+                        "mac_mapping": "undetermined",
+                        "mac_mapping_undetermined_because": why,
+                        "note": format!(
+                            "The .INT line is exact. No .MAC line is offered, and the reason is \
+                             in mac_mapping_undetermined_because — this is NOT a report that \
+                             '{}.mac' is missing. Re-read both documents for the same name and \
+                             retry.",
+                            frame.routine
+                        ),
+                    }),
+                ),
+                None => merge(
+                    &mut obj,
+                    serde_json::json!({
+                        "mapped_to_source_line": false,
+                        "note": "int_line_number counts the lines of the int_source text \
+                                 supplied, and offset 0 is the label line itself. It is an .INT \
+                                 line, NOT a .MAC or .cls line: the .int IRIS stores drops the \
+                                 blank lines of the .mac it was compiled from, so every blank \
+                                 line above the target shifts the source line by one. Pass \
+                                 mac_source to get the .MAC line counted exactly.",
+                    }),
+                ),
+            }
             crate::tools::envelope::ok_json(obj)
         }
         ref refusal => {
