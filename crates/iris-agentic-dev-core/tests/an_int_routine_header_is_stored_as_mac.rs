@@ -62,9 +62,15 @@ async fn server_with(head: ResponseTemplate) -> MockServer {
         .await;
     Mock::given(method("PUT"))
         .and(path_regex(r".*/doc/.*"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(
-            serde_json::json!({"status": {"errors": [], "summary": ""}, "console": []}),
-        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": {"errors": [], "summary": ""},
+            "console": [],
+            // #566: a real Atelier PUT always carries `result.status` — "" when it stored the
+            // document, the refusal text when it did not. This mock omitted the field, which is
+            // a response shape IRIS never sends, and a suite whose mocks omit the field that
+            // carries failure cannot catch a failure carried in that field.
+            "result": {"status": ""}
+        })))
         .mount(&server)
         .await;
     server

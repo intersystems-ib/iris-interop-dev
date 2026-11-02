@@ -21385,7 +21385,11 @@ mod reported_error_routing_tests {
         let server = MockServer::start().await;
         Mock::given(method("PUT"))
             .and(path_regex(r".*/doc/IrisDevTmp\..*"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                // #566: a real Atelier PUT always carries `result.status` — "" when the
+                // document was stored. Omitting it is a shape IRIS never sends.
+                "result": {"status": ""}
+            })))
             .mount(&server)
             .await;
         Mock::given(method("DELETE"))
