@@ -214,6 +214,7 @@ const REMEDIES: &[(&str, &str)] = &[
     ("UNSUPPORTED_IRIS_VERSION", "this IRIS build lacks the API the feature needs; the payload names the missing method — use a newer instance or take the manual route"),
     ("UPDATE_FAILED", "the update was attempted and refused; the message carries the server's reason — re-read the current value before retrying"),
     ("UPLOAD_FAILED", "the document was sent and not accepted; the message carries the server's reason — this is not a transport fault, so retrying unchanged will fail again"),
+    ("UPLOAD_UNCONFIRMED", "the server reported neither success nor a refusal, so whether the document is stored is unknown; read it back with iris_doc(mode=get) and compare before writing again"),
     ("USER_EXISTS", "a user of that name already exists; modify that account rather than creating it"),
     ("USER_NOT_FOUND", "list users with iris_credential_list or check_config and use an existing name, or create the account first"),
     ("VALUE_TRUNCATED", "the value arrived incomplete and is therefore not reported as the result; re-read it in pieces or through a stream rather than using the partial text"),

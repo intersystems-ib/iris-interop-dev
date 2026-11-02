@@ -2062,6 +2062,63 @@ mod scm_precheck_tests {
 // first instruction — delete the block and write again — is the data-layout loss this issue is about.
 // `strip_cls_suffix` went with it: the refusal was its only production caller.
 
+/// What Atelier said about a document upload.
+///
+/// Measured against IRIS for Health 2026.1 (`PUT /api/atelier/v1/{ns}/doc/{name}`), because the
+/// obvious reading of the response is wrong in both directions:
+///
+/// | outcome | HTTP | `status.errors` | `result.status` |
+/// |---|---|---|---|
+/// | created | 201 | `[]` | `""` |
+/// | updated | 200 | `[]` | `""` |
+/// | refused, illegal header line (#16021) | 200 | `[]` | the error |
+/// | refused, no class definition (#16022) | 200 | `[]` | the error |
+/// | refused, class name is not the document name (#16023) | 201 | `[]` | the error |
+///
+/// Neither signal the caller is tempted to read can separate a refusal from a success:
+/// `status.errors` is EMPTY on every refusal above, and the HTTP code is 200 for a successful
+/// UPDATE and 201 for a REFUSED name mismatch. `result.status` is the only field that
+/// distinguishes them, and it was the one field never read — so a document Atelier threw away
+/// was reported `success: true`, with an `open_uri` naming a document that does not exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DocumentWrite {
+    /// Atelier reported nothing against the document. It is stored.
+    Stored,
+    /// Atelier accepted the REQUEST and refused the DOCUMENT, naming why.
+    Refused(String),
+    /// The body carried neither an error nor a `result.status` of any kind, so this server said
+    /// nothing either way. Deliberately not `Stored`: "no refusal was reported" and "the write
+    /// landed" are different claims, and collapsing them is the defect this enum exists to stop.
+    Unreported,
+}
+
+/// Classify an Atelier document-PUT response body.
+///
+/// The HTTP status is deliberately NOT an input: the table above shows it cannot discriminate, so
+/// taking it would invite a caller to believe a 201 means stored.
+pub fn classify_document_write(put_body: &serde_json::Value) -> DocumentWrite {
+    // The transport/Atelier-level channel (build 110's SetTextFromString NULL-namespace bug via
+    // the web gateway arrives here). Read first: when populated it is the more specific complaint.
+    if let Some(first) = put_body["status"]["errors"]
+        .as_array()
+        .and_then(|errs| errs.first())
+    {
+        return DocumentWrite::Refused(
+            first["error"]
+                .as_str()
+                .unwrap_or("Document upload failed")
+                .to_string(),
+        );
+    }
+    // The document-level channel. An ABSENT key is not an empty one, which is the whole of the
+    // third case: this server reported no outcome, and that is not the same as reporting success.
+    match put_body["result"]["status"].as_str() {
+        Some(s) if s.trim().is_empty() => DocumentWrite::Stored,
+        Some(s) => DocumentWrite::Refused(s.to_string()),
+        None => DocumentWrite::Unreported,
+    }
+}
+
 async fn do_write(
     iris: &IrisConnection,
     client: &reqwest::Client,
@@ -2162,15 +2219,25 @@ async fn do_write(
     if !resp.status().is_success() {
         return http_err(resp, Some(name)).await;
     }
-    // Check body for Atelier-level errors (200 OK with status.errors, e.g. build 110
-    // SetTextFromString NULL namespace bug via web gateway).
+    // #566: a document Atelier REFUSED arrives as 2xx with an EMPTY `status.errors` and the
+    // refusal in `result.status`. Reading only `status.errors` reported every one of those as a
+    // success, handing back an `open_uri` for a document that was never stored — and marking the
+    // source-control checkout held, because `write_result_succeeded` reads the same `success`.
+    // `classify_document_write` carries the measured table; the HTTP code is not a discriminator.
     let put_body: serde_json::Value = resp.json().await.unwrap_or_default();
-    if let Some(errs) = put_body["status"]["errors"].as_array() {
-        if !errs.is_empty() {
-            let msg = errs[0]["error"]
-                .as_str()
-                .unwrap_or("Document upload failed");
-            return err_json("UPLOAD_FAILED", msg);
+    match classify_document_write(&put_body) {
+        DocumentWrite::Stored => {}
+        DocumentWrite::Refused(msg) => return err_json("UPLOAD_FAILED", &msg),
+        DocumentWrite::Unreported => {
+            return err_json(
+                "UPLOAD_UNCONFIRMED",
+                &format!(
+                    "The server answered the upload of '{name}' with no outcome at all: no error, \
+                     and no result status. Whether the document is stored is unknown, so this is \
+                     not reported as a write. Read it back with iris_doc(mode='get', name='{name}') \
+                     and compare it with what you sent before writing again."
+                ),
+            );
         }
     }
 
@@ -3691,7 +3758,11 @@ mod line_edit_mode_tests {
             .await;
         Mock::given(method("PUT"))
             .and(path_regex(r".*/doc/.*"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                // #566: a real Atelier PUT always carries `result.status` — "" when the
+                // document was stored. Omitting it is a shape IRIS never sends.
+                "result": {"status": ""}
+            })))
             .mount(&server)
             .await;
         Mock::given(method("POST"))
@@ -3803,7 +3874,11 @@ mod line_edit_mode_tests {
                 .await;
             Mock::given(method("PUT"))
                 .and(path_regex(r".*/doc/.*"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    // #566: a real Atelier PUT always carries `result.status` — "" when the
+                    // document was stored. Omitting it is a shape IRIS never sends.
+                    "result": {"status": ""}
+                })))
                 .mount(&server)
                 .await;
             let iris = IrisConnection::new(
@@ -3879,7 +3954,11 @@ mod line_edit_mode_tests {
                     .await;
                 Mock::given(method("PUT"))
                     .and(path_regex(r".*/doc/.*"))
-                    .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        // #566: a real Atelier PUT always carries `result.status` — "" when the
+                        // document was stored. Omitting it is a shape IRIS never sends.
+                        "result": {"status": ""}
+                    })))
                     .mount(&server)
                     .await;
                 Mock::given(method("POST"))
@@ -3966,7 +4045,11 @@ mod line_edit_mode_tests {
                 .await;
             Mock::given(method("PUT"))
                 .and(path_regex(r".*/doc/.*"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    // #566: a real Atelier PUT always carries `result.status` — "" when the
+                    // document was stored. Omitting it is a shape IRIS never sends.
+                    "result": {"status": ""}
+                })))
                 .mount(&server)
                 .await;
             // the compile REJECTS the class
@@ -4420,7 +4503,11 @@ mod prop_collision_put_tests {
         }
         Mock::given(method("PUT"))
             .and(path_regex(r".*/doc/.*"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                // #566: a real Atelier PUT always carries `result.status` — "" when the
+                // document was stored. Omitting it is a shape IRIS never sends.
+                "result": {"status": ""}
+            })))
             .mount(&server)
             .await;
         Mock::given(method("POST"))
