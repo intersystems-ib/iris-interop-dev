@@ -23,7 +23,7 @@ use iris_agentic_dev_core::tools::int_frame::{
     class_of_int_routine, classify_routine, int_labels, map_int_answer, map_label_offset,
     FrameKind, IntLine, IntLineOutcome,
 };
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // ─── defect 2: the z-strip is a CLASS rule applied to every frame ────────────────────────────
@@ -407,7 +407,12 @@ fn payload(r: Result<rmcp::model::CallToolResult, rmcp::ErrorData>) -> (bool, se
 #[test]
 fn a_routine_frame_is_never_answered_as_a_missing_class() {
     let frame = parse_int_frame("<UNDEFINED>LIST+2^OMORDL").unwrap();
-    let (is_error, v) = payload(map_int_answer("<UNDEFINED>LIST+2^OMORDL", &frame, None));
+    let (is_error, v) = payload(map_int_answer(
+        "<UNDEFINED>LIST+2^OMORDL",
+        &frame,
+        None,
+        None,
+    ));
     let whole = v.to_string();
     assert!(
         !whole.contains("ROUTINE_NOT_FOUND"),
@@ -442,7 +447,7 @@ fn a_routine_frame_is_never_answered_as_a_missing_class() {
 fn a_resolved_frame_reports_an_int_line_and_claims_nothing_about_the_source() {
     let err = "<UNDEFINED>LIST+3^OMORDL";
     let frame = parse_int_frame(err).unwrap();
-    let (is_error, v) = payload(map_int_answer(err, &frame, Some(INT)));
+    let (is_error, v) = payload(map_int_answer(err, &frame, Some(INT), None));
     assert!(!is_error);
     assert_eq!(v["success"], true);
     assert_eq!(v["int_line_number"], 6);
@@ -463,7 +468,7 @@ fn a_resolved_frame_reports_an_int_line_and_claims_nothing_about_the_source() {
 fn each_refusal_reaches_the_caller_as_an_error_envelope_with_its_own_code() {
     let err = "<UNDEFINED>LIST+99^OMORDL";
     let frame = parse_int_frame(err).unwrap();
-    let (is_error, v) = payload(map_int_answer(err, &frame, Some(INT)));
+    let (is_error, v) = payload(map_int_answer(err, &frame, Some(INT), None));
     assert!(is_error, "isError must be set: {v}");
     assert_eq!(v["success"], false);
     assert_eq!(v["error_code"], "INT_OFFSET_PAST_LABEL_BLOCK");
@@ -475,7 +480,7 @@ fn each_refusal_reaches_the_caller_as_an_error_envelope_with_its_own_code() {
 
     let err = "<UNDEFINED>NOPE+1^OMORDL";
     let frame = parse_int_frame(err).unwrap();
-    let (is_error, v) = payload(map_int_answer(err, &frame, Some(INT)));
+    let (is_error, v) = payload(map_int_answer(err, &frame, Some(INT), None));
     assert!(is_error);
     assert_eq!(v["error_code"], "INT_LABEL_NOT_FOUND");
     assert_eq!(
@@ -517,7 +522,7 @@ fn every_refusal_envelope_names_what_the_caller_should_do() {
     let mut seen = Vec::new();
     for (code, err, src) in &cases {
         let frame = parse_int_frame(err).unwrap_or_else(|| panic!("{err} must parse"));
-        let (is_error, v) = payload(map_int_answer(err, &frame, *src));
+        let (is_error, v) = payload(map_int_answer(err, &frame, *src, None));
         assert!(is_error, "{code} must set isError: {v}");
         assert_eq!(v["error_code"], *code, "drove the wrong refusal: {v}");
         let hint = v["hint"].as_str().unwrap_or_default();
@@ -591,6 +596,30 @@ async fn the_handler_asks_iris_about_a_class_only_when_the_frame_names_one() {
     );
     let client = reqwest::Client::new();
 
+    // #534 changed what this handler DOES on the routine path: it now reads the routine's own
+    // listing instead of asking the caller for the text, so the mock has to answer the document
+    // legs. What this test exists to assert is untouched and is the pair of query counts below —
+    // a routine frame sends NO SQL, and a class frame still sends exactly one.
+    Mock::given(method("HEAD"))
+        .and(path_regex(r".*/doc/OMORDL\.int$"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(r".*/doc/OMORDL\.int$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            serde_json::json!({"result": {"content": INT.lines().collect::<Vec<_>>()}}),
+        ))
+        .mount(&server)
+        .await;
+    // No `OMORDL.mac`: the INT-only legacy case. Its absence costs the source line and must not
+    // read as the ROUTINE being missing.
+    Mock::given(method("GET"))
+        .and(path_regex(r".*/doc/OMORDL\.mac$"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+
     // The frame from the issue. It names a ROUTINE, so no class is looked up.
     let err = "<UNDEFINED>LIST+2^OMORDL";
     let (is_error, v) = payload(handle_iris_debug(&iris, &client, params(err, None)).await);
@@ -602,10 +631,17 @@ async fn the_handler_asks_iris_about_a_class_only_when_the_frame_names_one() {
     );
     assert!(!is_error, "{v}");
     assert_eq!(v["frame_kind"], "routine");
-    assert_eq!(v["outcome"], "INT_SOURCE_REQUIRED");
+    // #534 superseded `outcome: INT_SOURCE_REQUIRED` here. The listing is read, so the frame
+    // resolves: LIST is INT line 3 and +2 is the blank line 5, exactly as
+    // `the_offset_counts_blank_lines_because_the_int_has_them` pins for the pure function.
+    assert_eq!(v["int_line_number"], 5, "{v}");
     assert!(
         !v.to_string().contains("ROUTINE_NOT_FOUND"),
-        "the old answer must be gone: {v}"
+        "a routine that IS there must not be answered with the missing-routine refusal: {v}"
+    );
+    assert!(
+        !v.to_string().contains("is not a compiled class"),
+        "nor with the class wording this issue is about: {v}"
     );
 
     // THE CONTROL: a class frame against the same mock does query, and the mock says the

@@ -495,11 +495,12 @@ pub struct DebugParams {
     pub error_string: Option<String>,
     // #534. The issue number stays in this `//` comment: a `///` line is the advertised schema
     // description, and `mcp_handshake` refuses maintainer bookkeeping on the wire.
-    /// map_int ONLY, optional: the .INT listing the frame's routine compiled to, as text —
-    /// read it with iris_doc(mode="get", name="<routine>.int"). Supply it and map_int counts
-    /// LABEL+offset against it and returns the exact INT line, or refuses with a named reason
-    /// rather than guessing. Omit it for a routine frame and map_int decomposes the frame and
-    /// asks you for this text; it does not fetch the document itself.
+    /// map_int ONLY, optional: the .INT listing the frame's routine compiled to, as text.
+    /// Supply it and map_int counts LABEL+offset against THAT text, or refuses with a named
+    /// reason rather than guessing. Omit it for a routine frame and map_int reads the .int and
+    /// the .mac itself and returns the exact INT line plus the .MAC line it was generated
+    /// from. Supply it to map a frame against a listing this server cannot reach, or to map
+    /// one against a specific generation of the routine.
     #[serde(default)]
     pub int_source: Option<String>,
     /// Class name for source_map
@@ -611,6 +612,110 @@ async fn studio_debugger_has(
     }
 }
 
+/// Whether the routine a frame names has a generated `.INT` in the namespace.
+#[derive(Debug)]
+enum RoutineSource {
+    /// Measured present: `RTN.int` is in the namespace.
+    Present,
+    /// Measured absent: the namespace was CONFIRMED reachable, and there is no `RTN.int` in it.
+    Absent,
+    /// Nothing was established. Carries the reason, for the refusal to print.
+    Undetermined(String),
+    /// `classify_404` produced a strictly BETTER error than this probe could word — the
+    /// namespace does not exist, or Atelier is not published at this URL at all. Returned
+    /// verbatim, as `handle_head` does, because restating it as a routine problem would name
+    /// the wrong cause.
+    Explained(Result<rmcp::model::CallToolResult, rmcp::ErrorData>),
+}
+
+/// Probe `RTN.int` with a HEAD.
+///
+/// Unlike `probe_mac_sibling`, which only routes a PUT, this answer is REPORTED to the caller as
+/// `ROUTINE_NOT_FOUND` — a fact claim about the world — so it carries `handle_head`'s stricter
+/// discipline. A bare 404 is not absence: #102 measured a document that provably exists reported
+/// absent both for a namespace that does not exist and for a wrong password, and a wrong
+/// `IRIS_WEB_PREFIX` 404s everything. Only `classify_404`'s `TargetMissing` arm, where the
+/// namespace was actually confirmed, may become `Absent`.
+async fn probe_int_routine(
+    iris: &IrisConnection,
+    client: &reqwest::Client,
+    namespace: &str,
+    routine: &str,
+) -> RoutineSource {
+    let doc = format!("{routine}.int");
+    let url = iris.versioned_ns_url(namespace, &format!("/doc/{}", urlencoding::encode(&doc)));
+    let resp = match client
+        .head(&url)
+        .basic_auth(&iris.username, Some(&iris.password))
+        .send()
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            return RoutineSource::Undetermined(format!(
+                "the probe for '{doc}' did not reach IRIS: {e}"
+            ))
+        }
+    };
+    let status = resp.status();
+    if status.is_success() {
+        return RoutineSource::Present;
+    }
+    if status.as_u16() != 404 {
+        return RoutineSource::Undetermined(format!(
+            "the probe for '{doc}' answered HTTP {status}, which says nothing about whether the \
+             routine is there"
+        ));
+    }
+    use crate::tools::interop::FourOhFour;
+    match crate::tools::interop::classify_404(iris, client, namespace, &url, "Nothing was read.")
+        .await
+    {
+        FourOhFour::TargetMissing => RoutineSource::Absent,
+        FourOhFour::Explained(e) => RoutineSource::Explained(e),
+        FourOhFour::Undetermined => RoutineSource::Undetermined(format!(
+            "'{doc}' answered 404 and it could not be established whether namespace \
+             '{namespace}' is reachable, so this is not reported as a missing routine"
+        )),
+    }
+}
+
+/// Read a document's text, or say why not. An absent content array is never "empty".
+async fn fetch_document_text(
+    iris: &IrisConnection,
+    client: &reqwest::Client,
+    namespace: &str,
+    doc: &str,
+) -> Result<String, String> {
+    let url = iris.versioned_ns_url(namespace, &format!("/doc/{}", urlencoding::encode(doc)));
+    let resp = client
+        .get(&url)
+        .basic_auth(&iris.username, Some(&iris.password))
+        .send()
+        .await
+        .map_err(|e| format!("the read of '{doc}' did not reach IRIS: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "the read of '{doc}' answered HTTP {}",
+            resp.status()
+        ));
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("the read of '{doc}' was not JSON: {e}"))?;
+    match body["result"]["content"].as_array() {
+        Some(lines) => Ok(lines
+            .iter()
+            .map(|l| l.as_str().unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n")),
+        None => Err(format!(
+            "'{doc}' came back with no content array, so its text was never read"
+        )),
+    }
+}
+
 pub async fn handle_iris_debug(
     iris: &IrisConnection,
     client: &reqwest::Client,
@@ -643,10 +748,136 @@ pub async fn handle_iris_debug(
             // back instead is the decomposition plus, when the caller supplied the .INT text,
             // the exact INT line — see `int_frame`.
             if frame.kind == crate::tools::int_frame::FrameKind::Routine {
+                // #534: when the CALLER brings the listing, map against it and probe nothing.
+                // That is the offline path and it is deliberate — it maps a frame against a
+                // listing from an instance this server cannot reach, or against a specific
+                // generation of the routine. Probing existence there could only fail for
+                // reasons that have nothing to do with the text in hand.
+                if let Some(src) = p.int_source.as_deref() {
+                    // The `.mac` is still worth trying: it costs one document read and, where it
+                    // is reachable, turns the INT line into the source line. `.ok()` because its
+                    // absence is not an error — see the best-effort note below.
+                    let mac_text = fetch_document_text(
+                        iris,
+                        client,
+                        &namespace,
+                        &format!("{}.mac", frame.routine),
+                    )
+                    .await
+                    .ok();
+                    return crate::tools::int_frame::map_int_answer(
+                        err,
+                        &frame,
+                        Some(src),
+                        mac_text.as_deref(),
+                    );
+                }
+                // Nothing was supplied, so this server reads it — and before anything is
+                // counted, establishes that the routine EXISTS. The original path asked
+                // %Dictionary.CompiledClass and answered ROUTINE_NOT_FOUND for a routine that
+                // was there; not asking at all was honest about the class but still never said
+                // when the routine was genuinely absent.
+                match probe_int_routine(iris, client, &namespace, &frame.routine).await {
+                    RoutineSource::Explained(e) => return e,
+                    RoutineSource::Absent => {
+                        return crate::tools::envelope::fail_with(
+                            "ROUTINE_NOT_FOUND",
+                            &format!(
+                                "there is no compiled routine '{rtn}' in namespace '{ns}' — the \
+                                 namespace answered and has no '{rtn}.int' — so the frame cannot \
+                                 be resolved. This is about a ROUTINE; no class of that name was \
+                                 looked for.",
+                                rtn = frame.routine,
+                                ns = namespace
+                            ),
+                            serde_json::json!({
+                                "error_string": err,
+                                "routine": frame.routine,
+                                "namespace": namespace,
+                                "frame_kind": frame.kind.as_str(),
+                                "hint": format!(
+                                    "List what is there with iris_doc(mode='list', \
+                                     namespace='{ns}') and check the spelling, or pass the \
+                                     namespace the routine actually lives in — a frame carries \
+                                     no namespace, so the one used here is the tool's default.",
+                                    ns = namespace
+                                ),
+                            }),
+                        );
+                    }
+                    RoutineSource::Undetermined(why) => {
+                        return crate::tools::envelope::fail_with(
+                            "ROUTINE_PRESENCE_UNDETERMINED",
+                            &format!(
+                                "{why}. Whether '{rtn}' is in namespace '{ns}' was not \
+                                 established, so this is NOT a report that it is missing.",
+                                rtn = frame.routine,
+                                ns = namespace
+                            ),
+                            serde_json::json!({
+                                "error_string": err,
+                                "routine": frame.routine,
+                                "namespace": namespace,
+                                "hint": "Fix the connection or the namespace and retry. To map \
+                                         the frame without this server reading anything, pass \
+                                         the listing yourself as int_source.",
+                            }),
+                        );
+                    }
+                    RoutineSource::Present => {}
+                }
+                // Read the listing, which is what #534 asks for: the caller should not have to
+                // fetch it to get an answer.
+                let fetched_int = {
+                    match fetch_document_text(
+                        iris,
+                        client,
+                        &namespace,
+                        &format!("{}.int", frame.routine),
+                    )
+                    .await
+                    {
+                        Ok(t) => t,
+                        Err(why) => {
+                            return crate::tools::envelope::fail_with(
+                                "INT_SOURCE_UNREADABLE",
+                                &format!(
+                                    "{why}. The routine is there — the HEAD probe confirmed \
+                                         it — so this is a failed READ, not a missing routine, \
+                                         and no line was counted."
+                                ),
+                                serde_json::json!({
+                                    "error_string": err,
+                                    "routine": frame.routine,
+                                    "namespace": namespace,
+                                    "hint": format!(
+                                        "Retry, or read it yourself with \
+                                         iris_doc(mode='get', name='{}.int') and pass the \
+                                         text as int_source.",
+                                        frame.routine
+                                    ),
+                                }),
+                            );
+                        }
+                    }
+                };
+                let int_text = Some(fetched_int.as_str());
+                // The `.mac` is best effort on purpose: a routine with no `.mac` is the INT-only
+                // legacy case the routines profile exists to serve (#537), not an error. Its
+                // absence costs the caller the source line and nothing else.
+                let mac_text = fetch_document_text(
+                    iris,
+                    client,
+                    &namespace,
+                    &format!("{}.mac", frame.routine),
+                )
+                .await
+                .ok();
                 return crate::tools::int_frame::map_int_answer(
                     err,
                     &frame,
-                    p.int_source.as_deref(),
+                    int_text,
+                    mac_text.as_deref(),
                 );
             }
             let exists = match iris
@@ -691,7 +922,9 @@ pub async fn handle_iris_debug(
             // the routine path uses applies here — a class's INT routine is `Pkg.Class.N` and
             // its labels are counted the same way. Without the text, the note below stands.
             if let Some(src) = p.int_source.as_deref() {
-                return crate::tools::int_frame::map_int_answer(err, &frame, Some(src));
+                // No `mac_source`: a class's source is its `.cls`, and mapping an INT line
+                // into a class body is a different problem from counting `.mac` lines (#142).
+                return crate::tools::int_frame::map_int_answer(err, &frame, Some(src), None);
             }
             ok_json(serde_json::json!({
                 "success": true,
