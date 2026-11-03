@@ -1137,7 +1137,13 @@ impl IrisConnection {
             // native Windows IRIS ($TEST=0 -> "output capture unavailable"). See upstream issue #56.
             "  Set tmpfile = ##class(%Library.File).TempFilename(\"txt\")".into(),
             "  Set savedIO = $IO".into(),
-            "  Open tmpfile:(\"WNS\"):5".into(),
+            // #464: `/IOT="UTF8"` on the WRITE end. Without it IRIS translates the device
+            // through the process default, which is an 8-bit table on a Unicode instance, so
+            // every code point above 255 written by the body arrives as `?`. Measured on
+            // 2026.1 before the fix: hiragana -> "?????", kanji -> "???", the euro sign -> "?",
+            // an emoji surrogate pair -> "??". Latin-1 accents survived, which is why this
+            // went unnoticed — Spanish text looks fine and CJK does not.
+            "  Open tmpfile:(\"WNS\":/IOT=\"UTF8\"):5".into(),
             "  If '$TEST { Quit \"ERROR: output capture unavailable\" }".into(),
             "  Use tmpfile".into(),
             "  Try {".into(),
@@ -1157,6 +1163,10 @@ impl IrisConnection {
             // Read line:0 (timeout 0) fails on some IRIS versions — %Stream.ReadLine is portable.
             "  Set out = \"\"".into(),
             "  Set stream = ##class(%Stream.FileCharacter).%New()".into(),
+            // #464: the READ end, and it must be set BEFORE LinkToFile — the stream fixes its
+            // translation when it is linked. Both ends are needed: `/IOT` alone writes UTF-8
+            // that this read would then decode through the 8-bit default.
+            "  Set stream.TranslateTable = \"UTF8\"".into(),
             "  Set sc = stream.LinkToFile(tmpfile)".into(),
             // $SYSTEM.Status.IsOK avoids needing %occStatus.inc in a non-objectgenerator method.
             "  If $SYSTEM.Status.IsOK(sc) {".into(),
