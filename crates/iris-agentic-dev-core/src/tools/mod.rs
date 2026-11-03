@@ -4646,10 +4646,27 @@ pub fn runtime_abort_line(output: &str) -> Option<&str> {
     // The wrapper's one non-`<signal>` failure, emitted when the device redirect could not be
     // established. Matched exactly rather than by the old blanket `starts_with("ERROR: ")`,
     // which also caught a script whose own first line happened to print the word.
-    output
+    if let Some(l) = output
         .lines()
         .map(str::trim)
         .find(|l| *l == "ERROR: output capture unavailable")
+    {
+        return Some(l);
+    }
+    // #437: the redirect WAS established and the body then moved the current device, so the
+    // capture holds at most a prefix of what was written. Recognised here, in the one function
+    // that decides `success`, rather than at each consumer: every caller of this function
+    // already words its failure as "…so X is UNKNOWN — this is not an empty Y: {reason}", which
+    // is exactly the right sentence for a lost capture, and adding it at some sites only would
+    // leave the siblings looking more trustworthy than they are.
+    //
+    // Searched on every line rather than the last, because the generator PREPENDS this one so
+    // that a body which moved the device and then threw still leaves its trap last — both are
+    // then present, and the trap is reported first above as the more actionable cause.
+    output
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("ERROR($DEVICE): "))
 }
 
 /// #390: the `<SIGNAL>` inside a status chain IRIS REPORTED, which is not the shape
@@ -4897,6 +4914,17 @@ fn iris_reported_envelope(
 }
 
 fn abort_hint(abort: &str) -> Option<&'static str> {
+    // #437: the wrapper's own device-loss line. First because it carries no frame and no
+    // `<signal>`, so none of the arms below can read it, and the remedy is not "fix the line".
+    if abort.starts_with("ERROR($DEVICE): ") {
+        return Some(
+            "Your code left the current device pointing somewhere else, so iris_execute could \
+             not capture the rest of what it wrote — the output above is at most a prefix, and \
+             whether the work completed is UNKNOWN. Restore the device before returning: \
+             `Set io=$IO` before the switch and `Use io` after it. A CALLEE can move it too, so \
+             wrap the call rather than only your own Open/Use.",
+        );
+    }
     // #209: known library frames first — they only match when there is no RunUser+ frame,
     // so this cannot take the slot from a per-line explanation.
     if let Some(h) = library_frame_hint(abort) {

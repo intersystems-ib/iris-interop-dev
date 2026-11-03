@@ -1272,8 +1272,11 @@ pub async fn interop_production_start_impl(
     };
     // #6: every user string reaching ObjectScript goes through os_str_expr.
     let code = format!(
-        r#"Set sc=##class(Ens.Director).StartProduction({}) If $$$ISERR(sc) {{ Write "ERROR:"_$System.Status.GetErrorText(sc) }} Else {{ Write "OK" }}"#,
-        os_str_expr(prod)
+        r#"{} If $$$ISERR(sc) {{ Write "ERROR:"_$System.Status.GetErrorText(sc) }} Else {{ Write "OK" }}"#,
+        restoring_device(&format!(
+            "Set sc=##class(Ens.Director).StartProduction({})",
+            os_str_expr(prod)
+        ))
     );
     // Bug 7: use params.namespace, not iris.namespace.
     match exec_http(iris, &code, &params.namespace).await {
@@ -1322,9 +1325,12 @@ pub async fn interop_production_stop_impl(
         None => return err_json("IRIS_UNREACHABLE", "No IRIS connection"),
     };
     let code = format!(
-        r#"Set sc=##class(Ens.Director).StopProduction({},{}) If $$$ISERR(sc) {{ Write "ERROR:"_$System.Status.GetErrorText(sc) }} Else {{ Write "OK" }}"#,
-        params.timeout,
-        if params.force { 1 } else { 0 }
+        r#"{} If $$$ISERR(sc) {{ Write "ERROR:"_$System.Status.GetErrorText(sc) }} Else {{ Write "OK" }}"#,
+        restoring_device(&format!(
+            "Set sc=##class(Ens.Director).StopProduction({},{})",
+            params.timeout,
+            if params.force { 1 } else { 0 }
+        ))
     );
     // Bug 7: use params.namespace, not iris.namespace.
     match exec_http(iris, &code, &params.namespace).await {
@@ -1371,9 +1377,12 @@ pub async fn interop_production_update_impl(
         None => return err_json("IRIS_UNREACHABLE", "No IRIS connection"),
     };
     let code = format!(
-        r#"Set sc=##class(Ens.Director).UpdateProduction({},{}) If $$$ISERR(sc) {{ Write "ERROR:"_$System.Status.GetErrorText(sc) }} Else {{ Write "OK" }}"#,
-        params.timeout,
-        if params.force { 1 } else { 0 }
+        r#"{} If $$$ISERR(sc) {{ Write "ERROR:"_$System.Status.GetErrorText(sc) }} Else {{ Write "OK" }}"#,
+        restoring_device(&format!(
+            "Set sc=##class(Ens.Director).UpdateProduction({},{})",
+            params.timeout,
+            if params.force { 1 } else { 0 }
+        ))
     );
     // Bug 7: use params.namespace.
     match exec_http(iris, &code, &params.namespace).await {
@@ -1417,9 +1426,12 @@ pub async fn interop_production_recover_impl(
         Some(i) => i,
         None => return err_json("IRIS_UNREACHABLE", "No IRIS connection"),
     };
-    let code = r#"Set sc=##class(Ens.Director).RecoverProduction() If $$$ISERR(sc) { Write "ERROR:"_$System.Status.GetErrorText(sc) } Else { Write "OK" }"#;
+    let code = format!(
+        r#"{} If $$$ISERR(sc) {{ Write "ERROR:"_$System.Status.GetErrorText(sc) }} Else {{ Write "OK" }}"#,
+        restoring_device("Set sc=##class(Ens.Director).RecoverProduction()")
+    );
     // Bug 7: use params.namespace.
-    match exec_http(iris, code, &params.namespace).await {
+    match exec_http(iris, &code, &params.namespace).await {
         Ok(output) => {
             let raw = output.trim();
             if raw.starts_with("OK") {
@@ -2120,10 +2132,15 @@ pub async fn interop_production_restart_item_impl(
     }
     let item_esc = item.replace('"', "\"\"");
     let code = format!(
-        r#"Set sc=##class(Ens.Director).EnableConfigItem("{}",0,1) If $$$ISERR(sc) {{ Write "ERROR:"_$System.Status.GetErrorText(sc) Quit }}
-Set sc=##class(Ens.Director).EnableConfigItem("{}",1,1) If $$$ISERR(sc) {{ Write "ERROR:"_$System.Status.GetErrorText(sc) Quit }}
+        r#"{} If $$$ISERR(sc) {{ Write "ERROR:"_$System.Status.GetErrorText(sc) Quit }}
+{} If $$$ISERR(sc) {{ Write "ERROR:"_$System.Status.GetErrorText(sc) Quit }}
 Write "OK""#,
-        item_esc, item_esc
+        restoring_device(&format!(
+            r#"Set sc=##class(Ens.Director).EnableConfigItem("{item_esc}",0,1)"#
+        )),
+        restoring_device(&format!(
+            r#"Set sc=##class(Ens.Director).EnableConfigItem("{item_esc}",1,1)"#
+        ))
     );
     match exec_http(iris, &code, namespace).await {
         Ok(output) => {
@@ -2724,6 +2741,34 @@ If '$IsObject(tProd) {{ Write "ERROR:INTEROP_ERROR:Cannot open production "_tPro
 /// Emitted after `%Save()` succeeded and before `UpdateProduction` — the Portal's order.
 pub const PRODUCTION_CLASS_SAVE: &str = "Set tSCC=tProd.SaveToClass()\nSet tClsErr=\"\" If $$$ISERR(tSCC) { Set tClsErr=$System.Status.GetErrorText(tSCC) }\n";
 
+/// #437: `Ens.Director.UpdateProduction`, bracketed so it cannot take the current device with it.
+///
+/// Every call site writes its own verdict (`OK`, `ERROR:UPDATE_FAILED:…`) on the very next
+/// statement. `UpdateProduction` re-jobs the production's workers, and a callee that leaves `$IO`
+/// on another device sends that verdict somewhere the capture never reads — the tool then reports
+/// an `INTEROP_ERROR` with an empty message for work that had already completed, which invites a
+/// second update. The `Use tIO` therefore has to land BETWEEN the call and the report.
+///
+/// One constant rather than the statement spelled out at each site: this file makes four of these
+/// calls and the bracket is wrong if any one of them is missed. [`restoring_device`] is the same
+/// guard for the lifecycle calls, whose statements differ.
+pub const UPDATE_PRODUCTION_KEEPING_DEVICE: &str =
+    "Set tIO=$IO Set tSC5=##class(Ens.Director).UpdateProduction(10,0) Use tIO";
+
+/// #437: bracket `stmts` so the current device is restored before anything reports on it.
+///
+/// For the `Ens.Director` lifecycle calls (`StartProduction`, `StopProduction`,
+/// `UpdateProduction`, `RecoverProduction`) and `Config.Namespaces` `Create`/`Delete`, each of
+/// which runs code that may `Use` a device of its own and not put it back. See
+/// [`UPDATE_PRODUCTION_KEEPING_DEVICE`] for why the restore must precede the report.
+///
+/// This is belt to the generator's braces: `build_exec_class` now detects a moved device and
+/// returns `ERROR($DEVICE)` rather than a truncated success, so a site missed here is reported
+/// instead of silent. This makes the output survive rather than merely be accounted for.
+pub fn restoring_device(stmts: &str) -> String {
+    format!("Set tIO=$IO {stmts} Use tIO")
+}
+
 /// #408: reports the class save AFTER the OK line, never before it.
 ///
 /// Two reasons for the order. A `%Status` chain's text is multi-line, so a marker written
@@ -2798,7 +2843,7 @@ If '$IsObject(tItem) {{
 Set tItem.Enabled={enabled_val}
 Set tSC4=tProd.%Save()
 If $$$ISERR(tSC4) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC4) Quit }}
-{class_save}Set tSC5=##class(Ens.Director).UpdateProduction(10,0)
+{class_save}{update}
 If $$$ISERR(tSC5) {{ Write "ERROR:UPDATE_FAILED:"_$System.Status.GetErrorText(tSC5) Quit }}
 Write "OK"{class_save_report}"#,
         prologue = resolve_production_prologue(production),
@@ -2806,6 +2851,7 @@ Write "OK"{class_save_report}"#,
         not_found = item_not_found_block(&item_e),
         enabled_val = if enabled { "1" } else { "0" },
         class_save = PRODUCTION_CLASS_SAVE,
+        update = UPDATE_PRODUCTION_KEEPING_DEVICE,
         class_save_report = PRODUCTION_CLASS_SAVE_REPORT,
     )
 }
@@ -2852,12 +2898,13 @@ Set tItem.Enabled={enabled}
 Set tSC4=tProd.%Save()
 If $$$ISERR(tSC4) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC4) Quit }}
 {class_save}Set tRun="" Do ##class(Ens.Director).GetProductionStatus(.tRun,.s2)
-If tRun=tProdName {{ Set tSC5=##class(Ens.Director).UpdateProduction(10,0) If $$$ISERR(tSC5) {{ Write "ERROR:UPDATE_FAILED:"_$System.Status.GetErrorText(tSC5) Quit }} }}
+If tRun=tProdName {{ {update} If $$$ISERR(tSC5) {{ Write "ERROR:UPDATE_FAILED:"_$System.Status.GetErrorText(tSC5) Quit }} }}
 Write "OK:"_tProdName{class_save_report}"#,
         prologue = resolve_production_prologue(production),
         item = item_e,
         class = class_e,
         class_save = PRODUCTION_CLASS_SAVE,
+        update = UPDATE_PRODUCTION_KEEPING_DEVICE,
         class_save_report = PRODUCTION_CLASS_SAVE_REPORT,
         enabled = if enabled { 1 } else { 0 },
         extra = extra
@@ -2877,12 +2924,13 @@ Do tProd.Items.RemoveAt(tIdx)
 Set tSC4=tProd.%Save()
 If $$$ISERR(tSC4) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC4) Quit }}
 {class_save}Set tRun="" Do ##class(Ens.Director).GetProductionStatus(.tRun,.s2)
-If tRun=tProdName {{ Set tSC5=##class(Ens.Director).UpdateProduction(10,0) If $$$ISERR(tSC5) {{ Write "ERROR:UPDATE_FAILED:"_$System.Status.GetErrorText(tSC5) Quit }} }}
+If tRun=tProdName {{ {update} If $$$ISERR(tSC5) {{ Write "ERROR:UPDATE_FAILED:"_$System.Status.GetErrorText(tSC5) Quit }} }}
 Write "OK:"_tProdName{class_save_report}"#,
         prologue = resolve_production_prologue(production),
         item = item_e,
         not_found = item_not_found_block(&item_e),
         class_save = PRODUCTION_CLASS_SAVE,
+        update = UPDATE_PRODUCTION_KEEPING_DEVICE,
         class_save_report = PRODUCTION_CLASS_SAVE_REPORT,
     )
 }
@@ -2925,9 +2973,11 @@ Set tS.Value={value}
     // C: apply live (Ens.Director.UpdateProduction) unless apply=false, so several
     // set_settings calls can be batched and applied once (or via iris_production update).
     let update_line = if apply {
-        "Set tSC5=##class(Ens.Director).UpdateProduction(10,0)\nIf $$$ISERR(tSC5) { Write \"ERROR:UPDATE_FAILED:\"_$System.Status.GetErrorText(tSC5) Quit }\n"
+        format!(
+            "{UPDATE_PRODUCTION_KEEPING_DEVICE}\nIf $$$ISERR(tSC5) {{ Write \"ERROR:UPDATE_FAILED:\"_$System.Status.GetErrorText(tSC5) Quit }}\n"
+        )
     } else {
-        ""
+        String::new()
     };
     format!(
         r#"{prologue}
