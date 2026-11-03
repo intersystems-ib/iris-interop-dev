@@ -1146,11 +1146,25 @@ impl IrisConnection {
             "  Open tmpfile:(\"WNS\":/IOT=\"UTF8\"):5".into(),
             "  If '$TEST { Quit \"ERROR: output capture unavailable\" }".into(),
             "  Use tmpfile".into(),
+            // #437: record which device is current when the body is done, so a body that
+            // moved it can be reported instead of silently losing its output. Initialised to
+            // `tmpfile` so the check cannot fire on a path that never reached a snapshot —
+            // that makes "no false positive" independent of the control flow below, and the
+            // live test is what proves the check can still FIRE.
+            "  Set devio = tmpfile".into(),
             "  Try {".into(),
             "    Do ..RunUser()".into(),
+            // Snapshotted on BOTH arms, before anything else writes: the Catch's own
+            // `Write` would otherwise go to the moved device and be lost with the rest.
+            "    Set devio = $IO".into(),
             "  } Catch ex {".into(),
+            "    Set devio = $IO".into(),
+            "    Use tmpfile".into(),
             "    Write \"ERROR: \",ex.DisplayString(),!".into(),
             "  }".into(),
+            // Re-attach before the sentinel for the same reason, which also restores IDEV-3's
+            // invariant (the file ends with a newline) for a body that moved the device.
+            "  Use tmpfile".into(),
             "  Write !".into(), // IDEV-3: sentinel ensures temp file always ends with \n
             // Snapshot $ZERROR now, before Close/Use/stream operations below can clobber
             // it. This captures non-exception errors (e.g. an OPEN failure that sets
@@ -1178,6 +1192,17 @@ impl IrisConnection {
             // SCM provider's internal Read even when the operation fully succeeded;
             // appending it to a non-empty result corrupted otherwise-valid output.
             "  If (out=\"\") && (ze'=\"\") && (ze'=\",\") { Set out = \"ERROR($ZERROR): \"_ze_$Char(10) }"
+                .into(),
+            // #437: the body left the current device somewhere else, so everything it wrote
+            // after the switch went to that device and is gone. PREPENDED, not appended: the
+            // wrapper's abort line has to stay the LAST line for `runtime_abort_line` to find
+            // it, and a body that moved the device and then threw produces both.
+            //
+            // Compared case-insensitively because a native Windows IRIS lower-cases `$IO`
+            // (upstream issue 139). Measured on 2026.1/Linux the two are byte-equal — `$IO`
+            // inside the capture reads back as the exact `TempFilename` path, and `$IO` after
+            // `Use other` equals `other` exactly — so this costs nothing where it is not needed.
+            "  If $ZConvert(devio,\"L\")'=$ZConvert(tmpfile,\"L\") { Set out = \"ERROR($DEVICE): output capture lost - the code left the current device on \"_devio_\" instead of the capture file, so anything written after the switch was discarded\"_$Char(10)_out }"
                 .into(),
             // Encode newlines as $C(1) for the Rust-side transport (decoded \x01 -> \n).
             "  Quit $Replace(out,$Char(10),$Char(1))".into(),

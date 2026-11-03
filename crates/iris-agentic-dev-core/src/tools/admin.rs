@@ -583,8 +583,11 @@ pub async fn admin_create_namespace_impl(
         r#"Set ns("Globals")={dd}
 Set ns("Routines")={cd}
 Set ns("Database")={dd}
-Set tSC=##class(Config.Namespaces).Create({nm},.ns)
-If $$$ISERR(tSC) {{ Write "ERROR:NAMESPACE_EXISTS:"_$System.Status.GetErrorText(tSC) }} Else {{ Write "OK" }}"#
+{create}
+If $$$ISERR(tSC) {{ Write "ERROR:NAMESPACE_EXISTS:"_$System.Status.GetErrorText(tSC) }} Else {{ Write "OK" }}"#,
+        create = crate::tools::interop::restoring_device(&format!(
+            "Set tSC=##class(Config.Namespaces).Create({nm},.ns)"
+        )),
     );
     match iris.execute_via_generator(&code, "%SYS", &client).await {
         Ok(out) => {
@@ -619,8 +622,11 @@ pub async fn admin_delete_namespace_impl(
     // Deletes namespace definition only — databases are NOT deleted (by design)
     let code = format!(
         r#"If '##class(Config.Namespaces).Exists({nm}) {{ Write "ERROR:NAMESPACE_NOT_FOUND:Namespace not found: "_{nm} Quit }}
-Set tSC=##class(Config.Namespaces).Delete({nm})
-If $$$ISERR(tSC) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC) }} Else {{ Write "OK" }}"#
+{delete}
+If $$$ISERR(tSC) {{ Write "ERROR:INTEROP_ERROR:"_$System.Status.GetErrorText(tSC) }} Else {{ Write "OK" }}"#,
+        delete = crate::tools::interop::restoring_device(&format!(
+            "Set tSC=##class(Config.Namespaces).Delete({nm})"
+        )),
     );
     match iris.execute_via_generator(&code, "%SYS", &client).await {
         Ok(out) => {
