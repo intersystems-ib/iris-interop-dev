@@ -23,6 +23,7 @@
 //! through the 8-bit default; `TranslateTable` alone decodes as UTF-8 bytes that were never
 //! written as UTF-8. The two assertions below are separate for that reason.
 
+#![allow(clippy::zombie_processes)]
 use iris_agentic_dev_core::iris::connection::IrisConnection;
 
 /// The generated ObjectScript, as one string.
