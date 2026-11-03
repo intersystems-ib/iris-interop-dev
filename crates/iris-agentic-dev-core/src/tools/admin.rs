@@ -104,23 +104,19 @@ While tRS.Next() {
 }"#;
     match iris.execute_via_generator(code, "%SYS", &client).await {
         Ok(out) => {
-            let out = out.trim();
-            if out.starts_with("ERROR:") {
-                return err_json("INTEROP_ERROR", out);
-            }
-            let databases: Vec<serde_json::Value> = out
-                .lines()
-                .filter(|l| !l.is_empty())
-                .map(|line| {
-                    let parts: Vec<&str> = line.splitn(4, '|').collect();
-                    serde_json::json!({
-                        "directory": parts.first().copied().unwrap_or(""),
-                        "mounted": parts.get(1).copied().unwrap_or("0") != "0",
-                        "size_mb": parts.get(2).copied().unwrap_or("0").trim().parse::<f64>().unwrap_or(0.0),
-                        "max_size_mb": parts.get(3).copied().unwrap_or("0").trim().parse::<f64>().unwrap_or(0.0),
-                    })
-                })
-                .collect();
+            let databases = match parse_database_listing(&out) {
+                DatabaseListing::Rows(rows) => rows,
+                DatabaseListing::ToolError(msg) => return err_json("INTEROP_ERROR", &msg),
+                DatabaseListing::GeneratorFailure(msg) => {
+                    return err_json(
+                        "IRIS_RUNTIME_ERROR",
+                        &format!(
+                            "listing the databases failed, so which ones exist is UNKNOWN — this \
+                             is not an empty list: {msg}"
+                        ),
+                    )
+                }
+            };
             let count = databases.len();
             ok_json(serde_json::json!({"success":true,"databases":databases,"count":count}))
         }
@@ -320,13 +316,18 @@ Write $GET(props("Roles"))"#
     match iris.execute_via_generator(&code, "%SYS", &client).await {
         Ok(out) => {
             let out = out.trim();
-            if let Some(msg) = out.strip_prefix("ERROR:USER_NOT_FOUND:") {
-                return err_json("USER_NOT_FOUND", msg);
-            }
-            let roles: Vec<&str> = if out.is_empty() {
-                vec![]
-            } else {
-                out.split(',').map(|r| r.trim()).collect()
+            let roles = match parse_user_roles(out) {
+                UserRoles::Roles(roles) => roles,
+                UserRoles::NotFound(msg) => return err_json("USER_NOT_FOUND", &msg),
+                UserRoles::GeneratorFailure(msg) => {
+                    return err_json(
+                        "IRIS_RUNTIME_ERROR",
+                        &format!(
+                            "reading the roles of {username} failed, so which roles they hold is \
+                             UNKNOWN — this is not an empty role list: {msg}"
+                        ),
+                    )
+                }
             };
             ok_json(serde_json::json!({"success":true,"username":username,"roles":roles}))
         }
@@ -602,6 +603,77 @@ If $$$ISERR(tSC) {{ Write "ERROR:NAMESPACE_EXISTS:"_$System.Status.GetErrorText(
         }
         Err(e) => err_json(admin_error_code(&e.to_string()), &e.to_string()),
     }
+}
+
+// ── interpreting generator output: three cases, never two ─────────────────────────────────────
+//
+// #437. Both functions below used to decide with `starts_with("ERROR:")`, which does NOT match
+// the generator's other two failure shapes — `ERROR($ZERROR): <SIGNAL>…` (an abort that left no
+// output) and `ERROR($DEVICE): …` (the body moved the current device, so the capture is short).
+// Neither starts with `ERROR:`; both fell through into the parser and came back as DATA with
+// `success: true`. A `<PROTECT>` on a system database became a database named
+// `ERROR($ZERROR): <PROTECT>…`, and a failed role read became a list of roles.
+//
+// `runtime_abort_line` is the one place those shapes are recognised, so both now ask it first.
+// The third enum case is what makes the compiler enumerate the call sites — see CLAUDE.md.
+
+/// Rows of `SYS.Database:List`, or why they could not be read.
+pub enum DatabaseListing {
+    Rows(Vec<serde_json::Value>),
+    /// The snippet ran and `SYS.Database:List` itself refused — a `%Status` we can quote.
+    ToolError(String),
+    /// The wrapper could not run the snippet, or could not capture what it wrote.
+    GeneratorFailure(String),
+}
+
+pub fn parse_database_listing(out: &str) -> DatabaseListing {
+    let out = out.trim();
+    if let Some(reason) = crate::tools::runtime_abort_line(out) {
+        return DatabaseListing::GeneratorFailure(reason.to_string());
+    }
+    if out.starts_with("ERROR:") {
+        return DatabaseListing::ToolError(out.to_string());
+    }
+    DatabaseListing::Rows(
+        out.lines()
+            .filter(|l| !l.is_empty())
+            .map(|line| {
+                let parts: Vec<&str> = line.splitn(4, '|').collect();
+                serde_json::json!({
+                    "directory": parts.first().copied().unwrap_or(""),
+                    "mounted": parts.get(1).copied().unwrap_or("0") != "0",
+                    "size_mb": parts.get(2).copied().unwrap_or("0").trim().parse::<f64>().unwrap_or(0.0),
+                    "max_size_mb": parts.get(3).copied().unwrap_or("0").trim().parse::<f64>().unwrap_or(0.0),
+                })
+            })
+            .collect(),
+    )
+}
+
+/// The roles a user holds, or why they could not be read.
+pub enum UserRoles {
+    Roles(Vec<String>),
+    NotFound(String),
+    GeneratorFailure(String),
+}
+
+pub fn parse_user_roles(out: &str) -> UserRoles {
+    let out = out.trim();
+    if let Some(msg) = out.strip_prefix("ERROR:USER_NOT_FOUND:") {
+        return UserRoles::NotFound(msg.to_string());
+    }
+    if let Some(reason) = crate::tools::runtime_abort_line(out) {
+        return UserRoles::GeneratorFailure(reason.to_string());
+    }
+    // A role name never begins with `ERROR`, so anything that does is a failure shape this
+    // function has not been taught — report it rather than splitting it into role names.
+    if out.starts_with("ERROR") {
+        return UserRoles::GeneratorFailure(out.to_string());
+    }
+    if out.is_empty() {
+        return UserRoles::Roles(vec![]);
+    }
+    UserRoles::Roles(out.split(',').map(|r| r.trim().to_string()).collect())
 }
 
 // ── Write: delete namespace ───────────────────────────────────────────────────

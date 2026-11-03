@@ -74,7 +74,9 @@ fn the_snapshot_precedes_the_sentinel_write() {
 #[test]
 fn the_catch_reattaches_the_capture_before_writing_the_trap() {
     let src = generated();
-    let catch = src.find("} Catch ex {").expect("the Catch arm must be present");
+    let catch = src
+        .find("} Catch ex {")
+        .expect("the Catch arm must be present");
     let trap = src[catch..]
         .find(r#"Write "ERROR: ",ex.DisplayString()"#)
         .map(|i| catch + i)
@@ -248,7 +250,9 @@ fn every_production_item_builder_restores_the_device_before_reporting() {
         let report = code[call..]
             .find("UPDATE_FAILED")
             .map(|i| call + i)
-            .unwrap_or_else(|| panic!("{name}: UpdateProduction's result is never reported:\n{code}"));
+            .unwrap_or_else(|| {
+                panic!("{name}: UpdateProduction's result is never reported:\n{code}")
+            });
         assert!(
             snapshot < call && call < restore && restore < report,
             "{name}: expected snapshot({snapshot}) < call({call}) < restore({restore}) < \
@@ -296,7 +300,7 @@ fn every_mutating_ens_director_call_in_the_source_is_bracketed() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
         let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{file}: {e}"));
         let all: Vec<&str> = src.lines().collect();
-        for (n, raw) in all.iter().map(|l| *l).enumerate() {
+        for (n, raw) in all.iter().copied().enumerate() {
             let line = raw.trim_start();
             if line.starts_with("//") {
                 continue;
@@ -358,9 +362,11 @@ fn the_namespace_writes_restore_the_device() {
             checked += 1;
         }
     }
-    assert_eq!(checked, 2, "expected one Create and one Delete, saw {checked}");
+    assert_eq!(
+        checked, 2,
+        "expected one Create and one Delete, saw {checked}"
+    );
 }
-
 
 /// Is the generated statement on `lines[at]` lexically inside a device bracket?
 ///
@@ -523,7 +529,9 @@ mod live {
         let mut checked = 0;
         for (what, code, expect_success) in &cases {
             let v = execute(code);
-            let success = v["success"].as_bool().unwrap_or_else(|| panic!("{what}: {v}"));
+            let success = v["success"]
+                .as_bool()
+                .unwrap_or_else(|| panic!("{what}: {v}"));
             assert_eq!(
                 success, *expect_success,
                 "{what}: expected success={expect_success}, got {v}"
