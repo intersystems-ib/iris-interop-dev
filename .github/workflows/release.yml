@@ -207,7 +207,7 @@ jobs:
       # Also un-floated: `@v3` would silently pick up a new upload implementation, and this step
       # is the only thing that publishes anything. (A commit SHA is stricter still; no other
       # action in this repo is SHA-pinned, so this stays a tag to match.)
-      - uses: softprops/action-gh-release@v3.0.3
+      - uses: softprops/action-gh-release@v3.0.4
         with:
           generate_release_notes: true
           body: |
